@@ -2078,6 +2078,7 @@ pub fn set_native_historical_risk_state<T: Serialize>(value: T) -> bool {
 #[cfg(all(test, feature = "live", not(madsim)))]
 mod read_view_tests {
     use super::*;
+    use crate::live::dst;
     use rstest::rstest;
     use std::sync::Arc;
 
