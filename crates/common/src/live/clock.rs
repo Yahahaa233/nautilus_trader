@@ -61,6 +61,7 @@ struct LiveRestoredTimers {
     // Removed schedules are not active inventory. Only their already retained,
     // closed callback may carry original messages admitted during cancellation.
     cancelled_tokens: BTreeMap<u64, (serde_json::Value, crate::runner::TimeEventCallbackToken)>,
+    retained_callbacks: BTreeMap<u64, crate::runner::RetainedTimeEventCallback>,
     inspectors: Vec<TimerInspector>,
     updaters: BTreeMap<String, Box<dyn Fn(u64, bool) -> anyhow::Result<()>>>,
     restored: std::cell::RefCell<serde_json::Value>,
@@ -314,7 +315,6 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
                     && original["status"] == "active"
                     && original["callback_kind"] == "registered_owner_thread"
                     && state & closed != 0
-                    && state & !closed != 0
                     && original["binding"]["state"].as_u64() == Some(state & !closed)
                     && !after["timers"]
                         .as_array()
@@ -337,9 +337,16 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
             .iter()
             .map(|(event, binding, _, _)| {
                 let token = &self.cancelled_tokens[binding].1;
-                let lease = token
-                    .restore_closed_queued_lease(self.clock_id.unwrap_or(self.actual_clock_id))
-                    .context("cancelled actual callback disappeared or has no retained lease")?;
+                let clock_id = self.clock_id.unwrap_or(self.actual_clock_id);
+                let lease = if token.checkpoint_inventory()["state"].as_u64() == Some(1u64 << 63) {
+                    self.retained_callbacks
+                        .get(binding)
+                        .context("idle cancelled actual callback was not retained before dispatch")?
+                        .restore_original_idle_cancelled_lease(clock_id)
+                } else {
+                    token.restore_closed_queued_lease(clock_id)
+                }
+                .context("cancelled actual callback disappeared or has no retained lease")?;
                 Ok(
                     crate::runner::TimeEventMessage::registered(event.clone(), lease)
                         .with_native_source_callback_binding(*binding),
@@ -448,6 +455,13 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
             "original handler timer registration differs"
         );
         let mut tokens = BTreeMap::new();
+        // Retain idle callbacks removed by this dispatch until its verified
+        // after-cut admissions finish. Older empty cancellations can now retire.
+        self.cancelled_tokens.retain(|_, (_, token)| {
+            token.checkpoint_inventory()["state"]
+                .as_u64()
+                .is_some_and(|state| state & ((1u64 << 63) - 1) != 0)
+        });
         for (row, source) in rows.iter_mut().zip(original) {
             let name = row["name"].as_str().unwrap().to_owned();
             clock.resolve_recovery_callback(
@@ -467,6 +481,14 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
                 .as_u64()
                 .ok_or_else(|| anyhow::anyhow!("original timer binding absent"))?;
             let token = clock.timers[&Ustr::from(&name)].registered_checkpoint_token()?;
+            if !token.is_closed() && !self.retained_callbacks.contains_key(&source_id) {
+                self.retained_callbacks.insert(
+                    source_id,
+                    token
+                        .retain_actual_callback()
+                        .context("actual historical owner callback could not be retained")?,
+                );
+            }
             // Existing native bindings stay bound to the same source ID. A
             // replacement is allowed only after its actual old token closed.
             if let Some((old_id, (_, _, _, old_token))) = self
@@ -535,11 +557,8 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
                     .insert(*id, (registration, token.clone()));
             }
         }
-        self.cancelled_tokens.retain(|_, (_, token)| {
-            token.checkpoint_inventory()["state"]
-                .as_u64()
-                .is_some_and(|state| state & ((1u64 << 63) - 1) != 0)
-        });
+        self.retained_callbacks
+            .retain(|id, _| tokens.contains_key(id) || self.cancelled_tokens.contains_key(id));
         self.updaters = clock
             .timers
             .iter()
@@ -904,6 +923,7 @@ impl Clock for LiveClock {
         );
         let pause = self.checkpoint_gate.pause_producers()?;
         let mut tokens = BTreeMap::new();
+        let mut retained_callbacks = BTreeMap::new();
         for spec in specs {
             let (callback, callback_source) = self.resolve_recovery_callback(
                 &spec.name.as_str().into(),
@@ -928,13 +948,22 @@ impl Clock for LiveClock {
                 spec.status == "exhausted",
             );
             let id = spec.binding["binding_id"].as_u64().unwrap();
+            let token = timer.registered_checkpoint_token()?;
+            if !token.is_closed() {
+                retained_callbacks.insert(
+                    id,
+                    token
+                        .retain_actual_callback()
+                        .context("actual restored owner callback could not be retained")?,
+                );
+            }
             tokens.insert(
                 id,
                 (
                     spec.name.clone(),
                     spec.interval_ns,
                     spec.next_time_ns,
-                    timer.registered_checkpoint_token()?,
+                    token,
                 ),
             );
             self.timers.insert(Ustr::from(spec.name.as_str()), timer);
@@ -958,6 +987,7 @@ impl Clock for LiveClock {
             source: inventory.clone(),
             tokens,
             cancelled_tokens: BTreeMap::new(),
+            retained_callbacks,
             inspectors,
             updaters,
             restored: std::cell::RefCell::new(restored),
@@ -1669,19 +1699,29 @@ mod tests {
     #[case("foreign_clock")]
     #[case("no_retained_lease")]
     #[case("duplicate_original")]
+    #[case("idle_valid")]
+    #[case("idle_changed_binding")]
+    #[case("idle_changed_event")]
+    #[case("idle_changed_profile")]
+    #[case("idle_accepted_before")]
+    #[case("idle_accepted_after")]
+    #[case("idle_foreign_clock")]
+    #[case("idle_duplicate_original")]
     fn actual_cancelled_timer_restores_only_original_late_queued_lease(#[case] fault: &str) {
         use crate::recovery_trace::{
             NativeInputSource, NativeProcessingReceipt, NativeTraceRecord, NativeTraceSource,
             historical::HistoricalInputScope,
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let idle_before = fault.starts_with("idle_");
+        let fault = fault.strip_prefix("idle_").unwrap_or(fault);
         let (source_tx, source_rx) = mpsc::channel();
         let mut source = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(source_tx))));
         source.register_default_handler(TimeEventCallback::RustLocal(std::rc::Rc::new(|_| {})));
         source
             .set_timer_ns(
                 "late-during-cancel",
-                DurationNanos::from_millis(100),
+                DurationNanos::from_millis(if idle_before { 500 } else { 100 }),
                 None,
                 None,
                 None,
@@ -1689,9 +1729,11 @@ mod tests {
                 Some(false),
             )
             .unwrap();
-        let first = source_rx
-            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-            .unwrap();
+        let first = (!idle_before).then(|| {
+            source_rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap()
+        });
         let freeze = |clock: &LiveClock| loop {
             match clock.freeze_running_timer_checkpoint() {
                 Ok(cut) => break cut,
@@ -1710,9 +1752,9 @@ mod tests {
         let original_count = original_before["timers"][0]["binding"]["state"]
             .as_u64()
             .unwrap();
-        let mut original_queued = vec![first];
+        let mut original_queued = first.into_iter().collect::<Vec<_>>();
         original_queued.extend(source_rx.try_iter());
-        assert!(original_count > 0);
+        assert_eq!(original_count == 0, idle_before);
         assert_eq!(original_queued.len() as u64, original_count);
         before_cut.finish().unwrap();
         let late = source_rx
@@ -1744,9 +1786,15 @@ mod tests {
         let mut receipt = target
             .restore_running_timer_checkpoint(&original_before)
             .unwrap();
-        let binding = original_queued[0].native_input_callback_binding()["binding_id"]
+        let binding = original_before["timers"][0]["binding"]["binding_id"]
             .as_u64()
             .unwrap();
+        for original in &original_queued {
+            assert_eq!(
+                original.native_input_callback_binding()["binding_id"].as_u64(),
+                Some(binding)
+            );
+        }
         let original_inputs = original_queued
             .iter()
             .map(|message| (message.event().clone(), binding, false))

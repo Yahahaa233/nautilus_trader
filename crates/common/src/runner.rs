@@ -91,7 +91,82 @@ struct TimeEventCallbackEntry {
 #[derive(Clone, Debug)]
 pub(crate) struct TimeEventCallbackToken(Arc<TimeEventCallbackTokenInner>);
 
+/// Keeps the actual owner callback while a paused historical dispatch can cancel
+/// an idle timer. This holds no queued lease and cannot restart the producer.
+#[cfg(feature = "live")]
+#[derive(Debug)]
+pub(crate) struct RetainedTimeEventCallback {
+    token: TimeEventCallbackToken,
+    callback: TimeEventCallback,
+}
+
+#[cfg(feature = "live")]
+impl RetainedTimeEventCallback {
+    pub(crate) fn restore_original_idle_cancelled_lease(
+        &self,
+        clock_id: nautilus_core::UUID4,
+    ) -> Option<TimeEventCallbackLease> {
+        if !crate::recovery_trace::historical::active()
+            || self.token.0.owner != thread::current().id()
+            || self.token.0.owner_clock_id.get() != Some(&clock_id)
+            || self.token.0.state.load(Ordering::Acquire) != CALLBACK_CLOSED
+        {
+            return None;
+        }
+        // The Reader has verified an original message accepted after its idle
+        // before-cut and before the same handler's after-cut. Keep the closed
+        // bit, and restore only the actual callback retained before that handler.
+        TIME_EVENT_CALLBACKS.with(|callbacks| {
+            let mut callbacks = callbacks.borrow_mut();
+            if let Some(entry) = callbacks.get(&self.token.0.id) {
+                if !entry
+                    .token
+                    .upgrade()
+                    .is_some_and(|token| Arc::ptr_eq(&token, &self.token.0))
+                {
+                    return None;
+                }
+            } else {
+                callbacks.insert(
+                    self.token.0.id,
+                    TimeEventCallbackEntry {
+                        callback: self.callback.clone(),
+                        token: Arc::downgrade(&self.token.0),
+                    },
+                );
+            }
+            self.token
+                .0
+                .state
+                .compare_exchange(
+                    CALLBACK_CLOSED,
+                    CALLBACK_CLOSED | 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .ok()
+                .map(|_| TimeEventCallbackLease(self.token.0.clone()))
+        })
+    }
+}
+
 impl TimeEventCallbackToken {
+    #[cfg(feature = "live")]
+    pub(crate) fn retain_actual_callback(&self) -> Option<RetainedTimeEventCallback> {
+        if self.0.owner != thread::current().id() || self.is_closed() {
+            return None;
+        }
+        TIME_EVENT_CALLBACKS.with(|callbacks| {
+            let callbacks = callbacks.borrow();
+            let entry = callbacks.get(&self.0.id)?;
+            let token = entry.token.upgrade()?;
+            Arc::ptr_eq(&token, &self.0).then(|| RetainedTimeEventCallback {
+                token: self.clone(),
+                callback: entry.callback.clone(),
+            })
+        })
+    }
+
     #[cfg(feature = "live")]
     pub(crate) fn bind_owner_clock(&self, clock_id: nautilus_core::UUID4) {
         // Only the actual LiveTimer factory binds this existing callback token.
