@@ -1386,6 +1386,7 @@ mod tests {
                 reconciliation: false,
                 ..Default::default()
             })
+            .with_delay_post_stop_secs(0)
             .with_delay_shutdown_secs(0)
             .with_event_store(move |instance, clock| {
                 let mut store = EventStoreLifecycle::boot(Some(config), instance, clock)?;
@@ -1404,8 +1405,8 @@ mod tests {
             })
             .build()
             .unwrap();
-        node.config.timeout_shutdown = Duration::ZERO;
-        node.config.delay_post_stop = Duration::ZERO;
+        assert_eq!(node.kernel.config.timeout_shutdown(), Duration::ZERO);
+        assert_eq!(node.kernel.delay_post_stop(), Duration::ZERO);
         node.set_dispatch_observer(NodeDispatchObserver::new(
             DispatchObserver::new(name.into(), |_| Ok(())).unwrap(),
             |source, phase, input| {
