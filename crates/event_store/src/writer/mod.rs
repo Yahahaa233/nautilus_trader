@@ -54,6 +54,106 @@ pub const DEFAULT_MAX_BATCH_LATENCY: Duration = Duration::from_millis(5);
 /// Default submit-side stall ceiling that fires the halt callback.
 pub const DEFAULT_HALT_THRESHOLD: Duration = Duration::from_millis(250);
 
+/// Monotonic timing shared with the waiter, including the phase active at timeout.
+/// This diagnostic carries no journal payload and never establishes durable completion.
+#[cfg(not(madsim))]
+#[derive(Debug)]
+pub(super) struct AppendTiming {
+    start: std::time::Instant,
+    stage: std::sync::atomic::AtomicU8,
+    times: [std::sync::atomic::AtomicU64; 6],
+}
+
+#[cfg(not(madsim))]
+impl AppendTiming {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            stage: std::sync::atomic::AtomicU8::new(0),
+            times: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    pub(super) fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    pub(super) fn mark(&self, stage: u8) {
+        use std::sync::atomic::Ordering;
+        let ns = u64::try_from(self.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.times[usize::from(stage) - 1].store(ns, Ordering::Release);
+        self.stage.store(stage, Ordering::Release);
+    }
+
+    fn summary(&self) -> String {
+        use std::sync::atomic::Ordering;
+        let stage = self.stage.load(Ordering::Acquire);
+        let times = self
+            .times
+            .each_ref()
+            .map(|time| time.load(Ordering::Acquire));
+        let delta = |index: usize| {
+            (times[index] > 0 && times[index - 1] > 0)
+                .then(|| times[index].saturating_sub(times[index - 1]))
+        };
+        format!(
+            "phase={} queued_ns={:?} build_and_prefix_ns={:?} encode_ns={:?} write_ns={:?} commit_ns={:?} backend_tail_ns={:?} elapsed_ns={}",
+            [
+                "queued",
+                "build",
+                "encode",
+                "write",
+                "commit",
+                "backend_tail",
+                "ack"
+            ][usize::from(stage)],
+            (times[0] > 0).then_some(times[0]),
+            delta(1),
+            delta(2),
+            delta(3),
+            delta(4),
+            delta(5),
+            self.elapsed().as_nanos(),
+        )
+    }
+}
+
+// The backend only observes the current writer call's probe. No payload or
+// authority crosses this thread-local scope, and no logging blocks the commit.
+#[cfg(not(madsim))]
+thread_local! {
+    static ACTIVE_APPEND_TIMING: std::cell::RefCell<Option<std::sync::Arc<AppendTiming>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(not(madsim))]
+#[derive(Debug)]
+pub(super) struct AppendProbeGuard(Option<std::sync::Arc<AppendTiming>>);
+#[cfg(not(madsim))]
+impl AppendProbeGuard {
+    fn enter(timing: std::sync::Arc<AppendTiming>) -> Self {
+        Self(ACTIVE_APPEND_TIMING.with(|slot| slot.replace(Some(timing))))
+    }
+}
+#[cfg(not(madsim))]
+impl Drop for AppendProbeGuard {
+    fn drop(&mut self) {
+        ACTIVE_APPEND_TIMING.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+pub(crate) fn mark_backend_phase(stage: u8) {
+    #[cfg(not(madsim))]
+    ACTIVE_APPEND_TIMING.with(|slot| {
+        if let Some(timing) = slot.borrow().as_ref() {
+            timing.mark(stage);
+        }
+    });
+    #[cfg(madsim)]
+    let _ = stage;
+}
+
 /// Configuration knobs for the writer.
 #[derive(Clone, Debug)]
 pub struct WriterConfig {
@@ -437,15 +537,18 @@ mod imp {
             }
             let tx = self.tx.as_ref().ok_or(EventStoreError::Closed)?;
             let (ack, ack_rx) = mpsc::sync_channel(1);
-            self.request_ack(
+            let timing = Arc::new(super::AppendTiming::new());
+            self.request_ack_traced(
                 tx,
                 WriterMessage::AppendDurable {
                     draft,
                     ts_publish: self.clock.get_time_ns(),
                     ack,
+                    timing: Arc::clone(&timing),
                 },
                 &ack_rx,
                 "native durable append",
+                Some(&timing),
             )
         }
 
@@ -455,6 +558,17 @@ mod imp {
             pending: WriterMessage,
             ack_rx: &mpsc::Receiver<Result<T, EventStoreError>>,
             operation: &str,
+        ) -> Result<T, EventStoreError> {
+            self.request_ack_traced(tx, pending, ack_rx, operation, None)
+        }
+
+        fn request_ack_traced<T>(
+            &self,
+            tx: &SyncSender<WriterMessage>,
+            pending: WriterMessage,
+            ack_rx: &mpsc::Receiver<Result<T, EventStoreError>>,
+            operation: &str,
+            timing: Option<&super::AppendTiming>,
         ) -> Result<T, EventStoreError> {
             let start = Instant::now();
 
@@ -470,14 +584,41 @@ mod imp {
                 }
             }
 
-            match ack_rx.recv_timeout(self.halt_threshold) {
-                Ok(result) => result,
+            self.receive_ack(ack_rx, start, operation, timing)
+        }
+
+        fn receive_ack<T>(
+            &self,
+            ack_rx: &mpsc::Receiver<Result<T, EventStoreError>>,
+            start: Instant,
+            operation: &str,
+            timing: Option<&super::AppendTiming>,
+        ) -> Result<T, EventStoreError> {
+            // Enqueue and ACK share the original total stall budget.
+            match ack_rx.recv_timeout(self.halt_threshold.saturating_sub(start.elapsed())) {
+                Ok(result) => {
+                    // A queued reply can win recv_timeout's wake-up race after
+                    // the caller was descheduled beyond its deadline. Durable
+                    // storage alone must not turn that late observation into
+                    // an in-budget acknowledgment or clear a failed source.
+                    let elapsed = start.elapsed();
+                    if result.is_ok() && elapsed > self.halt_threshold {
+                        self.signal_backpressure_stall(elapsed);
+                        return Err(EventStoreError::Backend(format!(
+                            "{operation} ack observed after {elapsed:?}, halt threshold {:?}; {}",
+                            self.halt_threshold,
+                            timing.map(super::AppendTiming::summary).unwrap_or_default(),
+                        )));
+                    }
+                    result
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     let elapsed = start.elapsed();
                     self.signal_backpressure_stall(elapsed);
                     Err(EventStoreError::Backend(format!(
-                        "{operation} ack stalled for {elapsed:?}, halt threshold {:?}",
+                        "{operation} ack stalled for {elapsed:?}, halt threshold {:?}; {}",
                         self.halt_threshold,
+                        timing.map(super::AppendTiming::summary).unwrap_or_default(),
                     )))
                 }
                 Err(RecvTimeoutError::Disconnected) => Err(EventStoreError::Backend(format!(
@@ -567,6 +708,107 @@ mod imp {
                     .map_err(|_| EventStoreError::Backend("writer thread panicked".to_string()))?;
             }
             result
+        }
+    }
+
+    #[cfg(test)]
+    mod deadline_tests {
+        use std::{
+            sync::{Arc, atomic::Ordering, mpsc},
+            time::{Duration, Instant},
+        };
+
+        use nautilus_core::time::get_atomic_clock_static;
+        use parking_lot::Mutex;
+        use rstest::rstest;
+
+        use super::EventStoreWriter;
+        use crate::{
+            backend::{EventStore, MemoryBackend},
+            error::EventStoreError,
+            writer::{
+                DEFAULT_HALT_THRESHOLD, HaltCallback, HaltReason, WriterConfig,
+                tests::{entry_draft, manifest},
+            },
+        };
+
+        fn actual_writer() -> (EventStoreWriter, Arc<Mutex<Vec<HaltReason>>>) {
+            let mut backend = MemoryBackend::new();
+            backend.open_run(manifest("original-ack-budget")).unwrap();
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let observed = Arc::clone(&captured);
+            let halt: HaltCallback = Arc::new(move |reason| observed.lock().push(reason));
+            let writer = EventStoreWriter::spawn(
+                Box::new(backend),
+                get_atomic_clock_static(),
+                halt,
+                WriterConfig::default(),
+            )
+            .unwrap();
+            (writer, captured)
+        }
+
+        #[rstest]
+        fn spent_enqueue_budget_cannot_start_a_fresh_ack_wait() {
+            let (writer, captured) = actual_writer();
+            let (ack, ack_rx) = mpsc::sync_channel::<Result<u64, EventStoreError>>(1);
+            let start = Instant::now().checked_sub(DEFAULT_HALT_THRESHOLD).unwrap();
+            let waiting = Instant::now();
+
+            // Keep the real ACK producer connected while the original enqueue
+            // budget is exhausted, so disconnection cannot masquerade as timeout.
+            let e = writer
+                .receive_ack(&ack_rx, start, "native durable append", None)
+                .unwrap_err();
+            let waited = waiting.elapsed();
+            drop(ack);
+            assert!(e.to_string().contains("ack stalled"), "{e}");
+            assert!(
+                waited < DEFAULT_HALT_THRESHOLD,
+                "spent enqueue budget started a new full ACK wait: {waited:?}"
+            );
+            assert!(writer.halted.load(Ordering::Acquire));
+            assert!(matches!(
+                captured.lock().as_slice(),
+                [HaltReason::BackpressureStall { threshold, stalled_for }]
+                    if *threshold == DEFAULT_HALT_THRESHOLD
+                        && *stalled_for >= DEFAULT_HALT_THRESHOLD
+            ));
+            assert!(matches!(writer.flush(), Err(EventStoreError::Closed)));
+            assert_eq!(captured.lock().len(), 1);
+        }
+
+        #[rstest]
+        fn queued_durable_success_observed_after_deadline_is_rejected_once() {
+            let (writer, captured) = actual_writer();
+            let actual = writer.append_durable(entry_draft(10)).unwrap();
+            assert_eq!(actual.sequence(), 1);
+            let (ack, ack_rx) = mpsc::sync_channel(1);
+            ack.send(Ok(actual)).unwrap();
+            let start = Instant::now()
+                .checked_sub(DEFAULT_HALT_THRESHOLD + Duration::from_nanos(1))
+                .unwrap();
+
+            // recv_timeout(0) reads an already queued successful reply, but the
+            // original request's elapsed budget still controls acceptance.
+            let e = writer
+                .receive_ack(&ack_rx, start, "native durable append", None)
+                .unwrap_err();
+            assert!(e.to_string().contains("ack observed after"), "{e}");
+            assert!(matches!(ack_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(writer.high_watermark(), 1);
+            assert!(writer.halted.load(Ordering::Acquire));
+            assert!(matches!(
+                captured.lock().as_slice(),
+                [HaltReason::BackpressureStall { threshold, stalled_for }]
+                    if *threshold == DEFAULT_HALT_THRESHOLD
+                        && *stalled_for > DEFAULT_HALT_THRESHOLD
+            ));
+            assert!(matches!(
+                writer.append_durable(entry_draft(11)),
+                Err(EventStoreError::Closed)
+            ));
+            assert_eq!(captured.lock().len(), 1);
         }
     }
 
@@ -861,7 +1103,7 @@ mod tests {
         manifest::{RegisteredComponents, RunManifest, RunStatus},
     };
 
-    fn manifest(run_id: &str) -> RunManifest {
+    pub(super) fn manifest(run_id: &str) -> RunManifest {
         RunManifest {
             run_id: run_id.to_string(),
             parent_run_id: None,
@@ -881,7 +1123,7 @@ mod tests {
         }
     }
 
-    fn entry_draft(ts_init: u64) -> EntryDraft {
+    pub(super) fn entry_draft(ts_init: u64) -> EntryDraft {
         EntryDraft {
             headers: Headers::empty(),
             topic: "exec.command.SubmitOrder".into(),
@@ -906,12 +1148,12 @@ mod tests {
     /// Wraps `MemoryBackend` so tests can read the same instance the writer thread
     /// commits into.
     #[derive(Debug)]
-    struct SharedMemory(Arc<Mutex<MemoryBackend>>);
+    struct SharedMemory(Arc<Mutex<MemoryBackend>>, Arc<AtomicUsize>);
 
     impl SharedMemory {
         fn new() -> (Self, Arc<Mutex<MemoryBackend>>) {
             let arc = Arc::new(Mutex::new(MemoryBackend::new()));
-            (Self(Arc::clone(&arc)), arc)
+            (Self(Arc::clone(&arc), Arc::new(AtomicUsize::new(0))), arc)
         }
     }
 
@@ -922,6 +1164,7 @@ mod tests {
         }
 
         fn append_batch(&mut self, entries: &[AppendEntry]) -> Result<u64, EventStoreError> {
+            self.1.fetch_add(1, Ordering::SeqCst);
             self.0.lock().append_batch(entries)
         }
 
@@ -968,6 +1211,100 @@ mod tests {
         fn high_watermark(&self) -> Result<u64, EventStoreError> {
             self.0.lock().high_watermark()
         }
+    }
+
+    #[rstest]
+    fn durable_append_commits_pending_prefix_once_and_acknowledges_exact_tail() {
+        let (backend, memory) = SharedMemory::new();
+        memory
+            .lock()
+            .open_run(manifest("durable-one-commit"))
+            .unwrap();
+        let commits = Arc::clone(&backend.1);
+        let writer = EventStoreWriter::spawn(
+            Box::new(backend),
+            get_atomic_clock_static(),
+            Arc::new(|_| {}),
+            WriterConfig {
+                max_batch_entries: 128,
+                max_batch_latency: Duration::from_secs(60),
+                ..WriterConfig::default()
+            },
+        )
+        .unwrap();
+        writer.submit(entry_draft(10)).unwrap();
+        let acknowledgment = writer.append_durable(entry_draft(11)).unwrap();
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert_eq!(acknowledgment.sequence(), 2);
+        let durable = memory.lock().scan_seq(2).unwrap().unwrap();
+        assert_eq!(durable.entry_hash, acknowledgment.entry_hash());
+        assert_eq!(
+            memory.lock().scan_seq(1).unwrap().unwrap().ts_init,
+            UnixNanos::from(10)
+        );
+        assert_eq!(writer.high_watermark(), 2);
+        writer.close(run_ended_draft()).unwrap();
+    }
+
+    #[rstest]
+    fn durable_append_failure_never_acknowledges_pending_prefix_or_tail(
+        captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
+    ) {
+        let (halt, captured) = captured_halt;
+        let backend = DiskFailureBackend::default();
+        let calls = Arc::clone(&backend.appends_seen);
+        let writer = EventStoreWriter::spawn(
+            Box::new(backend),
+            get_atomic_clock_static(),
+            halt,
+            WriterConfig {
+                max_batch_latency: Duration::from_secs(60),
+                ..WriterConfig::default()
+            },
+        )
+        .unwrap();
+        writer.submit(entry_draft(10)).unwrap();
+        assert!(
+            matches!(writer.append_durable(entry_draft(11)), Err(EventStoreError::Disk(reason)) if reason == "ENOSPC")
+        );
+        assert_eq!(writer.high_watermark(), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(captured.lock().len(), 1);
+        assert!(writer.append_durable(entry_draft(12)).is_err());
+        assert_eq!(captured.lock().len(), 1);
+    }
+
+    #[rstest]
+    fn durable_append_timeout_reports_phase_and_latches_fail_stop(
+        captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
+    ) {
+        let (halt, captured) = captured_halt;
+        let inner = Arc::new(Mutex::new(MemoryBackend::new()));
+        inner.lock().open_run(manifest("durable-stall")).unwrap();
+        let gate = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let writer = EventStoreWriter::spawn(
+            Box::new(BlockingBackend::new(inner, Arc::clone(&gate), calls)),
+            get_atomic_clock_static(),
+            halt,
+            WriterConfig {
+                halt_threshold: Duration::from_millis(50),
+                ..WriterConfig::default()
+            },
+        )
+        .unwrap();
+        let result = writer.append_durable(entry_draft(10));
+        // Release the writer before asserting so a failing assertion cannot leave
+        // Drop waiting forever on this test's deliberately blocked backend.
+        let (lock, condition) = &*gate;
+        *lock.lock() = true;
+        condition.notify_all();
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("ack stalled"), "{error}");
+        assert!(error.contains("phase="), "{error}");
+        assert_eq!(captured.lock().len(), 1);
+        assert!(writer.append_durable(entry_draft(11)).is_err());
+        assert_eq!(captured.lock().len(), 1);
     }
 
     /// `EventStore` wrapper that blocks `append_batch` until a release flag flips.

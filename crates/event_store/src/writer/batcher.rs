@@ -84,6 +84,7 @@ pub(super) enum WriterMessage {
         draft: EntryDraft,
         ts_publish: UnixNanos,
         ack: SyncSender<Result<super::DurableEntryAcknowledgment, EventStoreError>>,
+        timing: Arc<super::AppendTiming>,
     },
     /// Records a cache snapshot anchor after all pending entries have been flushed.
     RecordSnapshotAnchor {
@@ -247,28 +248,29 @@ pub(super) fn run(
                 draft,
                 ts_publish,
                 ack,
+                timing,
             }) => {
-                if !flush(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref()) {
-                    let _ = ack.send(Err(EventStoreError::Closed));
-                    return;
-                }
+                timing.mark(1);
                 let append = build_append_entry(draft, ts_publish, next_seq);
                 let acknowledgment = super::DurableEntryAcknowledgment {
                     sequence: append.entry.seq,
                     entry_hash: append.entry.entry_hash,
                 };
-                match backend.append_batch(std::slice::from_ref(&append)) {
-                    Ok(watermark) => {
-                        next_seq += 1;
-                        high_watermark.store(watermark, Ordering::Release);
-                        let _ = ack.send(Ok(acknowledgment));
-                    }
-                    Err(e) => {
-                        halt.fire(HaltReason::from_backend_error(&e));
-                        let _ = ack.send(Err(e));
-                        return;
-                    }
+                // The pending prefix and this entry retain their original order and
+                // share one Immediate transaction. ACK still follows the backend's
+                // durable commit and committed-suffix verification. A separate prefix
+                // flush only adds a second sync to the same acknowledgment budget.
+                batch.push(append);
+                next_seq += 1;
+                let _probe = super::AppendProbeGuard::enter(Arc::clone(&timing));
+                if let Err(error) =
+                    commit_batch(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref())
+                {
+                    let _ = ack.send(Err(error));
+                    return;
                 }
+                timing.mark(6);
+                let _ = ack.send(Ok(acknowledgment));
                 batch_deadline = None;
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -367,27 +369,37 @@ fn flush(
     halt: &HaltSink,
     high_watermark: &AtomicU64,
 ) -> bool {
+    commit_batch(backend, batch, halt, high_watermark).is_ok()
+}
+
+#[cfg(not(madsim))]
+fn commit_batch(
+    backend: &mut dyn EventStore,
+    batch: &mut Vec<AppendEntry>,
+    halt: &HaltSink,
+    high_watermark: &AtomicU64,
+) -> Result<(), EventStoreError> {
     // An empty flush must not acknowledge an unexpected storage generation. The
     // owned backend performs only its compact generation/identity check here;
     // unknown backends retain their original full-prefix fallback on request.
     if let Err(error) = backend.verified_append_only_entry_hashes() {
         halt.fire(HaltReason::from_backend_error(&error));
-        return false;
+        return Err(error);
     }
     if batch.is_empty() {
-        return true;
+        return Ok(());
     }
 
     match backend.append_batch(batch) {
         Ok(new_hwm) => {
             high_watermark.store(new_hwm, Ordering::Release);
             batch.clear();
-            true
+            Ok(())
         }
         Err(e) => {
             halt.fire(HaltReason::from_backend_error(&e));
             batch.clear();
-            false
+            Err(e)
         }
     }
 }

@@ -27,7 +27,7 @@ defi = [
   "nautilus-persistence?/defi",
   "nautilus-system/defi",
 ]
-live = ["nautilus-common/live"]
+live = ["nautilus-common/live", "nautilus-system/live"]
 persistence = ["dep:nautilus-persistence"]
 
 [package.metadata.docs.rs]

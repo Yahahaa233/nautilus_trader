@@ -903,6 +903,7 @@ impl EventStore for RedbBackend {
             })?;
         }
 
+        crate::writer::mark_backend_phase(2);
         let encoded: Vec<Vec<u8>> = entries
             .iter()
             .map(|append| {
@@ -912,6 +913,7 @@ impl EventStore for RedbBackend {
             })
             .collect::<Result<_, _>>()?;
 
+        crate::writer::mark_backend_phase(3);
         let db = state.db.read_write()?;
         let txn = begin_immediate_write(db)?;
         {
@@ -939,7 +941,9 @@ impl EventStore for RedbBackend {
                 }
             }
         }
+        crate::writer::mark_backend_phase(4);
         txn.commit().map_err(map_commit_err)?;
+        crate::writer::mark_backend_phase(5);
 
         let mut max_ts = state.max_ts_init;
         let mut new_hwm = state.high_watermark;
