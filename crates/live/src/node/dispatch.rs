@@ -27,7 +27,7 @@ pub struct NodeDispatchObserver {
                 DispatchSource,
                 &str,
                 &dyn Any,
-            ) -> Result<Vec<nautilus_common::recovery_trace::NativeReadWitness>>,
+            ) -> Result<nautilus_common::recovery_trace::NativeReadWitnesses>,
         >,
     >,
 }
@@ -176,6 +176,7 @@ impl NodeDispatchObserver {
                 input,
             )?;
             let payload = envelope.payload.clone();
+            let verification_witnesses = witnesses.iter().cloned().collect::<Vec<_>>();
             let mut guard = self.finish_begin(envelope)?;
             let token = guard
                 .token
@@ -188,13 +189,13 @@ impl NodeDispatchObserver {
                 source,
                 phase,
                 payload,
-                witnesses.clone(),
+                witnesses,
             )?);
             let verify = self
                 .verify_read_witnesses
                 .clone()
                 .context("native read witness verifier absent")?;
-            guard.verify_read_witnesses = Some(Rc::new(move || verify(&witnesses)));
+            guard.verify_read_witnesses = Some(Rc::new(move || verify(&verification_witnesses)));
             return Ok(guard);
         }
         self.finish_begin(envelope)
@@ -286,7 +287,7 @@ impl NodeDispatchObserver {
             DispatchSource,
             &str,
             &dyn Any,
-        ) -> Result<Vec<nautilus_common::recovery_trace::NativeReadWitness>>
+        ) -> Result<nautilus_common::recovery_trace::NativeReadWitnesses>
         + 'static,
         verify_witnesses: impl Fn(&[nautilus_common::recovery_trace::NativeReadWitness]) -> Result<()>
         + 'static,

@@ -30,7 +30,7 @@ use bytes::Bytes;
 use nautilus_common::{
     live::dst,
     recovery_trace::{
-        NativeIngressReceipt, NativeInputSource, NativeProcessingReceipt, NativeReadWitness,
+        NativeIngressReceipt, NativeInputSource, NativeProcessingReceipt, NativeReadWitnesses,
         NativeTraceRecord, NativeTraceSource,
         scope::{self, NativeCaptureScope},
     },
@@ -146,7 +146,7 @@ impl NativeTraceRecorder {
         clippy::too_many_arguments,
         reason = "native trace retains the complete dispatch identity"
     )]
-    pub fn begin_native(
+    pub fn begin_native<R: Into<NativeReadWitnesses>>(
         &self,
         root: u64,
         input: u64,
@@ -154,8 +154,10 @@ impl NativeTraceRecorder {
         input_source: NativeInputSource,
         phase: &str,
         payload: Value,
-        read_witnesses: Vec<NativeReadWitness>,
+        read_witnesses: R,
     ) -> Result<NativeTraceGuard> {
+        let (read_witnesses, read_views) = read_witnesses.into().into_parts();
+        read_views.verify(&read_witnesses)?;
         ensure!(
             !phase.is_empty() && phase.len() <= 128,
             "invalid native trace phase"
@@ -218,7 +220,14 @@ impl NativeTraceRecorder {
             read_witnesses,
         };
         state.append(&record)?;
-        let capture = NativeCaptureScope::enter(&state.source, root, input, parent, activity_at)?;
+        let capture = NativeCaptureScope::enter_with_read_views(
+            &state.source,
+            root,
+            input,
+            parent,
+            activity_at,
+            read_views,
+        )?;
         state.next_input = next_input;
         state.next_root = next_root;
         state.stack.push((root, input));
@@ -1671,7 +1680,10 @@ mod tests {
         writer::WriterConfig,
     };
     use indexmap::IndexMap;
-    use nautilus_common::recovery_trace::{NativeInputSource, historical::HistoricalInputScope};
+    use nautilus_common::recovery_trace::{
+        NativeInputSource, NativeReadProducerToken, NativeReadWitness,
+        historical::HistoricalInputScope,
+    };
     use nautilus_core::{UUID4, time::get_atomic_clock_realtime};
     use parking_lot::Mutex;
     use rstest::rstest;
@@ -1804,6 +1816,109 @@ mod tests {
         trace
             .checkpoint_cut(1, 1, "actual-inventory".into(), vec![])
             .unwrap()
+    }
+
+    fn bound_observation(token: &NativeReadProducerToken) -> NativeReadWitnesses {
+        let mut reads = NativeReadWitnesses::new();
+        reads
+            .push_bound(
+                token,
+                NativeReadWitness {
+                    component_id: "actual-producer".into(),
+                    profile: "actual-observation.v1".into(),
+                    source_version: "actual-version-7".into(),
+                    payload: serde_json::json!({"observed":7}),
+                },
+                Arc::new(7_u64),
+            )
+            .unwrap();
+        reads
+    }
+
+    #[rstest]
+    fn native_read_view_is_bound_only_after_actual_begin_ack_and_keeps_original_wire_witnesses() {
+        std::thread::spawn(|| {
+            let (trace, writer, backend, _, _) = actual_journal();
+            let token = NativeReadProducerToken::new();
+            let reads = bound_observation(&token);
+            let expected_wire = reads.iter().cloned().collect::<Vec<_>>();
+            assert!(scope::current_read_view::<u64>(&token).unwrap().is_none());
+            let guard = trace
+                .begin_native(
+                    1,
+                    1,
+                    None,
+                    NativeInputSource::Lifecycle,
+                    "source",
+                    serde_json::json!({"action":"start"}),
+                    reads,
+                )
+                .unwrap();
+            assert_eq!(writer.high_watermark(), 1);
+            let entry = backend.scan_seq(1).unwrap().unwrap();
+            let record: NativeTraceRecord = rmp_serde::from_slice(&entry.payload).unwrap();
+            let NativeTraceRecord::Begin { read_witnesses, .. } = record else {
+                panic!("actual acknowledged Begin absent");
+            };
+            assert_eq!(read_witnesses, expected_wire);
+            assert_eq!(
+                *scope::current_read_view::<u64>(&token)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                7
+            );
+            guard
+                .complete(serde_json::json!({"state":"started"}))
+                .unwrap();
+            assert_eq!(writer.high_watermark(), 2);
+            assert!(scope::current_read_view::<u64>(&token).unwrap().is_none());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[rstest]
+    fn rejected_actual_begin_ack_does_not_publish_native_read_view() {
+        std::thread::spawn(|| {
+            let (trace, writer, mut backend, _, halt) = actual_journal();
+            let token = NativeReadProducerToken::new();
+            let reads = bound_observation(&token);
+            backend.seal(RunStatus::Quarantined).unwrap();
+            assert!(
+                trace
+                    .begin_native(
+                        1,
+                        1,
+                        None,
+                        NativeInputSource::Lifecycle,
+                        "source",
+                        serde_json::json!({"action":"start"}),
+                        reads,
+                    )
+                    .is_err()
+            );
+            assert!(halt.is_halted());
+            assert_eq!(writer.high_watermark(), 0);
+            assert!(backend.scan_seq(1).unwrap().is_none());
+            assert!(!scope::capture_active());
+            assert!(scope::current_read_view::<u64>(&token).unwrap().is_none());
+            assert!(
+                trace
+                    .begin_native(
+                        1,
+                        1,
+                        None,
+                        NativeInputSource::Lifecycle,
+                        "source",
+                        serde_json::json!({"action":"retry"}),
+                        bound_observation(&token),
+                    )
+                    .is_err()
+            );
+        })
+        .join()
+        .unwrap();
     }
 
     #[rstest]

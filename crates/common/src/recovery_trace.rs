@@ -125,6 +125,165 @@ pub struct NativeReadWitness {
     pub payload: Value,
 }
 
+/// Process-local identity of the actual independent read producer.
+/// The identity cannot be reconstructed from serialized witness fields.
+#[derive(Clone, Debug, Default)]
+pub struct NativeReadProducerToken(std::sync::Arc<()>);
+
+impl NativeReadProducerToken {
+    /// Creates an identity owned by one actual producer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(std::sync::Arc::new(()))
+    }
+}
+
+#[derive(Clone)]
+struct NativeReadBinding {
+    producer: NativeReadProducerToken,
+    witness: NativeReadWitness,
+    value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+}
+
+/// Opaque typed reads accompanying the exact serialized Begin witnesses.
+/// These values stay process-local and do not establish execution authority.
+#[derive(Clone, Default)]
+pub struct NativeReadBindings(Vec<NativeReadBinding>);
+
+impl std::fmt::Debug for NativeReadBindings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeReadBindings")
+            .field("count", &self.0.len())
+            .finish()
+    }
+}
+
+impl NativeReadBindings {
+    /// Checks each opaque binding against one exact actual Begin witness.
+    ///
+    /// # Errors
+    /// Refuses substituted, missing, ambiguous or duplicate producer bindings.
+    pub fn verify(&self, witnesses: &[NativeReadWitness]) -> Result<()> {
+        for (index, binding) in self.0.iter().enumerate() {
+            ensure!(
+                witnesses.iter().filter(|w| **w == binding.witness).count() == 1,
+                "native read binding differs from its captured witness"
+            );
+            ensure!(
+                !self.0[..index]
+                    .iter()
+                    .any(|previous| std::sync::Arc::ptr_eq(
+                        &previous.producer.0,
+                        &binding.producer.0,
+                    )),
+                "duplicate native read producer binding"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One collector result with unchanged wire witnesses and optional actual typed reads.
+#[derive(Clone, Debug, Default)]
+pub struct NativeReadWitnesses {
+    witnesses: Vec<NativeReadWitness>,
+    bindings: NativeReadBindings,
+}
+
+impl From<Vec<NativeReadWitness>> for NativeReadWitnesses {
+    fn from(witnesses: Vec<NativeReadWitness>) -> Self {
+        Self {
+            witnesses,
+            bindings: NativeReadBindings::default(),
+        }
+    }
+}
+
+impl NativeReadWitnesses {
+    /// Creates an empty collector result.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds an unbound witness, preserving the original wire order.
+    pub fn push(&mut self, witness: NativeReadWitness) {
+        self.witnesses.push(witness);
+    }
+
+    /// Adds the actual immutable value captured by this producer with its witness.
+    ///
+    /// # Errors
+    /// Refuses missing witness identity or an already bound producer.
+    pub fn push_bound<T: std::any::Any + Send + Sync>(
+        &mut self,
+        producer: &NativeReadProducerToken,
+        witness: NativeReadWitness,
+        value: std::sync::Arc<T>,
+    ) -> Result<()> {
+        ensure!(
+            !witness.component_id.is_empty()
+                && !witness.profile.is_empty()
+                && !witness.source_version.is_empty(),
+            "native read witness identity absent"
+        );
+        ensure!(
+            !self
+                .bindings
+                .0
+                .iter()
+                .any(|binding| { std::sync::Arc::ptr_eq(&binding.producer.0, &producer.0) }),
+            "duplicate native read producer binding"
+        );
+        self.bindings.0.push(NativeReadBinding {
+            producer: producer.clone(),
+            witness: witness.clone(),
+            value,
+        });
+        self.witnesses.push(witness);
+        Ok(())
+    }
+
+    /// Returns the original wire witnesses in capture order.
+    pub fn iter(&self) -> std::slice::Iter<'_, NativeReadWitness> {
+        self.witnesses.iter()
+    }
+
+    /// Separates wire witnesses from their opaque process-local bindings.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<NativeReadWitness>, NativeReadBindings) {
+        (self.witnesses, self.bindings)
+    }
+}
+
+/// A read-only view of the same actual typed capture bound to the current input.
+pub struct NativeReadView<T> {
+    witness: NativeReadWitness,
+    value: std::sync::Arc<T>,
+}
+
+impl<T> std::fmt::Debug for NativeReadView<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeReadView")
+            .field("witness", &self.witness)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> NativeReadView<T> {
+    /// Returns the exact captured source witness.
+    #[must_use]
+    pub fn witness(&self) -> &NativeReadWitness {
+        &self.witness
+    }
+
+    /// Returns the original typed value without reconstructing private source seals.
+    #[must_use]
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+}
+
 /// Actual derived ingress admission, distinct from its later dequeue/processing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -333,6 +492,7 @@ pub mod scope {
         uuid_draws: Vec<nautilus_core::UUID4>,
         clock_reads: Vec<super::NativeClockRead>,
         queued_outputs: Vec<super::NativeQueuedOutput>,
+        read_views: super::NativeReadBindings,
     }
 
     #[derive(Debug, Default)]
@@ -451,6 +611,40 @@ pub mod scope {
         })
     }
 
+    /// Reads only the innermost actual input's matching opaque producer capture.
+    /// Outside native capture it returns `None`; it never falls back to a parent input.
+    ///
+    /// # Errors
+    /// Refuses failed/reentered capture, an unbound producer or a different value type.
+    pub fn current_read_view<T: std::any::Any + Send + Sync>(
+        producer: &super::NativeReadProducerToken,
+    ) -> Result<Option<super::NativeReadView<T>>> {
+        CURRENT.with(|current| {
+            let state = current
+                .try_borrow()
+                .context("native read source reentered")?;
+            let Some(frame) = state.frames.last() else {
+                return Ok(None);
+            };
+            ensure!(!state.failed, "native read source failed");
+            let binding = frame
+                .read_views
+                .0
+                .iter()
+                .find(|binding| std::sync::Arc::ptr_eq(&binding.producer.0, &producer.0))
+                .context("native read producer is not bound to current input")?;
+            let value = binding
+                .value
+                .clone()
+                .downcast::<T>()
+                .map_err(|_| anyhow::anyhow!("native read producer value type changed"))?;
+            Ok(Some(super::NativeReadView {
+                witness: binding.witness.clone(),
+                value,
+            }))
+        })
+    }
+
     /// Enables receipt tracking before the owning node starts consuming its channels.
     /// This records source admission and does not change callback or venue permissions.
     ///
@@ -547,6 +741,28 @@ pub mod scope {
             parent: Option<u64>,
             activity_at: dst::time::Instant,
         ) -> Result<Self> {
+            Self::enter_with_read_views(
+                source,
+                root,
+                input,
+                parent,
+                activity_at,
+                super::NativeReadBindings::default(),
+            )
+        }
+
+        /// Binds the exact process-local reads after the owning Begin was acknowledged.
+        ///
+        /// # Errors
+        /// Refuses the same failed, foreign or inconsistent scope as `enter`.
+        pub fn enter_with_read_views(
+            source: &NativeTraceSource,
+            root: u64,
+            input: u64,
+            parent: Option<u64>,
+            activity_at: dst::time::Instant,
+            read_views: super::NativeReadBindings,
+        ) -> Result<Self> {
             source.validate()?;
             ensure!(root > 0 && input > 0, "invalid native scope frontier");
             CURRENT.with(|state| {
@@ -581,6 +797,7 @@ pub mod scope {
                     uuid_draws: Vec::new(),
                     clock_reads: Vec::new(),
                     queued_outputs: Vec::new(),
+                    read_views,
                 });
                 Ok(Self {
                     epoch,
@@ -1855,5 +2072,238 @@ pub fn set_native_historical_risk_state<T: Serialize>(value: T) -> bool {
     {
         let _ = value;
         false
+    }
+}
+
+#[cfg(all(test, feature = "live", not(madsim)))]
+mod read_view_tests {
+    use super::*;
+    use rstest::rstest;
+    use std::sync::Arc;
+
+    fn source() -> NativeTraceSource {
+        NativeTraceSource {
+            schema_version: 1,
+            node_instance: UUID4::new(),
+            process_incarnation: UUID4::new(),
+            journal_run: "actual-read-view".into(),
+            logical_run: "logical".into(),
+            configuration_digest: "configuration".into(),
+            codec_profile: "read-view.v1".into(),
+            registered_profile_digest: "registered".into(),
+        }
+    }
+
+    fn witness(value: u64) -> NativeReadWitness {
+        NativeReadWitness {
+            component_id: "actual-producer".into(),
+            profile: "actual-observation.v1".into(),
+            source_version: format!("version-{value}"),
+            payload: serde_json::json!({"observed":value}),
+        }
+    }
+
+    fn capture(token: &NativeReadProducerToken, value: Arc<u64>) -> NativeReadBindings {
+        let mut reads = NativeReadWitnesses::new();
+        reads.push_bound(token, witness(*value), value).unwrap();
+        let (wire, bindings) = reads.into_parts();
+        bindings.verify(&wire).unwrap();
+        bindings
+    }
+
+    #[rstest]
+    fn matching_read_view_preserves_actual_capture_after_producer_refresh_and_finish_releases_it() {
+        std::thread::spawn(|| {
+            let token = NativeReadProducerToken::new();
+            let original = Arc::new(7);
+            let retained = Arc::downgrade(&original);
+            assert!(scope::current_read_view::<u64>(&token).unwrap().is_none());
+            let scope = scope::NativeCaptureScope::enter_with_read_views(
+                &source(),
+                1,
+                1,
+                None,
+                dst::time::Instant::now(),
+                capture(&token, original),
+            )
+            .unwrap();
+            let refreshed_producer = Arc::new(8_u64);
+            {
+                let view = scope::current_read_view::<u64>(&token.clone())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(*view.value(), 7);
+                assert_eq!(view.witness(), &witness(7));
+                assert_ne!(view.value(), refreshed_producer.as_ref());
+            }
+            scope.finish().unwrap();
+            assert!(retained.upgrade().is_none());
+            assert!(scope::current_read_view::<u64>(&token).unwrap().is_none());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[rstest]
+    fn nested_read_views_use_child_capture_and_restore_parent_without_parent_fallback() {
+        std::thread::spawn(|| {
+            let source = source();
+            let token = NativeReadProducerToken::new();
+            let parent_only = NativeReadProducerToken::new();
+            let mut reads = NativeReadWitnesses::new();
+            reads
+                .push_bound(&token, witness(7), Arc::new(7_u64))
+                .unwrap();
+            let mut other = witness(11);
+            other.component_id = "parent-only".into();
+            reads
+                .push_bound(&parent_only, other, Arc::new(11_u64))
+                .unwrap();
+            let (wire, bindings) = reads.into_parts();
+            bindings.verify(&wire).unwrap();
+            let parent = scope::NativeCaptureScope::enter_with_read_views(
+                &source,
+                1,
+                1,
+                None,
+                dst::time::Instant::now(),
+                bindings,
+            )
+            .unwrap();
+            let child = scope::NativeCaptureScope::enter_with_read_views(
+                &source,
+                1,
+                2,
+                Some(1),
+                dst::time::Instant::now(),
+                capture(&token, Arc::new(8)),
+            )
+            .unwrap();
+            assert_eq!(
+                *scope::current_read_view::<u64>(&token)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                8
+            );
+            assert!(scope::current_read_view::<u64>(&parent_only).is_err());
+            child.finish().unwrap();
+            assert_eq!(
+                *scope::current_read_view::<u64>(&token)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                7
+            );
+            assert_eq!(
+                *scope::current_read_view::<u64>(&parent_only)
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                11
+            );
+            parent.finish().unwrap();
+            assert!(scope::current_read_view::<u64>(&token).unwrap().is_none());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[rstest]
+    fn active_read_view_refuses_foreign_missing_and_wrong_type_producers() {
+        std::thread::spawn(|| {
+            let token = NativeReadProducerToken::new();
+            let foreign = NativeReadProducerToken::new();
+            let scope = scope::NativeCaptureScope::enter_with_read_views(
+                &source(),
+                1,
+                1,
+                None,
+                dst::time::Instant::now(),
+                capture(&token, Arc::new(7)),
+            )
+            .unwrap();
+            assert!(scope::current_read_view::<u64>(&foreign).is_err());
+            assert!(scope::current_read_view::<String>(&token).is_err());
+            scope.finish().unwrap();
+            let unbound =
+                scope::NativeCaptureScope::enter(&source(), 2, 2, None, dst::time::Instant::now())
+                    .unwrap();
+            assert!(scope::current_read_view::<u64>(&token).is_err());
+            unbound.finish().unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[rstest]
+    fn failed_child_keeps_parent_failed_and_releases_owned_values_on_drop() {
+        std::thread::spawn(|| {
+            let source = source();
+            let token = NativeReadProducerToken::new();
+            let original = Arc::new(7);
+            let retained = Arc::downgrade(&original);
+            let parent = scope::NativeCaptureScope::enter_with_read_views(
+                &source,
+                1,
+                1,
+                None,
+                dst::time::Instant::now(),
+                capture(&token, original),
+            )
+            .unwrap();
+            let child = scope::NativeCaptureScope::enter_with_read_views(
+                &source,
+                1,
+                2,
+                Some(1),
+                dst::time::Instant::now(),
+                capture(&token, Arc::new(8)),
+            )
+            .unwrap();
+            drop(child);
+            assert!(scope::current_read_view::<u64>(&token).is_err());
+            assert!(parent.finish().is_err());
+            assert!(retained.upgrade().is_none());
+            assert!(scope::current_read_view::<u64>(&token).unwrap().is_none());
+            assert!(
+                scope::NativeCaptureScope::enter(&source, 2, 3, None, dst::time::Instant::now(),)
+                    .is_err()
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[rstest]
+    fn bound_witness_clone_preserves_token_and_rejects_substituted_or_ambiguous_wire() {
+        let token = NativeReadProducerToken::new();
+        let mut reads = NativeReadWitnesses::new();
+        reads
+            .push_bound(&token, witness(7), Arc::new(7_u64))
+            .unwrap();
+        assert!(
+            reads
+                .push_bound(&token.clone(), witness(8), Arc::new(8_u64))
+                .is_err()
+        );
+        let (wire, bindings) = reads.clone().into_parts();
+        bindings.verify(&wire).unwrap();
+        let mut changed = wire.clone();
+        changed[0].payload["observed"] = serde_json::json!(8);
+        assert!(bindings.verify(&changed).is_err());
+        assert!(bindings.verify(&[]).is_err());
+        let mut ambiguous = wire.clone();
+        ambiguous.extend(wire.clone());
+        assert!(bindings.verify(&ambiguous).is_err());
+        let forged =
+            serde_json::from_value::<NativeReadWitness>(serde_json::to_value(&wire[0]).unwrap())
+                .unwrap();
+        let (_, unbound) = NativeReadWitnesses::from(vec![forged]).into_parts();
+        assert!(unbound.0.is_empty());
+        assert_eq!(
+            serde_json::to_vec(&wire).unwrap(),
+            serde_json::to_vec(&reads.into_parts().0).unwrap()
+        );
     }
 }

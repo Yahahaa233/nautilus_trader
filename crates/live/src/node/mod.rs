@@ -351,18 +351,15 @@ impl LiveNode {
     /// owned Journal continuation exactly once.
     #[cfg(feature = "native-tail-replay")]
     #[allow(clippy::too_many_arguments)]
-    pub fn prepare_owned_native_trace(
+    pub fn prepare_owned_native_trace<
+        R: Into<nautilus_common::recovery_trace::NativeReadWitnesses>,
+    >(
         &mut self,
         logical_run: String,
         configuration_digest: String,
         codec_profile: String,
         registered_profile_digest: String,
-        witnesses: impl Fn(
-            crate::dispatch::DispatchSource,
-            &str,
-            &dyn Any,
-        )
-            -> anyhow::Result<Vec<nautilus_common::recovery_trace::NativeReadWitness>>
+        witnesses: impl Fn(crate::dispatch::DispatchSource, &str, &dyn Any) -> anyhow::Result<R>
         + 'static,
         verify_witnesses: impl Fn(
             &[nautilus_common::recovery_trace::NativeReadWitness],
@@ -422,15 +419,12 @@ impl LiveNode {
     /// # Errors
     /// Refuses a changed installation, absent observer, non-idle node or a prior source root.
     #[cfg(feature = "native-tail-replay")]
-    pub fn set_native_recovery_trace(
+    pub fn set_native_recovery_trace<
+        R: Into<nautilus_common::recovery_trace::NativeReadWitnesses>,
+    >(
         &mut self,
         recorder: nautilus_event_store::native_trace::NativeTraceRecorder,
-        witnesses: impl Fn(
-            crate::dispatch::DispatchSource,
-            &str,
-            &dyn Any,
-        )
-            -> anyhow::Result<Vec<nautilus_common::recovery_trace::NativeReadWitness>>
+        witnesses: impl Fn(crate::dispatch::DispatchSource, &str, &dyn Any) -> anyhow::Result<R>
         + 'static,
         verify_witnesses: impl Fn(
             &[nautilus_common::recovery_trace::NativeReadWitness],
@@ -458,7 +452,8 @@ impl LiveNode {
         self.dispatch_observer.as_mut()
             .ok_or_else(|| anyhow::anyhow!("native trace requires the node dispatch observer"))?
             .attach_native_trace(recorder, move |source, phase, input| {
-                let mut found = witnesses(source, phase, input)?;
+                let mut found: nautilus_common::recovery_trace::NativeReadWitnesses =
+                    witnesses(source, phase, input)?.into();
                 anyhow::ensure!(!found.iter().any(|witness| witness.component_id.starts_with("native:")),
                     "caller cannot substitute the native risk witness");
                 found.push(nautilus_common::recovery_trace::NativeReadWitness {
