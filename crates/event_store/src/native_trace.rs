@@ -1901,7 +1901,7 @@ mod tests {
             assert!(halt.is_halted());
             assert_eq!(writer.high_watermark(), 0);
             assert!(backend.scan_seq(1).unwrap().is_none());
-            assert!(!scope::capture_active());
+            assert!(scope::current_cause().is_none());
             assert!(scope::current_read_view::<u64>(&token).unwrap().is_none());
             assert!(
                 trace
