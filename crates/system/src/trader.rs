@@ -87,6 +87,17 @@ struct ComponentStateCallbacks {
     save: ComponentStateSaveFn,
 }
 
+/// Actor and strategy callback results collected without database writes.
+///
+/// This is a component-state payload, not a checkpoint: the caller must establish
+/// a common dispatch boundary and bind native, ledger, queue and timer state.
+/// Execution algorithms and private framework state are not included.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CollectedComponentState {
+    pub actors: IndexMap<ActorId, IndexMap<String, Vec<u8>>>,
+    pub strategies: IndexMap<StrategyId, IndexMap<String, Vec<u8>>>,
+}
+
 /// Central orchestrator for managing trading components.
 ///
 /// The `Trader` manages the lifecycle and coordination of actors, strategies,
@@ -1607,6 +1618,184 @@ impl Trader {
             })?;
         }
 
+        Ok(())
+    }
+
+    /// Invokes every registered actor and strategy save callback in registration order.
+    ///
+    /// Unlike `save_state`, this works without a backing database and does not
+    /// write to cache or storage. The trader borrow is released before callbacks.
+    /// Empty callback results remain explicit entries. Any callback error prevents
+    /// a partial payload from being returned; all registered callbacks are attempted.
+    ///
+    /// # Errors
+    /// Returns an error for an active trader borrow, missing callback registration,
+    /// any callback failure, or changed registration during collection. The caller
+    /// must invoke this only at an established outer dispatch boundary.
+    pub fn collect_component_state(
+        trader: &Rc<RefCell<Self>>,
+    ) -> anyhow::Result<CollectedComponentState> {
+        let (actor_callbacks, strategy_callbacks) = {
+            let trader = trader
+                .try_borrow()
+                .map_err(|_| anyhow::anyhow!("Trader is active during state collection"))?;
+            anyhow::ensure!(
+                trader
+                    .actor_ids
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    == trader.actor_ids.len()
+                    && trader
+                        .strategy_ids
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == trader.strategy_ids.len(),
+                "Duplicate component registration during state collection"
+            );
+            (
+                trader.actor_state_callbacks()?,
+                trader.strategy_state_callbacks()?,
+            )
+        };
+        let mut result = CollectedComponentState {
+            actors: IndexMap::new(),
+            strategies: IndexMap::new(),
+        };
+        let mut errors = Vec::new();
+        for (id, callbacks) in &actor_callbacks {
+            match (callbacks.save)(id.inner()) {
+                Ok(state) => {
+                    result.actors.insert(*id, state);
+                }
+                Err(error) => errors.push(format!("actor {id} callback: {error:#}")),
+            }
+        }
+        for (id, callbacks) in &strategy_callbacks {
+            match (callbacks.save)(id.inner()) {
+                Ok(state) => {
+                    result.strategies.insert(*id, state);
+                }
+                Err(error) => errors.push(format!("strategy {id} callback: {error:#}")),
+            }
+        }
+        {
+            let current = trader
+                .try_borrow()
+                .map_err(|_| anyhow::anyhow!("Trader remained active after state collection"))?;
+            anyhow::ensure!(
+                current
+                    .actor_ids
+                    .iter()
+                    .copied()
+                    .eq(actor_callbacks.iter().map(|(id, _)| *id))
+                    && current
+                        .strategy_ids
+                        .iter()
+                        .copied()
+                        .eq(strategy_callbacks.iter().map(|(id, _)| *id)),
+                "Component registration changed during state collection"
+            );
+        }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "Failed to collect component state: {}",
+            errors.join("; ")
+        );
+        Ok(result)
+    }
+
+    /// Restores actor and strategy callback state into an already registered,
+    /// non-running trader without touching the cache database.
+    ///
+    /// The caller must have built a fresh node and registered the exact same
+    /// components before invoking this method.  Registration order and the
+    /// complete component identity set are checked before any callback runs;
+    /// a callback failure is returned to the caller and the node must then be
+    /// discarded rather than started.  Execution algorithms, native cache,
+    /// portfolio state, queues and risk permission are intentionally outside
+    /// this API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the trader is active, component identities do not
+    /// match exactly, registration changes during the operation, or a callback
+    /// rejects its payload.
+    pub fn restore_component_state(
+        trader: &Rc<RefCell<Self>>,
+        state: &CollectedComponentState,
+    ) -> anyhow::Result<()> {
+        let (actor_callbacks, strategy_callbacks, actor_ids, strategy_ids) = {
+            let trader = trader
+                .try_borrow()
+                .map_err(|_| anyhow::anyhow!("Trader is active during state restoration"))?;
+            anyhow::ensure!(
+                matches!(
+                    trader.state,
+                    ComponentState::PreInitialized
+                        | ComponentState::Ready
+                        | ComponentState::Stopped
+                ),
+                "Cannot restore component state while trader is {:?}",
+                trader.state
+            );
+            let actor_callbacks = trader.actor_state_callbacks()?;
+            let strategy_callbacks = trader.strategy_state_callbacks()?;
+            let actor_ids = trader.actor_ids.clone();
+            let strategy_ids = trader.strategy_ids.clone();
+            (actor_callbacks, strategy_callbacks, actor_ids, strategy_ids)
+        };
+
+        let captured_actor_ids = state.actors.keys().copied().collect::<Vec<_>>();
+        let captured_strategy_ids = state.strategies.keys().copied().collect::<Vec<_>>();
+        anyhow::ensure!(
+            captured_actor_ids == actor_ids,
+            "Actor state identity/order does not match registered trader components"
+        );
+        anyhow::ensure!(
+            captured_strategy_ids == strategy_ids,
+            "Strategy state identity/order does not match registered trader components"
+        );
+
+        // All identities were checked above, so callback invocation cannot
+        // discover a missing component halfway through a restore.
+        for (actor_id, callbacks) in actor_callbacks {
+            let payload = state
+                .actors
+                .get(&actor_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Actor {actor_id} state payload disappeared during restoration"
+                    )
+                })?;
+            (callbacks.load)(actor_id.inner(), payload).map_err(|error| {
+                anyhow::anyhow!("Failed to restore actor {actor_id} state: {error:#}")
+            })?;
+        }
+        for (strategy_id, callbacks) in strategy_callbacks {
+            let payload = state
+                .strategies
+                .get(&strategy_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Strategy {strategy_id} state payload disappeared during restoration"
+                    )
+                })?;
+            (callbacks.load)(strategy_id.inner(), payload).map_err(|error| {
+                anyhow::anyhow!("Failed to restore strategy {strategy_id} state: {error:#}")
+            })?;
+        }
+
+        let trader = trader
+            .try_borrow()
+            .map_err(|_| anyhow::anyhow!("Trader remained active after state restoration"))?;
+        anyhow::ensure!(
+            trader.actor_ids == actor_ids && trader.strategy_ids == strategy_ids,
+            "Component registration changed during state restoration"
+        );
         Ok(())
     }
 
@@ -5410,3 +5599,7 @@ class ModuleStrategy(Strategy):
         }
     }
 }
+
+#[cfg(test)]
+#[path = "component_collection_tests.rs"]
+mod component_collection_tests;
