@@ -71,6 +71,11 @@ pub struct StrategyConfig {
     #[serde(default = "default_false")]
     #[builder(default)]
     pub manage_contingent_orders: bool,
+    /// Hold OTO children locally until parent fills, then submit native child orders.
+    /// Requires open contingent-order management for subsequent OUO/OCO updates.
+    #[serde(default = "default_false")]
+    #[builder(default)]
+    pub manage_order_lists_locally: bool,
     /// If all order GTD time in force expirations should be managed by the strategy.
     /// If True, then will ensure open orders have their GTD timers re-activated on start.
     #[serde(default = "default_false")]
@@ -157,6 +162,14 @@ impl StrategyConfig {
         {
             errors.push(ConfigError::invalid_value("order_id_tag", e.to_string()));
         }
+
+        errors.check(
+            !self.manage_order_lists_locally || self.manage_contingent_orders,
+            ConfigError::invalid_value(
+                "manage_order_lists_locally",
+                "requires manage_contingent_orders",
+            ),
+        );
 
         let interval_ms = self.market_exit_interval_ms;
         errors.check(

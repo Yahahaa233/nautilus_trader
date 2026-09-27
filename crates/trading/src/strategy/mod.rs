@@ -20,7 +20,9 @@ pub mod config;
 pub mod core;
 
 pub use core::{StrategyCore, StrategyNative};
+mod submission;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+pub use submission::{PreparedSubmission, SubmissionInterceptor};
 
 use ahash::AHashSet;
 pub use api::{OrderApi, PortfolioApi};
@@ -259,6 +261,33 @@ pub trait Strategy: DataActor {
             anyhow::bail!("OrderList denied: {e}");
         }
 
+        let params = params.filter(|params| !params.is_empty());
+
+        let first_order = orders.first();
+        let order_inits: Vec<_> = orders.iter().map(|o| o.init_event().clone()).collect();
+        let exec_algorithm_id = first_order.and_then(|o| o.exec_algorithm_id());
+
+        let command = SubmitOrderList::new(
+            trader_id,
+            client_id,
+            strategy_id,
+            order_list.clone(),
+            order_inits,
+            exec_algorithm_id,
+            position_id,
+            params,
+            UUID4::new(),
+            ts_init,
+            None, // correlation_id
+        );
+        let prepared = core
+            .submission_interceptor
+            .as_ref()
+            .map(|interceptor| {
+                interceptor.prepare(&TradingCommand::SubmitOrderList(command.clone()))
+            })
+            .transpose()?;
+
         {
             let cache_rc = core.cache_rc();
             let mut cache = cache_rc.try_borrow_mut().map_err(|_| {
@@ -287,35 +316,32 @@ pub trait Strategy: DataActor {
             }
         }
 
+        if let Some(prepared) = prepared {
+            if let Err(error) = prepared.bind(&TradingCommand::SubmitOrderList(command.clone())) {
+                for order in &orders {
+                    publish_order_initialized(order);
+                }
+                self.deny_order_list(&orders, Ustr::from(&format!("提交绑定失败：{error}")));
+                return Err(error);
+            }
+        }
+
         for order in &orders {
             publish_order_initialized(order);
         }
-
-        let params = params.filter(|params| !params.is_empty());
-
-        let first_order = orders.first();
-        let order_inits: Vec<_> = orders.iter().map(|o| o.init_event().clone()).collect();
-        let exec_algorithm_id = first_order.and_then(Order::exec_algorithm_id);
-
-        let command = SubmitOrderList::new(
-            trader_id,
-            client_id,
-            strategy_id,
-            order_list,
-            order_inits,
-            exec_algorithm_id,
-            position_id,
-            params,
-            UUID4::new(),
-            ts_init,
-            None, // correlation_id
-        );
 
         let has_emulated_order = orders
             .iter()
             .any(|o| o.emulation_trigger().is_some() || o.is_emulated());
 
-        if has_emulated_order {
+        let local_oto = core.config.manage_order_lists_locally
+            && orders.first().is_some_and(|order| {
+                order.contingency_type() == Some(nautilus_model::enums::ContingencyType::Oto)
+            });
+        if has_emulated_order || local_oto {
+            // The emulator's local manager holds initialized children. With no
+            // emulation trigger, it submits them to the native client after fills.
+            // The strategy's open-order manager subsequently owns OUO/OCO actions.
             send_emulator_command(TradingCommand::SubmitOrderList(command));
         } else if let Some(algo_id) = exec_algorithm_id {
             let endpoint = format!("{algo_id}.execute");
@@ -407,10 +433,6 @@ pub trait Strategy: DataActor {
             return Ok(());
         }
 
-        if !self.mark_order_pending_update(&order)? {
-            return Ok(());
-        }
-
         let command = ModifyOrder::new(
             trader_id,
             client_id,
@@ -428,6 +450,26 @@ pub trait Strategy: DataActor {
             params,
             None, // correlation_id
         );
+
+        let prepared = StrategyNative::strategy_core(self)
+            .submission_interceptor
+            .as_ref()
+            .map(|interceptor| interceptor.prepare(&TradingCommand::ModifyOrder(command.clone())))
+            .transpose()?;
+        if !self.mark_order_pending_update(&order)? {
+            return Ok(());
+        }
+        if let Some(prepared) = prepared {
+            if let Err(error) = prepared.bind(&TradingCommand::ModifyOrder(command.clone())) {
+                reject_unsubmitted_modification(
+                    StrategyNative::strategy_core_mut(self),
+                    &order,
+                    &command,
+                    Ustr::from(&format!("改单绑定失败：{error}")),
+                )?;
+                return Err(error);
+            }
+        }
 
         if order.emulation_trigger().is_some() || order.is_emulated() {
             send_emulator_command(TradingCommand::ModifyOrder(command));
@@ -460,6 +502,12 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        anyhow::ensure!(
+            StrategyNative::strategy_core(self)
+                .submission_interceptor
+                .is_none(),
+            "受控提交尚不支持批量改单"
+        );
         if updates.is_empty() {
             anyhow::bail!("Cannot batch modify empty order list");
         }
@@ -2369,19 +2417,6 @@ where
     let core = StrategyNative::strategy_core_mut(strategy);
     let params = params.filter(|params| !params.is_empty());
 
-    {
-        let cache_rc = core.cache_rc();
-        let mut cache = cache_rc.try_borrow_mut().map_err(|_| {
-            anyhow::anyhow!(
-                "Cannot submit order {}: cache is currently borrowed",
-                order.client_order_id()
-            )
-        })?;
-        cache.add_order(order.clone(), position_id, client_id, true)?;
-    }
-
-    publish_order_initialized(order);
-
     let command = SubmitOrder::new(
         trader_id,
         client_id,
@@ -2396,6 +2431,32 @@ where
         ts_init,
         None, // correlation_id
     );
+    let prepared = core
+        .submission_interceptor
+        .as_ref()
+        .map(|interceptor| interceptor.prepare(&TradingCommand::SubmitOrder(command.clone())))
+        .transpose()?;
+
+    {
+        let cache_rc = core.cache_rc();
+        let mut cache = cache_rc.try_borrow_mut().map_err(|_| {
+            anyhow::anyhow!(
+                "Cannot submit order {}: cache is currently borrowed",
+                order.client_order_id()
+            )
+        })?;
+        cache.add_order(order.clone(), position_id, client_id, true)?;
+    }
+
+    if let Some(prepared) = prepared {
+        if let Err(error) = prepared.bind(&TradingCommand::SubmitOrder(command.clone())) {
+            publish_order_initialized(order);
+            strategy.deny_order(order, Ustr::from(&format!("提交绑定失败：{error}")));
+            return Err(error);
+        }
+    }
+
+    publish_order_initialized(order);
 
     if order.emulation_trigger().is_some() {
         send_emulator_command(TradingCommand::SubmitOrder(command));
@@ -2427,6 +2488,41 @@ fn send_algo_command(command: SubmitOrder, exec_algorithm_id: ExecAlgorithmId) {
 
     let endpoint = format!("{exec_algorithm_id}.execute");
     msgbus::send_any(endpoint.into(), &TradingCommand::SubmitOrder(command));
+}
+
+/// 已知尚未发送的改单绑定失败，通过原事件模型恢复待修改状态。
+fn reject_unsubmitted_modification(
+    core: &mut StrategyCore,
+    order: &OrderAny,
+    command: &ModifyOrder,
+    reason: Ustr,
+) -> anyhow::Result<()> {
+    let now = core.clock_mut().timestamp_ns();
+    let mut rejected = OrderModifyRejected::new(
+        command.trader_id,
+        command.strategy_id,
+        command.instrument_id,
+        command.client_order_id,
+        reason,
+        UUID4::new(),
+        now,
+        now,
+        false,
+        order.venue_order_id(),
+        order.account_id(),
+    );
+    rejected.causation_id = Some(command.command_id);
+    let event = OrderEventAny::ModifyRejected(rejected);
+    core.cache_rc().borrow_mut().update_order(&event)?;
+    msgbus::publish_order_event(
+        format!("events.order.{}", command.strategy_id).into(),
+        &event,
+    );
+    msgbus::publish_order_event(
+        msgbus::switchboard::get_order_modify_rejected_topic(command.instrument_id),
+        &event,
+    );
+    Ok(())
 }
 
 fn send_risk_command(command: TradingCommand) {
@@ -4007,6 +4103,43 @@ mod tests {
             order_list.client_order_ids.as_slice(),
             &[client_order_id1, client_order_id2]
         );
+    }
+
+    #[rstest]
+    fn test_native_oto_list_routes_to_local_manager_without_emulating_protection() {
+        let mut strategy = create_test_strategy();
+        strategy.core.config.manage_contingent_orders = true;
+        strategy.core.config.manage_order_lists_locally = true;
+        register_strategy(&mut strategy);
+        let (handler, messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("OrderEmulator.execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::order_emulator_execute(),
+            handler,
+        );
+        let orders = strategy
+            .order()
+            .bracket()
+            .instrument_id(InstrumentId::from("AUD/USD.SIM"))
+            .order_side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .entry_order_type(OrderType::Market)
+            .entry_post_only(false)
+            .maybe_sl_trigger_price(Some(Price::from("0.99000")))
+            .maybe_tp_price(Some(Price::from("1.01000")))
+            .call();
+        assert!(
+            orders
+                .iter()
+                .all(|order| order.emulation_trigger().is_none())
+        );
+        strategy
+            .submit_order_list(orders, None, None, None)
+            .unwrap();
+        assert!(matches!(
+            messages.get_messages().as_slice(),
+            [TradingCommand::SubmitOrderList(_)]
+        ));
     }
 
     #[rstest]
@@ -7080,5 +7213,266 @@ mod tests {
         assert_eq!(custom.config().order_id_tag, config.order_id_tag);
         assert_eq!(custom.actor_id(), ActorId::from("MACRO-001"));
         assert!(custom.external_order_instrument_ids().is_none());
+    }
+
+    struct SubmissionTestHook {
+        cache: Rc<RefCell<Cache>>,
+        ids: Vec<ClientOrderId>,
+        timeline: Rc<RefCell<Vec<&'static str>>>,
+        failure: u8,
+        commands: Rc<RefCell<Vec<TradingCommand>>>,
+    }
+    impl SubmissionInterceptor for SubmissionTestHook {
+        fn prepare(&self, command: &TradingCommand) -> anyhow::Result<Box<dyn PreparedSubmission>> {
+            self.timeline.borrow_mut().push("prepare");
+            self.commands.borrow_mut().push(command.clone());
+            for id in &self.ids {
+                if matches!(command, TradingCommand::ModifyOrder(_)) {
+                    assert_eq!(
+                        self.cache.borrow().order(id).unwrap().status(),
+                        OrderStatus::Accepted
+                    );
+                } else {
+                    assert!(!self.cache.borrow().order_exists(id));
+                }
+            }
+            anyhow::ensure!(self.failure != 1, "准备拒绝");
+            Ok(Box::new(PreparedTestHook {
+                cache: self.cache.clone(),
+                ids: self.ids.clone(),
+                timeline: self.timeline.clone(),
+                failure: self.failure,
+                command: format!("{command:?}"),
+            }))
+        }
+    }
+    struct PreparedTestHook {
+        cache: Rc<RefCell<Cache>>,
+        ids: Vec<ClientOrderId>,
+        timeline: Rc<RefCell<Vec<&'static str>>>,
+        failure: u8,
+        command: String,
+    }
+    impl PreparedSubmission for PreparedTestHook {
+        fn bind(self: Box<Self>, command: &TradingCommand) -> anyhow::Result<()> {
+            assert_eq!(self.command, format!("{command:?}"));
+            self.timeline.borrow_mut().push("bind");
+            for id in &self.ids {
+                assert_eq!(
+                    self.cache.borrow().order(id).unwrap().status(),
+                    if matches!(command, TradingCommand::ModifyOrder(_)) {
+                        OrderStatus::PendingUpdate
+                    } else {
+                        OrderStatus::Initialized
+                    }
+                );
+            }
+            anyhow::ensure!(self.failure != 2, "绑定拒绝");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_submission_interceptor_preserves_native_single_and_list_lifecycle() {
+        for list in [false, true] {
+            for failure in [0, 1, 2] {
+                std::thread::spawn(move || {
+                    let mut strategy = create_test_strategy();
+                    register_strategy(&mut strategy);
+                    let orders = if list {
+                        vec![
+                            make_initialized_market_order("HOOK-1"),
+                            make_initialized_market_order("HOOK-2"),
+                        ]
+                    } else {
+                        vec![make_initialized_market_order("HOOK-1")]
+                    };
+                    let ids: Vec<_> = orders.iter().map(|o| o.client_order_id()).collect();
+                    let cache = strategy.core.cache_rc();
+                    let timeline = Rc::new(RefCell::new(Vec::new()));
+                    let hook = Rc::new(SubmissionTestHook {
+                        cache: cache.clone(),
+                        ids: ids.clone(),
+                        timeline: timeline.clone(),
+                        failure,
+                        commands: Rc::new(RefCell::new(Vec::new())),
+                    });
+                    strategy
+                        .core
+                        .set_submission_interceptor(hook.clone())
+                        .unwrap();
+                    assert!(strategy.core.set_submission_interceptor(hook).is_err());
+                    let events = timeline.clone();
+                    msgbus::subscribe_order_events(
+                        "events.order.*".into(),
+                        TypedHandler::from(move |event: &OrderEventAny| {
+                            events.borrow_mut().push(match event {
+                                OrderEventAny::Initialized(_) => "init",
+                                OrderEventAny::Denied(_) => "denied",
+                                _ => panic!("非预期事件：{event:?}"),
+                            });
+                        }),
+                        None,
+                    );
+                    let sent = timeline.clone();
+                    msgbus::register_trading_command_endpoint(
+                        MessagingSwitchboard::risk_engine_queue_execute(),
+                        TypedIntoHandler::from(move |_: TradingCommand| {
+                            sent.borrow_mut().push("send");
+                        }),
+                    );
+                    let result = if list {
+                        strategy.submit_order_list(orders, None, None, None)
+                    } else {
+                        strategy.submit_order(orders[0].clone(), None, None, None)
+                    };
+                    assert_eq!(result.is_ok(), failure == 0);
+                    let mut expected = vec!["prepare"];
+                    if failure != 1 {
+                        expected.push("bind");
+                        expected.extend(std::iter::repeat_n("init", ids.len()));
+                        if failure == 0 {
+                            expected.push("send");
+                        } else {
+                            expected.extend(std::iter::repeat_n("denied", ids.len()));
+                        }
+                    }
+                    assert_eq!(*timeline.borrow(), expected);
+                    for id in ids {
+                        let state = cache.borrow().order(&id).map(|o| o.status());
+                        assert_eq!(
+                            state,
+                            match failure {
+                                1 => None,
+                                2 => Some(OrderStatus::Denied),
+                                _ => Some(OrderStatus::Initialized),
+                            }
+                        );
+                    }
+                })
+                .join()
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_modification_interceptor_rejection_preserves_order_and_command_causation() {
+        for failure in [0, 1, 2] {
+            std::thread::spawn(move || {
+                let mut strategy = create_test_strategy();
+                register_strategy(&mut strategy);
+                let order = make_accepted_limit_order("MODIFY-HOOK-1");
+                add_order_to_cache(&strategy, &order);
+                let cache = strategy.core.cache_rc();
+                let timeline = Rc::new(RefCell::new(Vec::new()));
+                let commands = Rc::new(RefCell::new(Vec::new()));
+                strategy
+                    .core
+                    .set_submission_interceptor(Rc::new(SubmissionTestHook {
+                        cache: cache.clone(),
+                        ids: vec![order.client_order_id()],
+                        timeline: timeline.clone(),
+                        failure,
+                        commands: commands.clone(),
+                    }))
+                    .unwrap();
+                let events = Rc::new(RefCell::new(Vec::new()));
+                let captured = events.clone();
+                let recorded = timeline.clone();
+                msgbus::subscribe_order_events(
+                    "events.order.*".into(),
+                    TypedHandler::from(move |event: &OrderEventAny| {
+                        captured.borrow_mut().push(event.clone());
+                        recorded.borrow_mut().push(match event {
+                            OrderEventAny::PendingUpdate(_) => "pending",
+                            OrderEventAny::ModifyRejected(_) => "rejected",
+                            _ => panic!("非预期事件"),
+                        });
+                    }),
+                    None,
+                );
+                let sent = timeline.clone();
+                msgbus::register_trading_command_endpoint(
+                    MessagingSwitchboard::risk_engine_queue_execute(),
+                    TypedIntoHandler::from(move |_: TradingCommand| {
+                        sent.borrow_mut().push("send");
+                    }),
+                );
+                let result = strategy.modify_order(
+                    order.client_order_id(),
+                    None,
+                    Some(Price::from("51000.0")),
+                    None,
+                    None,
+                    None,
+                );
+                assert_eq!(result.is_ok(), failure == 0);
+                let expected = match failure {
+                    0 => vec!["prepare", "pending", "bind", "send"],
+                    1 => vec!["prepare"],
+                    _ => vec!["prepare", "pending", "bind", "rejected"],
+                };
+                assert_eq!(*timeline.borrow(), expected);
+                let current = cache
+                    .borrow()
+                    .order(&order.client_order_id())
+                    .unwrap()
+                    .clone();
+                assert_eq!(current.price(), order.price());
+                assert_eq!(current.quantity(), order.quantity());
+                assert_eq!(
+                    current.status(),
+                    if failure == 0 {
+                        OrderStatus::PendingUpdate
+                    } else {
+                        OrderStatus::Accepted
+                    }
+                );
+                if failure == 2 {
+                    let commands = commands.borrow();
+                    let TradingCommand::ModifyOrder(command) = &commands[0] else {
+                        unreachable!()
+                    };
+                    let events = events.borrow();
+                    let OrderEventAny::ModifyRejected(rejected) = events.last().unwrap() else {
+                        unreachable!()
+                    };
+                    assert_eq!(rejected.causation_id, Some(command.command_id));
+                    assert_eq!(rejected.account_id, order.account_id());
+                    assert_eq!(rejected.venue_order_id, order.venue_order_id());
+                }
+                let before = cache
+                    .borrow()
+                    .order(&order.client_order_id())
+                    .unwrap()
+                    .last_event()
+                    .clone();
+                assert!(
+                    strategy
+                        .modify_orders(
+                            vec![(
+                                order.client_order_id(),
+                                None,
+                                Some(Price::from("52000.0")),
+                                None
+                            )],
+                            None,
+                            None
+                        )
+                        .is_err()
+                );
+                assert_eq!(
+                    cache
+                        .borrow()
+                        .order(&order.client_order_id())
+                        .unwrap()
+                        .last_event(),
+                    &before
+                );
+            })
+            .join()
+            .unwrap();
+        }
     }
 }

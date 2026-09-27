@@ -54,6 +54,7 @@ use super::{
 /// strategy value.
 pub struct StrategyCore {
     pub(crate) actor: DataActorCore,
+    pub(crate) submission_interceptor: Option<Rc<dyn super::SubmissionInterceptor>>,
     /// The strategy configuration.
     pub config: StrategyConfig,
     strategy_id: Option<StrategyId>,
@@ -145,6 +146,16 @@ pub trait StrategyNative {
 }
 
 impl StrategyCore {
+    /// 安装一次原生提交约束；不允许替换已安装的约束。
+    pub fn set_submission_interceptor(
+        &mut self,
+        interceptor: Rc<dyn super::SubmissionInterceptor>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.submission_interceptor.is_none(), "提交约束已经安装");
+        self.submission_interceptor = Some(interceptor);
+        Ok(())
+    }
+
     /// Creates a new [`StrategyCore`] instance with correctness checking.
     ///
     /// # Errors
@@ -181,6 +192,7 @@ impl StrategyCore {
 
         Ok(Self {
             actor: DataActorCore::new(actor_config),
+            submission_interceptor: None,
             config,
             strategy_id,
             order_id_tag,
