@@ -197,9 +197,10 @@ impl BusCaptureAdapter {
     ///
     /// Returns:
     ///
-    /// - [`CaptureError::Halted`] when a prior capture already observed a writer failure
+    /// - [`CaptureError::Halted`] when a prior capture already observed an encoding or writer failure
     ///   and the adapter has fail-stopped.
-    /// - [`CaptureError::Encode`] when the registered encoder rejects the message.
+    /// - [`CaptureError::Encode`] when the registered encoder rejects the message; the halt
+    ///   callback fires before this error returns.
     /// - [`CaptureError::Submit`] when the writer rejects the submit; the adapter halt
     ///   callback fires before this error returns.
     pub fn capture<T: 'static>(
@@ -233,9 +234,12 @@ impl BusCaptureAdapter {
             return Err(CaptureError::Halted);
         }
 
-        // Encode before noting the identity: a rejected encode must be re-attempted
-        // on the message's next dispatch hop, not dropped as a duplicate.
-        let Some((payload_type, encoded)) = self.registry.encode_any(message)? else {
+        // Encoding failure makes this run incomplete. Stop before any later dispatch.
+        let Some((payload_type, encoded)) = self.registry.encode_any(message).map_err(|error| {
+            self.fail_stop_reason(HaltReason::CaptureEncoding(error.to_string()));
+            CaptureError::Encode(error)
+        })?
+        else {
             return Ok(false);
         };
 
@@ -273,12 +277,16 @@ impl BusCaptureAdapter {
     }
 
     fn fail_stop(&self, err: &SubmitError) {
+        self.fail_stop_reason(halt_reason_from_submit(err));
+    }
+
+    fn fail_stop_reason(&self, reason: HaltReason) {
         if self
             .halted
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            (self.halt)(halt_reason_from_submit(err));
+            (self.halt)(reason);
         }
     }
 }
@@ -635,51 +643,37 @@ mod tests {
     }
 
     #[rstest]
-    fn capture_propagates_encoder_error_without_halting(
+    fn capture_encoder_error_halts_before_later_messages(
         captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
     ) {
-        // An encoder failure is the encoder's contract violation, not a writer fail-stop:
-        // the caller should see CaptureError::Encode but the adapter must stay live so a
-        // subsequent capture for an allow-listed type still goes through.
         let (halt, captured) = captured_halt;
         let (writer, backend) = writer_with_open_run("run-encode-err", Arc::clone(&halt));
         let adapter = BusCaptureAdapter::new(Arc::clone(&writer), stub_registry(), halt);
-
         let err = adapter
-            .capture::<FailingMessage>(
-                Topic::from("exec.command.Failing"),
+            .capture(
+                Topic::from("failure"),
                 &FailingMessage,
                 Headers::empty(),
                 UnixNanos::from(500),
             )
-            .expect_err("encoder must reject");
-
-        match err {
-            CaptureError::Encode(EncodeError::Serialize(msg)) => {
-                assert!(msg.contains("rejected"), "msg was: {msg}");
-            }
-            other => panic!("expected Encode(Serialize), was {other:?}"),
-        }
-        assert!(
-            !adapter.is_halted(),
-            "encoder failure must not fail-stop the adapter",
+            .expect_err("encoder rejects");
+        assert!(matches!(err, CaptureError::Encode(_)));
+        assert!(adapter.is_halted());
+        assert!(matches!(
+            captured.lock().as_slice(),
+            [HaltReason::CaptureEncoding(_)]
+        ));
+        let later = adapter.capture(
+            Topic::from("later"),
+            &StubCommand {
+                client_order_id: "later".to_string(),
+            },
+            Headers::empty(),
+            UnixNanos::from(501),
         );
-        assert!(captured.lock().is_empty());
-
-        // Subsequent capture for a registered type still works.
-        adapter
-            .capture::<StubCommand>(
-                Topic::from("exec.command.SubmitOrder"),
-                &StubCommand {
-                    client_order_id: "O-after-encode-err".to_string(),
-                },
-                Headers::empty(),
-                UnixNanos::from(501),
-            )
-            .expect("capture after encoder error");
-        drain(&writer, 1);
-        let backend = backend.lock();
-        assert_eq!(backend.high_watermark().expect("hwm"), 1);
+        assert!(matches!(later, Err(CaptureError::Halted)));
+        assert_eq!(captured.lock().len(), 1);
+        assert_eq!(backend.lock().high_watermark().expect("hwm"), 0);
     }
 
     #[rstest]
@@ -731,11 +725,10 @@ mod tests {
     }
 
     #[rstest]
-    fn capture_retries_encode_on_next_hop_after_encoder_failure(
+    fn capture_blocks_next_hop_after_encoder_failure(
         captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
     ) {
-        // The identity is noted only after a successful encode, so the next hop
-        // re-attempts a failed encode instead of deduping it.
+        // A later dispatch cannot hide an earlier capture failure by retrying it.
         let (halt, _captured) = captured_halt;
         let (writer, backend) = writer_with_open_run("run-encode-retry", Arc::clone(&halt));
 
@@ -778,13 +771,12 @@ mod tests {
                 Headers::empty(),
                 UnixNanos::from(101),
             )
-            .expect("second hop re-attempts encode");
+            .expect_err("second hop blocked");
 
-        assert!(retried, "encode retry must capture, was deduped");
-        assert_eq!(attempts.load(Ordering::Acquire), 2);
-        drain(&writer, 1);
+        assert!(matches!(retried, CaptureError::Halted));
+        assert_eq!(attempts.load(Ordering::Acquire), 1);
         let backend = backend.lock();
-        assert_eq!(backend.high_watermark().expect("hwm"), 1);
+        assert_eq!(backend.high_watermark().expect("hwm"), 0);
     }
 
     #[rstest]

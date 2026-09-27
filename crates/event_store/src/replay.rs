@@ -2720,8 +2720,8 @@ mod tests {
     /// Add a file here when the cache module is split further, or its methods drop out of this
     /// classification guard.
     const CACHE_IMPL_SOURCES: &[&str] = &[
-        include_str!("../../common/src/cache/mod.rs"),
-        include_str!("../../common/src/cache/position.rs"),
+        include_str!("../test_data/upstream-cache/mod.rs"),
+        include_str!("../test_data/upstream-cache/position.rs"),
     ];
 
     fn collect_cache_public_methods(require_mut_self: bool) -> AHashSet<&'static str> {

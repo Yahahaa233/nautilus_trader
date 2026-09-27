@@ -46,6 +46,10 @@ pub enum HaltReason {
     BackendCorrupted(String),
     /// The backend returned an unclassified error that the writer cannot retry past.
     BackendError(String),
+    /// A registered encoder rejected a state-affecting message; capture is incomplete.
+    CaptureEncoding(String),
+    /// The owner failed a required persistence operation outside the native writer.
+    ExternalPersistence(String),
 }
 
 impl HaltReason {

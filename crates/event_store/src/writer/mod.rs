@@ -320,13 +320,37 @@ mod imp {
                 content_hash: content_hash.into(),
                 ack: ack_tx,
             };
+            self.request_ack(tx, pending, &ack_rx, "snapshot anchor")
+        }
+
+        /// Commits earlier queued entries and returns their durable high-watermark.
+        /// Does not seal the run or create a snapshot anchor.
+        ///
+        /// # Errors
+        /// Returns an error on backend failure, writer halt, closure or acknowledgment timeout.
+        pub fn flush(&self) -> Result<u64, EventStoreError> {
+            if self.halted.load(Ordering::Acquire) {
+                return Err(EventStoreError::Closed);
+            }
+            let tx = self.tx.as_ref().ok_or(EventStoreError::Closed)?;
+            let (ack, ack_rx) = mpsc::sync_channel(1);
+            self.request_ack(tx, WriterMessage::Flush { ack }, &ack_rx, "flush")
+        }
+
+        fn request_ack<T>(
+            &self,
+            tx: &SyncSender<WriterMessage>,
+            pending: WriterMessage,
+            ack_rx: &mpsc::Receiver<Result<T, EventStoreError>>,
+            operation: &str,
+        ) -> Result<T, EventStoreError> {
             let start = Instant::now();
 
             if let Err(e) = self.enqueue_with_backpressure(tx, pending, start) {
                 match e {
                     EnqueueFailure::Stalled(elapsed) => {
                         return Err(EventStoreError::Backend(format!(
-                            "snapshot anchor submit stalled for {elapsed:?}, halt threshold {:?}",
+                            "{operation} submit stalled for {elapsed:?}, halt threshold {:?}",
                             self.halt_threshold,
                         )));
                     }
@@ -340,13 +364,13 @@ mod imp {
                     let elapsed = start.elapsed();
                     self.signal_backpressure_stall(elapsed);
                     Err(EventStoreError::Backend(format!(
-                        "snapshot anchor ack stalled for {elapsed:?}, halt threshold {:?}",
+                        "{operation} ack stalled for {elapsed:?}, halt threshold {:?}",
                         self.halt_threshold,
                     )))
                 }
-                Err(RecvTimeoutError::Disconnected) => Err(EventStoreError::Backend(
-                    "snapshot anchor ack channel disconnected".to_string(),
-                )),
+                Err(RecvTimeoutError::Disconnected) => Err(EventStoreError::Backend(format!(
+                    "{operation} ack channel disconnected"
+                ))),
             }
         }
 
@@ -563,6 +587,18 @@ mod imp {
         #[must_use]
         pub fn high_watermark(&self) -> u64 {
             self.high_watermark.load(Ordering::Acquire)
+        }
+
+        /// Confirms the watermark; simulation submits commit synchronously.
+        ///
+        /// # Errors
+        /// Returns an error if the writer has closed or failed.
+        pub fn flush(&self) -> Result<u64, EventStoreError> {
+            let inner = self.inner.lock();
+            if inner.closed {
+                return Err(EventStoreError::Closed);
+            }
+            Ok(self.high_watermark.load(Ordering::Acquire))
         }
 
         /// Records a snapshot anchor at the current durable high-watermark.
@@ -972,6 +1008,32 @@ mod tests {
             captured_for_cb.lock().push(reason);
         });
         (halt, captured)
+    }
+
+    #[rstest]
+    fn flush_failure_never_acknowledges_uncommitted_entries(
+        captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
+    ) {
+        let (halt, captured) = captured_halt;
+        let writer = EventStoreWriter::spawn(
+            Box::new(DiskFailureBackend::default()),
+            get_atomic_clock_static(),
+            halt,
+            WriterConfig {
+                max_batch_entries: 100,
+                max_batch_latency: Duration::from_secs(30),
+                ..WriterConfig::default()
+            },
+        )
+        .expect("spawn");
+        writer.submit(entry_draft(10)).expect("enqueue");
+        assert!(writer.flush().is_err());
+        assert_eq!(writer.high_watermark(), 0);
+        assert!(writer.flush().is_err());
+        assert!(matches!(
+            captured.lock().as_slice(),
+            [HaltReason::BackendDisk(_)]
+        ));
     }
 
     #[rstest]
@@ -1444,7 +1506,10 @@ mod tests {
     }
 
     #[rstest]
+    #[case(false)]
+    #[case(true)]
     fn record_snapshot_anchor_signals_halt_when_ack_stalls(
+        #[case] flush: bool,
         captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
     ) {
         let (halt, captured) = captured_halt;
@@ -1480,9 +1545,14 @@ mod tests {
         writer.submit(entry_draft(10)).expect("first submit fits");
         std::thread::sleep(Duration::from_millis(20));
 
-        let err = writer
-            .record_snapshot_anchor("cache://position-snapshots/P-1/0", "blake3:abc")
-            .expect_err("snapshot anchor ack must time out");
+        let result = if flush {
+            writer.flush().map(|_| ())
+        } else {
+            writer
+                .record_snapshot_anchor("cache://position-snapshots/P-1/0", "blake3:abc")
+                .map(|_| ())
+        };
+        let err = result.expect_err("control request ack must time out");
         let post_halt = writer
             .submit(entry_draft(11))
             .expect_err("post-halt submit");
@@ -1494,7 +1564,11 @@ mod tests {
         match err {
             EventStoreError::Backend(msg) => {
                 assert!(
-                    msg.contains("snapshot anchor ack stalled"),
+                    msg.contains(if flush {
+                        "flush ack stalled"
+                    } else {
+                        "snapshot anchor ack stalled"
+                    }),
                     "msg was: {msg}"
                 );
             }
@@ -1518,7 +1592,10 @@ mod tests {
     }
 
     #[rstest]
+    #[case(false)]
+    #[case(true)]
     fn record_snapshot_anchor_signals_halt_when_submit_stalls(
+        #[case] flush: bool,
         captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
     ) {
         let (halt, captured) = captured_halt;
@@ -1564,9 +1641,14 @@ mod tests {
         );
         writer.submit(entry_draft(11)).expect("second submit fits");
 
-        let err = writer
-            .record_snapshot_anchor("cache://position-snapshots/P-1/0", "blake3:abc")
-            .expect_err("snapshot anchor submit must time out");
+        let result = if flush {
+            writer.flush().map(|_| ())
+        } else {
+            writer
+                .record_snapshot_anchor("cache://position-snapshots/P-1/0", "blake3:abc")
+                .map(|_| ())
+        };
+        let err = result.expect_err("control request submit must time out");
         let post_halt = writer
             .submit(entry_draft(12))
             .expect_err("post-halt submit");
@@ -1578,7 +1660,11 @@ mod tests {
         match err {
             EventStoreError::Backend(msg) => {
                 assert!(
-                    msg.contains("snapshot anchor submit stalled"),
+                    msg.contains(if flush {
+                        "flush submit stalled"
+                    } else {
+                        "snapshot anchor submit stalled"
+                    }),
                     "msg was: {msg}"
                 );
             }

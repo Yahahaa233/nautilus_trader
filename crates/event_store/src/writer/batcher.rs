@@ -70,6 +70,11 @@ pub(super) enum WriterMessage {
         /// One-shot reply channel for the close result.
         ack: SyncSender<Result<u64, EventStoreError>>,
     },
+    /// Confirms all earlier queued entries are durably committed without sealing.
+    Flush {
+        /// Durable high-watermark after the flush.
+        ack: SyncSender<Result<u64, EventStoreError>>,
+    },
     /// Records a cache snapshot anchor after all pending entries have been flushed.
     RecordSnapshotAnchor {
         /// Cache-owned reference to the snapshot blob.
@@ -185,6 +190,14 @@ pub(super) fn run(
                 let _ = ack.send(final_result);
                 return;
             }
+            Ok(WriterMessage::Flush { ack }) => {
+                if !flush(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref()) {
+                    let _ = ack.send(Err(EventStoreError::Closed));
+                    return;
+                }
+                let _ = ack.send(Ok(high_watermark.load(Ordering::Acquire)));
+                batch_deadline = None;
+            }
             Ok(WriterMessage::RecordSnapshotAnchor {
                 blob_ref,
                 content_hash,
@@ -272,6 +285,9 @@ fn drain_pending(rx: &Receiver<WriterMessage>, batch: &mut Vec<AppendEntry>, nex
                 let _ = ack.send(Err(EventStoreError::Backend(
                     "writer is already closing".to_string(),
                 )));
+            }
+            WriterMessage::Flush { ack } => {
+                let _ = ack.send(Err(EventStoreError::Closed));
             }
             WriterMessage::RecordSnapshotAnchor { ack, .. } => {
                 let _ = ack.send(Err(EventStoreError::Backend(

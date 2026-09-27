@@ -342,6 +342,25 @@ impl EventStoreSession {
         self.writer.as_ref().map_or(0, |w| w.high_watermark())
     }
 
+    /// Confirms earlier captures are durable without creating a cache snapshot anchor.
+    ///
+    /// # Errors
+    /// Refuses a closed or halted session, including capture failures outside the writer.
+    pub fn flush(&self) -> Result<u64, EventStoreError> {
+        if self.is_halted() {
+            return Err(EventStoreError::Closed);
+        }
+        let watermark = self
+            .writer
+            .as_ref()
+            .ok_or(EventStoreError::Closed)?
+            .flush()?;
+        if self.is_halted() {
+            return Err(EventStoreError::Closed);
+        }
+        Ok(watermark)
+    }
+
     /// Returns a snapshot anchorer bound to the open writer.
     ///
     /// The execution engine installs this callback while the run is open. The callback
@@ -349,14 +368,29 @@ impl EventStoreSession {
     /// high-watermark after flushing earlier captured entries.
     #[must_use]
     pub fn snapshot_anchorer(&self) -> Option<SnapshotAnchorer> {
+        if self.is_halted() {
+            return None;
+        }
+        let halt = self.halt_signal.clone();
         let writer = Arc::clone(self.writer.as_ref()?);
 
         Some(Rc::new(move |snapshot_ref: CacheSnapshotRef| {
+            anyhow::ensure!(
+                !halt.is_halted(),
+                "event store capture halted: {:?}",
+                halt.reason()
+            );
             let content_hash = compute_snapshot_content_hash(snapshot_ref.blob.as_ref());
             writer
                 .record_snapshot_anchor(snapshot_ref.blob_ref, content_hash)
                 .map(|_| ())
-                .map_err(|e| anyhow::anyhow!("record snapshot anchor: {e}"))
+                .map_err(|e| anyhow::anyhow!("record snapshot anchor: {e}"))?;
+            anyhow::ensure!(
+                !halt.is_halted(),
+                "event store halted during snapshot anchor: {:?}",
+                halt.reason()
+            );
+            Ok(())
         }))
     }
 
@@ -379,6 +413,9 @@ impl EventStoreSession {
     /// seal step fails, or the writer Arc has outstanding clones (the bus tap must be
     /// cleared before close to release the adapter's writer reference).
     pub fn close(&mut self, ts_init: UnixNanos) -> Result<(), EventStoreError> {
+        if self.is_halted() {
+            return Err(EventStoreError::Closed);
+        }
         // Drop the adapter first so the writer Arc has no other strong owners on
         // try_unwrap. The kernel clears the bus tap before this site, so dropping the
         // session-side adapter clone here is the last release before close.
@@ -723,6 +760,49 @@ impl EventStoreLifecycle {
     #[must_use]
     pub fn halt_reason(&self) -> Option<HaltReason> {
         self.halt.reason()
+    }
+
+    /// Captures a caller-owned message directly, without dispatching it on the bus,
+    /// and confirms all entries through that capture are durable.
+    ///
+    /// # Errors
+    /// Rejects unregistered types, duplicate identities, absent or halted sessions,
+    /// encoding failures, and failed durable confirmation.
+    pub fn capture_and_flush<T: 'static>(
+        &self,
+        topic: Topic,
+        message: &T,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<u64> {
+        let session = self.session.as_ref().ok_or(EventStoreError::Closed)?;
+        anyhow::ensure!(!session.is_halted(), "event store capture halted");
+        let adapter = session.adapter().ok_or(EventStoreError::Closed)?;
+        let headers = adapter
+            .registry()
+            .headers_for_any(message)
+            .unwrap_or_else(Headers::empty);
+        anyhow::ensure!(
+            adapter.capture(topic, message, headers, ts_init)?,
+            "required event was not captured: unregistered type or duplicate identity"
+        );
+        Ok(session.flush()?)
+    }
+
+    /// Marks the current lifecycle failed when an owner-side persistence contract fails.
+    /// The first reason is retained; normal sealing and durable confirmation are refused.
+    pub fn abort(&self, reason: HaltReason) {
+        self.halt.callback()(reason);
+    }
+
+    /// Confirms earlier captures in the currently open run are durable.
+    ///
+    /// # Errors
+    /// Refuses an absent, closed or halted run; absence never counts as confirmation.
+    pub fn flush(&self) -> Result<u64, EventStoreError> {
+        self.session
+            .as_ref()
+            .ok_or(EventStoreError::Closed)?
+            .flush()
     }
 
     /// Surfaces the current halt as a typed [`KernelError`], or `None` when the
@@ -1291,7 +1371,7 @@ impl EventStoreBusTap {
                 log::error!("Event store capture submit failed on {topic}: {e}");
             }
             Err(CaptureError::Encode(e)) => {
-                log::warn!("Event store encoder rejected message on {topic}: {e}");
+                log::error!("Event store capture halted: encoder rejected message on {topic}: {e}");
             }
         }
     }
@@ -2039,6 +2119,58 @@ mod tests {
             .expect("manifest present");
         assert_eq!(manifest.status, RunStatus::Ended);
         assert!(manifest.high_watermark >= 2);
+    }
+
+    #[rstest]
+    fn capture_halt_blocks_retained_snapshot_callback_and_direct_close() {
+        let tmp = TempDir::new().expect("tempdir");
+        let config = make_config(tmp.path().to_path_buf());
+        let halt = HaltSignal::new();
+        let mut session = open_run(
+            &config,
+            INSTANCE_ID,
+            build_run_id(UnixNanos::from(4_000)),
+            None,
+            UnixNanos::from(4_000),
+            &RegisteredComponents::default(),
+            halt.clone(),
+            get_atomic_clock_static(),
+        )
+        .expect("open run");
+        let run_id = session.run_id().to_string();
+        let anchorer = session.snapshot_anchorer().expect("snapshot anchorer");
+        halt.callback()(HaltReason::CaptureEncoding(
+            "injected codec failure".to_string(),
+        ));
+        assert!(
+            anchorer(CacheSnapshotRef::new(
+                "cache://failed",
+                Bytes::from_static(b"snapshot")
+            ))
+            .is_err(),
+            "retained callback must observe capture halt"
+        );
+        assert!(
+            session.snapshot_anchorer().is_none(),
+            "no new callback after halt"
+        );
+        drop(anchorer);
+        assert!(
+            session.close(UnixNanos::from(4_500)).is_err(),
+            "failed run cannot close normally"
+        );
+        drop(session);
+        let recovered = recover_predecessors(&config.base_dir, INSTANCE_ID).expect("recover");
+        assert_eq!(recovered.recovered[0].status, RunStatus::CrashedRecovered);
+        let reader = RedbBackend::open_sealed(&config.base_dir, INSTANCE_ID, &run_id)
+            .expect("open recovered");
+        assert_eq!(reader.high_watermark().expect("hwm"), 1);
+        assert!(
+            reader
+                .latest_snapshot_anchor()
+                .expect("anchor query")
+                .is_none()
+        );
     }
 
     #[rstest]
