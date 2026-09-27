@@ -248,12 +248,14 @@ impl OrderStatus {
             (Self::PendingUpdate, OrderEventAny::PendingUpdate(_)) => Self::PendingUpdate,  // Allow multiple requests
             (Self::PendingUpdate, OrderEventAny::PendingCancel(_)) => Self::PendingCancel,
             (Self::PendingUpdate, OrderEventAny::ModifyRejected(_)) => Self::PendingUpdate,  // Handled by modify_rejected to restore previous_status
+            (state @ (Self::Submitted | Self::Accepted | Self::Triggered | Self::PartiallyFilled
+                | Self::PendingCancel | Self::Filled | Self::Canceled | Self::Expired),
+                OrderEventAny::ModifyRejected(_)) => *state,
             (Self::PendingUpdate, OrderEventAny::Updated(_)) => Self::PendingUpdate,  // Handled by updated to restore previous_status
             (Self::PendingUpdate, OrderEventAny::Filled(_)) => Self::Filled,
             (Self::PendingUpdate, OrderEventAny::FillVoided(_)) => Self::PendingUpdate,
             (Self::PendingCancel, OrderEventAny::Rejected(_)) => Self::Rejected,
             (Self::PendingCancel, OrderEventAny::PendingCancel(_)) => Self::PendingCancel,  // Allow multiple requests
-            (Self::PendingCancel, OrderEventAny::ModifyRejected(_)) => Self::PendingCancel, // Preserve in-flight cancellation
             (Self::PendingCancel, OrderEventAny::CancelRejected(_)) => Self::PendingCancel,  // Handled by cancel_rejected to restore previous_status
             (Self::PendingCancel, OrderEventAny::Canceled(_)) => Self::Canceled,
             (Self::PendingCancel, OrderEventAny::Expired(_)) => Self::Expired,
@@ -874,7 +876,7 @@ impl OrderCore {
 
         let rejection_status = if matches!(
             (&event, self.status),
-            (OrderEventAny::ModifyRejected(_), _)
+            (OrderEventAny::ModifyRejected(_), OrderStatus::PendingUpdate)
                 | (OrderEventAny::CancelRejected(_), OrderStatus::PendingCancel)
         ) {
             self.previous_status.ok_or(OrderError::NoPreviousState)?
@@ -3598,6 +3600,66 @@ mod tests {
             .apply(OrderEventAny::ModifyRejected(modify_rejected))
             .unwrap();
         assert_eq!(order.status(), OrderStatus::Accepted);
+    }
+
+    #[rstest]
+    #[case("partial")]
+    #[case("filled")]
+    #[case("canceled")]
+    #[case("expired")]
+    #[case("pending_cancel")]
+    fn test_modify_rejection_preserves_intervening_order_event(#[case] scenario: &str) {
+        let mut order: MarketOrder = OrderInitializedSpec::builder().build().try_into().unwrap();
+        order
+            .apply(OrderEventAny::Submitted(
+                OrderSubmittedSpec::builder().build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        order
+            .apply(OrderEventAny::PendingUpdate(
+                OrderPendingUpdateSpec::builder().build(),
+            ))
+            .unwrap();
+        let intervening = match scenario {
+            "partial" => OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .last_qty(Quantity::from(50_000))
+                    .build(),
+            ),
+            "filled" => OrderEventAny::Filled(OrderFilledSpec::builder().build()),
+            "canceled" => OrderEventAny::Canceled(OrderCanceledSpec::builder().build()),
+            "expired" => OrderEventAny::Expired(OrderExpiredSpec::builder().build()),
+            "pending_cancel" => {
+                OrderEventAny::PendingCancel(OrderPendingCancelSpec::builder().build())
+            }
+            _ => unreachable!(),
+        };
+        order.apply(intervening).unwrap();
+        let status = order.status();
+        let filled = order.filled_qty();
+        let quantity = order.quantity();
+        let closed = order.ts_closed();
+        order
+            .apply(OrderEventAny::ModifyRejected(
+                OrderModifyRejectedSpec::builder().build(),
+            ))
+            .unwrap();
+        assert_eq!(
+            order.status(),
+            if scenario == "partial" {
+                OrderStatus::PartiallyFilled
+            } else {
+                status
+            }
+        );
+        assert_eq!(order.filled_qty(), filled);
+        assert_eq!(order.quantity(), quantity);
+        assert_eq!(order.ts_closed(), closed);
     }
 
     #[rstest]

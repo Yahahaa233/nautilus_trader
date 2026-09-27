@@ -483,10 +483,7 @@ mod tests {
 
     use super::*;
 
-    const DOC_PATH: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/concepts/execution/index.md"
-    );
+    const DOC_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test_data/execution.md");
     const BLOCK_BEGIN: &str = "<!-- BEGIN GENERATED: order-denied-reasons -->";
     const BLOCK_END: &str = "<!-- END GENERATED: order-denied-reasons -->";
 
