@@ -525,7 +525,10 @@ impl ExecutionManager {
                 "Execution client {} disappeared while publishing raw mass status reports",
                 mass_status.client_id
             );
-            return ReconciliationResult::default();
+            return ReconciliationResult {
+                unresolved: vec!["execution_client_unavailable"],
+                ..Default::default()
+            };
         }
 
         let venue = mass_status.venue;
@@ -559,6 +562,7 @@ impl ExecutionManager {
             &retained_fill_state,
         );
 
+        let mut unresolved = IndexSet::new();
         let mut events = Vec::new();
         let mut external_orders = Vec::new();
         let mut orders_reconciled = 0usize;
@@ -607,6 +611,7 @@ impl ExecutionManager {
                         .borrow_mut()
                         .index_venue_order_id(client_order_id, &report.venue_order_id)
                     {
+                        unresolved.insert("venue_order_index_failed");
                         log::warn!("Failed to index venue order ID: {e}");
                     }
 
@@ -674,6 +679,7 @@ impl ExecutionManager {
                         .borrow_mut()
                         .index_venue_order_id(client_order_id, &report.venue_order_id)
                     {
+                        unresolved.insert("venue_order_index_failed");
                         log::warn!("Failed to index venue order ID: {e}");
                     }
                 } else if let Some(order) = self.get_order_by_venue_order_id(report.venue_order_id)
@@ -724,6 +730,7 @@ impl ExecutionManager {
                         .borrow_mut()
                         .index_venue_order_id(&order.client_order_id(), &report.venue_order_id)
                     {
+                        unresolved.insert("venue_order_index_failed");
                         log::warn!("Failed to index venue order ID: {e}");
                     }
                 } else if let Some(instrument) = self.get_instrument(&report.instrument_id) {
@@ -812,6 +819,7 @@ impl ExecutionManager {
                     .borrow_mut()
                     .index_venue_order_id(&order.client_order_id(), &report.venue_order_id)
                 {
+                    unresolved.insert("venue_order_index_failed");
                     log::warn!("Failed to index venue order ID: {e}");
                 }
             } else if let Some(instrument) = self.get_instrument(&report.instrument_id) {
@@ -954,6 +962,7 @@ impl ExecutionManager {
                 let report = match create_orphan_fill_order_report(&sorted_fills, &instrument) {
                     Ok(report) => report,
                     Err(e) => {
+                        unresolved.insert("orphan_fill_materialization_failed");
                         log::error!(
                             "Cannot materialize orphan fills for venue order {venue_order_id}: {e}"
                         );
@@ -1016,13 +1025,16 @@ impl ExecutionManager {
             {
                 if self.is_fill_applied(fill, fill_key) {
                     self.fills_processed.mark(fill_key);
-                } else if let Some(venue_position_id) = fill.position_id {
-                    log::error!(
-                        "Skipping reconciliation for venue position {venue_position_id}: historical fill {} was not applied",
-                        fill.trade_id,
-                    );
+                } else {
+                    unresolved.insert("historical_fill_not_applied");
+                    if let Some(venue_position_id) = fill.position_id {
+                        log::error!(
+                            "Skipping reconciliation for venue position {venue_position_id}: historical fill {} was not applied",
+                            fill.trade_id,
+                        );
 
-                    unapplied_fill_position_ids.insert(venue_position_id);
+                        unapplied_fill_position_ids.insert(venue_position_id);
+                    }
                 }
             }
         }
@@ -1079,6 +1091,7 @@ impl ExecutionManager {
         }
 
         if orders_skipped_no_instrument > 0 {
+            unresolved.insert("instrument_not_in_cache");
             log::warn!("{orders_skipped_no_instrument} orders skipped (instrument not in cache)");
         }
 
@@ -1092,12 +1105,13 @@ impl ExecutionManager {
 
         log::info!(
             color = LogColor::Blue as u8;
-            "Reconciliation complete for {venue}: reconciled={orders_reconciled}, external={external_orders_created}, open={open_orders_initialized}, fills={fills_applied}, positions={positions_created}, skipped={orders_skipped_duplicate}, filtered={orders_skipped_filtered}",
+            "Reconciliation processing finished for {venue}: reconciled={orders_reconciled}, external={external_orders_created}, open={open_orders_initialized}, fills={fills_applied}, positions={positions_created}, skipped={orders_skipped_duplicate}, filtered={orders_skipped_filtered}, unresolved={unresolved:?}",
         );
 
         ReconciliationResult {
             events,
             external_orders,
+            unresolved: unresolved.into_iter().collect(),
         }
     }
 

@@ -20,6 +20,7 @@ name = "nautilus_live"
 crate-type = ["rlib"]
 
 [features]
+dispatch-observer = []
 default = ["node", "plugin"]
 fuzz = ["dep:libfuzzer-sys"]
 node = [

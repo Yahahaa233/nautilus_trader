@@ -39,7 +39,7 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
-//! - `defi`: Enables DeFi (Decentralized Finance) support.
+//! - `defi`: Enables `DeFi` (Decentralized Finance) support.
 //! - `examples`: Enables example strategies and testkit support for live nodes.
 //! - `extension-module`: Builds as a Python extension module.
 //! - `fuzz`: Provides shared libFuzzer integration for adapter fuzz binaries.
@@ -120,6 +120,7 @@
 
 pub mod execution;
 pub mod runner;
+pub mod runner_recovery;
 pub mod socket;
 pub mod task;
 
@@ -152,3 +153,7 @@ pub use socket::{
     SocketControl, SocketControlFactory, SocketReconnectLookup, SocketReconnectRegistry,
     SocketReconnectRequestOutcome,
 };
+
+/// Opt-in dispatch bookkeeping; callers must explicitly wire every ingress.
+#[cfg(feature = "dispatch-observer")]
+pub mod dispatch;

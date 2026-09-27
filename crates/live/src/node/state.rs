@@ -14,7 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicU8, Ordering},
 };
 
@@ -22,6 +22,23 @@ use super::metrics::{RunnerMetrics, RunnerMetricsSnapshot};
 
 const STOP_REQUESTED: u8 = 1 << 7;
 const STATE_MASK: u8 = !STOP_REQUESTED;
+
+/// Native startup processing evidence, not an account reconciliation certificate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartupReconciliationPhase {
+    Disabled,
+    Processing,
+    Processed,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupReconciliationObservation {
+    pub phase: StartupReconciliationPhase,
+    pub observed_at_ns: u64,
+    pub clients: usize,
+    pub reason: Option<String>,
+}
 
 /// Lifecycle state of the `LiveNode` runner.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -116,6 +133,7 @@ pub(super) enum RunningTransition {
 #[derive(Clone, Debug)]
 pub struct LiveNodeHandle {
     control: Arc<AtomicU8>,
+    startup_reconciliation: Arc<RwLock<Option<StartupReconciliationObservation>>>,
     pub(crate) metrics: Arc<RunnerMetrics>,
 }
 
@@ -131,11 +149,27 @@ impl LiveNodeHandle {
     pub fn new() -> Self {
         Self {
             control: Arc::new(AtomicU8::new(NodeState::Idle.as_u8())),
+            startup_reconciliation: Arc::new(RwLock::new(None)),
             metrics: Arc::new(RunnerMetrics::default()),
         }
     }
 
+    /// Returns the original observation without renewing its timestamp.
+    #[must_use]
+    pub fn startup_reconciliation(&self) -> Option<StartupReconciliationObservation> {
+        self.startup_reconciliation.read().ok().and_then(|value| value.clone())
+    }
+
+    pub(super) fn observe_startup_reconciliation(&self, observation: StartupReconciliationObservation) {
+        if let Ok(mut value) = self.startup_reconciliation.write() {
+            *value = Some(observation);
+        }
+    }
+
     pub(crate) fn set_starting(&self) {
+        if let Ok(mut observation) = self.startup_reconciliation.write() {
+            *observation = None;
+        }
         self.set_state(NodeState::Starting);
     }
 

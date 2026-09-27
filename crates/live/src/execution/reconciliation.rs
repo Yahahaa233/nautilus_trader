@@ -93,6 +93,9 @@ pub struct ReconciliationResult {
     pub events: Vec<OrderEventAny>,
     /// External orders that need to be registered with execution clients.
     pub external_orders: Vec<ExternalOrderMetadata>,
+    /// Known processing failures. An empty list is not proof of complete account
+    /// reconciliation: configured filters and coverage require separate evidence.
+    pub unresolved: Vec<&'static str>,
 }
 
 /// Result of inflight order checks containing terminal events and intermediate queries.

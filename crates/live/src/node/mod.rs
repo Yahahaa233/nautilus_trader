@@ -83,10 +83,16 @@
 
 use std::{any::Any, fmt::Debug, time::Duration};
 
+#[cfg(feature = "dispatch-observer")]
+use std::collections::VecDeque;
+
 use anyhow::Context;
 use nautilus_common::{
     actor::{Actor, DataActor, DataActorNative},
-    cache::database::{CacheDatabaseAdapter, CacheDatabaseFactory},
+    cache::{
+        Cache,
+        database::{CacheDatabaseAdapter, CacheDatabaseFactory},
+    },
     clients::ExecutionClient,
     component::Component,
     enums::{Environment, LogColor},
@@ -128,6 +134,7 @@ use crate::{
         manager::{ExecutionManager, ExecutionManagerConfig, TargetedOrderReportResult},
     },
     runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent},
+    runner_recovery::RunnerRecoveryHandoff,
     socket::{SocketReconnectLookup, SocketReconnectRegistry},
 };
 
@@ -137,9 +144,16 @@ pub mod config;
 #[cfg(feature = "plugin")]
 pub mod plugin;
 
+#[cfg(feature = "dispatch-observer")]
+mod dispatch;
+#[cfg(feature = "dispatch-observer")]
+pub use dispatch::NodeDispatchObserver;
+
 mod metrics;
 mod queue;
 mod reconciliation;
+#[cfg(feature = "dispatch-observer")]
+mod recovery;
 mod state;
 
 use builder::ExternalMessageBusIngress;
@@ -154,7 +168,7 @@ use reconciliation::{
     TargetedOrderReportTask,
 };
 use state::{EngineConnectionStatus, RunningTransition};
-pub use state::{LiveNodeHandle, NodeRunMode, NodeState};
+pub use state::{LiveNodeHandle, NodeRunMode, NodeState, StartupReconciliationObservation, StartupReconciliationPhase};
 
 /// Dispatches the run loop performs before yielding to the executor.
 ///
@@ -180,6 +194,13 @@ impl Debug for StreamProcessor {
 #[derive(Debug)]
 pub struct LiveNode {
     kernel: NautilusKernel,
+    #[cfg(feature = "dispatch-observer")]
+    dispatch_observer: Option<NodeDispatchObserver>,
+    #[cfg(feature = "dispatch-observer")]
+    recovery_dispatch_queue: VecDeque<crate::dispatch::DispatchInput>,
+    recovery_requires_release: bool,
+    #[cfg(feature = "dispatch-observer")]
+    recovery_native_frontier: Option<crate::runner_recovery::RunnerRecoveryWatermark>,
     runner: Option<AsyncRunner>,
     config: LiveNodeConfig,
     handle: LiveNodeHandle,
@@ -190,11 +211,363 @@ pub struct LiveNode {
     external_msgbus: Option<ExternalMessageBusIngress>,
     stream_processors: Vec<StreamProcessor>,
     shutdown_deadline: Option<dst::time::Instant>,
+    contain_event_store_failure: bool,
     #[cfg(feature = "plugin")]
     plugins: plugin::NodePlugins,
 }
 
+// The token guard spans the entire synchronous implementation, including descendants.
+#[allow(clippy::unused_unit)]
+macro_rules! begin_node_dispatch {
+    ($node:expr, $source:ident, $input:expr, $fallback:expr) => {{
+        #[cfg(feature = "dispatch-observer")]
+        {
+            match $node.begin_node_dispatch(crate::dispatch::DispatchSource::$source, $input) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    log::error!("Dispatch begin failed: {error:#}");
+                    $node.handle.stop();
+                    return $fallback;
+                }
+            }
+        }
+        #[cfg(not(feature = "dispatch-observer"))]
+        {
+            // Keep the call site and its receiver observable in the uninstrumented
+            // build without creating a unit binding that Clippy rejects.
+            let _ = &$node;
+            None::<()>
+        }
+    }};
+}
+macro_rules! complete_node_dispatch {
+    ($node:expr, $guard:expr) => {{
+        #[cfg(feature = "dispatch-observer")]
+        if let Some(guard) = $guard {
+            if let Err(error) = guard.complete() {
+                log::error!("Dispatch completion failed: {error:#}");
+                $node.handle.stop();
+            }
+        }
+        #[cfg(not(feature = "dispatch-observer"))]
+        {
+            let _ = $guard;
+        }
+    }};
+}
+
 impl LiveNode {
+    /// Installs partial dispatch instrumentation before startup; no recovery authority.
+    /// # Errors
+    /// Rejects duplicate installation or any non-idle node.
+    #[cfg(feature = "dispatch-observer")]
+    pub fn set_dispatch_observer(&mut self, observer: NodeDispatchObserver) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.state() == NodeState::Idle && self.dispatch_observer.is_none(),
+            "dispatch observer requires a fresh idle node"
+        );
+        self.dispatch_observer = Some(observer);
+        Ok(())
+    }
+
+    /// Returns the latest completed-root proof from the installed observer.
+    /// A missing observer yields `None`; the proof never grants recovery or
+    /// execution authority and becomes invalid after the next input.
+    ///
+    /// # Errors
+    /// Rejects reentrant access or a failed observer run.
+    #[cfg(feature = "dispatch-observer")]
+    pub fn dispatch_completion_proof(
+        &self,
+    ) -> anyhow::Result<Option<crate::dispatch::DispatchCompletionProof>> {
+        self.dispatch_observer
+            .as_ref()
+            .map_or(Ok(None), NodeDispatchObserver::completion_proof)
+    }
+
+    /// Runs a caller-owned recovery callback inside the same observed dispatch
+    /// boundary used by live ingress. The node must remain idle: this method
+    /// provides the durable begin/complete envelope and callback ordering, but
+    /// it does not start the node, create a queue, or grant execution access.
+    ///
+    /// A callback error rejects the input and stops the node handle. A
+    /// completion or observer failure also stops the handle so a caller cannot
+    /// accidentally continue with an invalid dispatch proof.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-idle node, a node without the opt-in observer, observer
+    /// begin/complete failures, or the caller callback failure.
+    #[cfg(feature = "dispatch-observer")]
+    pub fn with_recovery_dispatch<T, F>(
+        &mut self,
+        input: crate::dispatch::DispatchInput,
+        apply: F,
+    ) -> anyhow::Result<T>
+    where
+        F: FnOnce(&mut Self) -> anyhow::Result<T>,
+    {
+        anyhow::ensure!(
+            self.state() == NodeState::Idle,
+            "recovery dispatch requires a fresh idle node"
+        );
+        anyhow::ensure!(
+            !self.handle.should_stop(),
+            "recovery node is stopped or poisoned"
+        );
+        self.recovery_requires_release = true;
+        let observer = self
+            .dispatch_observer
+            .clone()
+            .context("recovery dispatch requires an installed dispatch observer")?;
+        let guard = match observer.begin_input(input) {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.handle.stop();
+                return Err(error).context("recovery dispatch begin failed");
+            }
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| apply(self)));
+        let result = match result {
+            Ok(result) => result,
+            Err(panic) => {
+                self.handle.stop();
+                drop(guard);
+                std::panic::resume_unwind(panic);
+            }
+        };
+        match result {
+            Ok(value) => {
+                if let Err(error) = guard.complete() {
+                    self.handle.stop();
+                    return Err(error).context("recovery dispatch completion failed");
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                self.handle.stop();
+                if let Err(abort_error) = guard.rejected() {
+                    return Err(error).context(format!(
+                        "recovery dispatch callback failed and abort could not be recorded: {abort_error:#}"
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Queues one already encoded recovery input for ordered handoff to this
+    /// node. Queuing is deliberately separate from dispatch: the caller can
+    /// stage the complete sealed inventory before any business callback runs,
+    /// and [`Self::drain_recovery_dispatch`] consumes it in FIFO order.
+    ///
+    /// The node must remain fresh and idle. A queued input is not considered
+    /// acknowledged until the drain method enters its observed begin/complete
+    /// boundary. Starting or disposing a node with queued recovery inputs is
+    /// rejected so a pending envelope cannot be silently lost.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-idle or stop-requested node, a node without the opt-in
+    /// observer, or an empty dispatch phase.
+    #[cfg(feature = "dispatch-observer")]
+    pub fn enqueue_recovery_dispatch(
+        &mut self,
+        input: crate::dispatch::DispatchInput,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.state() == NodeState::Idle && !self.handle.should_stop(),
+            "recovery dispatch queue requires a fresh idle node"
+        );
+        anyhow::ensure!(
+            self.dispatch_observer.is_some(),
+            "recovery dispatch queue requires an installed dispatch observer"
+        );
+        anyhow::ensure!(!input.phase.trim().is_empty(), "empty dispatch phase");
+        self.recovery_dispatch_queue.push_back(input);
+        Ok(())
+    }
+
+    /// Returns the number of staged recovery inputs awaiting dispatch.
+    #[cfg(feature = "dispatch-observer")]
+    #[must_use]
+    pub fn recovery_dispatch_queue_len(&self) -> usize {
+        self.recovery_dispatch_queue.len()
+    }
+
+    /// Drains staged recovery inputs through the same observed dispatch
+    /// boundary used by live ingress.
+    ///
+    /// Inputs are offered strictly FIFO. On callback or observer failure the
+    /// current input is put back at the front, all later inputs remain staged,
+    /// and the node is stopped by [`Self::with_recovery_dispatch`]. The caller
+    /// can therefore inspect the exact unprocessed suffix instead of losing it
+    /// to a partially consumed in-memory queue.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-idle node, a missing observer, or the first failed input.
+    #[cfg(feature = "dispatch-observer")]
+    pub fn drain_recovery_dispatch<F>(&mut self, mut apply: F) -> anyhow::Result<usize>
+    where
+        F: FnMut(&mut Self, crate::dispatch::DispatchInput) -> anyhow::Result<()>,
+    {
+        anyhow::ensure!(
+            self.state() == NodeState::Idle && !self.handle.should_stop(),
+            "recovery dispatch drain requires a fresh idle node"
+        );
+        anyhow::ensure!(
+            self.dispatch_observer.is_some(),
+            "recovery dispatch drain requires an installed dispatch observer"
+        );
+
+        let mut drained = 0;
+        while let Some(input) = self.recovery_dispatch_queue.pop_front() {
+            let callback_input = input.clone();
+            let result =
+                self.with_recovery_dispatch(input.clone(), |node| apply(node, callback_input));
+            match result {
+                Ok(()) => drained += 1,
+                Err(error) => {
+                    self.recovery_dispatch_queue.push_front(input);
+                    return Err(error).context("recovery dispatch queue drain failed");
+                }
+            }
+        }
+        Ok(drained)
+    }
+
+    /// Exposes machine-readable observer coverage and failure state to the host
+    /// so an incomplete matrix cannot be mistaken for a healthy node.
+    ///
+    /// # Errors
+    /// Rejects reentrant access while reading observer state.
+    #[cfg(feature = "dispatch-observer")]
+    pub fn dispatch_coverage(&self) -> anyhow::Result<serde_json::Value> {
+        self.dispatch_observer.as_ref().map_or_else(
+            || Ok(serde_json::json!({"installed": false})),
+            NodeDispatchObserver::coverage,
+        )
+    }
+
+    #[cfg(feature = "dispatch-observer")]
+    fn begin_node_dispatch(
+        &self,
+        source: crate::dispatch::DispatchSource,
+        input: &dyn std::any::Any,
+    ) -> anyhow::Result<Option<dispatch::NodeDispatchGuard>> {
+        let phase = format!("{:?}", self.state());
+        self.dispatch_observer
+            .as_ref()
+            .map(|observer| observer.begin(source, &phase, input))
+            .transpose()
+    }
+
+    fn note_dispatch_gap(&self, reason: &str) -> bool {
+        #[cfg(feature = "dispatch-observer")]
+        if let Some(observer) = &self.dispatch_observer
+            && let Err(error) = observer.uncovered(reason)
+        {
+            log::error!("Dispatch coverage recording failed: {error:#}");
+            self.handle.stop();
+            return false;
+        }
+        #[cfg(not(feature = "dispatch-observer"))]
+        {
+            let _ = (self, reason);
+        }
+        true
+    }
+
+    /// Returns whether the kernel's injected event store has entered its fail-stop state.
+    ///
+    /// Event-store write failures can happen while the node is otherwise idle, so the running
+    /// loop must poll this state independently of business-message traffic. A halted store is
+    /// never treated as a recoverable transient condition by the live node.
+    fn event_store_halted(&self) -> bool {
+        self.kernel
+            .event_store()
+            .is_some_and(nautilus_system::KernelEventStore::is_halted)
+    }
+
+    /// Keeps connections and remediation dispatch alive after a persistence halt.
+    /// Requires an installed synchronous submission guard before opting in.
+    ///
+    /// # Errors
+    /// Returns an error when the journal or submission guard is absent.
+    pub fn enable_event_store_failure_containment(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.kernel.event_store().is_some(),
+            "event store required for containment"
+        );
+        anyhow::ensure!(
+            self.kernel.exec_engine.borrow().has_submission_guard(),
+            "submission guard required for containment"
+        );
+        self.contain_event_store_failure = true;
+        Ok(())
+    }
+
+    /// A running but persistence-failed node is not a healthy trading runtime.
+    #[must_use]
+    pub fn persistence_degraded(&self) -> bool {
+        self.contain_event_store_failure && self.event_store_halted()
+    }
+
+    #[cfg(feature = "dispatch-observer")]
+    fn record_discarded_dispatch(
+        &self,
+        source: crate::dispatch::DispatchSource,
+        input: &dyn std::any::Any,
+    ) -> bool {
+        let Some(observer) = &self.dispatch_observer else {
+            return true;
+        };
+        let phase = format!("{:?}", self.state());
+        if let Err(error) = observer.record_discarded(source, &phase, input) {
+            log::error!("Discarded dispatch recording failed: {error:#}");
+            self.handle.stop();
+            return false;
+        }
+        true
+    }
+
+    #[allow(clippy::unused_unit)]
+    fn process_external_message(&self, message: &BusMessage) {
+        let guard = begin_node_dispatch!(self, ExternalMessage, message, ());
+        self.process_external_msgbus_message(message);
+        complete_node_dispatch!(self, guard);
+    }
+
+    #[allow(clippy::unused_unit)]
+    fn process_time_event(&self, message: TimeEventMessage) -> bool {
+        let guard = begin_node_dispatch!(self, Time, &message, false);
+        let dispatched = AsyncRunner::handle_time_event(message);
+        #[cfg(feature = "dispatch-observer")]
+        if !dispatched {
+            if let Some(guard) = guard {
+                let _ = guard.rejected();
+                self.handle.stop();
+            }
+            return false;
+        }
+        complete_node_dispatch!(self, guard);
+        dispatched
+    }
+    #[allow(clippy::unused_unit)]
+    fn process_data_event(&self, event: DataEvent) {
+        let guard = begin_node_dispatch!(self, DataEvent, &event, ());
+        AsyncRunner::handle_data_event(event);
+        complete_node_dispatch!(self, guard);
+    }
+    #[allow(clippy::unused_unit)]
+    fn process_data_command(&self, command: DataCommand) {
+        let guard = begin_node_dispatch!(self, DataCommand, &command, ());
+        AsyncRunner::handle_data_command(command);
+        complete_node_dispatch!(self, guard);
+    }
+
     /// Creates a new `LiveNode` from builder components.
     ///
     /// This is an internal constructor used by `LiveNodeBuilder`.
@@ -215,6 +588,13 @@ impl LiveNode {
     ) -> Self {
         Self {
             kernel,
+            #[cfg(feature = "dispatch-observer")]
+            dispatch_observer: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_dispatch_queue: VecDeque::new(),
+            recovery_requires_release: false,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_native_frontier: None,
             runner: Some(runner),
             config,
             handle: LiveNodeHandle::new(),
@@ -225,6 +605,7 @@ impl LiveNode {
             external_msgbus,
             stream_processors: Vec::new(),
             shutdown_deadline: None,
+            contain_event_store_failure: false,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
         }
@@ -292,6 +673,13 @@ impl LiveNode {
 
         let node = Self {
             kernel,
+            #[cfg(feature = "dispatch-observer")]
+            dispatch_observer: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_dispatch_queue: VecDeque::new(),
+            recovery_requires_release: false,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_native_frontier: None,
             runner: Some(runner),
             config,
             handle: LiveNodeHandle::new(),
@@ -302,6 +690,7 @@ impl LiveNode {
             external_msgbus: None,
             stream_processors: Vec::new(),
             shutdown_deadline: None,
+            contain_event_store_failure: false,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
         };
@@ -380,6 +769,42 @@ impl LiveNode {
             .push(StreamProcessor(Box::new(callback)));
     }
 
+    /// Returns a pre-start handoff into this node's real runner channels.
+    ///
+    /// The handoff is available only while the node is idle and still owns its
+    /// runner. `run_with_mode` closes it when channel receivers are extracted;
+    /// `start` closes it immediately because that lifecycle intentionally does
+    /// not service runner channels after startup.
+    ///
+    /// # Errors
+    /// Returns an error when the node is not idle or its runner has already
+    /// been consumed.
+    pub fn recovery_runner_handoff(&self) -> anyhow::Result<RunnerRecoveryHandoff> {
+        anyhow::ensure!(
+            self.state() == NodeState::Idle,
+            "recovery runner handoff requires an idle live node"
+        );
+        self.runner
+            .as_ref()
+            .context("recovery runner handoff unavailable after runner consumption")?
+            .recovery_handoff()
+    }
+
+    fn ensure_recovery_start_permitted(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.recovery_requires_release,
+            "recovered node requires independently verified recovery release; startup denied"
+        );
+        if let Some(runner) = &self.runner {
+            let progress = runner.recovery_progress_handle().completion_watermark()?;
+            anyhow::ensure!(
+                progress.watermark.is_none() && progress.sent_watermark.is_none(),
+                "runner recovery handoff requires independently verified recovery release; startup denied"
+            );
+        }
+        Ok(())
+    }
+
     /// Starts the live node without entering a select loop.
     ///
     /// Connects clients, runs reconciliation, and starts the trader, but does
@@ -391,8 +816,18 @@ impl LiveNode {
     ///
     /// Returns an error if startup fails.
     pub async fn start(&mut self) -> anyhow::Result<()> {
+        self.ensure_recovery_start_permitted()?;
         if self.state().is_running() {
             anyhow::bail!("Already running");
+        }
+        #[cfg(feature = "dispatch-observer")]
+        anyhow::ensure!(
+            self.recovery_dispatch_queue.is_empty(),
+            "cannot start with undrained recovery dispatch queue"
+        );
+
+        if let Some(runner) = self.runner.as_ref() {
+            runner.close_recovery_handoff();
         }
 
         if self.external_msgbus.is_some() {
@@ -409,8 +844,18 @@ impl LiveNode {
 
         self.handle.set_starting();
 
+        anyhow::ensure!(
+            self.note_dispatch_gap("startup_lifecycle_buffering_and_flush"),
+            "startup dispatch coverage recording failed"
+        );
         self.kernel.reset_shutdown_flag();
         self.kernel.start_async().await;
+
+        if self.event_store_halted() {
+            return self
+                .abort_startup("Event-store persistence halted during startup")
+                .await;
+        }
 
         if self.kernel.is_event_store_replay() {
             log::info!(
@@ -568,6 +1013,7 @@ impl LiveNode {
         self.close_external_ingress();
         self.handle.set_stopped();
         self.kernel.dispose();
+        self.note_dispatch_gap("shutdown_lifecycle");
     }
 
     async fn process_runner_for(&mut self, duration: Duration) -> usize {
@@ -614,14 +1060,14 @@ impl LiveNode {
     fn process_runner_event(&mut self, event: PendingRunnerEvent) {
         match event {
             PendingRunnerEvent::TimeEvent(message) => {
-                let _ = AsyncRunner::handle_time_event(message);
+                let _ = self.process_time_event(message);
             }
             PendingRunnerEvent::SystemEvent(event) => self.process_system_event(event),
             PendingRunnerEvent::SystemCommand(command) => self.process_system_command(command),
             PendingRunnerEvent::ExecEvent(event) => self.process_exec_event(event),
             PendingRunnerEvent::ExecCommand(command) => self.process_exec_command(command),
-            PendingRunnerEvent::DataEvent(event) => AsyncRunner::handle_data_event(event),
-            PendingRunnerEvent::DataCommand(command) => AsyncRunner::handle_data_command(command),
+            PendingRunnerEvent::DataEvent(event) => self.process_data_event(event),
+            PendingRunnerEvent::DataCommand(command) => self.process_data_command(command),
         }
     }
 
@@ -637,7 +1083,14 @@ impl LiveNode {
         }
     }
 
+    #[allow(clippy::unused_unit)]
     fn process_system_command(&self, command: SystemCommand) {
+        let guard = begin_node_dispatch!(self, SystemCommand, &command, ());
+        self.process_system_command_unobserved(command);
+        complete_node_dispatch!(self, guard);
+    }
+
+    fn process_system_command_unobserved(&self, command: SystemCommand) {
         match command {
             SystemCommand::ReconnectSocket(command) => {
                 self.process_socket_reconnect(command);
@@ -694,7 +1147,14 @@ impl LiveNode {
         }
     }
 
+    #[allow(clippy::unused_unit)]
     fn process_system_event(&self, event: SystemEvent) {
+        let guard = begin_node_dispatch!(self, SystemEvent, &event, ());
+        self.process_system_event_unobserved(event);
+        complete_node_dispatch!(self, guard);
+    }
+
+    fn process_system_event_unobserved(&self, event: SystemEvent) {
         match event {
             SystemEvent::SocketState(change) => self.publish_socket_state_change(change),
         }
@@ -844,8 +1304,32 @@ impl LiveNode {
     /// # Errors
     ///
     /// Returns an error if reconciliation fails or times out.
-    #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
     async fn perform_startup_reconciliation(&mut self) -> anyhow::Result<()> {
+        let clients = self.kernel.exec_engine.borrow().client_ids().len();
+        self.handle.observe_startup_reconciliation(StartupReconciliationObservation {
+            phase: StartupReconciliationPhase::Processing,
+            observed_at_ns: self.kernel.clock.borrow().timestamp_ns().as_u64(),
+            clients,
+            reason: None,
+        });
+        let result = self.perform_startup_reconciliation_inner().await;
+        self.handle.observe_startup_reconciliation(StartupReconciliationObservation {
+            phase: if result.is_err() {
+                StartupReconciliationPhase::Failed
+            } else if !self.config.exec_engine.reconciliation {
+                StartupReconciliationPhase::Disabled
+            } else {
+                StartupReconciliationPhase::Processed
+            },
+            observed_at_ns: self.kernel.clock.borrow().timestamp_ns().as_u64(),
+            clients,
+            reason: result.as_ref().err().map(|error| error.to_string().chars().take(1024).collect()),
+        });
+        result
+    }
+
+    #[expect(clippy::await_holding_refcell_ref)]
+    async fn perform_startup_reconciliation_inner(&mut self) -> anyhow::Result<()> {
         if !self.config.exec_engine.reconciliation {
             log::info!("Startup reconciliation disabled");
             self.kernel
@@ -902,6 +1386,10 @@ impl LiveNode {
 
             match mass_status_result {
                 Ok(Some(mass_status)) => {
+                    anyhow::ensure!(
+                        mass_status.reports_complete(),
+                        "Startup reconciliation requires complete mass status from {client_id}"
+                    );
                     log_info!(
                         "Reconciling ExecutionMassStatus for {}",
                         client_id,
@@ -911,6 +1399,12 @@ impl LiveNode {
                     let result = self
                         .exec_manager
                         .reconcile_execution_mass_status(&mass_status, &self.kernel.exec_engine);
+
+                    anyhow::ensure!(
+                        result.unresolved.is_empty(),
+                        "Startup reconciliation unresolved for {client_id}: {:?}",
+                        result.unresolved
+                    );
 
                     anyhow::ensure!(
                         self.kernel
@@ -958,9 +1452,8 @@ impl LiveNode {
                     }
                 }
                 Ok(None) => {
-                    log::warn!(
-                        "No mass status available from {client_id} \
-                         (likely adapter error when generating reports)"
+                    anyhow::bail!(
+                        "Startup reconciliation requires mass status from {client_id}; no report received"
                     );
                 }
                 Err(e) => {
@@ -1021,6 +1514,7 @@ impl LiveNode {
     ///
     /// Returns an error if the node fails to start or encounters a runtime error.
     pub async fn run_with_mode(&mut self, mode: NodeRunMode) -> anyhow::Result<()> {
+        self.ensure_recovery_start_permitted()?;
         if self.state().is_running() {
             anyhow::bail!("Already running");
         }
@@ -1028,6 +1522,11 @@ impl LiveNode {
         if self.runner.is_none() {
             anyhow::bail!("Runner already consumed - run() called twice");
         }
+        #[cfg(feature = "dispatch-observer")]
+        anyhow::ensure!(
+            self.recovery_dispatch_queue.is_empty(),
+            "cannot run with undrained recovery dispatch queue"
+        );
 
         self.prepare_cache().await?;
 
@@ -1050,8 +1549,29 @@ impl LiveNode {
         log::info!("Event loop starting");
 
         self.handle.set_starting();
+        anyhow::ensure!(
+            self.note_dispatch_gap("startup_lifecycle_buffering_and_flush"),
+            "startup dispatch coverage recording failed"
+        );
         self.kernel.reset_shutdown_flag();
         self.kernel.start_async().await;
+
+        if self.event_store_halted() {
+            let result = self
+                .abort_startup("Event-store persistence halted during startup")
+                .await;
+            self.drain_channels(
+                &mut time_evt_rx,
+                &mut system_evt_rx,
+                &mut system_cmd_rx,
+                &mut exec_evt_rx,
+                &mut exec_cmd_rx,
+                &mut data_evt_rx,
+                &mut data_cmd_rx,
+            );
+            log::info!("Event loop stopped");
+            return result;
+        }
 
         if self.kernel.is_event_store_replay() {
             log::info!(
@@ -1077,7 +1597,7 @@ impl LiveNode {
                 let result = self
                     .abort_startup("External message bus ingress failed to start")
                     .await;
-                Self::drain_channels(
+                self.drain_channels(
                     &mut time_evt_rx,
                     &mut system_evt_rx,
                     &mut system_cmd_rx,
@@ -1133,7 +1653,7 @@ impl LiveNode {
             let result = self
                 .abort_startup_with_error("Data client connection timed out", e)
                 .await;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1195,7 +1715,7 @@ impl LiveNode {
                 let result = self
                     .abort_startup_with_error("Execution client connection timed out", e)
                     .await;
-                Self::drain_channels(
+                self.drain_channels(
                     &mut time_evt_rx,
                     &mut system_evt_rx,
                     &mut system_cmd_rx,
@@ -1216,7 +1736,7 @@ impl LiveNode {
                     anyhow::anyhow!("readiness timeout while waiting for engine connections"),
                 )
                 .await;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1234,7 +1754,7 @@ impl LiveNode {
             .or_else(|| self.startup_abort_reason())
         {
             self.abort_startup(reason).await?;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1252,7 +1772,7 @@ impl LiveNode {
         // Run reconciliation now that instruments are in cache and start trader
         if let Err(e) = self.perform_startup_reconciliation().await {
             let result = self.abort_startup("Startup reconciliation failed").await;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1274,7 +1794,7 @@ impl LiveNode {
 
         if let Some(reason) = self.startup_abort_reason() {
             let result = self.abort_startup(reason).await;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1289,7 +1809,7 @@ impl LiveNode {
 
         if let Err(e) = self.kernel.start_trader() {
             let result = self.abort_after_trader_start_failure(e).await;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1305,7 +1825,7 @@ impl LiveNode {
         #[cfg(feature = "plugin")]
         if let Err(e) = self.plugins.start_controllers() {
             let result = self.abort_after_trader_start_failure(e).await;
-            Self::drain_channels(
+            self.drain_channels(
                 &mut time_evt_rx,
                 &mut system_evt_rx,
                 &mut system_cmd_rx,
@@ -1537,6 +2057,17 @@ impl LiveNode {
                     } else if self.kernel.is_shutdown_requested() {
                         log::info!("Received ShutdownSystem command, shutting down");
                         self.initiate_shutdown();
+                    } else if self.event_store_halted() {
+                        if self.contain_event_store_failure {
+                            let engine = self.kernel.exec_engine.borrow();
+                            if !engine.submissions_fenced() {
+                                log::error!("Event-store persistence halted; submissions fenced, remediation connections retained");
+                                engine.fence_submissions();
+                            }
+                        } else {
+                            log::error!("Event-store persistence halted; shutting down");
+                            self.initiate_shutdown();
+                        }
                     }
                 }
                 () = async {
@@ -1553,6 +2084,12 @@ impl LiveNode {
                         None => std::future::pending::<ReportTaskOutcome<OpenOrderReportResult>>().await,
                     }
                 }, if open_order_report_task.is_some() => {
+                    if !self.note_dispatch_gap("http_open_order_query_result") {
+                        // The observer has latched a durable coverage failure and stopped the
+                        // node.  Do not `continue`: the task remains ready and this biased
+                        // branch would otherwise spin forever without reaching shutdown.
+                        break;
+                    }
                     let maintenance_start = dst::time::Instant::now();
 
                     drop(open_order_report_task.take());
@@ -1596,6 +2133,9 @@ impl LiveNode {
                         None => std::future::pending::<ReportTaskOutcome<Vec<TargetedOrderReportResult>>>().await,
                     }
                 }, if targeted_order_report_task.is_some() => {
+                    if !self.note_dispatch_gap("http_targeted_query_result") {
+                        break;
+                    }
                     let maintenance_start = dst::time::Instant::now();
 
                     let planned_client_order_ids = targeted_order_report_task
@@ -1632,6 +2172,9 @@ impl LiveNode {
                         None => std::future::pending::<ReportTaskOutcome<PositionReportTaskResult>>().await,
                     }
                 }, if position_report_task.is_some() => {
+                    if !self.note_dispatch_gap("http_position_query_result") {
+                        break;
+                    }
                     let maintenance_start = dst::time::Instant::now();
 
                     drop(position_report_task.take());
@@ -1657,6 +2200,9 @@ impl LiveNode {
                 // Maintenance dispatcher (before event processing to avoid
                 // starvation). See module docs for design rationale.
                 _ = maintenance_timer.tick(), if is_running => {
+                    if !self.note_dispatch_gap("maintenance_mutations") {
+                        break;
+                    }
                     let maintenance_start = dst::time::Instant::now();
                     metrics.publish_queue_depths(
                         RunnerChannelQueueDepths::from_receivers(
@@ -1737,7 +2283,7 @@ impl LiveNode {
                 // when the biased select polls receivers each iteration.
                 Some(handler) = time_evt_rx.recv() => {
                     let dispatch_start = dst::time::Instant::now();
-                    let dispatched = AsyncRunner::handle_time_event(handler);
+                    let dispatched = self.process_time_event(handler);
 
                     if dispatched && is_shutting_down {
                         log::debug!("Residual time event");
@@ -1808,9 +2354,12 @@ impl LiveNode {
                                 log::debug!("Residual external message bus message: {message}");
                                 residual_events += 1;
                             }
-                            self.process_external_msgbus_message(&message);
+                            self.process_external_message(&message);
                         }
                         None => {
+                            if !self.note_dispatch_gap("external_ingress_closed") {
+                                break;
+                            }
                             log::info!("External message bus ingress closed");
                             external_msgbus_rx = None;
                             self.close_external_ingress();
@@ -1830,7 +2379,7 @@ impl LiveNode {
                         log::debug!("Residual data event: {evt:?}");
                         residual_events += 1;
                     }
-                    AsyncRunner::handle_data_event(evt);
+                    self.process_data_event(evt);
                     record_runner_dispatch(
                         &metrics,
                         SystemChannel::DataEvents,
@@ -1845,7 +2394,7 @@ impl LiveNode {
                         log::debug!("Residual data command: {cmd:?}");
                         residual_events += 1;
                     }
-                    AsyncRunner::handle_data_command(cmd);
+                    self.process_data_command(cmd);
                     record_runner_dispatch(
                         &metrics,
                         SystemChannel::DataCommands,
@@ -1877,7 +2426,7 @@ impl LiveNode {
         let stop_result = self.finalize_stop().await;
 
         // Handle events that arrived during finalize_stop
-        Self::drain_channels(
+        self.drain_channels(
             &mut time_evt_rx,
             &mut system_evt_rx,
             &mut system_cmd_rx,
@@ -1988,13 +2537,15 @@ impl LiveNode {
         Ok(Some(receiver))
     }
 
-    fn republish_external_msgbus_message(message: &BusMessage) {
+    fn republish_external_msgbus_message(message: &BusMessage) -> bool {
         if let Err(e) = msgbus::republish_external_message(message) {
             log::error!(
                 "Failed to republish external message bus topic '{}': {e:#}",
                 message.topic
             );
+            return false;
         }
+        true
     }
 
     fn process_external_msgbus_message(&self, message: &BusMessage) {
@@ -2027,7 +2578,16 @@ impl LiveNode {
         }
     }
 
+    #[allow(clippy::unused_unit)]
     fn process_reconciliation_events(&mut self, events: &[OrderEventAny]) {
+        #[cfg(feature = "dispatch-observer")]
+        let owned = events.to_vec();
+        let guard = begin_node_dispatch!(self, Reconciliation, &owned, ());
+        self.process_reconciliation_events_unobserved(events);
+        complete_node_dispatch!(self, guard);
+    }
+
+    fn process_reconciliation_events_unobserved(&mut self, events: &[OrderEventAny]) {
         if events.is_empty() {
             return;
         }
@@ -2053,9 +2613,26 @@ impl LiveNode {
         }
     }
 
+    #[allow(clippy::unused_unit)]
     fn process_exec_event(&mut self, event: ExecutionEvent) {
-        let Some(close_ids) = self.observe_exec_event_before_dispatch(&event) else {
+        let guard = begin_node_dispatch!(self, ExecutionEvent, &event, ());
+        let dispatched = self.process_exec_event_unobserved(event);
+        #[cfg(feature = "dispatch-observer")]
+        if !dispatched {
+            if let Some(guard) = guard {
+                let _ = guard.rejected();
+                self.handle.stop();
+            }
             return;
+        }
+        #[cfg(not(feature = "dispatch-observer"))]
+        let _ = dispatched;
+        complete_node_dispatch!(self, guard);
+    }
+
+    fn process_exec_event_unobserved(&mut self, event: ExecutionEvent) -> bool {
+        let Some(close_ids) = self.observe_exec_event_before_dispatch(&event) else {
+            return false;
         };
 
         self.dispatch_exec_event_and_commit_fill(event);
@@ -2072,9 +2649,17 @@ impl LiveNode {
                     .clear_recon_tracking(client_order_id, true);
             }
         }
+        true
     }
 
+    #[allow(clippy::unused_unit)]
     fn process_exec_command(&mut self, message: TradingCommandMessage) {
+        let guard = begin_node_dispatch!(self, ExecutionCommand, &message, ());
+        self.process_exec_command_unobserved(message);
+        complete_node_dispatch!(self, guard);
+    }
+
+    fn process_exec_command_unobserved(&mut self, message: TradingCommandMessage) {
         let mut messages = vec![message];
         while let Some(message) = messages.pop() {
             if message.endpoint() == MessagingSwitchboard::exec_engine_execute() {
@@ -2247,7 +2832,7 @@ impl LiveNode {
         let finalize_result = self.finalize_stop().await;
 
         if let Some(receivers) = receivers {
-            Self::drain_channels(
+            self.drain_channels(
                 receivers.time_evt,
                 receivers.system_evt,
                 receivers.system_cmd,
@@ -2298,7 +2883,7 @@ impl LiveNode {
 
                 () = dst::time::sleep_until(deadline) => break,
                 Some(message) = receivers.time_evt.recv() => {
-                    let _ = AsyncRunner::handle_time_event(message);
+                    let _ = self.process_time_event(message);
                     processed += 1;
                 }
                 Some(event) = receivers.system_evt.recv() => {
@@ -2318,11 +2903,11 @@ impl LiveNode {
                     processed += 1;
                 }
                 Some(event) = receivers.data_evt.recv() => {
-                    AsyncRunner::handle_data_event(event);
+                    self.process_data_event(event);
                     processed += 1;
                 }
                 Some(command) = receivers.data_cmd.recv() => {
-                    AsyncRunner::handle_data_command(command);
+                    self.process_data_command(command);
                     processed += 1;
                 }
             }
@@ -2392,6 +2977,7 @@ impl LiveNode {
         let readiness_result = self.await_engines_disconnected(deadline).await;
         let kernel_result = self.kernel.finalize_stop().await;
 
+        self.note_dispatch_gap("shutdown_lifecycle");
         self.handle.set_stopped();
 
         let mut errors = Vec::new();
@@ -2407,6 +2993,10 @@ impl LiveNode {
             errors.push(format!("failed while finalizing kernel shutdown: {e}"));
         }
 
+        if self.event_store_halted() {
+            errors.push("event-store persistence halted".into());
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -2414,7 +3004,13 @@ impl LiveNode {
         }
     }
 
+    #[allow(clippy::unused_unit)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shutdown drains each runner receiver without changing channel ownership"
+    )]
     fn drain_channels(
+        &self,
         time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
         system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
         system_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
@@ -2423,38 +3019,60 @@ impl LiveNode {
         data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
         data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
     ) {
+        if !self.note_dispatch_gap("final_drain_discarded_system_inputs") {
+            return;
+        }
         let mut drained = 0;
 
         while let Ok(handler) = time_evt_rx.try_recv() {
-            let _ = AsyncRunner::handle_time_event(handler);
+            let _ = self.process_time_event(handler);
             drained += 1;
         }
 
-        while system_evt_rx.try_recv().is_ok() {
+        while let Ok(event) = system_evt_rx.try_recv() {
+            // Keep the value consumed when observer instrumentation is disabled.
+            let _ = &event;
+            #[cfg(feature = "dispatch-observer")]
+            if !self.record_discarded_dispatch(crate::dispatch::DispatchSource::SystemEvent, &event)
+            {
+                return;
+            }
             drained += 1;
         }
 
-        while system_cmd_rx.try_recv().is_ok() {
+        while let Ok(command) = system_cmd_rx.try_recv() {
+            // Keep the value consumed when observer instrumentation is disabled.
+            let _ = &command;
+            #[cfg(feature = "dispatch-observer")]
+            if !self
+                .record_discarded_dispatch(crate::dispatch::DispatchSource::SystemCommand, &command)
+            {
+                return;
+            }
             drained += 1;
         }
 
         while let Ok(evt) = data_evt_rx.try_recv() {
-            AsyncRunner::handle_data_event(evt);
+            self.process_data_event(evt);
             drained += 1;
         }
 
         while let Ok(cmd) = data_cmd_rx.try_recv() {
-            AsyncRunner::handle_data_command(cmd);
+            self.process_data_command(cmd);
             drained += 1;
         }
 
         while let Ok(evt) = exec_evt_rx.try_recv() {
+            let guard = begin_node_dispatch!(self, ExecutionEvent, &evt, ());
             AsyncRunner::handle_exec_event(evt);
+            complete_node_dispatch!(self, guard);
             drained += 1;
         }
 
         while let Ok(cmd) = exec_cmd_rx.try_recv() {
+            let guard = begin_node_dispatch!(self, ExecutionCommand, &cmd, ());
             AsyncRunner::handle_trading_command(cmd);
+            complete_node_dispatch!(self, guard);
             drained += 1;
         }
 
@@ -2827,6 +3445,80 @@ impl LiveNode {
             .map_err(|e| anyhow::anyhow!("Cannot deregister external order claims: {e}"))?
             .set_external_order_claims(strategy_id, &[])?;
 
+        Ok(())
+    }
+
+    /// Restores actor and strategy callback state into the freshly assembled
+    /// node while it is still idle.
+    ///
+    /// This is a component-state operation only.  The caller remains
+    /// responsible for restoring native cache/portfolio state, replaying
+    /// queues at a common dispatch boundary, reconciling the venue, and
+    /// obtaining an independent execution authorization before starting.
+    /// A callback failure leaves the node unsuitable for start; callers should
+    /// discard it and preserve the source checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-idle node, mismatched component identities/order, or a
+    /// component callback failure.
+    pub fn restore_component_state(
+        &mut self,
+        state: &nautilus_system::trader::CollectedComponentState,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.state() == NodeState::Idle,
+            "Cannot restore component state after node startup has begun"
+        );
+        self.recovery_requires_release = true;
+        nautilus_system::trader::Trader::restore_component_state(self.kernel.trader(), state)
+    }
+
+    /// Installs an isolated, validated native cache into a freshly assembled idle node.
+    ///
+    /// This operation preserves the node's shared cache handle so the portfolio and engines
+    /// observe the same cache object. It accepts only a cache without a persistence adapter and
+    /// rejects a target that already contains native state or has a database waiting to be
+    /// installed on startup. The caller must still restore component state, replay pending
+    /// inputs at a common boundary, reconcile the venue and obtain an independent execution
+    /// authorization before starting the node.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-idle node, a cache with persistence backing, or a target cache that already
+    /// contains instruments, accounts, orders or positions.
+    pub fn restore_native_cache(&mut self, cache: Cache) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.state() == NodeState::Idle,
+            "Cannot restore native cache after node startup has begun"
+        );
+        anyhow::ensure!(
+            !self.has_pending_cache_database(),
+            "Cannot restore native cache while a cache database is pending installation"
+        );
+        anyhow::ensure!(
+            !self.kernel.load_state() && !self.kernel.is_event_store_replay_configured(),
+            "Cannot restore native cache while startup state loading or event-store replay is configured"
+        );
+        anyhow::ensure!(
+            !cache.has_backing(),
+            "Native handoff cache must not have a persistence backing"
+        );
+
+        let cache_handle = self.kernel.cache();
+        let mut target = cache_handle.try_borrow_mut().map_err(|error| {
+            anyhow::anyhow!("Cannot borrow target cache for native handoff: {error}")
+        })?;
+        anyhow::ensure!(
+            !target.has_backing()
+                && target.instrument_ids(None).is_empty()
+                && target.accounts_all_owned().is_empty()
+                && target.orders_total_count(None, None, None, None, None) == 0
+                && target.positions_total_count(None, None, None, None, None) == 0,
+            "Target cache already contains native state or a persistence backing"
+        );
+        self.recovery_requires_release = true;
+        *target = cache;
         Ok(())
     }
 
@@ -3267,6 +3959,7 @@ mod tests {
         },
     };
 
+    use crate::runner_recovery::{RunnerRecoveryCodecRegistry, RunnerRecoveryEnvelope};
     use bytes::Bytes;
     use indexmap::{IndexMap, IndexSet};
     use log::{Level, LevelFilter, Log, Metadata, Record};
@@ -3276,7 +3969,9 @@ mod tests {
         replace_exec_cmd_sender,
     };
     use nautilus_common::{
-        actor::{DataActor, DataActorCore, data_actor::DataActorConfig},
+        actor::{
+            DataActor, DataActorCore, data_actor::DataActorConfig, registry::get_actor_unchecked,
+        },
         cache::Cache,
         clock::{Clock, TestClock},
         enums::SerializationEncoding,
@@ -3321,7 +4016,10 @@ mod tests {
         reports::{FillReport, PositionStatusReport},
         types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
     };
-    use nautilus_system::{KernelEventStore, RegisteredComponents, event_store::EventStoreConfig};
+    use nautilus_system::{
+        KernelEventStore, RegisteredComponents, event_store::EventStoreConfig,
+        trader::CollectedComponentState,
+    };
     use nautilus_testkit::{
         cache::TestCacheDatabaseControl,
         components::{StateActor, StateStrategy},
@@ -3764,6 +4462,38 @@ mod tests {
             UnixNanos::default(),
         )));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_start_closes_retained_recovery_runner_handoff() {
+        let config = LiveNodeConfig {
+            trader_id: TraderId::from("RECOVERY-HANDOFF-START-001"),
+            exec_engine: crate::config::LiveExecutionEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            timeout_connection: Duration::ZERO,
+            timeout_reconciliation: Duration::ZERO,
+            timeout_portfolio: Duration::ZERO,
+            timeout_disconnection: Duration::ZERO,
+            delay_post_stop: Duration::ZERO,
+            timeout_shutdown: Duration::ZERO,
+            ..Default::default()
+        };
+        let mut node = LiveNode::build("RecoveryHandoffStart".to_string(), Some(config)).unwrap();
+        let mut handoff = node.recovery_runner_handoff().unwrap();
+        let registry = RunnerRecoveryCodecRegistry::new([]).seal().unwrap();
+
+        node.start().await.unwrap();
+        assert!(
+            handoff
+                .enqueue_batch(std::iter::empty::<RunnerRecoveryEnvelope>(), &registry)
+                .is_err()
+        );
+        assert!(node.recovery_runner_handoff().is_err());
+        node.stop().await.unwrap();
+        node.dispose();
     }
 
     #[rstest]
@@ -5319,6 +6049,48 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct HaltableKernelEventStore {
+        halted: Rc<Cell<bool>>,
+    }
+
+    impl KernelEventStore for HaltableKernelEventStore {
+        fn restore_parent_cache(
+            &mut self,
+            _instance_id: UUID4,
+            _cache: &mut Cache,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn open(
+            &mut self,
+            _instance_id: UUID4,
+            _components: &RegisteredComponents,
+            _environment: Environment,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn snapshot_anchorer(&self) -> Option<SnapshotAnchorer> {
+            None
+        }
+
+        fn seal(&mut self, _ts_init: UnixNanos) {}
+
+        fn run_id(&self) -> Option<&str> {
+            Some("haltable-run")
+        }
+
+        fn parent_run_id(&self) -> Option<&str> {
+            None
+        }
+
+        fn is_halted(&self) -> bool {
+            self.halted.get()
+        }
+    }
+
+    #[derive(Debug)]
     struct TestStrategy {
         core: StrategyCore,
     }
@@ -5355,6 +6127,28 @@ mod tests {
             });
 
         builder.build().unwrap()
+    }
+
+    fn live_node_with_haltable_store(halted: Rc<Cell<bool>>) -> LiveNode {
+        let config = LiveNodeConfig {
+            environment: Environment::Sandbox,
+            exec_engine: crate::config::LiveExecutionEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            timeout_connection: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(100),
+            delay_post_stop: Duration::ZERO,
+            timeout_shutdown: Duration::ZERO,
+            ..Default::default()
+        };
+        LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_event_store(move |_instance_id, _clock| {
+                Ok(Box::new(HaltableKernelEventStore { halted }) as Box<dyn KernelEventStore>)
+            })
+            .build()
+            .unwrap()
     }
 
     #[rstest]
@@ -6283,6 +7077,120 @@ mod tests {
     }
 
     #[rstest]
+    #[case(None, false)]
+    #[case(Some(false), false)]
+    #[case(Some(true), false)]
+    #[case(Some(true), true)]
+    #[tokio::test]
+    async fn test_startup_reconciliation_requires_complete_mass_status(
+        #[case] complete: Option<bool>,
+        #[case] missing_instrument: bool,
+    ) {
+        struct MassStatusClient(Option<bool>, bool);
+        #[async_trait::async_trait(?Send)]
+        impl nautilus_common::clients::ExecutionClient for MassStatusClient {
+            fn generate_account_state(
+                &self,
+                _balances: Vec<AccountBalance>,
+                _margins: Vec<MarginBalance>,
+                _reported: bool,
+                _ts_event: UnixNanos,
+                _params: Option<Params>,
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("account mutation is outside this reconciliation fixture")
+            }
+            fn is_connected(&self) -> bool {
+                true
+            }
+            fn client_id(&self) -> ClientId {
+                ClientId::from("STUB")
+            }
+            fn account_id(&self) -> AccountId {
+                AccountId::from("TEST-ACCOUNT")
+            }
+            fn venue(&self) -> Venue {
+                Venue::from("TEST")
+            }
+            fn oms_type(&self) -> OmsType {
+                OmsType::Netting
+            }
+            fn get_account(&self) -> Option<AccountAny> {
+                None
+            }
+            fn start(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn stop(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn generate_mass_status(
+                &self,
+                _lookback_mins: Option<u64>,
+            ) -> anyhow::Result<Option<nautilus_model::reports::ExecutionMassStatus>> {
+                Ok(self.0.map(|complete| {
+                    let mut report = nautilus_model::reports::ExecutionMassStatus::new(
+                        self.client_id(),
+                        self.account_id(),
+                        self.venue(),
+                        UnixNanos::from(1),
+                        None,
+                    );
+                    report.set_report_window(None, complete);
+                    if self.1 {
+                        report.add_order_reports(vec![
+                            nautilus_model::reports::OrderStatusReport::new(
+                                self.account_id(),
+                                InstrumentId::from("UNKNOWN.TEST"),
+                                None,
+                                VenueOrderId::from("V-UNKNOWN"),
+                                Some(OrderSide::Buy),
+                                OrderType::Market,
+                                TimeInForce::Gtc,
+                                OrderStatus::Accepted,
+                                Quantity::from("1"),
+                                Quantity::from("0"),
+                                UnixNanos::from(1),
+                                UnixNanos::from(1),
+                                UnixNanos::from(1),
+                                None,
+                            ),
+                        ]);
+                    }
+                    report
+                }))
+            }
+        }
+        let mut node = LiveNode::build("MissingMassStatusNode".to_string(), None).unwrap();
+        assert!(node.handle().startup_reconciliation().is_none());
+        node.kernel
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(MassStatusClient(complete, missing_instrument)))
+            .unwrap();
+        let result = node.perform_startup_reconciliation().await;
+        if missing_instrument {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("Startup reconciliation unresolved for STUB"));
+            assert!(error.contains("instrument_not_in_cache"));
+        } else if complete == Some(true) {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("Startup reconciliation requires") && error.contains("STUB"));
+        }
+        assert!(!node.handle().is_running());
+        let observation = node.handle().startup_reconciliation().unwrap();
+        assert_eq!(observation.clients, 1);
+        assert!(observation.observed_at_ns > 0);
+        assert_eq!(observation.phase, if complete == Some(true) && !missing_instrument {
+            StartupReconciliationPhase::Processed
+        } else { StartupReconciliationPhase::Failed });
+        assert_eq!(node.handle().clone().startup_reconciliation(), Some(observation));
+        node.handle.set_starting();
+        assert!(node.handle().startup_reconciliation().is_none());
+    }
+
+    #[rstest]
     #[tokio::test(start_paused = true)]
     async fn test_stop_processes_residual_exec_event_during_grace_period() {
         let config = LiveNodeConfig {
@@ -6410,6 +7318,145 @@ mod tests {
         assert_eq!(control.actor_state(&actor_id), Some(actor_save));
         assert_eq!(control.strategy_state(&strategy_id), Some(strategy_save));
         assert_eq!(node.state(), NodeState::Stopped);
+    }
+
+    #[rstest]
+    fn test_restore_component_state_loads_registered_strategy_while_idle() {
+        let strategy_id = StrategyId::from("LIVE-RESTORE-STRATEGY-001");
+        let control = TestCacheDatabaseControl::default();
+        let mut node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .build()
+            .unwrap();
+        node.add_strategy(StateStrategy::new(
+            strategy_id,
+            control.clone(),
+            IndexMap::new(),
+        ))
+        .unwrap();
+
+        let payload = IndexMap::from([("strategy-load".to_string(), b"restored".to_vec())]);
+        let state = CollectedComponentState {
+            actors: IndexMap::new(),
+            strategies: IndexMap::from([(strategy_id, payload.clone())]),
+        };
+        node.restore_component_state(&state).unwrap();
+
+        let registered = get_actor_unchecked::<StateStrategy>(&strategy_id.inner());
+        assert_eq!(registered.state_load(), Some(&payload));
+        drop(registered);
+        assert!(control.events().contains(&"strategy.on_load".to_string()));
+        node.dispose();
+    }
+
+    #[rstest]
+    fn test_restore_native_cache_replaces_empty_idle_cache() {
+        let mut source = Cache::default();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        source.add_instrument(instrument).unwrap();
+
+        let mut node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .build()
+            .unwrap();
+        node.restore_native_cache(source).unwrap();
+        assert!(
+            node.kernel()
+                .cache
+                .borrow()
+                .instrument(&instrument_id)
+                .is_some()
+        );
+        node.dispose();
+    }
+
+    #[tokio::test]
+    async fn test_recovered_cache_cannot_enter_either_startup_path() {
+        let mut node = LiveNode::builder(TraderId::from("RECOVERY-001"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .build()
+            .unwrap();
+        node.restore_native_cache(Cache::default()).unwrap();
+        assert!(
+            node.start()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("recovery release")
+        );
+        assert!(
+            node.run()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("recovery release")
+        );
+        assert_eq!(node.state(), NodeState::Idle);
+        node.dispose();
+    }
+
+    #[tokio::test]
+    async fn test_bound_runner_recovery_cannot_be_started_as_a_fresh_node() {
+        let mut node = LiveNode::builder(TraderId::from("RECOVERY-002"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .build()
+            .unwrap();
+        node.recovery_runner_handoff()
+            .unwrap()
+            .bind_watermark("recovery", 1, 1)
+            .unwrap();
+        assert!(
+            node.start()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("recovery release")
+        );
+        assert!(
+            node.run()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("recovery release")
+        );
+        assert_eq!(node.state(), NodeState::Idle);
+        node.dispose();
+    }
+
+    #[rstest]
+    fn test_restore_native_cache_rejects_nonempty_target() {
+        let mut node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .build()
+            .unwrap();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        node.kernel_mut()
+            .cache
+            .borrow_mut()
+            .add_instrument(instrument)
+            .unwrap();
+
+        assert!(node.restore_native_cache(Cache::default()).is_err());
+        node.dispose();
+    }
+
+    #[rstest]
+    fn test_restore_native_cache_rejects_startup_state_loading() {
+        let mut node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)
+            .unwrap()
+            .with_load_state(true)
+            .with_reconciliation(false)
+            .build()
+            .unwrap();
+
+        assert!(node.restore_native_cache(Cache::default()).is_err());
+        node.dispose();
     }
 
     #[rstest]
@@ -6608,6 +7655,92 @@ mod tests {
         assert!(node.kernel.is_event_store_replay_configured());
         assert!(!node.kernel.is_event_store_replay());
         assert!(node.runner.is_none());
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_run_stops_and_reports_when_event_store_halts_while_idle() {
+        let halted = Rc::new(Cell::new(false));
+        let mut node = live_node_with_haltable_store(halted.clone());
+        let handle = node.handle();
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let run = node.run();
+            tokio::pin!(run);
+
+            let drive = async {
+                wait_until_async(|| async { handle.is_running() }, Duration::from_secs(10)).await;
+                halted.set(true);
+                wait_until_async(
+                    || async { handle.state() == NodeState::Stopped },
+                    Duration::from_secs(10),
+                )
+                .await;
+            };
+
+            tokio::select! {
+                biased;
+
+                () = drive => {
+                    let error = run.await.expect_err("halted event store should fail the run");
+                    assert!(error
+                        .to_string()
+                        .contains("event-store persistence halted"));
+                }
+                result = &mut run => {
+                    assert!(halted.get(), "node stopped before the event store was halted");
+                    let error = result.expect_err("halted event store should fail the run");
+                    assert!(error
+                        .to_string()
+                        .contains("event-store persistence halted"));
+                }
+            }
+        })
+        .await
+        .expect("event-store halt should stop the idle node before timeout");
+
+        assert_eq!(handle.state(), NodeState::Stopped);
+        node.dispose();
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_event_store_containment_retains_running_loop_until_explicit_stop() {
+        let halted = Rc::new(Cell::new(false));
+        let mut node = live_node_with_haltable_store(halted.clone());
+        assert!(node.enable_event_store_failure_containment().is_err());
+        let engine = node.kernel.exec_engine.clone();
+        let health = halted.clone();
+        engine
+            .borrow_mut()
+            .set_submission_guard(Some(Rc::new(move |_| {
+                anyhow::ensure!(!health.get(), "injected persistence failure");
+                Ok(())
+            })));
+        node.enable_event_store_failure_containment().unwrap();
+        let handle = node.handle();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let run = node.run();
+            tokio::pin!(run);
+            let drive = async {
+                wait_until_async(|| async { handle.is_running() }, Duration::from_secs(5)).await;
+                halted.set(true);
+                wait_until_async(|| async { engine.borrow().submissions_fenced() }, Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(handle.is_running(), "containment must retain the runner");
+                handle.stop();
+            };
+            tokio::select! {
+                biased;
+                () = drive => {
+                    assert!(run.await.unwrap_err().to_string().contains("event-store persistence halted"));
+                }
+                result = &mut run => panic!("contained node exited before explicit stop: {result:?}"),
+            }
+        }).await.unwrap();
+        assert!(node.persistence_degraded());
+        assert_eq!(handle.state(), NodeState::Stopped);
+        node.dispose();
     }
 
     #[rstest]
@@ -8209,4 +9342,6 @@ mod tests {
             self.closed.store(true, Ordering::Relaxed);
         }
     }
+    #[cfg(feature = "dispatch-observer")]
+    include!("dispatch_tests.rs");
 }

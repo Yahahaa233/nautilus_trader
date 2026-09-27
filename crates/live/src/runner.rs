@@ -59,7 +59,13 @@
 //!   thread. `bind_senders` overwrites any existing TLS contents on the
 //!   thread, so the last caller wins.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::Debug,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use nautilus_common::{
     live::runner::{
@@ -206,6 +212,8 @@ pub struct AsyncRunner {
     exec_cmd_tx: tokio::sync::mpsc::UnboundedSender<TradingCommandMessage>,
     data_evt_tx: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     data_cmd_tx: tokio::sync::mpsc::UnboundedSender<DataCommand>,
+    recovery_handoff_available: Arc<AtomicBool>,
+    recovery_progress: crate::runner_recovery::RunnerRecoveryProgressHandle,
 }
 
 /// Handle for stopping the `AsyncRunner` from another context.
@@ -253,6 +261,7 @@ impl AsyncRunner {
         let (exec_cmd_tx, exec_cmd_rx) = unbounded_channel::<TradingCommandMessage>();
         let (data_evt_tx, data_evt_rx) = unbounded_channel::<DataEvent>();
         let (data_cmd_tx, data_cmd_rx) = unbounded_channel::<DataCommand>();
+        let recovery_progress = crate::runner_recovery::RunnerRecoveryProgressHandle::new();
 
         Self {
             channels: AsyncRunnerChannels {
@@ -273,6 +282,8 @@ impl AsyncRunner {
             exec_cmd_tx,
             data_evt_tx,
             data_cmd_tx,
+            recovery_handoff_available: Arc::new(AtomicBool::new(true)),
+            recovery_progress,
         }
     }
 
@@ -307,6 +318,89 @@ impl AsyncRunner {
         replace_data_cmd_sender(Arc::new(sender));
     }
 
+    /// Returns a pre-start handoff into this runner's internal channels.
+    ///
+    /// # Errors
+    /// Returns an error after the runner has entered its loop or its receivers
+    /// have been extracted.
+    pub fn recovery_handoff(
+        &self,
+    ) -> anyhow::Result<crate::runner_recovery::RunnerRecoveryHandoff> {
+        crate::runner_recovery::RunnerRecoveryHandoff::from_runner(self)
+    }
+
+    /// Returns the shared bookkeeping handle for a pre-start recovery
+    /// handoff.
+    ///
+    /// Capture this handle before `take_channels()` consumes the runner. The
+    /// live node can acknowledge dequeue and successful processing through
+    /// the handle after startup; those acknowledgements remain independent of
+    /// the sender's sent watermark and never grant execution authority.
+    #[must_use]
+    pub fn recovery_progress(&self) -> crate::runner_recovery::RunnerRecoveryProgressHandle {
+        self.recovery_progress.clone()
+    }
+
+    pub(crate) fn recovery_progress_handle(
+        &self,
+    ) -> crate::runner_recovery::RunnerRecoveryProgressHandle {
+        self.recovery_progress.clone()
+    }
+
+    /// Closes any outstanding recovery handoff handles.
+    ///
+    /// Hosts which use `LiveNode::start`, whose channels remain owned by the
+    /// node after startup, must call this before handing control to the live
+    /// trader.
+    pub fn close_recovery_handoff(&self) {
+        self.recovery_handoff_available
+            .store(false, Ordering::Release);
+    }
+
+    pub(crate) fn recovery_handoff_available(&self) -> &Arc<AtomicBool> {
+        &self.recovery_handoff_available
+    }
+
+    pub(crate) fn time_event_sender_clone(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<TimeEventMessage> {
+        self.time_evt_tx.clone()
+    }
+
+    pub(crate) fn system_event_sender_clone(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<SystemEvent> {
+        self.system_evt_tx.clone()
+    }
+
+    pub(crate) fn system_command_sender_clone(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<SystemCommand> {
+        self.system_cmd_tx.clone()
+    }
+
+    pub(crate) fn execution_event_sender_clone(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<ExecutionEvent> {
+        self.exec_evt_tx.clone()
+    }
+
+    pub(crate) fn execution_command_sender_clone(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<TradingCommandMessage> {
+        self.exec_cmd_tx.clone()
+    }
+
+    pub(crate) fn data_event_sender_clone(&self) -> tokio::sync::mpsc::UnboundedSender<DataEvent> {
+        self.data_evt_tx.clone()
+    }
+
+    pub(crate) fn data_command_sender_clone(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<DataCommand> {
+        self.data_cmd_tx.clone()
+    }
+
     /// Stops the runner with an internal shutdown signal.
     pub fn stop(&self) {
         if let Err(e) = self.signal_tx.send(()) {
@@ -328,6 +422,7 @@ impl AsyncRunner {
     /// endpoints (which use thread-local storage).
     #[must_use]
     pub fn take_channels(self) -> AsyncRunnerChannels {
+        self.close_recovery_handoff();
         self.channels
     }
 
@@ -397,6 +492,7 @@ impl AsyncRunner {
     /// This method processes time, system, execution, and data events in an async loop.
     /// It will run until a signal is received or the event streams are closed.
     pub async fn run(&mut self) {
+        self.close_recovery_handoff();
         self.bind_senders();
 
         log::info!("AsyncRunner starting");
@@ -775,6 +871,8 @@ mod tests {
             data_cmd_tx,
             signal_rx,
             signal_tx,
+            recovery_handoff_available: Arc::new(AtomicBool::new(true)),
+            recovery_progress: crate::runner_recovery::RunnerRecoveryProgressHandle::new(),
         }
     }
 

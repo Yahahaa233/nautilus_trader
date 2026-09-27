@@ -61,3 +61,18 @@ Use of this software is subject to the [Disclaimer](https://nautilustrader.io/le
 <img src="https://github.com/nautechsystems/nautilus_trader/raw/develop/assets/nautilus-logo-white.png" alt="logo" width="300" height="auto"/>
 
 © 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
+
+## Managed Metis extension
+
+| Local contract | Scope and regression entry | Removal criterion |
+|---|---|---|
+| Explicit dispatch begin/complete/abort protocol | Opt-in `dispatch-observer`; `dispatch::tests` checks nesting, ordered tokens, durable failure and aborts | Equivalent upstream protocol plus complete ingress wiring and failure tests |
+| Idle recovery dispatch boundary and FIFO handoff | `LiveNode::with_recovery_dispatch` plus `enqueue_recovery_dispatch`/`drain_recovery_dispatch` stage and drain caller-owned envelopes in observed FIFO order, preserving a failed suffix | Observed completion must still be tied to the composite/runner watermark; durable idempotency and recovery authorization remain separate |
+| Pre-start runner-channel recovery handoff | `RunnerRecoveryHandoff` with sealed `RunnerRecoveryCodecRegistry` decodes validated envelopes into the seven real runner mpsc channels, optionally binds a composite identity/checkpoint/dispatch watermark with contiguous sequencing, and closes retained handles after startup or receiver extraction; `PausedCompositeRecovery::replay_pending_into_runner` supplies ordered composite inventory checks and a channel-only receipt | Production codec registration, observed processing completion, durable idempotency, venue reconciliation and recovery authorization |
+
+Source revision and limits are recorded in [METIS_SOURCE.md](METIS_SOURCE.md).
+The observer is optionally connected to synchronous LiveNode dispatch paths. Remaining
+startup, query-result, maintenance, external and lifecycle paths emit Uncovered
+dispositions; queue state is not collected and coverage remains incomplete. Nodes
+without an observer retain upstream behavior. Tests do not establish composite
+checkpoint or recovery acceptance.
