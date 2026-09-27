@@ -194,6 +194,16 @@ impl OrderManager {
     /// like `OrderSubmitted`, `OrderAccepted`, etc. are no-ops for the order manager.
     pub fn handle_event(&mut self, event: &OrderEventAny) -> Vec<OrderManagerAction> {
         match event {
+            OrderEventAny::Denied(event) => {
+                self.oto_target_quantities.remove(&event.client_order_id);
+                let order = self.cache.borrow().order_owned(&event.client_order_id);
+                match order {
+                    Some(order) if order.contingency_type().is_some() => {
+                        self.handle_contingencies(&order)
+                    }
+                    _ => Vec::new(),
+                }
+            }
             OrderEventAny::Rejected(event) => self.handle_order_rejected(*event),
             OrderEventAny::Canceled(event) => self.handle_order_canceled(*event),
             OrderEventAny::Expired(event) => self.handle_order_expired(*event),
@@ -994,6 +1004,50 @@ mod tests {
                 .submit_order_commands
                 .contains_key(&order.client_order_id())
         );
+    }
+
+    #[rstest]
+    fn test_denied_oto_entry_cancels_initialized_native_child() {
+        let (clock, cache) = create_test_components();
+        let mut manager = OrderManager::new(clock, cache.clone(), true);
+        let child_id = ClientOrderId::from("O-CHILD");
+        let parent = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(InstrumentId::from("AUD/USD.SIM"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .client_order_id(ClientOrderId::from("O-PARENT"))
+            .contingency_type(ContingencyType::Oto)
+            .linked_order_ids(vec![child_id])
+            .build();
+        let child = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUD/USD.SIM"))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from(100_000))
+            .client_order_id(child_id)
+            .price(Price::from("1.00100"))
+            .parent_order_id(parent.client_order_id())
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(parent.clone(), None, None, false)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_order(child, None, None, false)
+            .unwrap();
+        let event = OrderEventAny::Denied(nautilus_model::events::OrderDenied::new(
+            parent.trader_id(),
+            parent.strategy_id(),
+            parent.instrument_id(),
+            parent.client_order_id(),
+            "test denial".into(),
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        ));
+        cache.borrow_mut().update_order(&event).unwrap();
+        assert!(matches!(manager.handle_event(&event).as_slice(),
+            [OrderManagerAction::CancelLocal(order)] if order.client_order_id() == child_id));
     }
 
     #[rstest]

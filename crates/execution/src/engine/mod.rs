@@ -72,8 +72,8 @@ use nautilus_model::{
     },
     events::{
         OrderAccepted, OrderDenied, OrderDeniedReason, OrderEvent, OrderEventAny, OrderFillVoided,
-        OrderFilled, OrderInitialized, PositionChanged, PositionClosed, PositionEvent,
-        PositionOpened,
+        OrderFilled, OrderInitialized, OrderModifyRejected, PositionChanged, PositionClosed,
+        PositionEvent, PositionOpened,
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId, StrategyId,
@@ -89,6 +89,10 @@ use nautilus_model::{
 use position::CorrectedPosition;
 pub use position::{PositionStateSnapshot, SnapshotAnchorer};
 use rust_decimal::Decimal;
+
+/// Synchronous persistence/authorization barrier before risk-bearing commands
+/// leave the execution engine, including externally routed commands.
+pub type SubmissionGuard = Rc<dyn Fn(&TradingCommand) -> anyhow::Result<()>>;
 
 use crate::{
     client::ExecutionClientAdapter,
@@ -125,6 +129,8 @@ pub struct ExecutionEngine {
     report_count: u64,
     filtered_unclaimed_external_order_count: u64,
     snapshot_anchorer: Option<SnapshotAnchorer>,
+    submission_guard: Option<SubmissionGuard>,
+    submissions_fenced: Cell<bool>,
 }
 
 impl Debug for ExecutionEngine {
@@ -163,6 +169,8 @@ impl ExecutionEngine {
             report_count: 0,
             filtered_unclaimed_external_order_count: 0,
             snapshot_anchorer: None,
+            submission_guard: None,
+            submissions_fenced: Cell::new(false),
         }
     }
 
@@ -290,6 +298,42 @@ impl ExecutionEngine {
     /// `None` disables anchor recording for later cache snapshots.
     pub fn set_snapshot_anchorer(&mut self, anchorer: Option<SnapshotAnchorer>) {
         self.snapshot_anchorer = anchorer;
+    }
+
+    /// Installs a node-thread persistence barrier. Cancellations and queries
+    /// bypass it so a failed persistence subsystem cannot disable remediation.
+    /// The callback must not dispatch messages or reenter this engine.
+    pub fn set_submission_guard(&mut self, guard: Option<SubmissionGuard>) {
+        self.submission_guard = guard;
+    }
+
+    /// Permanently prohibits submission and modification on this engine instance.
+    /// A new engine/run is required to clear the fence; remediation stays available.
+    pub fn fence_submissions(&self) {
+        self.submissions_fenced.set(true);
+    }
+
+    /// Whether an owner-provided synchronous submission barrier is installed.
+    #[must_use]
+    pub fn has_submission_guard(&self) -> bool {
+        self.submission_guard.is_some()
+    }
+
+    /// Whether this engine has entered permanent submission containment.
+    #[must_use]
+    pub fn submissions_fenced(&self) -> bool {
+        self.submissions_fenced.get()
+    }
+
+    fn check_submission_guard(&self, command: &TradingCommand) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.submissions_fenced.get(),
+            "execution submissions fenced"
+        );
+        if let Some(guard) = &self.submission_guard {
+            guard(command)?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -1912,6 +1956,44 @@ impl ExecutionEngine {
 
     fn execute_command(&self, command: TradingCommand) {
         self.command_count.set(self.command_count.get() + 1);
+
+        if matches!(
+            &command,
+            TradingCommand::SubmitOrder(_)
+                | TradingCommand::SubmitOrderList(_)
+                | TradingCommand::ModifyOrder(_)
+                | TradingCommand::ModifyOrders(_)
+        ) && let Err(error) = self.check_submission_guard(&command)
+        {
+            log::error!("Execution submission barrier refused command: {error:#}");
+            let orders = match &command {
+                TradingCommand::SubmitOrder(cmd) => self
+                    .cache
+                    .borrow()
+                    .order(&cmd.client_order_id)
+                    .map(|order| order.clone())
+                    .into_iter()
+                    .collect(),
+                TradingCommand::SubmitOrderList(cmd) => self
+                    .cache
+                    .borrow()
+                    .orders_for_ids(&cmd.order_list.client_order_ids, cmd),
+                _ => Vec::new(),
+            };
+            for order in orders {
+                self.deny_order(&order, "Execution persistence/authorization barrier failed");
+            }
+            match &command {
+                TradingCommand::ModifyOrder(cmd) => self.reject_guarded_modification(cmd),
+                TradingCommand::ModifyOrders(cmd) => {
+                    for modification in &cmd.modifies {
+                        self.reject_guarded_modification(modification);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
 
         if self.config.debug {
             log::debug!("{RECV}{CMD} {command}");
@@ -4613,6 +4695,49 @@ impl ExecutionEngine {
         for (strategy_id, count) in counts {
             self.pos_id_generator.set_count(count, strategy_id);
             log::info!("Set PositionId count for {strategy_id} to {count}");
+        }
+    }
+
+    /// Local refusal must release pending-update state and notify the strategy.
+    /// It is not a rejection received from the venue and never sends a command.
+    fn reject_guarded_modification(&self, command: &ModifyOrder) {
+        let order = self
+            .cache
+            .borrow()
+            .order(&command.client_order_id)
+            .map(|order| order.clone());
+        let Some(order) = order else {
+            log::warn!("Cannot report modification refusal for an uncached order");
+            return;
+        };
+        if order.trader_id() != command.trader_id
+            || order.strategy_id() != command.strategy_id
+            || order.instrument_id() != command.instrument_id
+        {
+            log::error!("Modification refusal identity does not match cached order");
+            return;
+        }
+        let now = self.clock.borrow().timestamp_ns();
+        let mut rejection = OrderModifyRejected::new(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            "Local execution persistence/authorization barrier failed".into(),
+            UUID4::new(),
+            now,
+            now,
+            false,
+            order.venue_order_id(),
+            order.account_id(),
+        );
+        rejection.causation_id = Some(command.command_id);
+        let event = OrderEventAny::ModifyRejected(rejection);
+        if self
+            .update_cached_order(order.client_order_id(), &event, true)
+            .is_some()
+        {
+            self.publish_order_event(&event);
         }
     }
 

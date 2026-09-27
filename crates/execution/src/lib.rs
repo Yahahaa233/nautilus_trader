@@ -144,6 +144,7 @@ pub mod engine;
 pub mod matching_core;
 pub mod matching_engine;
 pub mod models;
+pub mod native_liquidation;
 pub mod order_emulator;
 pub mod order_manager;
 pub mod protection;
