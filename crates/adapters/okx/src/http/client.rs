@@ -317,6 +317,127 @@ mod tests {
     };
     use crate::http::models::OKXFeeRate;
 
+    #[tokio::test]
+    async fn pending_pages_require_exhaustion_and_correct_cursor() {
+        let mut calls = 0;
+        let rows = super::collect_pending_pages(
+            None,
+            |cursor| {
+                calls += 1;
+                let page = if calls == 1 {
+                    assert_eq!(cursor, None);
+                    (0..100).map(|n| n.to_string()).collect()
+                } else {
+                    assert_eq!(cursor.as_deref(), Some("99"));
+                    vec!["100".to_owned()]
+                };
+                std::future::ready(Ok(page))
+            },
+            String::as_str,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(rows.len(), 101);
+    }
+
+    #[tokio::test]
+    async fn pending_pages_reject_duplicates_invalid_ids_and_oversized_pages() {
+        for page in [
+            vec!["".to_owned()],
+            vec!["same".to_owned(); 2],
+            (0..101).map(|n| n.to_string()).collect(),
+        ] {
+            assert!(
+                super::collect_pending_pages(
+                    None,
+                    |_| std::future::ready(Ok(page.clone())),
+                    String::as_str
+                )
+                .await
+                .is_err()
+            );
+        }
+        let mut calls = 0;
+        let result = super::collect_pending_pages(
+            None,
+            |_| {
+                calls += 1;
+                std::future::ready(Ok((0..100).map(|n| n.to_string()).collect()))
+            },
+            String::as_str,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn pending_pages_reject_cap_and_mid_query_failure() {
+        let mut calls = 0;
+        let result = super::collect_pending_pages(
+            None,
+            |_| {
+                let page: Vec<_> = (calls * 100..(calls + 1) * 100)
+                    .map(|n| n.to_string())
+                    .collect();
+                calls += 1;
+                std::future::ready(Ok(page))
+            },
+            String::as_str,
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("上限"));
+        assert_eq!(calls, super::MAX_RECONCILIATION_PAGES);
+        let mut calls = 0;
+        let result = super::collect_pending_pages(
+            None,
+            |_| {
+                calls += 1;
+                std::future::ready(if calls == 1 {
+                    Ok((0..100).map(|n| n.to_string()).collect())
+                } else {
+                    Err(anyhow::anyhow!("查询失败"))
+                })
+            },
+            String::as_str,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), "查询失败");
+    }
+
+    #[tokio::test]
+    async fn pending_pages_respect_explicit_limit_without_claiming_full_snapshot() {
+        let result = super::collect_pending_pages(
+            Some(0),
+            |_| {
+                std::future::ready(Err::<Vec<String>, _>(anyhow::anyhow!(
+                    "零结果请求不能发送查询"
+                )))
+            },
+            String::as_str,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_empty());
+        let mut calls = 0;
+        let result = super::collect_pending_pages(
+            Some(101),
+            |_| {
+                let page = (calls * 100..(calls + 1) * 100)
+                    .map(|n| n.to_string())
+                    .collect();
+                calls += 1;
+                std::future::ready(Ok(page))
+            },
+            String::as_str,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.len(), 101);
+        assert_eq!(calls, 2);
+    }
+
     struct UnserializableParams;
 
     impl Serialize for UnserializableParams {
@@ -502,6 +623,49 @@ const OKX_PAGE_SIZE: usize = 100;
 
 // Safety cap on paginated reconciliation fetches to avoid unbounded loops
 const MAX_RECONCILIATION_PAGES: usize = 50;
+
+// 普通与条件挂单共用分页完整性检查；显式 limit 是调用者要求的结果上限。
+async fn collect_pending_pages<T, F, Fut>(
+    limit: Option<usize>,
+    mut fetch: F,
+    identifier: impl Fn(&T) -> &str,
+) -> anyhow::Result<Vec<T>>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<T>>>,
+{
+    let mut all = Vec::new();
+    if limit == Some(0) {
+        return Ok(all);
+    }
+    let mut cursor = None;
+    let mut seen = AHashSet::new();
+    for _ in 0..MAX_RECONCILIATION_PAGES {
+        let page = fetch(cursor.take()).await?;
+        let count = page.len();
+        anyhow::ensure!(count <= OKX_PAGE_SIZE, "挂单响应超过请求页大小");
+        for item in &page {
+            let id = identifier(item);
+            anyhow::ensure!(!id.trim().is_empty(), "挂单缺少交易所订单标识");
+            anyhow::ensure!(
+                seen.insert(id.to_owned()),
+                "挂单分页出现重复订单，需重新查询"
+            );
+        }
+        cursor = page.last().map(|item| identifier(item).to_owned());
+        all.extend(page);
+        if let Some(maximum) = limit
+            && all.len() >= maximum
+        {
+            all.truncate(maximum);
+            return Ok(all);
+        }
+        if count < OKX_PAGE_SIZE {
+            return Ok(all);
+        }
+    }
+    anyhow::bail!("挂单分页达到上限，无法证明查询完整")
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReportInstrumentScope<'a> {
@@ -1118,7 +1282,9 @@ impl OKXRawHttpClient {
                     | "/api/v5/trade/order-algo"
                     | "/api/v5/sprd/order"
             );
-        let should_retry = |error: &OKXHttpError| !is_order_submit && error.is_retryable();
+        let should_retry = |error: &OKXHttpError| {
+            !is_order_submit && path != "/api/v5/trade/amend-algos" && error.is_retryable()
+        };
 
         let create_error = |error: RetryError| -> OKXHttpError {
             match error {
@@ -2274,6 +2440,29 @@ impl OKXHttpClient {
         params: GetAlgoOrdersParams,
     ) -> Result<Vec<OKXOrderAlgo>, OKXHttpError> {
         self.inner.get_order_algo_pending(params).await
+    }
+
+    /// 按全部已知算法类型读取账户挂单，保留原始订单，不按已缓存合约过滤。
+    /// 任一类型查询失败、分页不完整或跨类型重复时，整次查询失败。
+    pub async fn request_all_pending_algo_orders(&self) -> anyhow::Result<Vec<OKXOrderAlgo>> {
+        let mut all = Vec::new();
+        let mut seen = AHashSet::new();
+        for kind in OKXAlgoOrderType::QUERY_TYPES {
+            let params = GetAlgoOrdersParams {
+                ord_type: Some(kind),
+                ..Default::default()
+            };
+            let page = self.paginate_algo_pending_sweep(&params, None).await?;
+            for order in &page.items {
+                anyhow::ensure!(order.ord_type == kind, "算法挂单响应类型与查询不一致");
+                anyhow::ensure!(
+                    seen.insert(order.algo_id.clone()),
+                    "不同算法查询返回重复挂单"
+                );
+            }
+            all.extend(page.items);
+        }
+        Ok(all)
     }
 
     /// Requests information on current account positions.
@@ -4028,6 +4217,9 @@ impl OKXHttpClient {
             let mut page: Vec<Bar> = Vec::with_capacity(raw.len());
 
             for r in &raw {
+                if r.8 != "1" {
+                    continue;
+                }
                 page.push(parse_candlestick(
                     r,
                     bar_type,
@@ -4264,6 +4456,9 @@ impl OKXHttpClient {
                 let mut page: Vec<Bar> = Vec::with_capacity(raw.len());
 
                 for r in &raw {
+                    if r.8 != "1" {
+                        continue;
+                    }
                     page.push(parse_candlestick(
                         r,
                         bar_type,
@@ -4408,13 +4603,15 @@ impl OKXHttpClient {
         let pending_base = pending_base.build().map_err(|e| anyhow::anyhow!(e))?;
 
         let (combined_resp, mut complete) = if open_only {
-            let pending = self.paginate_orders_pending(&pending_base, limit).await?;
+            let pending = self
+                .paginate_orders_pending_sweep(&pending_base, limit)
+                .await?;
             (pending.items, pending.complete)
         } else {
             let (history, pending) = Box::pin(async {
                 tokio::try_join!(
                     self.paginate_orders_history(&history_base, limit),
-                    self.paginate_orders_pending(&pending_base, limit),
+                    self.paginate_orders_pending_sweep(&pending_base, limit),
                 )
             })
             .await?;
@@ -4946,56 +5143,41 @@ impl OKXHttpClient {
         Ok(PageSweep::from_pages(all, exhausted))
     }
 
-    // Paginates through pending orders using `ord_id` as the cursor
-    async fn paginate_orders_pending(
+    /// 分页读取挂单；limit=None 时必须读完，异常或页数耗尽不返回部分成功。
+    pub async fn paginate_orders_pending(
+        &self,
+        base: &GetOrderListParams,
+        limit: Option<u32>,
+    ) -> anyhow::Result<Vec<OKXOrderHistory>> {
+        let sweep = self.paginate_orders_pending_sweep(base, limit).await?;
+        anyhow::ensure!(sweep.complete, "pending order query is incomplete");
+        Ok(sweep.items)
+    }
+
+    async fn paginate_orders_pending_sweep(
         &self,
         base: &GetOrderListParams,
         limit: Option<u32>,
     ) -> anyhow::Result<PageSweep<OKXOrderHistory>> {
-        let mut all = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut exhausted = true;
-
-        for _ in 0..MAX_RECONCILIATION_PAGES {
-            let mut params = base.clone();
-            params.after = cursor.take();
-
-            let page = self
-                .inner
-                .get_orders_pending(params)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-
-            let page_len = page.len();
-            cursor = page.last().map(|o| o.ord_id.to_string());
-            all.extend(page);
-
-            if page_len < OKX_PAGE_SIZE {
-                exhausted = false;
-                break;
-            }
-
-            if let Some(lim) = limit
-                && all.len() >= lim as usize
-            {
-                exhausted = false;
-                break;
-            }
-        }
-
-        if exhausted && !all.is_empty() {
-            log::warn!(
-                "Pending orders pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
-                 results may be truncated ({} records)",
-                all.len()
-            );
-        }
-
-        if let Some(lim) = limit {
-            all.truncate(lim as usize);
-        }
-
-        Ok(PageSweep::from_pages(all, exhausted))
+        anyhow::ensure!(
+            base.after.is_none() && base.before.is_none(),
+            "完整挂单查询不能指定起始游标"
+        );
+        let items = collect_pending_pages(
+            limit.map(|v| v as usize),
+            |cursor| {
+                let mut params = base.clone();
+                params.after = cursor;
+                params.limit = Some(OKX_PAGE_SIZE as u32);
+                async move { Ok(self.inner.get_orders_pending(params).await?) }
+            },
+            |order: &OKXOrderHistory| order.ord_id.as_str(),
+        )
+        .await?;
+        Ok(PageSweep {
+            items,
+            complete: true,
+        })
     }
 
     // Paginates through transaction details (fills) using `bill_id` as the cursor
@@ -5051,58 +5233,56 @@ impl OKXHttpClient {
         Ok(PageSweep::from_pages(all, exhausted))
     }
 
-    // Paginates through pending algo orders using `algo_id` as the cursor
+    // Paginates through pending algo orders using `algo_id` as the cursor.
+    //
+    // 分页完整性由 collect_pending_pages 保证：页数耗尽、重复标识、空标识、
+    // 超页响应、中途请求失败均返回错误。仅在不要求完整活跃覆盖时，HTTP 404
+    // 才视为分页结束（rc5 上游行为）；要求完整覆盖时 404 同样报错。
     async fn paginate_algo_pending(
         &self,
         base: &GetAlgoOrdersParams,
         limit: Option<usize>,
         require_complete_active_coverage: bool,
     ) -> anyhow::Result<PageSweep<OKXOrderAlgo>> {
-        let mut all = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut exhausted = true;
-
-        for _ in 0..MAX_RECONCILIATION_PAGES {
-            let mut params = base.clone();
-            params.after = cursor.take();
-
-            let page = match self.inner.get_order_algo_pending(params).await {
-                Ok(result) => result,
-                Err(OKXHttpError::UnexpectedStatus { status, .. })
-                    if status == StatusCode::NOT_FOUND && !require_complete_active_coverage =>
-                {
-                    exhausted = false;
-                    break;
+        anyhow::ensure!(
+            base.after.is_none() && base.before.is_none(),
+            "完整挂单查询不能指定起始游标"
+        );
+        let items = collect_pending_pages(
+            limit,
+            |cursor| {
+                let mut params = base.clone();
+                params.after = cursor;
+                params.limit = Some(OKX_PAGE_SIZE as u32);
+                async move {
+                    match self.inner.get_order_algo_pending(params).await {
+                        Ok(page) => Ok(page),
+                        Err(OKXHttpError::UnexpectedStatus { status, .. })
+                            if status == StatusCode::NOT_FOUND
+                                && !require_complete_active_coverage =>
+                        {
+                            Ok(Vec::new())
+                        }
+                        Err(e) => Err(e.into()),
+                    }
                 }
-                Err(e) => return Err(e.into()),
-            };
+            },
+            |order: &OKXOrderAlgo| order.algo_id.as_str(),
+        )
+        .await?;
+        Ok(PageSweep {
+            items,
+            complete: true,
+        })
+    }
 
-            let page_len = page.len();
-            cursor = page.last().map(|o| o.algo_id.clone());
-            all.extend(page);
-
-            if page_len < OKX_PAGE_SIZE {
-                exhausted = false;
-                break;
-            }
-
-            if let Some(lim) = limit
-                && all.len() >= lim
-            {
-                exhausted = false;
-                break;
-            }
-        }
-
-        if exhausted && !all.is_empty() {
-            log::warn!(
-                "Algo pending pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
-                 results may be truncated ({} records)",
-                all.len()
-            );
-        }
-
-        Ok(PageSweep::from_pages(all, exhausted))
+    /// 分页读取指定类型的条件挂单；HTTP 错误不能作为空列表。
+    async fn paginate_algo_pending_sweep(
+        &self,
+        base: &GetAlgoOrdersParams,
+        limit: Option<usize>,
+    ) -> anyhow::Result<PageSweep<OKXOrderAlgo>> {
+        self.paginate_algo_pending(base, limit, true).await
     }
 
     // Paginates through historical algo orders using `algo_id` as the cursor
@@ -5949,7 +6129,7 @@ impl OKXHttpClient {
             .map_err(|e| OKXHttpError::ValidationError(e.to_string()))?;
 
         let pending = self
-            .paginate_orders_pending(&pending_base, None)
+            .paginate_orders_pending_sweep(&pending_base, None)
             .await
             .map_err(|e| OKXHttpError::ValidationError(e.to_string()))?;
         let requests = pending
@@ -6252,6 +6432,7 @@ impl OKXHttpClient {
         new_sl_trigger_px_type: Option<String>,
     ) -> Result<OKXAmendAlgoOrderResponse, OKXHttpError> {
         let request = OKXAmendAlgoOrderRequest {
+            req_id: None,
             inst_id: instrument_id.symbol.as_str().to_string(),
             algo_id,
             algo_cl_ord_id: None,
@@ -6616,6 +6797,17 @@ impl OKXHttpClient {
         let trigger_px_type_enum = trigger_type.map_or(OKXTriggerType::Last, Into::into);
 
         let uses_close_fraction = close_fraction.is_some();
+        // Reduce-only stops use the TP/SL conditional API, not generic trigger orders.
+        // Preserve exact filled quantity; closeFraction is only used when requested.
+        let uses_reduce_only_stop = reduce_only == Some(true)
+            && matches!(
+                order_type,
+                OrderType::StopMarket
+                    | OrderType::StopLimit
+                    | OrderType::MarketIfTouched
+                    | OrderType::LimitIfTouched
+            );
+
         let (
             algo_type,
             sz,
@@ -6630,7 +6822,7 @@ impl OKXHttpClient {
             tp_trigger_px_type,
             pos_side,
             reduce_only,
-        ) = if uses_close_fraction {
+        ) = if uses_close_fraction || uses_reduce_only_stop {
             if order_type == OrderType::TrailingStopMarket {
                 return Err(OKXHttpError::ValidationError(
                     "OKX close_fraction does not support TrailingStopMarket".to_string(),
@@ -6687,7 +6879,11 @@ impl OKXHttpClient {
 
             (
                 OKXAlgoOrderType::Conditional,
-                None,
+                if uses_close_fraction {
+                    None
+                } else {
+                    Some(quantity.to_string())
+                },
                 None,
                 None,
                 None,
@@ -7337,6 +7533,8 @@ fn parse_http_algo_order(
     };
 
     let msg = OKXAlgoOrderMsg {
+        req_id: None,
+        amend_result: None,
         algo_id: order.algo_id.clone(),
         algo_cl_ord_id: order.algo_cl_ord_id.clone(),
         cl_ord_id: order.cl_ord_id.clone(),

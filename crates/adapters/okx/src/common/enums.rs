@@ -821,6 +821,17 @@ pub enum OKXTriggerType {
     Mark,
 }
 
+impl From<OKXTriggerType> for TriggerType {
+    fn from(value: OKXTriggerType) -> Self {
+        match value {
+            OKXTriggerType::Last => Self::LastPrice,
+            OKXTriggerType::Mark => Self::MarkPrice,
+            OKXTriggerType::Index => Self::IndexPrice,
+            OKXTriggerType::None => Self::Default,
+        }
+    }
+}
+
 impl From<TriggerType> for OKXTriggerType {
     fn from(value: TriggerType) -> Self {
         match value {
@@ -1392,6 +1403,20 @@ pub enum OKXAlgoOrderType {
     /// Forward-compatible fallback for algo order types OKX adds later.
     #[serde(other)]
     Other,
+}
+
+impl OKXAlgoOrderType {
+    /// 账户算法挂单查询覆盖的官方类型，不表示执行端支持这些算法。
+    pub const QUERY_TYPES: [Self; 8] = [
+        Self::Conditional,
+        Self::Oco,
+        Self::Trigger,
+        Self::MoveOrderStop,
+        Self::Iceberg,
+        Self::Twap,
+        Self::Chase,
+        Self::SmartIceberg,
+    ];
 }
 
 /// Returns whether an order type requires algo order handling.

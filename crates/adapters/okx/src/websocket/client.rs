@@ -216,6 +216,51 @@ pub(crate) struct PendingOrderInfo {
     pub trader_id: TraderId,
     pub strategy_id: StrategyId,
     pub instrument_id: InstrumentId,
+    pub command_id: Option<nautilus_core::UUID4>,
+}
+
+impl PendingOrderInfo {
+    pub(crate) fn from_modification(
+        command: &nautilus_common::messages::execution::ModifyOrder,
+    ) -> Self {
+        Self {
+            trader_id: command.trader_id,
+            strategy_id: command.strategy_id,
+            instrument_id: command.instrument_id,
+            command_id: Some(command.command_id),
+        }
+    }
+
+    pub(crate) fn rejection(
+        &self,
+        account_id: AccountId,
+        order_id: ClientOrderId,
+        venue_order_id: Option<VenueOrderId>,
+        reason: &str,
+        ts_event: nautilus_core::UnixNanos,
+        ts_init: nautilus_core::UnixNanos,
+    ) -> nautilus_model::events::OrderEventAny {
+        let mut event = nautilus_model::events::OrderModifyRejected::new(
+            self.trader_id,
+            self.strategy_id,
+            self.instrument_id,
+            order_id,
+            reason.into(),
+            nautilus_core::UUID4::new(),
+            ts_event,
+            ts_init,
+            false,
+            venue_order_id,
+            Some(account_id),
+        );
+        event.causation_id = self.command_id;
+        nautilus_model::events::OrderEventAny::ModifyRejected(event)
+    }
+
+    pub(crate) fn matches_amendment(&self, request_id: Option<&str>) -> bool {
+        self.command_id
+            .is_some_and(|id| request_id == Some(id.to_string().replace('-', "").as_str()))
+    }
 }
 
 /// Provides a WebSocket client for connecting to [OKX](https://okx.com).
@@ -2699,6 +2744,7 @@ impl OKXWebSocketClient {
                 trader_id,
                 strategy_id,
                 instrument_id,
+                command_id: None,
             },
         );
 
@@ -2748,8 +2794,11 @@ impl OKXWebSocketClient {
         new_px_vol: Option<String>,
         rpi_taker_access: Option<bool>,
         rpi_px_round: Option<bool>,
+        command_id: nautilus_core::UUID4,
     ) -> Result<(), OKXWsError> {
         let mut builder = WsAmendOrderParamsBuilder::default();
+        let request_id = command_id.to_string().replace('-', "");
+        builder.req_id(request_id.clone());
 
         let inst_id_code = self
             .get_inst_id_code(&instrument_id.symbol.inner())
@@ -2768,14 +2817,6 @@ impl OKXWebSocketClient {
 
         if let Some(client_order_id) = client_order_id {
             builder.cl_ord_id(client_order_id.as_str());
-            self.pending_amends.insert(
-                client_order_id.to_string(),
-                PendingOrderInfo {
-                    trader_id,
-                    strategy_id,
-                    instrument_id,
-                },
-            );
         }
 
         // For options: newPxUsd/newPxVol are mutually exclusive with newPx
@@ -2803,7 +2844,6 @@ impl OKXWebSocketClient {
             .build()
             .map_err(|e| OKXWsError::ClientError(format!("Build amend params error: {e}")))?;
 
-        let request_id = self.generate_unique_request_id();
         let request = OKXWsRequest {
             id: Some(request_id.clone()),
             op: super::enums::OKXWsOperation::AmendOrder,
@@ -2813,6 +2853,22 @@ impl OKXWebSocketClient {
 
         let payload = serde_json::to_string(&request)
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize amend: {e}")))?;
+
+        if let Some(client_order_id) = client_order_id {
+            match self.pending_amends.entry(client_order_id.to_string()) {
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    return Err(OKXWsError::ClientError("该订单已有待确认改单".into()));
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    entry.insert(PendingOrderInfo {
+                        trader_id,
+                        strategy_id,
+                        instrument_id,
+                        command_id: Some(command_id),
+                    });
+                }
+            }
+        }
 
         let cmd = HandlerCommand::Send {
             payload,
@@ -2874,6 +2930,7 @@ impl OKXWebSocketClient {
                     trader_id,
                     strategy_id,
                     instrument_id,
+                    command_id: None,
                 },
             );
         }

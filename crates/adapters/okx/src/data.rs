@@ -2824,28 +2824,38 @@ impl DataClient for OKXDataClient {
         let end_nanos = datetime_to_unix_nanos(end);
 
         self.spawn_task(async move {
-            match http
-                .request_bars(bar_type, start, end, limit)
-                .await
-                .context("failed to request bars from OKX")
-            {
-                Ok(bars) => {
-                    let response = DataResponse::Bars(BarsResponse::new(
-                        request_id,
-                        client_id,
-                        bar_type,
-                        bars,
-                        start_nanos,
-                        end_nanos,
-                        clock.get_time_ns(),
-                        params,
-                    ));
-
-                    if let Err(e) = sender.send(DataEvent::Response(response)) {
-                        log::error!("Failed to send bars response: {e}");
+            // Retry before publishing a single response: indicators must never receive
+            // overlapping partial history from successive transport attempts.
+            let mut result = Vec::new();
+            for attempt in 0..3 {
+                match http.request_bars(bar_type, start, end, limit).await {
+                    Ok(bars) => {
+                        let sufficient = !bars.is_empty()
+                            && limit.is_none_or(|count| bars.len() >= count as usize);
+                        result = bars;
+                        if sufficient { break; }
+                        log::warn!("Historical bars incomplete: {bar_type}, received={}, requested={limit:?}, attempt={}", result.len(), attempt + 1);
+                    }
+                    Err(error) => {
+                        result.clear();
+                        log::warn!("Historical bars attempt {} failed for {bar_type}: {error}", attempt + 1);
                     }
                 }
-                Err(e) => log::error!("Bar request failed: {e:?}"),
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                }
+            }
+            if let Err(error) = historical_bar_availability(&mut result) {
+                log::error!("Historical bar availability invalid for {bar_type}: {error}");
+                result.clear();
+            }
+            log::info!("Historical bars response: {bar_type}, records={}", result.len());
+            let response = DataResponse::Bars(BarsResponse::new(
+                request_id, client_id, bar_type, result, start_nanos, end_nanos,
+                clock.get_time_ns(), params,
+            ));
+            if let Err(error) = sender.send(DataEvent::Response(response)) {
+                log::error!("Failed to send bars response: {error}");
             }
         });
 
@@ -2989,6 +2999,20 @@ fn push_convention_str(out: &mut AHashSet<OKXGreeksType>, raw: &str) {
     }
 }
 
+// DataEngine trims historical responses by each record's ts_init. HTTP arrival
+// occurs after the request end, so using arrival here discards the whole batch.
+// For confirmed historical bars, availability is the close of the candle; the
+// response envelope keeps the actual receive time. Live bar timestamps are untouched.
+fn historical_bar_availability(bars: &mut [nautilus_model::data::Bar]) -> anyhow::Result<()> {
+    for bar in bars {
+        let interval = u64::try_from(bar.bar_type.spec().timedelta().as_nanos())?;
+        let closed_at = bar.ts_event.as_u64().checked_add(interval)
+            .ok_or_else(|| anyhow::anyhow!("historical bar close timestamp overflow"))?;
+        bar.ts_init = closed_at.into();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, net::SocketAddr, sync::Arc};
@@ -3006,6 +3030,31 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    #[test]
+    fn historical_bars_survive_engine_bounds_using_close_time() {
+        use nautilus_core::UUID4;
+        use nautilus_model::{data::{Bar, BarType}, types::{Price, Quantity}};
+        let kind: BarType = "BTC-USDT-SWAP.OKX-5-MINUTE-LAST-EXTERNAL".parse().unwrap();
+        let interval = 300_000_000_000u64;
+        let end = 4 * interval;
+        let mut bars: Vec<_> = (1..=4).map(|slot| Bar::new(kind,
+            Price::new(100., 2), Price::new(101., 2), Price::new(99., 2),
+            Price::new(100., 2), Quantity::new(1., 2), (slot * interval).into(),
+            (end + 1).into())).collect();
+        let response = |data| DataResponse::Bars(BarsResponse::new(UUID4::new(),
+            ClientId::from("OKX"), kind, data, None, Some(end.into()), (end+1).into(), None));
+        let mut old = response(bars.clone());
+        old.trim_to_bounds();
+        assert_eq!(old.record_count(), Some(0));
+        historical_bar_availability(&mut bars).unwrap();
+        let mut fixed = response(bars);
+        fixed.trim_to_bounds();
+        let DataResponse::Bars(fixed) = fixed else { unreachable!() };
+        assert_eq!(fixed.data.len(), 3);
+        assert_eq!(fixed.data.last().unwrap().ts_init.as_u64(), end);
+        assert_eq!(fixed.ts_init.as_u64(), end + 1);
+    }
+
     use crate::{
         common::{
             consts::OKX_CLIENT_ID, enums::OKXEnvironment, models::OKXInstrument,

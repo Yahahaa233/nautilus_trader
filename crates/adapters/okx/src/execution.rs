@@ -52,7 +52,8 @@ use nautilus_live::{
 use nautilus_model::{
     accounts::AccountAny,
     enums::{
-        AccountType, OmsType, OrderStatus, OrderType, PositionSide, TimeInForce, TrailingOffsetType,
+        AccountType, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
+        TrailingOffsetType,
     },
     events::OrderDeniedReason,
     identifiers::{
@@ -74,7 +75,10 @@ use crate::{
             OKX_WS_HEARTBEAT_SECS, okx_reduce_only_wire_value, resolve_instrument_families,
             validate_okx_client_order_id,
         },
-        enums::{OKXInstrumentType, OKXMarginMode, OKXTradeMode, is_advance_algo_order},
+        enums::{
+            OKXAlgoOrderStatus, OKXAlgoOrderType, OKXInstrumentType, OKXMarginMode, OKXTradeMode,
+            is_advance_algo_order,
+        },
         failure::{classify_okx_http_failure, classify_okx_venue_code, classify_okx_ws_failure},
         parse::{
             is_okx_spread_symbol, is_order_status_report_more_advanced, nanos_to_datetime,
@@ -88,7 +92,9 @@ use crate::{
             AlgoOrderReportSweep, FillHistory, OKXHttpClient, OKXPendingAlgoOrderReportsError,
             ReportInstrumentScope,
         },
-        models::OKXCancelAlgoOrderRequest,
+        error::OKXHttpError,
+        models::{OKXAmendAlgoOrderRequest, OKXCancelAlgoOrderRequest, OKXOrderAlgo},
+        query::GetAlgoOrderParams,
     },
     websocket::{
         client::OKXWebSocketClient,
@@ -666,7 +672,7 @@ impl OKXExecutionClient {
         }
     }
 
-    fn cancel_order_route(
+    fn existing_order_route(
         &self,
         instrument_id: InstrumentId,
         order_state: Option<(OrderType, Option<bool>)>,
@@ -961,6 +967,128 @@ impl OKXExecutionClient {
         });
 
         Ok(())
+    }
+
+    fn modify_algo_order(&self, command: ModifyOrder) {
+        let info = crate::websocket::client::PendingOrderInfo::from_modification(&command);
+        let expected = {
+            let cache = self.core.cache();
+            cache
+                .order(&command.client_order_id)
+                .map(|order| (order.order_type(), order.order_side()))
+        };
+        let pending = self.ws_dispatch_state.pending_amends.clone();
+        match pending.entry(command.client_order_id.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                if entry.get().command_id == info.command_id {
+                    return;
+                }
+                drop(entry);
+                let now = self.clock.get_time_ns();
+                self.emitter.send_order_event(info.rejection(
+                    self.emitter.account_id(),
+                    command.client_order_id,
+                    command.venue_order_id,
+                    "已有未决改单",
+                    now,
+                    now,
+                ));
+                return;
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(info.clone());
+            }
+        }
+        self.ensure_order_identity(
+            command.client_order_id,
+            command.strategy_id,
+            command.instrument_id,
+        );
+        let http = self.http_client.clone();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        self.spawn_task("modify_algo_order", async move {
+            // 查询负责识别实际交易所类型；查询失败时尚未发送修改，可明确拒绝。
+            let request = match http
+                .raw_client()
+                .get_algo_order(GetAlgoOrderParams {
+                    algo_id: command.venue_order_id.map(|id| id.to_string()),
+                    algo_cl_ord_id: Some(command.client_order_id.to_string()),
+                })
+                .await
+            {
+                Ok(orders) if orders.len() == 1 => {
+                    build_algo_amendment(&command, &orders[0], expected)
+                }
+                Ok(_) => Err(anyhow::anyhow!("条件单查询必须唯一匹配")),
+                Err(error) => Err(anyhow::anyhow!("条件单修改前查询失败：{error}")),
+            };
+            let outcome = match request {
+                Err(error) => Some(error.to_string()),
+                Ok(request) => {
+                    let req_id = request.req_id.clone();
+                    let algo_id = request.algo_id.clone();
+                    match http.amend_algo_order(request).await {
+                        Ok(response)
+                            if response.req_id == req_id && response.algo_id == algo_id =>
+                        {
+                            match response.s_code.as_deref() {
+                                Some("0") => None, // 只接收请求；订单频道确认后才删除待确认登记。
+                                Some(code) if !code.is_empty() => {
+                                    let error = OKXHttpError::OkxError {
+                                        error_code: code.to_string(),
+                                        message: response.s_msg.unwrap_or_default(),
+                                    };
+                                    if is_okx_http_modify_rejection(&error) {
+                                        Some(error.to_string())
+                                    } else {
+                                        log::warn!("条件单改单响应结果不明：{error}");
+                                        None
+                                    }
+                                }
+                                _ => {
+                                    log::warn!(
+                                        "条件单改单响应结果不明：{}",
+                                        command.client_order_id
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            log::warn!("条件单改单响应身份不匹配：{}", command.client_order_id);
+                            None
+                        }
+                        Err(error) if is_okx_http_modify_rejection(&error) => {
+                            Some(error.to_string())
+                        }
+                        Err(error) => {
+                            log::warn!("条件单改单结果不明，保留待确认登记：{error}");
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some(reason) = outcome {
+                if pending
+                    .remove_if(command.client_order_id.as_str(), |_, current| {
+                        current.command_id == info.command_id
+                    })
+                    .is_some()
+                {
+                    let now = clock.get_time_ns();
+                    emitter.send_order_event(info.rejection(
+                        emitter.account_id(),
+                        command.client_order_id,
+                        command.venue_order_id,
+                        &reason,
+                        now,
+                        now,
+                    ));
+                }
+            }
+            Ok(())
+        });
     }
 
     fn cancel_ws_order(&self, cmd: &CancelOrder) {
@@ -2427,15 +2555,34 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
-        if is_spread_instrument(cmd.instrument_id) {
-            self.emitter.emit_order_modify_rejected_event(
-                cmd.strategy_id,
+        let route = {
+            let cache = self.core.cache();
+            let order_state = cache
+                .order(&cmd.client_order_id)
+                .map(|order| (order.order_type(), order.is_triggered()));
+            self.existing_order_route(
                 cmd.instrument_id,
+                order_state,
+                self.ws_dispatch_state
+                    .order_venue_binding(cmd.client_order_id)
+                    .is_some_and(|(_, bound)| bound),
+            )
+        };
+        if route == OrderCommandRoute::AlgoHttp {
+            self.modify_algo_order(cmd);
+            return Ok(());
+        }
+        let info = crate::websocket::client::PendingOrderInfo::from_modification(&cmd);
+        if is_spread_instrument(cmd.instrument_id) {
+            let now = self.clock.get_time_ns();
+            self.emitter.send_order_event(info.rejection(
+                self.emitter.account_id(),
                 cmd.client_order_id,
                 cmd.venue_order_id,
                 "OKX spread orders do not support modify requests",
-                self.clock.get_time_ns(),
-            );
+                now,
+                now,
+            ));
             return Ok(());
         }
 
@@ -2471,19 +2618,30 @@ impl ExecutionClient for OKXExecutionClient {
                     new_px_vol,
                     rpi_taker_access,
                     rpi_px_round,
+                    command.command_id,
                 )
                 .await;
 
             if let Err(e) = result {
-                emit_modify_failure(
+                if matches!(
                     classify_okx_ws_failure(&e),
-                    &emitter,
-                    clock,
-                    command.strategy_id,
-                    command.instrument_id,
-                    command.client_order_id,
-                    command.venue_order_id,
-                );
+                    CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
+                ) {
+                    let ts_event = clock.get_time_ns();
+                    emitter.send_order_event(info.rejection(
+                        emitter.account_id(),
+                        command.client_order_id,
+                        command.venue_order_id,
+                        &format!("modify-order-error: {e}"),
+                        ts_event,
+                        ts_event,
+                    ));
+                } else {
+                    log::warn!(
+                        "Ambiguous modify failure for {}, awaiting reconciliation: {e}",
+                        command.client_order_id
+                    );
+                }
                 return Err(anyhow::Error::new(e).context("modify order failed"));
             }
 
@@ -2502,7 +2660,7 @@ impl ExecutionClient for OKXExecutionClient {
             let order_state = cache
                 .order(&cmd.client_order_id)
                 .map(|order| (order.order_type(), order.is_triggered()));
-            self.cancel_order_route(
+            self.existing_order_route(
                 cmd.instrument_id,
                 order_state,
                 venue_binding.is_some_and(|(_, has_bound_child)| has_bound_child),
@@ -2555,7 +2713,7 @@ impl ExecutionClient for OKXExecutionClient {
                     let authoritative_venue_order_id = venue_binding
                         .map(|(venue_order_id, _)| venue_order_id)
                         .or(order.venue_order_id());
-                    match self.cancel_order_route(
+                    match self.existing_order_route(
                         order.instrument_id(),
                         order_state,
                         venue_binding.is_some_and(|(_, has_bound_child)| has_bound_child),
@@ -2672,7 +2830,7 @@ impl ExecutionClient for OKXExecutionClient {
             let authoritative_venue_order_id = venue_binding
                 .map(|(venue_order_id, _)| venue_order_id)
                 .or(cancel.venue_order_id);
-            match self.cancel_order_route(
+            match self.existing_order_route(
                 cancel.instrument_id,
                 order_state,
                 venue_binding.is_some_and(|(_, has_bound_child)| has_bound_child),
@@ -3078,6 +3236,121 @@ enum OrderSubmission {
     List,
 }
 
+fn build_algo_amendment(
+    command: &ModifyOrder,
+    order: &OKXOrderAlgo,
+    expected: Option<(OrderType, OrderSide)>,
+) -> anyhow::Result<OKXAmendAlgoOrderRequest> {
+    let (order_type, side) = expected.ok_or_else(|| anyhow::anyhow!("缺少原始条件单"))?;
+    anyhow::ensure!(OrderSide::from(order.side) == side, "条件单方向不匹配");
+    let is_limit = matches!(order_type, OrderType::StopLimit | OrderType::LimitIfTouched);
+    anyhow::ensure!(
+        is_limit || command.price.is_none(),
+        "市价条件单不能通过改单变为限价单"
+    );
+
+    anyhow::ensure!(
+        order.inst_id.as_str() == command.instrument_id.symbol.as_str()
+            && order.algo_cl_ord_id == command.client_order_id.as_str()
+            && command
+                .venue_order_id
+                .is_none_or(|id| id.as_str() == order.algo_id),
+        "条件单查询身份不匹配"
+    );
+    anyhow::ensure!(
+        order.state == OKXAlgoOrderStatus::Live && order.ord_id.is_empty(),
+        "条件单已经触发或终止"
+    );
+    anyhow::ensure!(
+        command
+            .params
+            .as_ref()
+            .is_none_or(|params| params.is_empty()),
+        "条件单改单不接受额外参数"
+    );
+    anyhow::ensure!(
+        command.quantity.is_some() || command.price.is_some() || command.trigger_price.is_some(),
+        "改单字段为空"
+    );
+    anyhow::ensure!(
+        command.quantity.is_none_or(|q| q.as_f64() > 0.0)
+            && command.price.is_none_or(|p| p.as_f64() > 0.0)
+            && command.trigger_price.is_none_or(|p| p.as_f64() > 0.0),
+        "条件单修改值必须大于零"
+    );
+    anyhow::ensure!(
+        order.close_fraction.is_empty() || command.quantity.is_none(),
+        "按持仓比例退出的条件单不能改为固定数量"
+    );
+    let mut request = OKXAmendAlgoOrderRequest {
+        req_id: Some(command.command_id.to_string().replace('-', "")),
+        inst_id: order.inst_id.to_string(),
+        algo_id: order.algo_id.clone(),
+        algo_cl_ord_id: Some(order.algo_cl_ord_id.clone()),
+        new_sz: command.quantity.map(|q| q.to_string()),
+        new_trigger_px: None,
+        new_tp_trigger_px: None,
+        new_tp_ord_px: None,
+        new_tp_trigger_px_type: None,
+        new_sl_trigger_px: None,
+        new_sl_ord_px: None,
+        new_sl_trigger_px_type: None,
+        new_order_px: None,
+        new_callback_ratio: None,
+        new_callback_spread: None,
+        new_active_px: None,
+    };
+    match order.ord_type {
+        OKXAlgoOrderType::Trigger => {
+            anyhow::ensure!(
+                command.price.is_none() && command.trigger_price.is_none(),
+                "计划委托改价字段尚无已核实协议，不能发送"
+            );
+        }
+        OKXAlgoOrderType::Conditional => {
+            let sl = !order.sl_trigger_px.is_empty();
+            let tp = !order.tp_trigger_px.is_empty();
+            anyhow::ensure!(sl != tp, "条件单必须只有一个明确止盈或止损方向");
+            anyhow::ensure!(
+                matches!(
+                    (sl, order_type),
+                    (true, OrderType::StopMarket | OrderType::StopLimit)
+                        | (
+                            false,
+                            OrderType::MarketIfTouched | OrderType::LimitIfTouched
+                        )
+                ),
+                "条件单止盈止损类型与原单不匹配"
+            );
+            let working_price = if sl {
+                &order.sl_ord_px
+            } else {
+                &order.tp_ord_px
+            };
+            anyhow::ensure!(
+                !working_price.is_empty() && (working_price != "-1") == is_limit,
+                "条件单限价市价类型与原单不匹配"
+            );
+            if sl {
+                request.new_sl_trigger_px = command.trigger_price.map(|p| p.to_string());
+                request.new_sl_ord_px = command.price.map(|p| p.to_string());
+            } else {
+                request.new_tp_trigger_px = command.trigger_price.map(|p| p.to_string());
+                request.new_tp_ord_px = command.price.map(|p| p.to_string());
+            }
+        }
+        _ => anyhow::bail!("不支持该条件单类型的原生修改"),
+    }
+    Ok(request)
+}
+
+fn is_okx_http_modify_rejection(error: &OKXHttpError) -> bool {
+    matches!(
+        classify_okx_http_failure(error),
+        CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
+    )
+}
+
 fn emit_submit_failure(
     failure: CommandFailure,
     emitter: &ExecutionEventEmitter,
@@ -3100,34 +3373,6 @@ fn emit_submit_failure(
         CommandFailure::Ambiguous(reason) => {
             log::warn!(
                 "Ambiguous submit failure for {client_order_id}, awaiting reconciliation: {reason}"
-            );
-        }
-    }
-}
-
-fn emit_modify_failure(
-    failure: CommandFailure,
-    emitter: &ExecutionEventEmitter,
-    clock: &'static AtomicTime,
-    strategy_id: StrategyId,
-    instrument_id: InstrumentId,
-    client_order_id: ClientOrderId,
-    venue_order_id: Option<VenueOrderId>,
-) {
-    match failure {
-        CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
-            emitter.emit_order_modify_rejected_event(
-                strategy_id,
-                instrument_id,
-                client_order_id,
-                venue_order_id,
-                &reason,
-                clock.get_time_ns(),
-            );
-        }
-        CommandFailure::Ambiguous(reason) => {
-            log::warn!(
-                "Ambiguous modify failure for {client_order_id}, awaiting reconciliation: {reason}"
             );
         }
     }
@@ -3459,6 +3704,19 @@ mod tests {
             ),
             QueryOrderRoute::Spread,
         );
+    }
+
+    #[rstest]
+    #[case("51000", true)]
+    #[case("50001", false)]
+    #[case("50004", false)]
+    #[case("51149", false)]
+    fn test_modify_http_failure_classification(#[case] code: &str, #[case] rejected: bool) {
+        let error = OKXHttpError::OkxError {
+            error_code: code.into(),
+            message: "test".into(),
+        };
+        assert_eq!(is_okx_http_modify_rejection(&error), rejected);
     }
 
     #[rstest]
@@ -4056,11 +4314,11 @@ mod tests {
         let pending_trigger = Some((OrderType::StopLimit, Some(false)));
 
         assert_eq!(
-            client.cancel_order_route(instrument_id, pending_trigger, false),
+            client.existing_order_route(instrument_id, pending_trigger, false),
             OrderCommandRoute::AlgoHttp
         );
         assert_eq!(
-            client.cancel_order_route(instrument_id, pending_trigger, true),
+            client.existing_order_route(instrument_id, pending_trigger, true),
             OrderCommandRoute::RegularWs
         );
     }

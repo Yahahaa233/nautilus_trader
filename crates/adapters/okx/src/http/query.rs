@@ -616,7 +616,8 @@ pub struct GetAlgoOrdersParams {
     /// Client supplied algo order identifier (optional).
     #[serde(rename = "algoClOrdId", skip_serializing_if = "Option::is_none")]
     pub algo_cl_ord_id: Option<String>,
-    /// Instrument type: SPOT, MARGIN, SWAP, FUTURES, OPTION.
+    /// Any 表示不按品种类型过滤；接口不接受字面量 ANY。
+    #[serde(skip_serializing_if = "is_any_instrument_type")]
     pub inst_type: OKXInstrumentType,
     /// Specific instrument identifier (optional).
     #[serde(rename = "instId", skip_serializing_if = "Option::is_none")]
@@ -636,6 +637,10 @@ pub struct GetAlgoOrdersParams {
     /// Maximum number of records to return (optional, default 100).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+}
+
+fn is_any_instrument_type(value: &OKXInstrumentType) -> bool {
+    *value == OKXInstrumentType::Any
 }
 
 /// Parameters for the GET /api/v5/trade/fills endpoint (transaction details).

@@ -141,6 +141,41 @@ pub struct OrderStateSnapshot {
     pub price: Option<Price>,
 }
 
+/// 将订单频道的当前数量与价格转换为修改事件。
+pub(crate) fn parse_order_update(
+    msg: &OKXOrderMsg,
+    client_order_id: ClientOrderId,
+    account_id: AccountId,
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderUpdated> {
+    let quantity = parse_quantity(&msg.sz, instrument.size_precision())?;
+    let price = if is_market_price(&msg.px) {
+        None
+    } else {
+        Some(parse_price(&msg.px, instrument.price_precision())?)
+    };
+    Ok(OrderUpdated::new(
+        trader_id,
+        strategy_id,
+        instrument.id(),
+        client_order_id,
+        quantity,
+        UUID4::new(),
+        parse_millisecond_timestamp(msg.u_time),
+        ts_init,
+        false,
+        Some(VenueOrderId::new(msg.ord_id)),
+        Some(account_id),
+        price,
+        None,
+        None,
+        false,
+    ))
+}
+
 /// Parses an OKX order message into a specific order event.
 ///
 /// This function determines the appropriate event type based on:
@@ -191,31 +226,15 @@ pub fn parse_order_event(
         && let Some(prev) = previous_state
         && is_order_updated_excluding_venue_id_for_live(msg, prev, instrument)?
     {
-        let ts_event = parse_millisecond_timestamp(msg.u_time);
-        let quantity = parse_quantity(&msg.sz, instrument.size_precision())?;
-        let price = if is_market_price(&msg.px) {
-            None
-        } else {
-            Some(parse_price(&msg.px, instrument.price_precision())?)
-        };
-
-        return Ok(ParsedOrderEvent::Updated(OrderUpdated::new(
+        return Ok(ParsedOrderEvent::Updated(parse_order_update(
+            msg,
+            client_order_id,
+            account_id,
             trader_id,
             strategy_id,
-            instrument_id,
-            client_order_id,
-            quantity,
-            UUID4::new(),
-            ts_event,
+            instrument,
             ts_init,
-            false, // reconciliation
-            Some(venue_order_id),
-            Some(account_id),
-            price,
-            None,  // trigger_price
-            None,  // protection_price
-            false, // is_quote_quantity
-        )));
+        )?));
     }
 
     match msg.state {
@@ -1558,12 +1577,7 @@ pub fn parse_algo_order_status_report(
         )?)
     };
 
-    let trigger_type = match algo_fields.trigger_px_type {
-        OKXTriggerType::Last => TriggerType::LastPrice,
-        OKXTriggerType::Mark => TriggerType::MarkPrice,
-        OKXTriggerType::Index => TriggerType::IndexPrice,
-        OKXTriggerType::None => TriggerType::Default,
-    };
+    let trigger_type = TriggerType::from(algo_fields.trigger_px_type);
 
     let ts_accepted = parse_millisecond_timestamp(msg.c_time);
     let ts_last = parse_millisecond_timestamp(msg.u_time);
@@ -6632,6 +6646,8 @@ mod tests {
         let ts_init = UnixNanos::from(999_000_000_000u64);
 
         let msg = OKXAlgoOrderMsg {
+            req_id: None,
+            amend_result: None,
             algo_id: "algo_1".to_string(),
             algo_cl_ord_id: "algo_cl_1".to_string(),
             cl_ord_id: String::new(),
@@ -6686,6 +6702,8 @@ mod tests {
 
     fn stub_algo_order_msg(ord_type: OKXAlgoOrderType) -> OKXAlgoOrderMsg {
         OKXAlgoOrderMsg {
+            req_id: None,
+            amend_result: None,
             algo_id: "algo_1".to_string(),
             algo_cl_ord_id: "algo_cl_1".to_string(),
             cl_ord_id: String::new(),

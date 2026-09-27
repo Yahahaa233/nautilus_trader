@@ -21,7 +21,7 @@ use anyhow::Context;
 use jiff::Timestamp;
 pub use nautilus_core::serialization::{
     deserialize_empty_string_as_none, deserialize_empty_ustr_as_none,
-    deserialize_optional_string_to_u64, deserialize_string_to_u64,
+    deserialize_optional_string_to_u64,
 };
 use nautilus_core::{Params, UUID4, datetime::NANOSECONDS_IN_MILLISECOND, nanos::UnixNanos};
 use nautilus_model::{
@@ -124,6 +124,15 @@ pub fn determine_order_type(okx_ord_type: OKXOrderType, px: &str) -> anyhow::Res
     determine_order_type_with_alt(okx_ord_type, px, "", "")
 }
 
+/// 普通订单、价差订单与账户对账共用有效期转换。
+pub fn parse_time_in_force(order_type: OKXOrderType) -> TimeInForce {
+    match order_type {
+        OKXOrderType::Fok | OKXOrderType::OpFok => TimeInForce::Fok,
+        OKXOrderType::Ioc | OKXOrderType::OptimalLimitIoc => TimeInForce::Ioc,
+        _ => TimeInForce::Gtc,
+    }
+}
+
 /// Like [`determine_order_type`] but considers alternative pricing fields.
 ///
 /// When options are priced via `px_vol` or `px_usd`, the primary `px` field
@@ -166,11 +175,34 @@ pub fn deserialize_target_currency_as_none<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    if s.is_empty() {
-        Ok(None)
-    } else {
-        s.parse().map(Some).map_err(serde::de::Error::custom)
+    match Option::<String>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) => s.parse().map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StringOrU64 {
+    String(String),
+    Number(u64),
+}
+
+/// Deserializes an OKX timestamp represented either as its API string or as
+/// the numeric form emitted when a parsed response is persisted as JSON.
+///
+/// OKX sends timestamp fields as strings, while `Serialize` for the typed
+/// `u64` model fields writes numbers. Recovery query evidence must accept both
+/// representations so a collected response can be inspected offline.
+pub fn deserialize_string_to_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match StringOrU64::deserialize(deserializer)? {
+        StringOrU64::String(value) if value.is_empty() => Ok(0),
+        StringOrU64::String(value) => value.parse::<u64>().map_err(serde::de::Error::custom),
+        StringOrU64::Number(value) => Ok(value),
     }
 }
 
@@ -836,11 +868,7 @@ pub fn parse_order_status_report(
         .state
         .try_into()
         .map_err(|e| anyhow::anyhow!("Unsupported OKX order status: {e}"))?;
-    let time_in_force = match okx_ord_type {
-        OKXOrderType::Fok | OKXOrderType::OpFok => TimeInForce::Fok,
-        OKXOrderType::Ioc | OKXOrderType::OptimalLimitIoc => TimeInForce::Ioc,
-        _ => TimeInForce::Gtc,
-    };
+    let time_in_force = parse_time_in_force(okx_ord_type);
 
     let client_order_id = parse_parent_client_order_id(
         order.algo_cl_ord_id.as_ref().map(Ustr::as_str),
@@ -1232,11 +1260,7 @@ pub fn parse_spread_order_status_report(
         .state
         .try_into()
         .map_err(|e| anyhow::anyhow!("Unsupported OKX order status: {e}"))?;
-    let time_in_force = match order.ord_type {
-        OKXOrderType::Ioc | OKXOrderType::OptimalLimitIoc => TimeInForce::Ioc,
-        OKXOrderType::Fok | OKXOrderType::OpFok => TimeInForce::Fok,
-        _ => TimeInForce::Gtc,
-    };
+    let time_in_force = parse_time_in_force(order.ord_type);
     let client_order_id = if order.cl_ord_id.is_empty() {
         None
     } else {
@@ -4655,6 +4679,18 @@ mod tests {
     }
 
     #[rstest]
+    fn test_deserialize_target_currency_null_as_none() {
+        #[derive(Deserialize)]
+        struct TestStruct {
+            #[serde(deserialize_with = "deserialize_target_currency_as_none")]
+            value: Option<OKXTargetCurrency>,
+        }
+
+        let parsed: TestStruct = serde_json::from_str(r#"{"value":null}"#).unwrap();
+        assert!(parsed.value.is_none());
+    }
+
+    #[rstest]
     fn test_deserialize_string_to_u64() {
         use serde::Deserialize;
 
@@ -4671,6 +4707,10 @@ mod tests {
         let json_empty = r#"{"value": ""}"#;
         let result_empty: TestStruct = serde_json::from_str(json_empty).unwrap();
         assert_eq!(result_empty.value, 0);
+
+        let json_number = r#"{"value": 12345}"#;
+        let result_number: TestStruct = serde_json::from_str(json_number).unwrap();
+        assert_eq!(result_number.value, 12345);
     }
 
     #[rstest]
@@ -6144,11 +6184,7 @@ mod tests {
         #[case] okx_ord_type: OKXOrderType,
         #[case] expected_tif: TimeInForce,
     ) {
-        let time_in_force = match okx_ord_type {
-            OKXOrderType::Fok | OKXOrderType::OpFok => TimeInForce::Fok,
-            OKXOrderType::Ioc | OKXOrderType::OptimalLimitIoc => TimeInForce::Ioc,
-            _ => TimeInForce::Gtc,
-        };
+        let time_in_force = parse_time_in_force(okx_ord_type);
 
         assert_eq!(
             time_in_force, expected_tif,
@@ -6216,11 +6252,7 @@ mod tests {
         };
         assert_eq!(okx_ord_type, expected_okx_type);
 
-        let parsed_tif = match okx_ord_type {
-            OKXOrderType::Fok | OKXOrderType::OpFok => TimeInForce::Fok,
-            OKXOrderType::Ioc | OKXOrderType::OptimalLimitIoc => TimeInForce::Ioc,
-            _ => TimeInForce::Gtc,
-        };
+        let parsed_tif = parse_time_in_force(okx_ord_type);
         assert_eq!(parsed_tif, original_tif);
     }
 

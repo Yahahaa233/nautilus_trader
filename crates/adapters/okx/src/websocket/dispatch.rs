@@ -71,7 +71,7 @@ use crate::{
         messages::{ExecutionReport, OKXAlgoOrderMsg, OKXOrderMsg, OKXWsMessage},
         parse::{
             OrderStateSnapshot, ParsedOrderEvent, parse_algo_order_msg,
-            parse_algo_order_status_report, parse_order_event, parse_order_msg,
+            parse_algo_order_status_report, parse_order_event, parse_order_msg, parse_order_update,
             parse_spread_order_event, parse_spread_order_msg, update_fee_fill_caches,
         },
     },
@@ -79,6 +79,10 @@ use crate::{
 
 /// Maximum entries held by the dedup sets before the oldest is evicted.
 const DEDUP_CAPACITY: usize = 10_000;
+
+#[cfg(test)]
+#[path = "amendment_tests.rs"]
+mod amendment_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OrderVenueBinding {
@@ -633,7 +637,7 @@ pub fn dispatch_ws_message(
                             state.pending_cancels.remove(cl_ord_id);
                         }
                         OKXWsOperation::AmendOrder | OKXWsOperation::BatchAmendOrders => {
-                            state.pending_amends.remove(cl_ord_id);
+                            // 接收请求不代表修改成功，等待订单频道确认。
                         }
                         _ => {}
                     }
@@ -707,15 +711,19 @@ pub fn dispatch_ws_message(
                         );
                     }
                     OKXWsOperation::AmendOrder | OKXWsOperation::BatchAmendOrders => {
-                        state.pending_amends.remove(cl_ord_id);
-                        emitter.emit_order_modify_rejected_event(
-                            ident.strategy_id,
-                            ident.instrument_id,
-                            client_order_id,
-                            venue_order_id,
-                            &reason,
-                            ts_init,
-                        );
+                        let pending = state
+                            .pending_amends
+                            .remove_if(cl_ord_id, |_, info| info.matches_amendment(id.as_deref()));
+                        if let Some((_, info)) = pending {
+                            emitter.send_order_event(info.rejection(
+                                account_id,
+                                client_order_id,
+                                venue_order_id,
+                                &reason,
+                                ts_init,
+                                ts_init,
+                            ));
+                        }
                     }
                     _ => {
                         log::warn!(
@@ -888,6 +896,85 @@ fn route_algo_order_message(
         })
 }
 
+// Process amendment confirmation independently of parent/child lifecycle routing.
+fn dispatch_algo_amendment(
+    msg: &OKXAlgoOrderMsg,
+    emitter: &ExecutionEventEmitter,
+    state: &WsDispatchState,
+    account_id: AccountId,
+    instruments: &AHashMap<Ustr, InstrumentAny>,
+    ts_init: UnixNanos,
+) -> bool {
+    if let Ok(Some(report)) = parse_algo_order_msg(msg, account_id, instruments, ts_init) {
+        if let ExecutionReport::Order(ref order) = report {
+            if let Some(cid) = order.client_order_id {
+                let pending = state
+                    .pending_amends
+                    .get(cid.as_str())
+                    .filter(|info| {
+                        info.instrument_id == order.instrument_id
+                            && info.matches_amendment(msg.req_id.as_deref())
+                    })
+                    .map(|info| info.clone());
+                if let Some(info) = pending {
+                    let event = match msg.amend_result.as_deref() {
+                        Some("0") => {
+                            let mut update = OrderUpdated::new(
+                                info.trader_id,
+                                info.strategy_id,
+                                order.instrument_id,
+                                cid,
+                                order.quantity,
+                                UUID4::new(),
+                                order.ts_last,
+                                ts_init,
+                                false,
+                                Some(order.venue_order_id),
+                                Some(account_id),
+                                order.price,
+                                order.trigger_price,
+                                None,
+                                false,
+                            );
+                            update.causation_id = info.command_id;
+                            Some(OrderEventAny::Updated(update))
+                        }
+                        Some("-1") => Some(info.rejection(
+                            account_id,
+                            cid,
+                            Some(order.venue_order_id),
+                            "条件单频道确认改单失败",
+                            order.ts_last,
+                            ts_init,
+                        )),
+                        _ => None,
+                    };
+                    if let Some(event) = event {
+                        if state
+                            .pending_amends
+                            .remove_if(cid.as_str(), |_, current| {
+                                current.command_id == info.command_id
+                            })
+                            .is_some()
+                        {
+                            emitter.send_order_event(event);
+                        }
+                    }
+                }
+                // 未确认、旧请求和重复通知不能通过状态报告间接修改缓存。
+                // 已触发及终态仍进入原有报告处理，避免丢失订单状态。
+                if order.order_status == OrderStatus::Accepted
+                    && (msg.req_id.as_deref().is_some_and(|id| !id.is_empty())
+                        || state.pending_amends.contains_key(cid.as_str()))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn dispatch_algo_order_message(
     msg: &OKXAlgoOrderMsg,
     emitter: &ExecutionEventEmitter,
@@ -896,6 +983,9 @@ fn dispatch_algo_order_message(
     instruments: &AHashMap<Ustr, InstrumentAny>,
     ts_init: UnixNanos,
 ) {
+    if dispatch_algo_amendment(msg, emitter, state, account_id, instruments, ts_init) {
+        return;
+    }
     let route = route_algo_order_message(msg, state);
 
     match route {
@@ -1576,21 +1666,74 @@ fn dispatch_order_messages(
                 ts_init,
             ) {
                 Ok(event) => {
+                    let mut events = Vec::with_capacity(2);
+                    let req_id = msg.req_id.as_deref().filter(|id| !id.is_empty());
+                    let pending = state
+                        .pending_amends
+                        .get(client_order_id.as_str())
+                        .filter(|info| info.matches_amendment(req_id))
+                        .map(|info| info.clone());
+                    if let Some(info) = pending {
+                        let result = match msg.amend_result.as_deref() {
+                            Some("0") => parse_order_update(
+                                msg,
+                                client_order_id,
+                                account_id,
+                                info.trader_id,
+                                info.strategy_id,
+                                instrument,
+                                ts_init,
+                            )
+                            .map(|mut update| {
+                                update.causation_id = info.command_id;
+                                OrderEventAny::Updated(update)
+                            }),
+                            Some("-1" | "1") => Ok(info.rejection(
+                                account_id,
+                                client_order_id,
+                                Some(VenueOrderId::new(msg.ord_id)),
+                                "订单频道确认改单失败",
+                                parse_millisecond_timestamp(msg.u_time),
+                                ts_init,
+                            )),
+                            _ => Err(anyhow::anyhow!("改单结果缺失或未知")),
+                        };
+                        match result {
+                            Ok(update) => {
+                                state
+                                    .pending_amends
+                                    .remove_if(client_order_id.as_str(), |_, current| {
+                                        current.command_id == info.command_id
+                                    });
+                                if let OrderEventAny::Updated(update) = update {
+                                    events.push(ParsedOrderEvent::Updated(update));
+                                } else {
+                                    emitter.send_order_event(update);
+                                }
+                            }
+                            Err(error) => log::error!("改单确认无效 {client_order_id}: {error}"),
+                        }
+                    }
+                    // 修改与成交分别处理；有 reqId 的更新只能由上面的关联确认产生。
+                    if req_id.is_none() || !matches!(event, ParsedOrderEvent::Updated(_)) {
+                        events.push(event);
+                    }
                     update_order_state_cache(msg, instrument, client_order_id, order_state_cache);
-                    dispatch_parsed_order_event(
-                        event,
-                        client_order_id,
-                        account_id,
-                        VenueOrderId::new(msg.ord_id),
-                        &ident,
-                        instrument,
-                        msg.state,
-                        emitter,
-                        state,
-                        order_state_cache,
-                        ts_init,
-                    );
-
+                    for event in events {
+                        dispatch_parsed_order_event(
+                            event,
+                            client_order_id,
+                            account_id,
+                            VenueOrderId::new(msg.ord_id),
+                            &ident,
+                            instrument,
+                            msg.state,
+                            emitter,
+                            state,
+                            order_state_cache,
+                            ts_init,
+                        );
+                    }
                     if state.contains_terminal(&client_order_id)
                         && let Some(bindings) = lifecycle_bindings.as_mut()
                         && let Some(binding) =
@@ -3344,6 +3487,12 @@ mod tests {
             serde_json::from_str(include_str!("../../test_data/rpi_minimum_notional.json"))
                 .unwrap();
         let mut response = fixtures[case]["response"].clone();
+        // Metis 语义：改单请求以命令 UUID 的 32 位表示为 reqId，
+        // 拒绝回报只有匹配当前请求才能关闭登记，因此测试帧 id 必须与登记一致。
+        let amend_command_id = amend.then(UUID4::new);
+        if let Some(command_id) = amend_command_id {
+            response["id"] = serde_json::Value::from(command_id.to_string().replace('-', ""));
+        }
         if reverse {
             response["data"].as_array_mut().unwrap().reverse();
         }
@@ -3373,6 +3522,7 @@ mod tests {
                 trader_id: TraderId::from("TRADER-001"),
                 strategy_id,
                 instrument_id,
+                command_id: None,
             },
         );
         let mut originals = Vec::new();
@@ -3405,6 +3555,7 @@ mod tests {
                     trader_id: TraderId::from("TRADER-001"),
                     strategy_id,
                     instrument_id,
+                    command_id: amend_command_id,
                 },
             );
             originals.push(context);
@@ -3462,7 +3613,19 @@ mod tests {
             }
             event => panic!("Unexpected event: {event:?}"),
         }
-        assert_eq!(pending.len(), 1);
+        // Metis 语义：改单请求被接收不代表修改成功，登记保留到订单频道确认；
+        // amend 用例中被接收的腿仍保留登记，只有被拒绝的腿关闭登记。
+        let accepted_amends = if amend {
+            response["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["sCode"] == "0")
+                .count()
+        } else {
+            0
+        };
+        assert_eq!(pending.len(), 1 + accepted_amends);
         assert!(pending.contains_key(unrelated));
 
         for original in originals {
@@ -3503,6 +3666,7 @@ mod tests {
             state.pending_orders.insert(
                 client_order_id.to_string(),
                 PendingOrderInfo {
+                    command_id: None,
                     trader_id: TraderId::from("TRADER-001"),
                     strategy_id,
                     instrument_id,

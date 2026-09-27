@@ -530,6 +530,9 @@ pub struct OKXPositionTier {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OKXAccountConfiguration {
+    /// Metis patch: exchange account UID (real OKX payload field, not modeled upstream).
+    #[serde(default)]
+    pub uid: String,
     /// Account mode.
     #[serde(rename = "acctLv", deserialize_with = "deserialize_configuration_enum")]
     pub account_level: OKXAccountLevel,
@@ -1508,6 +1511,9 @@ pub struct OKXCancelAlgoOrderResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OKXAmendAlgoOrderRequest {
+    /// 调用方改单请求标识，用于关联条件单频道结果。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub req_id: Option<String>,
     /// Instrument ID.
     pub inst_id: String,
     /// Algo order ID.
@@ -1752,6 +1758,7 @@ mod tests {
         // via `newSlTriggerPx`, not `newTriggerPx`. Verify the camelCase field name
         // and that an unset `new_trigger_px` is omitted.
         let request = OKXAmendAlgoOrderRequest {
+            req_id: None,
             inst_id: "ETH-USDT-SWAP".to_string(),
             algo_id: "123".to_string(),
             algo_cl_ord_id: None,
@@ -1782,6 +1789,7 @@ mod tests {
     #[rstest]
     fn test_amend_algo_order_request_serializes_oco_tp_sl_fields() {
         let request = OKXAmendAlgoOrderRequest {
+            req_id: None,
             inst_id: "DOGE-USDT-SWAP".to_string(),
             algo_id: "algo-oco-1".to_string(),
             algo_cl_ord_id: None,
@@ -1940,6 +1948,7 @@ mod tests {
     #[rstest]
     fn test_amend_algo_order_trigger_serialization() {
         let request = OKXAmendAlgoOrderRequest {
+            req_id: None,
             inst_id: "ETH-USDT-SWAP".to_string(),
             algo_id: "123456".to_string(),
             algo_cl_ord_id: None,
@@ -1971,6 +1980,7 @@ mod tests {
     #[rstest]
     fn test_amend_algo_order_trailing_stop_serialization() {
         let request = OKXAmendAlgoOrderRequest {
+            req_id: None,
             inst_id: "BTC-USDT-SWAP".to_string(),
             algo_id: "789012".to_string(),
             algo_cl_ord_id: Some("client456".to_string()),
@@ -2115,6 +2125,7 @@ mod tests {
     #[rstest]
     fn test_amend_algo_order_callback_spread_serialization() {
         let request = OKXAmendAlgoOrderRequest {
+            req_id: None,
             inst_id: "ETH-USDT-SWAP".to_string(),
             algo_id: "456789".to_string(),
             algo_cl_ord_id: None,
@@ -2144,6 +2155,7 @@ mod tests {
     #[rstest]
     fn test_amend_algo_order_size_only_serialization() {
         let request = OKXAmendAlgoOrderRequest {
+            req_id: None,
             inst_id: "BTC-USDT-SWAP".to_string(),
             algo_id: "111222".to_string(),
             algo_cl_ord_id: None,
@@ -2174,6 +2186,7 @@ mod tests {
     #[rstest]
     fn test_amend_algo_order_all_fields_serialization() {
         let request = OKXAmendAlgoOrderRequest {
+            req_id: None,
             inst_id: "BTC-USDT-SWAP".to_string(),
             algo_id: "333444".to_string(),
             algo_cl_ord_id: Some("client789".to_string()),

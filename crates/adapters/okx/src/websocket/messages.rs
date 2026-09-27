@@ -1130,6 +1130,12 @@ pub struct OKXOrderMsg {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OKXAlgoOrderMsg {
+    /// 调用方改单请求标识；非改单通知可为空。
+    #[serde(default)]
+    pub req_id: Option<String>,
+    /// 条件单修改结果：0 成功，-1 失败。
+    #[serde(default)]
+    pub amend_result: Option<String>,
     /// Algorithm ID.
     pub algo_id: String,
     /// Algorithm client order ID.
