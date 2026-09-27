@@ -394,6 +394,16 @@ impl SimulatedExchange {
         })
     }
 
+    /// Total fills dropped for price/quantity grid incompatibility across
+    /// all matching engines of this exchange.
+    #[must_use]
+    pub fn skipped_fill_count(&self) -> u64 {
+        self.matching_engines
+            .values()
+            .map(|matching_engine| matching_engine.skipped_fill_count())
+            .sum()
+    }
+
     pub fn initialize_account(&mut self) {
         self.generate_fresh_account_state();
     }
@@ -1962,6 +1972,7 @@ impl SimulatedExchange {
             command.quantity.unwrap_or_else(|| order.quantity()),
             command.price.or_else(|| order.price()),
             command.trigger_price.or_else(|| order.trigger_price()),
+            command.command_id,
         );
         true
     }
@@ -1972,9 +1983,10 @@ impl SimulatedExchange {
         quantity: Quantity,
         price: Option<Price>,
         trigger_price: Option<Price>,
+        command_id: UUID4,
     ) {
         let ts_now = self.clock.borrow().timestamp_ns();
-        let event = OrderEventAny::Updated(OrderUpdated::new(
+        let mut event = OrderEventAny::Updated(OrderUpdated::new(
             order.trader_id(),
             order.strategy_id(),
             order.instrument_id(),
@@ -1991,6 +2003,9 @@ impl SimulatedExchange {
             None,
             order.is_quote_quantity(),
         ));
+        if let OrderEventAny::Updated(value) = &mut event {
+            value.causation_id = Some(command_id);
+        }
         self.dispatch_order_event(event);
     }
 

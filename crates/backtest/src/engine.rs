@@ -79,6 +79,40 @@ use crate::{
     },
 };
 
+/// Optional research adapter observing only data already delivered and settled.
+/// The completed callback runs once after all input items at a timestamp and
+/// native timer, funding, and liquidation settlement. It cannot see next data.
+pub trait ReplayTimestampObserver {
+    fn on_data_settled(&mut self, data: &Data) -> anyhow::Result<()>;
+    fn on_timestamp_complete(
+        &mut self,
+        engine: &mut BacktestEngine,
+        timestamp: UnixNanos,
+    ) -> anyhow::Result<()>;
+}
+
+/// Materializes an owned [`Data`] from the iterator's borrowed view so the
+/// replay observer keeps the rc4 contract of observing a fully settled item.
+fn data_ref_to_owned(data: DataRef<'_>) -> Data {
+    match data {
+        DataRef::BookDelta(value) => Data::BookDelta(value.clone()),
+        DataRef::BookDeltas(value) => Data::BookDeltas(Box::new(value.clone())),
+        DataRef::BookDepth10(value) => Data::BookDepth10(Box::new(value.clone())),
+        DataRef::Quote(value) => Data::Quote(value.clone()),
+        DataRef::Trade(value) => Data::Trade(value.clone()),
+        DataRef::Bar(value) => Data::Bar(value.clone()),
+        DataRef::MarkPrice(value) => Data::MarkPrice(value.clone()),
+        DataRef::IndexPrice(value) => Data::IndexPrice(value.clone()),
+        DataRef::FundingRate(value) => Data::FundingRate(value.clone()),
+        DataRef::OptionGreeks(value) => Data::OptionGreeks(value.clone()),
+        DataRef::InstrumentStatus(value) => Data::InstrumentStatus(value.clone()),
+        DataRef::InstrumentClose(value) => Data::InstrumentClose(value.clone()),
+        DataRef::Custom(value) => Data::Custom(value.clone()),
+        #[cfg(feature = "defi")]
+        DataRef::Defi(value) => Data::Defi(Box::new(value.clone())),
+    }
+}
+
 /// Core backtesting engine for running event-driven strategy backtests on historical data.
 ///
 /// The `BacktestEngine` provides a high-fidelity simulation environment that processes
@@ -120,6 +154,8 @@ pub struct BacktestEngine {
     backtest_start: Option<UnixNanos>,
     backtest_end: Option<UnixNanos>,
     funding_error: Option<String>,
+    replay_observer: Option<Rc<RefCell<dyn ReplayTimestampObserver>>>,
+    last_observer_ns: Option<UnixNanos>,
 }
 
 impl Debug for BacktestEngine {
@@ -189,7 +225,22 @@ impl BacktestEngine {
             backtest_start: None,
             backtest_end: None,
             funding_error: None,
+            replay_observer: None,
+            last_observer_ns: None,
         })
+    }
+
+    /// Installs the explicit research observer before a run. Legacy default is None.
+    pub fn set_replay_timestamp_observer(
+        &mut self,
+        observer: Rc<RefCell<dyn ReplayTimestampObserver>>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.iteration == 0 && self.run_id.is_none() && self.replay_observer.is_none(),
+            "replay observer must be installed once before the run"
+        );
+        self.replay_observer = Some(observer);
+        Ok(())
     }
 
     /// Returns a reference to the underlying kernel.
@@ -267,6 +318,16 @@ impl BacktestEngine {
     #[must_use]
     pub fn list_venues(&self) -> Vec<Venue> {
         self.venues.keys().copied().collect()
+    }
+
+    /// Total fills dropped for price/quantity grid incompatibility across
+    /// all venues' matching engines.
+    #[must_use]
+    pub fn skipped_fill_count(&self) -> u64 {
+        self.venues
+            .values()
+            .map(|exchange| exchange.borrow().skipped_fill_count())
+            .sum()
     }
 
     /// # Errors
@@ -881,7 +942,7 @@ impl BacktestEngine {
                 break;
             }
 
-            let settlement_scope = {
+            let (settlement_scope, observed_data) = {
                 let Some(data) = self.data_iterator.peek() else {
                     continue;
                 };
@@ -892,14 +953,18 @@ impl BacktestEngine {
                     &self.kernel.clock,
                     data,
                 )?;
+                let observed_data = self.replay_observer.as_ref().map(|_| data_ref_to_owned(data));
                 self.kernel.data_engine.borrow_mut().process_data_ref(data);
-                settlement_scope
+                (settlement_scope, observed_data)
             };
             self.data_iterator.advance();
 
             // Drain deferred commands, then process exchange queues
             self.drain_command_queues();
             self.settle_venues(ts_init, settlement_scope);
+            if let (Some(observer), Some(data)) = (self.replay_observer.clone(), observed_data) {
+                observer.borrow_mut().on_data_settled(&data)?;
+            }
 
             let prev_last_ns = self.last_ns;
             // If timestamp changed (or exhausted), flush timers then run modules
@@ -910,6 +975,21 @@ impl BacktestEngine {
             {
                 self.flush_accumulator_events(&clocks, prev_last_ns)?;
                 self.finalize_timestamp(&clocks, prev_last_ns, settlement_scope)?;
+                if !self.kernel.is_shutdown_requested()
+                    && self.last_observer_ns != Some(prev_last_ns)
+                {
+                    if let Some(observer) = self.replay_observer.clone() {
+                        // No next input is exposed to the adapter. Any commands
+                        // submitted by the barrier are drained at this same time,
+                        // without recursively finalizing or invoking the barrier.
+                        self.last_observer_ns = Some(prev_last_ns);
+                        observer
+                            .borrow_mut()
+                            .on_timestamp_complete(self, prev_last_ns)?;
+                        self.drain_command_queues();
+                        self.settle_venues(prev_last_ns, settlement_scope);
+                    }
+                }
             }
 
             self.iteration += 1;
@@ -1137,6 +1217,8 @@ impl BacktestEngine {
         self.backtest_start = None;
         self.backtest_end = None;
         self.funding_error = None;
+        self.replay_observer = None;
+        self.last_observer_ns = None;
         self.iteration = 0;
         self.force_stop = false;
         self.last_ns = UnixNanos::default();
