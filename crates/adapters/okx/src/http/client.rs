@@ -318,6 +318,34 @@ mod tests {
     use crate::http::models::OKXFeeRate;
 
     #[tokio::test]
+    async fn pending_pages_caller_limit_is_not_complete_coverage() {
+        for (limit, size, complete, kept) in [
+            (Some(0), 0, false, 0),
+            (Some(1), 2, false, 1),
+            (Some(100), 100, false, 100),
+            (Some(2), 2, true, 2),
+            (Some(3), 2, true, 2),
+            (None, 0, true, 0),
+        ] {
+            let mut calls = 0;
+            let sweep = super::collect_pending_sweep(
+                limit,
+                |_| {
+                    calls += 1;
+                    assert!(calls <= 1, "unexpected extra request");
+                    std::future::ready(Ok((0..size).map(|n| n.to_string()).collect()))
+                },
+                String::as_str,
+            )
+            .await
+            .unwrap();
+            assert_eq!(sweep.complete, complete, "{limit:?}/{size}");
+            assert_eq!(sweep.items.len(), kept);
+            assert_eq!(calls, if limit == Some(0) { 0 } else { 1 });
+        }
+    }
+
+    #[tokio::test]
     async fn pending_pages_require_exhaustion_and_correct_cursor() {
         let mut calls = 0;
         let rows = super::collect_pending_pages(
@@ -625,18 +653,21 @@ const OKX_PAGE_SIZE: usize = 100;
 const MAX_RECONCILIATION_PAGES: usize = 50;
 
 // 普通与条件挂单共用分页完整性检查；显式 limit 是调用者要求的结果上限。
-async fn collect_pending_pages<T, F, Fut>(
+async fn collect_pending_sweep<T, F, Fut>(
     limit: Option<usize>,
     mut fetch: F,
     identifier: impl Fn(&T) -> &str,
-) -> anyhow::Result<Vec<T>>
+) -> anyhow::Result<PageSweep<T>>
 where
     F: FnMut(Option<String>) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<Vec<T>>>,
 {
     let mut all = Vec::new();
     if limit == Some(0) {
-        return Ok(all);
+        return Ok(PageSweep {
+            items: all,
+            complete: false,
+        });
     }
     let mut cursor = None;
     let mut seen = AHashSet::new();
@@ -657,14 +688,36 @@ where
         if let Some(maximum) = limit
             && all.len() >= maximum
         {
+            // A caller cap is not evidence of endpoint exhaustion. Even when
+            // the last HTTP page is short, truncating its rows loses coverage.
+            let complete = count < OKX_PAGE_SIZE && all.len() <= maximum;
             all.truncate(maximum);
-            return Ok(all);
+            return Ok(PageSweep {
+                items: all,
+                complete,
+            });
         }
         if count < OKX_PAGE_SIZE {
-            return Ok(all);
+            return Ok(PageSweep {
+                items: all,
+                complete: true,
+            });
         }
     }
     anyhow::bail!("挂单分页达到上限，无法证明查询完整")
+}
+
+#[cfg(test)]
+async fn collect_pending_pages<T, F, Fut>(
+    limit: Option<usize>,
+    fetch: F,
+    identifier: impl Fn(&T) -> &str,
+) -> anyhow::Result<Vec<T>>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<T>>>,
+{
+    Ok(collect_pending_sweep(limit, fetch, identifier).await?.items)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -703,6 +756,24 @@ impl<T> PageSweep<T> {
             complete: !exhausted || items.is_empty(),
             items,
         }
+    }
+}
+
+/// Evidence produced only after unlimited strict pending-order queries finish.
+/// This covers known pending-order endpoints, not atomic account reconciliation.
+#[derive(Clone, Debug, Serialize)]
+pub struct PendingAccountOrderCoverage {
+    schema_version: u32,
+    regular_order_ids: Vec<String>,
+    algo_order_ids: Vec<String>,
+    queried_algo_types: Vec<OKXAlgoOrderType>,
+}
+impl PendingAccountOrderCoverage {
+    /// Verify membership after a consumer normalizes the returned raw records.
+    pub fn matches_ids(&self, mut regular: Vec<String>, mut algos: Vec<String>) -> bool {
+        regular.sort();
+        algos.sort();
+        regular == self.regular_order_ids && algos == self.algo_order_ids
     }
 }
 
@@ -2463,6 +2534,32 @@ impl OKXHttpClient {
             all.extend(page.items);
         }
         Ok(all)
+    }
+
+    /// Collect all pending regular/known-algorithm orders without caller filters or limits.
+    /// Coverage is returned only after every strict query succeeds.
+    pub async fn request_pending_account_orders(
+        &self,
+    ) -> anyhow::Result<(
+        Vec<OKXOrderHistory>,
+        Vec<OKXOrderAlgo>,
+        PendingAccountOrderCoverage,
+    )> {
+        let regular = self
+            .paginate_orders_pending(&GetOrderListParams::default(), None)
+            .await?;
+        let algos = self.request_all_pending_algo_orders().await?;
+        let mut regular_order_ids: Vec<_> = regular.iter().map(|v| v.ord_id.to_string()).collect();
+        let mut algo_order_ids: Vec<_> = algos.iter().map(|v| v.algo_id.clone()).collect();
+        regular_order_ids.sort();
+        algo_order_ids.sort();
+        let coverage = PendingAccountOrderCoverage {
+            schema_version: 1,
+            regular_order_ids,
+            algo_order_ids,
+            queried_algo_types: OKXAlgoOrderType::QUERY_TYPES.to_vec(),
+        };
+        Ok((regular, algos, coverage))
     }
 
     /// Requests information on current account positions.
@@ -5163,7 +5260,7 @@ impl OKXHttpClient {
             base.after.is_none() && base.before.is_none(),
             "完整挂单查询不能指定起始游标"
         );
-        let items = collect_pending_pages(
+        collect_pending_sweep(
             limit.map(|v| v as usize),
             |cursor| {
                 let mut params = base.clone();
@@ -5173,11 +5270,7 @@ impl OKXHttpClient {
             },
             |order: &OKXOrderHistory| order.ord_id.as_str(),
         )
-        .await?;
-        Ok(PageSweep {
-            items,
-            complete: true,
-        })
+        .await
     }
 
     // Paginates through transaction details (fills) using `bill_id` as the cursor
@@ -5248,7 +5341,7 @@ impl OKXHttpClient {
             base.after.is_none() && base.before.is_none(),
             "完整挂单查询不能指定起始游标"
         );
-        let items = collect_pending_pages(
+        collect_pending_sweep(
             limit,
             |cursor| {
                 let mut params = base.clone();
@@ -5269,11 +5362,7 @@ impl OKXHttpClient {
             },
             |order: &OKXOrderAlgo| order.algo_id.as_str(),
         )
-        .await?;
-        Ok(PageSweep {
-            items,
-            complete: true,
-        })
+        .await
     }
 
     /// 分页读取指定类型的条件挂单；HTTP 错误不能作为空列表。

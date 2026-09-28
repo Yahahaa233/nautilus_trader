@@ -8042,3 +8042,82 @@ async fn test_http_request_instruments_caches_usdc_inst_id_code_and_trade_quote_
         )]
     );
 }
+
+#[tokio::test]
+async fn test_pending_account_coverage_requires_every_strict_query() {
+    use nautilus_okx::common::enums::OKXAlgoOrderType;
+    for fail in [false, true] {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = seen.clone();
+        let app = Router::new()
+            .route(
+                "/api/v5/trade/orders-pending",
+                get(|| async { Json(json!({"code":"0","msg":"","data":[]})) }),
+            )
+            .route(
+                "/api/v5/trade/orders-algo-pending",
+                get(move |Query(query): Query<HashMap<String, String>>| {
+                    let recorded = recorded.clone();
+                    async move {
+                        assert!(!query.contains_key("instId") && !query.contains_key("instType"));
+                        let kind = query["ordType"].clone();
+                        recorded.lock().unwrap().push(kind.clone());
+                        if fail && kind == "trigger" {
+                            Json(json!({"code":"51000","msg":"injected failure","data":[]}))
+                        } else {
+                            Json(json!({"code":"0","msg":"","data":[]}))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = OKXHttpClient::with_credentials(
+            Some("fixture-key".into()),
+            Some("fixture-secret".into()),
+            Some("fixture-pass".into()),
+            Some(format!("http://{addr}")),
+            5,
+            0,
+            1,
+            1,
+            OKXEnvironment::Demo,
+            None,
+        )
+        .unwrap();
+        let result = client.request_pending_account_orders().await;
+        server.abort();
+        if fail {
+            assert!(result.is_err());
+        } else {
+            let (regular, algos, coverage) = result.unwrap();
+            assert!(regular.is_empty() && algos.is_empty());
+            assert!(coverage.matches_ids(vec![], vec![]));
+            assert!(!coverage.matches_ids(vec!["invented".into()], vec![]));
+            let mut expected: Vec<String> = OKXAlgoOrderType::QUERY_TYPES
+                .iter()
+                .map(|kind| {
+                    serde_json::to_value(kind)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect();
+            expected.sort();
+            let mut actual = seen.lock().unwrap().clone();
+            actual.sort();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                serde_json::to_value(coverage).unwrap()["queried_algo_types"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                8
+            );
+        }
+    }
+}

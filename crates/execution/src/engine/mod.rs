@@ -2207,14 +2207,64 @@ impl ExecutionEngine {
         }
     }
 
+    /// Read the local client/account selected by the native command routing rules.
+    /// This does not validate, dispatch or authorize the command. External clients
+    /// have no locally attested account and therefore return None.
+    ///
+    /// # Errors
+    /// Returns an error when order-cache attribution is being mutated.
+    pub fn local_command_route(
+        &self,
+        command: &TradingCommand,
+    ) -> anyhow::Result<Option<(ClientId, AccountId)>> {
+        if command.client_id().is_some_and(|id| self.external_clients.contains(&id)) {
+            return Ok(None);
+        }
+        let _cache = self.cache.try_borrow()
+            .map_err(|_| anyhow::anyhow!("execution route cache is busy"))?;
+        Ok(self.find_client_for_command(command)
+            .map(|adapter| (adapter.client.client_id(), adapter.client.account_id())))
+    }
+
+    /// Observe local routing for explicit facts using the native dispatch resolver.
+    /// No order is inserted or submitted. Callers must independently establish the
+    /// account and instrument facts; this function does not attest those inputs.
+    pub fn local_route_for(
+        &self,
+        client_id: Option<ClientId>,
+        account_id: Option<AccountId>,
+        instrument_id: Option<InstrumentId>,
+    ) -> Option<(ClientId, AccountId)> {
+        if client_id.is_some_and(|id| self.external_clients.contains(&id)) {
+            return None;
+        }
+        self.find_client_for_route(client_id, account_id, instrument_id)
+            .map(|adapter| (adapter.client.client_id(), adapter.client.account_id()))
+    }
+
     fn find_client_for_command(&self, command: &TradingCommand) -> Option<&ExecutionClientAdapter> {
+        // Preserve the explicit-client fast path without borrowing order attribution.
         if let Some(client_id) = command.client_id()
             && let Some(adapter) = self.clients.get(&client_id)
         {
             return Some(adapter);
         }
+        self.find_client_for_route(command.client_id(), self.account_id_for_command(command), Self::instrument_id_for_command(command))
+    }
 
-        if let Some(account_id) = self.account_id_for_command(command) {
+    fn find_client_for_route(
+        &self,
+        client_id: Option<ClientId>,
+        account_id: Option<AccountId>,
+        instrument_id: Option<InstrumentId>,
+    ) -> Option<&ExecutionClientAdapter> {
+        if let Some(client_id) = client_id
+            && let Some(adapter) = self.clients.get(&client_id)
+        {
+            return Some(adapter);
+        }
+
+        if let Some(account_id) = account_id {
             let issuer = account_id.get_issuer();
             let issuer_client_id = ClientId::from(issuer.as_str());
 
@@ -2229,7 +2279,7 @@ impl ExecutionEngine {
             }
         }
 
-        if let Some(instrument_id) = Self::instrument_id_for_command(command)
+        if let Some(instrument_id) = instrument_id
             && let Some(client_id) = self.routing_map.get(&instrument_id.venue)
             && let Some(adapter) = self.clients.get(client_id)
         {

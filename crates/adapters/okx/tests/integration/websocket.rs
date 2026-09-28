@@ -42,7 +42,7 @@ use nautilus_common::{
     messages::{SystemEvent, system::SocketState},
     testing::wait_until_async,
 };
-use nautilus_core::UnixNanos;
+use nautilus_core::{UUID4, UnixNanos};
 use nautilus_live::{SocketControl, SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     enums::{OrderSide, OrderType, PositionSide, TimeInForce},
@@ -1545,6 +1545,7 @@ async fn test_modify_event_order_omits_speed_bump(#[case] batch: bool, #[case] o
                 None,
                 Some(true),
                 Some(false),
+                UUID4::new(),
             )
             .await
             .expect("modify event order failed");
@@ -1713,6 +1714,7 @@ async fn test_rpi_websocket_subscription_and_single_batch_order_matrix() {
             None,
             Some(true),
             Some(false),
+            UUID4::new(),
         )
         .await
         .expect("amend RPI order failed");
