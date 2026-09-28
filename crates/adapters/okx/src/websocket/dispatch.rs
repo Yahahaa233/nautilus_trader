@@ -905,71 +905,69 @@ fn dispatch_algo_amendment(
     instruments: &AHashMap<Ustr, InstrumentAny>,
     ts_init: UnixNanos,
 ) -> bool {
-    if let Ok(Some(report)) = parse_algo_order_msg(msg, account_id, instruments, ts_init) {
-        if let ExecutionReport::Order(ref order) = report {
-            if let Some(cid) = order.client_order_id {
-                let pending = state
+    if let Ok(Some(ExecutionReport::Order(ref order))) =
+        parse_algo_order_msg(msg, account_id, instruments, ts_init)
+        && let Some(cid) = order.client_order_id
+    {
+        let pending = state
+            .pending_amends
+            .get(cid.as_str())
+            .filter(|info| {
+                info.instrument_id == order.instrument_id
+                    && info.matches_amendment(msg.req_id.as_deref())
+            })
+            .map(|info| info.clone());
+        if let Some(info) = pending {
+            let event = match msg.amend_result.as_deref() {
+                Some("0") => {
+                    let mut update = OrderUpdated::new(
+                        info.trader_id,
+                        info.strategy_id,
+                        order.instrument_id,
+                        cid,
+                        order.quantity,
+                        UUID4::new(),
+                        order.ts_last,
+                        ts_init,
+                        false,
+                        Some(order.venue_order_id),
+                        Some(account_id),
+                        order.price,
+                        order.trigger_price,
+                        None,
+                        false,
+                    );
+                    update.causation_id = info.command_id;
+                    Some(OrderEventAny::Updated(update))
+                }
+                Some("-1") => Some(info.rejection(
+                    account_id,
+                    cid,
+                    Some(order.venue_order_id),
+                    "条件单频道确认改单失败",
+                    order.ts_last,
+                    ts_init,
+                )),
+                _ => None,
+            };
+            if let Some(event) = event
+                && state
                     .pending_amends
-                    .get(cid.as_str())
-                    .filter(|info| {
-                        info.instrument_id == order.instrument_id
-                            && info.matches_amendment(msg.req_id.as_deref())
+                    .remove_if(cid.as_str(), |_, current| {
+                        current.command_id == info.command_id
                     })
-                    .map(|info| info.clone());
-                if let Some(info) = pending {
-                    let event = match msg.amend_result.as_deref() {
-                        Some("0") => {
-                            let mut update = OrderUpdated::new(
-                                info.trader_id,
-                                info.strategy_id,
-                                order.instrument_id,
-                                cid,
-                                order.quantity,
-                                UUID4::new(),
-                                order.ts_last,
-                                ts_init,
-                                false,
-                                Some(order.venue_order_id),
-                                Some(account_id),
-                                order.price,
-                                order.trigger_price,
-                                None,
-                                false,
-                            );
-                            update.causation_id = info.command_id;
-                            Some(OrderEventAny::Updated(update))
-                        }
-                        Some("-1") => Some(info.rejection(
-                            account_id,
-                            cid,
-                            Some(order.venue_order_id),
-                            "条件单频道确认改单失败",
-                            order.ts_last,
-                            ts_init,
-                        )),
-                        _ => None,
-                    };
-                    if let Some(event) = event {
-                        if state
-                            .pending_amends
-                            .remove_if(cid.as_str(), |_, current| {
-                                current.command_id == info.command_id
-                            })
-                            .is_some()
-                        {
-                            emitter.send_order_event(event);
-                        }
-                    }
-                }
-                // 未确认、旧请求和重复通知不能通过状态报告间接修改缓存。
-                // 已触发及终态仍进入原有报告处理，避免丢失订单状态。
-                if order.order_status == OrderStatus::Accepted
-                    && (msg.req_id.as_deref().is_some_and(|id| !id.is_empty())
-                        || state.pending_amends.contains_key(cid.as_str()))
-                {
-                    return true;
-                }
+                    .is_some()
+            {
+                emitter.send_order_event(event);
             }
+        }
+        // 未确认、旧请求和重复通知不能通过状态报告间接修改缓存。
+        // 已触发及终态仍进入原有报告处理，避免丢失订单状态。
+        if order.order_status == OrderStatus::Accepted
+            && (msg.req_id.as_deref().is_some_and(|id| !id.is_empty())
+                || state.pending_amends.contains_key(cid.as_str()))
+        {
+            return true;
         }
     }
     false

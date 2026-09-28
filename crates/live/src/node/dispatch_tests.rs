@@ -468,3 +468,79 @@ fn paused_queue_capture_holds_gate_through_callback_and_rejects_failure() {
         node.kernel.dispose();
     }
 }
+
+#[tokio::test]
+async fn paused_timer_inventory_checks_registered_actor_and_retains_borrows() {
+    use nautilus_common::timer::TimeEventCallback;
+    let mut node = LiveNode::builder(TraderId::from("CLOCK-INVENTORY-001"), Environment::Sandbox)
+        .unwrap()
+        .with_reconciliation(false)
+        .build()
+        .unwrap();
+    node.add_actor(StartupSocketActor::new(Rc::new(RefCell::new(Vec::new()))))
+        .unwrap();
+    let clocks = node
+        .kernel
+        .trader
+        .borrow()
+        .registered_component_clocks()
+        .unwrap();
+    assert_eq!(clocks.len(), 1);
+    let actor_clock = clocks[0].1.clone();
+    recovery_quiescence::with_empty_registered_timers(
+        &node.kernel.clock,
+        &node.kernel.trader,
+        || {
+            assert!(actor_clock.try_borrow_mut().is_err());
+            assert!(node.kernel.clock.try_borrow_mut().is_err());
+            assert!(node.kernel.trader.try_borrow_mut().is_err());
+            Ok(())
+        },
+    )
+    .unwrap();
+    let deadline = nautilus_core::UnixNanos::from(
+        actor_clock.borrow().timestamp_ns().as_u64() + 60_000_000_000,
+    );
+    actor_clock
+        .borrow_mut()
+        .set_time_alert_ns(
+            "pending-actor",
+            deadline,
+            Some(TimeEventCallback::RustLocal(Rc::new(|_| {}))),
+            None,
+        )
+        .unwrap();
+    assert_eq!(node.kernel.clock.borrow().timer_count(), 0);
+    assert!(
+        recovery_quiescence::with_empty_registered_timers::<()>(
+            &node.kernel.clock,
+            &node.kernel.trader,
+            || panic!("must not capture active actor timer")
+        )
+        .is_err()
+    );
+    assert_eq!(actor_clock.borrow().timer_names(), vec!["pending-actor"]);
+    actor_clock.borrow_mut().cancel_timers();
+    let held = actor_clock.borrow_mut();
+    assert!(
+        recovery_quiescence::with_empty_registered_timers(
+            &node.kernel.clock,
+            &node.kernel.trader,
+            || Ok(())
+        )
+        .is_err()
+    );
+    drop(held);
+    node.kernel
+        .trader
+        .borrow_mut()
+        .create_component_clock(nautilus_model::identifiers::ComponentId::from("ORPHAN"));
+    assert!(
+        recovery_quiescence::with_empty_registered_timers(
+            &node.kernel.clock,
+            &node.kernel.trader,
+            || Ok(())
+        )
+        .is_err()
+    );
+}

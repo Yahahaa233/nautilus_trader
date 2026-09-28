@@ -2515,6 +2515,10 @@ impl OKXHttpClient {
 
     /// 按全部已知算法类型读取账户挂单，保留原始订单，不按已缓存合约过滤。
     /// 任一类型查询失败、分页不完整或跨类型重复时，整次查询失败。
+    ///
+    /// # Errors
+    /// Returns an error for failed HTTP queries, incomplete pagination, unexpected
+    /// algorithm types, or duplicate orders across type queries.
     pub async fn request_all_pending_algo_orders(&self) -> anyhow::Result<Vec<OKXOrderAlgo>> {
         let mut all = Vec::new();
         let mut seen = AHashSet::new();
@@ -2538,6 +2542,10 @@ impl OKXHttpClient {
 
     /// Collect all pending regular/known-algorithm orders without caller filters or limits.
     /// Coverage is returned only after every strict query succeeds.
+    ///
+    /// # Errors
+    /// Returns an error when regular or algorithm order collection fails or cannot
+    /// establish complete, nonduplicated query coverage.
     pub async fn request_pending_account_orders(
         &self,
     ) -> anyhow::Result<(
@@ -5241,6 +5249,10 @@ impl OKXHttpClient {
     }
 
     /// 分页读取挂单；limit=None 时必须读完，异常或页数耗尽不返回部分成功。
+    ///
+    /// # Errors
+    /// Returns an error for caller-specified starting cursors, failed HTTP queries,
+    /// inconsistent pagination, or an incomplete sweep.
     pub async fn paginate_orders_pending(
         &self,
         base: &GetOrderListParams,

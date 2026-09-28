@@ -154,6 +154,8 @@ mod queue;
 mod reconciliation;
 #[cfg(feature = "dispatch-observer")]
 mod recovery;
+#[cfg(feature = "dispatch-observer")]
+mod recovery_quiescence;
 mod state;
 
 use builder::ExternalMessageBusIngress;
@@ -866,6 +868,26 @@ impl LiveNode {
                     && node.kernel.exec_engine.try_borrow()?.check_disconnected(),
                 "queue capture requires disconnected clients"
             );
+            anyhow::ensure!(
+                node.config
+                    .data_engine
+                    .external_clients
+                    .as_ref()
+                    .is_none_or(Vec::is_empty),
+                "external data clients have no paused inventory proof"
+            );
+            let data = node.kernel.data_engine.try_borrow()?;
+            let execution = node.kernel.exec_engine.try_borrow()?;
+            anyhow::ensure!(
+                execution.get_external_client_ids().is_empty(),
+                "external execution clients have no paused inventory proof"
+            );
+            for client in data.get_clients() {
+                client.get_client().verify_paused_recovery_inventory()?;
+            }
+            for client in execution.get_all_clients() {
+                client.verify_paused_recovery_inventory()?;
+            }
             Ok(())
         };
         check(self)?;
@@ -889,35 +911,45 @@ impl LiveNode {
             .context("runner receivers unavailable")?
             .ingress_gate();
         let guard = ingress.freeze()?;
+        let kernel_clock = self.kernel.clock.clone();
+        let trader = self.kernel.trader.clone();
+        let data_engine = self.kernel.data_engine.clone();
+        let exec_engine = self.kernel.exec_engine.clone();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            check(self)?;
-            let snapshot = self
-                .runner
-                .as_mut()
-                .context("runner receivers unavailable")?
-                .snapshot_pending(&guard, registry)?;
-            let value = collect(&snapshot)?;
-            check(self)?;
-            guard.verify()?;
-            anyhow::ensure!(
-                observer.coverage()? == coverage,
-                "observer changed during queue capture"
-            );
-            if let Some(proof) = &proof {
-                proof.verify()?;
-            }
-            let value = persist(value)?;
-            check(self)?;
-            guard.verify()?;
-            anyhow::ensure!(
-                observer.coverage()? == coverage,
-                "observer changed during persistence"
-            );
-            if let Some(proof) = &proof {
-                proof.verify()?;
-            }
-            guard.finish()?;
-            Ok(value)
+            let _data_inventory = data_engine.try_borrow()?;
+            let _execution_inventory = exec_engine.try_borrow()?;
+            recovery_quiescence::with_empty_registered_timers(&kernel_clock, &trader, || {
+                nautilus_common::runner::with_empty_sync_command_queues(|| {
+                    check(self)?;
+                    let snapshot = self
+                        .runner
+                        .as_mut()
+                        .context("runner receivers unavailable")?
+                        .snapshot_pending(&guard, registry)?;
+                    let value = collect(&snapshot)?;
+                    check(self)?;
+                    guard.verify()?;
+                    anyhow::ensure!(
+                        observer.coverage()? == coverage,
+                        "observer changed during queue capture"
+                    );
+                    if let Some(proof) = &proof {
+                        proof.verify()?;
+                    }
+                    let value = persist(value)?;
+                    check(self)?;
+                    guard.verify()?;
+                    anyhow::ensure!(
+                        observer.coverage()? == coverage,
+                        "observer changed during persistence"
+                    );
+                    if let Some(proof) = &proof {
+                        proof.verify()?;
+                    }
+                    guard.finish()?;
+                    Ok(value)
+                })
+            })
         }));
         match outcome {
             Ok(Ok(value)) => Ok(value),

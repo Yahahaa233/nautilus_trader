@@ -178,6 +178,16 @@ impl LiveExecutionClient {
 
 #[async_trait(?Send)]
 impl ExecutionClient for LiveExecutionClient {
+    fn verify_paused_recovery_inventory(&self) -> anyhow::Result<()> {
+        let pending = self.pending_instruments.try_borrow()?;
+        anyhow::ensure!(
+            pending.is_empty(),
+            "live execution instrument updates remain pending"
+        );
+        let client = self.client.try_borrow()?;
+        client.verify_paused_recovery_inventory()
+    }
+
     fn is_connected(&self) -> bool {
         self.client.borrow().is_connected()
     }
@@ -383,5 +393,52 @@ impl ExecutionClient for LiveExecutionClient {
         self.client
             .borrow()
             .calculate_commission(instrument, last_qty, last_px, liquidity_side)
+    }
+}
+
+#[cfg(test)]
+mod paused_inventory_tests {
+    use super::*;
+    use nautilus_execution::engine::stubs::StubExecutionClient;
+    use nautilus_model::instruments::stubs::crypto_perpetual_ethusdt;
+
+    #[test]
+    fn paused_wrapper_inventory_preserves_pending_and_rejects_unknown_or_busy() {
+        let client = LiveExecutionClient::new(Box::new(StubExecutionClient::new(
+            ClientId::from("SIM"),
+            AccountId::from("SIM-001"),
+            Venue::from("SIM"),
+            OmsType::Netting,
+            None,
+        )));
+        assert!(
+            client
+                .verify_paused_recovery_inventory()
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
+        let held = client.client.borrow_mut();
+        assert!(client.verify_paused_recovery_inventory().is_err());
+        drop(held);
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        client
+            .pending_instruments
+            .borrow_mut()
+            .push_back(instrument.clone());
+        assert!(
+            client
+                .verify_paused_recovery_inventory()
+                .unwrap_err()
+                .to_string()
+                .contains("remain pending")
+        );
+        assert_eq!(
+            client.pending_instruments.borrow().front(),
+            Some(&instrument)
+        );
+        assert_eq!(client.pending_instruments.borrow().len(), 1);
+        let _held = client.pending_instruments.borrow_mut();
+        assert!(client.verify_paused_recovery_inventory().is_err());
     }
 }

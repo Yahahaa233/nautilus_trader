@@ -103,6 +103,8 @@ use crate::{
 
 #[derive(Debug)]
 pub struct OKXDataClient {
+    // Monotonic: reset/disconnect cannot turn a used adapter into a fresh one.
+    recovery_pristine: std::sync::atomic::AtomicBool,
     client_id: ClientId,
     config: OKXDataClientConfig,
     http_client: OKXHttpClient,
@@ -230,6 +232,7 @@ impl OKXDataClient {
         }
 
         Ok(Self {
+            recovery_pristine: std::sync::atomic::AtomicBool::new(true),
             client_id,
             config,
             http_client,
@@ -292,6 +295,8 @@ impl OKXDataClient {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         match self.tasks.spawner() {
             Ok(spawner) => spawn_task(&spawner, fut),
             Err(e) => log::debug!("Skipping task after OKX shutdown began: {e}"),
@@ -1787,6 +1792,32 @@ async fn reconcile_instruments(
 
 #[async_trait::async_trait(?Send)]
 impl DataClient for OKXDataClient {
+    fn verify_paused_recovery_inventory(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recovery_pristine.load(Ordering::Acquire)
+                && !self.is_connected()
+                && !self.transports_started
+                && self.tasks.is_empty()
+                && self.tasks.is_open(),
+            "OKX data recovery requires a fresh inactive adapter"
+        );
+        anyhow::ensure!(
+            self.book_channels.load().is_empty()
+                && self.index_ticker_map.load().is_empty()
+                && self.option_greeks_subs.load().is_empty()
+                && self
+                    .option_summary_family_subs
+                    .try_lock()
+                    .context("OKX subscription inventory busy")?
+                    .is_empty(),
+            "OKX data subscription inventory is not empty"
+        );
+        for socket in [&self.ws_public, &self.ws_business].into_iter().flatten() {
+            socket.verify_paused_recovery_inventory()?;
+        }
+        Ok(())
+    }
+
     fn client_id(&self) -> ClientId {
         self.client_id
     }
@@ -1796,6 +1827,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         log::info!(
             "Started: client_id={}, vip_level={:?}, instrument_types={:?}, environment={}, proxy_url={:?}",
             self.client_id,
@@ -1808,12 +1841,16 @@ impl DataClient for OKXDataClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         log::info!("Stopping {id}", id = self.client_id);
         self.begin_generation_shutdown();
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         log::debug!("Resetting {id}", id = self.client_id);
         self.begin_generation_shutdown();
         self.book_channels.store(AHashMap::new());
@@ -1825,12 +1862,16 @@ impl DataClient for OKXDataClient {
     }
 
     fn dispose(&mut self) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         log::debug!("Disposing {id}", id = self.client_id);
         self.begin_generation_shutdown();
         Ok(())
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         if self.is_connected() && self.tasks.is_open() {
             return Ok(());
         }
@@ -1863,6 +1904,8 @@ impl DataClient for OKXDataClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         if self.is_disconnected()
             && !self.transports_started
             && self.tasks.is_empty()
@@ -1904,6 +1947,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn subscribe_instruments(&mut self, _cmd: SubscribeInstruments) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         for inst_type in &self.config.instrument_types {
             let ws = self.public_ws()?.clone();
             let inst_type = *inst_type;
@@ -1922,6 +1967,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn subscribe_instrument(&mut self, cmd: SubscribeInstrument) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         // OKX instruments channel doesn't support subscribing to individual instruments via instId
         // Instead, subscribe to the instrument type if not already subscribed
         let instrument_id = cmd.instrument_id;
@@ -1940,6 +1987,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         if cmd.book_type != BookType::L2_MBP {
             anyhow::bail!("OKX only supports L2_MBP order book deltas");
         }
@@ -2026,6 +2075,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let instrument_id = cmd.instrument_id;
 
         if is_okx_spread_symbol(instrument_id.symbol.as_str()) {
@@ -2054,6 +2105,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let instrument_id = cmd.instrument_id;
 
         if is_okx_spread_symbol(instrument_id.symbol.as_str()) {
@@ -2082,6 +2135,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn subscribe_mark_prices(&mut self, cmd: SubscribeMarkPrices) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let ws = self.public_ws()?.clone();
         let instrument_id = cmd.instrument_id;
 
@@ -2097,6 +2152,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn subscribe_index_prices(&mut self, cmd: SubscribeIndexPrices) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let ws = self.public_ws()?.clone();
         let instrument_id = cmd.instrument_id;
         let symbol = instrument_id.symbol.inner();
@@ -2119,6 +2176,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let ws = self.business_ws()?.clone();
         let bar_type = cmd.bar_type;
 
@@ -2134,6 +2193,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn subscribe_funding_rates(&mut self, cmd: SubscribeFundingRates) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let ws = self.public_ws()?.clone();
         let instrument_id = cmd.instrument_id;
 
@@ -2149,6 +2210,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn subscribe_option_greeks(&mut self, cmd: SubscribeOptionGreeks) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let instrument_id = cmd.instrument_id;
         let conventions = parse_greeks_conventions_from_params(cmd.params.as_ref());
         self.option_greeks_subs.insert(instrument_id, conventions);
@@ -2195,6 +2258,8 @@ impl DataClient for OKXDataClient {
         &mut self,
         cmd: SubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let ws = self.public_ws()?.clone();
         let instrument_id = cmd.instrument_id;
 
@@ -2210,6 +2275,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn unsubscribe_instrument(&mut self, cmd: &UnsubscribeInstrument) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let instrument_id = cmd.instrument_id;
         let ws = self.public_ws()?.clone();
 
@@ -2226,6 +2293,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let instrument_id = cmd.instrument_id;
 
         if is_okx_spread_symbol(instrument_id.symbol.as_str()) {
@@ -2288,6 +2357,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let instrument_id = cmd.instrument_id;
 
         if is_okx_spread_symbol(instrument_id.symbol.as_str()) {
@@ -2316,6 +2387,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let instrument_id = cmd.instrument_id;
 
         if is_okx_spread_symbol(instrument_id.symbol.as_str()) {
@@ -2344,6 +2417,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn unsubscribe_mark_prices(&mut self, cmd: &UnsubscribeMarkPrices) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let ws = self.public_ws()?.clone();
         let instrument_id = cmd.instrument_id;
 
@@ -2359,6 +2434,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn unsubscribe_index_prices(&mut self, cmd: &UnsubscribeIndexPrices) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let ws = self.public_ws()?.clone();
         let instrument_id = cmd.instrument_id;
         let symbol = instrument_id.symbol.inner();
@@ -2393,6 +2470,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let ws = self.business_ws()?.clone();
         let bar_type = cmd.bar_type;
 
@@ -2408,6 +2487,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn unsubscribe_funding_rates(&mut self, cmd: &UnsubscribeFundingRates) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let ws = self.public_ws()?.clone();
         let instrument_id = cmd.instrument_id;
 
@@ -2423,6 +2504,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn unsubscribe_option_greeks(&mut self, cmd: &UnsubscribeOptionGreeks) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let instrument_id = cmd.instrument_id;
         self.option_greeks_subs.remove(&instrument_id);
 
@@ -2461,6 +2544,8 @@ impl DataClient for OKXDataClient {
         &mut self,
         cmd: &UnsubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let ws = self.public_ws()?.clone();
         let instrument_id = cmd.instrument_id;
 
@@ -2476,6 +2561,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let instruments_cache = self.instruments_by_symbol.clone();
@@ -2619,6 +2706,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let instruments = self.instruments_by_symbol.clone();
@@ -2720,6 +2809,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let instrument_id = request.instrument_id;
@@ -2765,6 +2856,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let instrument_id = request.instrument_id;
@@ -2808,6 +2901,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let bar_type = request.bar_type;
@@ -2861,6 +2956,8 @@ impl DataClient for OKXDataClient {
     }
 
     fn request_funding_rates(&self, request: RequestFundingRates) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let instrument_id = request.instrument_id;
@@ -2907,6 +3004,8 @@ impl DataClient for OKXDataClient {
         &self,
         request: RequestOptionChainReferencePrice,
     ) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let series_id = request.series_id;
@@ -3004,7 +3103,10 @@ fn push_convention_str(out: &mut AHashSet<OKXGreeksType>, raw: &str) {
 fn historical_bar_availability(bars: &mut [nautilus_model::data::Bar]) -> anyhow::Result<()> {
     for bar in bars {
         let interval = u64::try_from(bar.bar_type.spec().timedelta().as_nanos())?;
-        let closed_at = bar.ts_event.as_u64().checked_add(interval)
+        let closed_at = bar
+            .ts_event
+            .as_u64()
+            .checked_add(interval)
             .ok_or_else(|| anyhow::anyhow!("historical bar close timestamp overflow"))?;
         bar.ts_init = closed_at.into();
     }
@@ -3031,23 +3133,48 @@ mod tests {
     #[test]
     fn historical_bars_survive_engine_bounds_using_close_time() {
         use nautilus_core::UUID4;
-        use nautilus_model::{data::{Bar, BarType}, types::{Price, Quantity}};
+        use nautilus_model::{
+            data::{Bar, BarType},
+            types::{Price, Quantity},
+        };
         let kind: BarType = "BTC-USDT-SWAP.OKX-5-MINUTE-LAST-EXTERNAL".parse().unwrap();
         let interval = 300_000_000_000u64;
         let end = 4 * interval;
-        let mut bars: Vec<_> = (1..=4).map(|slot| Bar::new(kind,
-            Price::new(100., 2), Price::new(101., 2), Price::new(99., 2),
-            Price::new(100., 2), Quantity::new(1., 2), (slot * interval).into(),
-            (end + 1).into())).collect();
-        let response = |data| DataResponse::Bars(BarsResponse::new(UUID4::new(),
-            ClientId::from("OKX"), kind, data, None, Some(end.into()), (end+1).into(), None));
+        let mut bars: Vec<_> = (1..=4)
+            .map(|slot| {
+                Bar::new(
+                    kind,
+                    Price::new(100., 2),
+                    Price::new(101., 2),
+                    Price::new(99., 2),
+                    Price::new(100., 2),
+                    Quantity::new(1., 2),
+                    (slot * interval).into(),
+                    (end + 1).into(),
+                )
+            })
+            .collect();
+        let response = |data| {
+            DataResponse::Bars(BarsResponse::new(
+                UUID4::new(),
+                ClientId::from("OKX"),
+                kind,
+                data,
+                None,
+                Some(end.into()),
+                (end + 1).into(),
+                None,
+            ))
+        };
         let mut old = response(bars.clone());
         old.trim_to_bounds();
         assert_eq!(old.record_count(), Some(0));
         historical_bar_availability(&mut bars).unwrap();
         let mut fixed = response(bars);
         fixed.trim_to_bounds();
-        let DataResponse::Bars(fixed) = fixed else { unreachable!() };
+        let DataResponse::Bars(fixed) = fixed else {
+            unreachable!()
+        };
         assert_eq!(fixed.data.len(), 3);
         assert_eq!(fixed.data.last().unwrap().ts_init.as_u64(), end);
         assert_eq!(fixed.ts_init.as_u64(), end + 1);
@@ -4913,6 +5040,36 @@ mod tests {
             Some(Price::from("0.5")),
             "the HTTP cache keeps the fresher concurrent definition"
         );
+    }
+
+    #[tokio::test]
+    async fn paused_recovery_data_inventory_requires_pristine_adapter() {
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_data_event_sender(sender);
+        let mut client =
+            OKXDataClient::new(*OKX_CLIENT_ID, OKXDataClientConfig::default()).unwrap();
+        client.verify_paused_recovery_inventory().unwrap();
+        let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel();
+        let signal = DropSignal(Some(drop_tx));
+        client.spawn_ws(
+            async move {
+                let _signal = signal;
+                std::future::pending::<anyhow::Result<()>>().await
+            },
+            "recovery inventory test",
+        );
+        assert!(client.verify_paused_recovery_inventory().is_err());
+        assert!(!client.tasks.is_empty());
+        assert!(matches!(
+            drop_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        client.reset().unwrap();
+        terminate_tasks(&client.tasks, "recovery inventory test")
+            .await
+            .unwrap();
+        assert!(client.tasks.is_empty());
+        assert!(client.verify_paused_recovery_inventory().is_err());
     }
 
     #[tokio::test]

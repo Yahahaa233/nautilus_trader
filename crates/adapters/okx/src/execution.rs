@@ -108,6 +108,8 @@ use crate::{
 
 #[derive(Debug)]
 pub struct OKXExecutionClient {
+    // Monotonic: reset/disconnect cannot turn a used adapter into a fresh one.
+    recovery_pristine: std::sync::atomic::AtomicBool,
     core: ExecutionClientCore,
     clock: &'static AtomicTime,
     config: OKXExecutionClientConfig,
@@ -219,6 +221,7 @@ impl OKXExecutionClient {
         ));
 
         Ok(Self {
+            recovery_pristine: std::sync::atomic::AtomicBool::new(true),
             core,
             clock,
             config,
@@ -1069,23 +1072,22 @@ impl OKXExecutionClient {
                     }
                 }
             };
-            if let Some(reason) = outcome {
-                if pending
+            if let Some(reason) = outcome
+                && pending
                     .remove_if(command.client_order_id.as_str(), |_, current| {
                         current.command_id == info.command_id
                     })
                     .is_some()
-                {
-                    let now = clock.get_time_ns();
-                    emitter.send_order_event(info.rejection(
-                        emitter.account_id(),
-                        command.client_order_id,
-                        command.venue_order_id,
-                        &reason,
-                        now,
-                        now,
-                    ));
-                }
+            {
+                let now = clock.get_time_ns();
+                emitter.send_order_event(info.rejection(
+                    emitter.account_id(),
+                    command.client_order_id,
+                    command.venue_order_id,
+                    &reason,
+                    now,
+                    now,
+                ));
             }
             Ok(())
         });
@@ -1309,6 +1311,8 @@ impl OKXExecutionClient {
             }
         };
 
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         match self.pending_tasks.spawner() {
             Ok(spawner) => spawn_task(&spawner, fut),
             Err(e) => log::debug!("Skipping {description} after OKX shutdown began: {e}"),
@@ -1802,6 +1806,24 @@ fn derive_trade_mode_for_instrument(
 
 #[async_trait(?Send)]
 impl ExecutionClient for OKXExecutionClient {
+    fn verify_paused_recovery_inventory(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.recovery_pristine
+                .load(std::sync::atomic::Ordering::Acquire)
+                && !self.core.is_connected()
+                && !self.core.is_started()
+                && self.session_tasks.is_empty()
+                && self.pending_tasks.is_empty()
+                && self.session_tasks.is_open()
+                && self.pending_tasks.is_open()
+                && self.ws_dispatch_state.order_identities.is_empty(),
+            "OKX execution recovery requires a fresh inactive adapter"
+        );
+        self.ws_private.verify_paused_recovery_inventory()?;
+        self.ws_business.verify_paused_recovery_inventory()?;
+        Ok(())
+    }
+
     fn is_connected(&self) -> bool {
         self.core.is_connected()
     }
@@ -1827,6 +1849,8 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         if self.core.is_connected() && self.pending_tasks.is_open() && self.session_tasks.is_open()
         {
             return Ok(());
@@ -1855,6 +1879,8 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         if self.core.is_disconnected()
             && self.pending_tasks.is_empty()
             && self.session_tasks.is_empty()
@@ -1870,11 +1896,15 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         self.update_account_state();
         Ok(())
     }
 
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let http_client = self.http_client.clone();
         let account_id = self.core.account_id;
         let emitter = self.emitter.clone();
@@ -2074,6 +2104,8 @@ impl ExecutionClient for OKXExecutionClient {
         ts_event: UnixNanos,
         info: Option<Params>,
     ) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         self.emitter
             .emit_account_state(balances, margins, reported, ts_event, info);
         Ok(())
@@ -2086,6 +2118,8 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         if self.core.is_started() {
             return Ok(());
         }
@@ -2108,6 +2142,8 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let was_started = self.core.is_started();
         self.core.set_stopped();
         self.begin_generation_shutdown();
@@ -2119,11 +2155,15 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         self.begin_generation_shutdown();
         Ok(())
     }
 
     fn dispose(&mut self) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         self.begin_generation_shutdown();
         Ok(())
     }
@@ -2132,6 +2172,8 @@ impl ExecutionClient for OKXExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let Some(instrument_id) = cmd.instrument_id else {
             anyhow::bail!("generate_order_status_report requires instrument_id");
         };
@@ -2284,6 +2326,8 @@ impl ExecutionClient for OKXExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(self.collect_order_status_reports(cmd, false).await?.reports)
     }
 
@@ -2291,6 +2335,8 @@ impl ExecutionClient for OKXExecutionClient {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(self.collect_fill_reports(cmd, FillHistory::Recent).await?.0)
     }
 
@@ -2298,6 +2344,8 @@ impl ExecutionClient for OKXExecutionClient {
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(self.collect_position_status_reports(cmd).await?.0)
     }
 
@@ -2305,6 +2353,8 @@ impl ExecutionClient for OKXExecutionClient {
         &self,
         lookback_mins: Option<u64>,
     ) -> anyhow::Result<Option<ExecutionMassStatus>> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         log::info!("Generating ExecutionMassStatus (lookback_mins={lookback_mins:?})");
 
         let ts_now = self.clock.get_time_ns();
@@ -2392,6 +2442,8 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let route = {
             let cache = self.core.cache();
             let order = cache.try_order(&cmd.client_order_id)?;
@@ -2424,6 +2476,8 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         if is_spread_instrument(cmd.instrument_id) {
             let cache = self.core.cache();
             let denied = OrderDeniedReason::UnsupportedOrderList {
@@ -2555,6 +2609,8 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let route = {
             let cache = self.core.cache();
             let order_state = cache
@@ -2652,6 +2708,8 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn cancel_order(&self, mut cmd: CancelOrder) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let venue_binding = self
             .ws_dispatch_state
             .order_venue_binding(cmd.client_order_id);
@@ -2680,6 +2738,8 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         match self.cancel_all_orders_route(cmd.instrument_id) {
             CancelAllOrdersRoute::SpreadHttp | CancelAllOrdersRoute::MassCancelHttp => {
                 self.mass_cancel_instrument(cmd.instrument_id);
@@ -2813,6 +2873,8 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
+        self.recovery_pristine
+            .store(false, std::sync::atomic::Ordering::Release);
         let cache = self.core.cache();
 
         let mut regular_payload = Vec::new();
@@ -4268,6 +4330,30 @@ mod tests {
             OKXExecutionClient::new(core, config).expect("failed to build test client"),
             cache,
         )
+    }
+
+    #[tokio::test]
+    async fn paused_recovery_execution_inventory_requires_pristine_adapter() {
+        let mut client = build_test_exec_client();
+        client.verify_paused_recovery_inventory().unwrap();
+        let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel();
+        let signal = DropSignal(Some(drop_tx));
+        client.spawn_task("recovery inventory test", async move {
+            let _signal = signal;
+            std::future::pending::<anyhow::Result<()>>().await
+        });
+        assert!(client.verify_paused_recovery_inventory().is_err());
+        assert!(!client.pending_tasks.is_empty());
+        assert!(matches!(
+            drop_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        client.reset().unwrap();
+        terminate_tasks(&client.pending_tasks, "recovery inventory test")
+            .await
+            .unwrap();
+        assert!(client.pending_tasks.is_empty());
+        assert!(client.verify_paused_recovery_inventory().is_err());
     }
 
     #[rstest]

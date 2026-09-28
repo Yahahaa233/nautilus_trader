@@ -266,6 +266,44 @@ impl Trader {
         self.clocks.values().cloned().collect()
     }
 
+    /// Returns every registered component clock after checking exact ownership.
+    /// Callers must retain a trader borrow while holding these clocks for capture.
+    ///
+    /// # Errors
+    /// Refuses missing, orphaned, or duplicate component clock identities.
+    pub fn registered_component_clocks(
+        &self,
+    ) -> anyhow::Result<Vec<(ComponentId, Rc<RefCell<dyn Clock>>)>> {
+        let expected: Vec<ComponentId> = self
+            .actor_ids
+            .iter()
+            .copied()
+            .map(ComponentId::from)
+            .chain(self.strategy_ids.iter().copied().map(ComponentId::from))
+            .chain(
+                self.exec_algorithm_ids
+                    .iter()
+                    .copied()
+                    .map(ComponentId::from),
+            )
+            .collect();
+        let unique: std::collections::HashSet<_> = expected.iter().copied().collect();
+        anyhow::ensure!(
+            unique.len() == expected.len(),
+            "duplicate component clock identity"
+        );
+        anyhow::ensure!(
+            self.clocks.len() == expected.len()
+                && expected.iter().all(|id| self.clocks.contains_key(id)),
+            "registered component clock inventory mismatch"
+        );
+        Ok(self
+            .clocks
+            .iter()
+            .map(|(id, clock)| (*id, clock.clone()))
+            .collect())
+    }
+
     /// Returns the total number of registered components.
     #[must_use]
     pub const fn component_count(&self) -> usize {
@@ -1761,29 +1799,19 @@ impl Trader {
         // All identities were checked above, so callback invocation cannot
         // discover a missing component halfway through a restore.
         for (actor_id, callbacks) in actor_callbacks {
-            let payload = state
-                .actors
-                .get(&actor_id)
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Actor {actor_id} state payload disappeared during restoration"
-                    )
-                })?;
+            let payload = state.actors.get(&actor_id).cloned().ok_or_else(|| {
+                anyhow::anyhow!("Actor {actor_id} state payload disappeared during restoration")
+            })?;
             (callbacks.load)(actor_id.inner(), payload).map_err(|error| {
                 anyhow::anyhow!("Failed to restore actor {actor_id} state: {error:#}")
             })?;
         }
         for (strategy_id, callbacks) in strategy_callbacks {
-            let payload = state
-                .strategies
-                .get(&strategy_id)
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Strategy {strategy_id} state payload disappeared during restoration"
-                    )
-                })?;
+            let payload = state.strategies.get(&strategy_id).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Strategy {strategy_id} state payload disappeared during restoration"
+                )
+            })?;
             (callbacks.load)(strategy_id.inner(), payload).map_err(|error| {
                 anyhow::anyhow!("Failed to restore strategy {strategy_id} state: {error:#}")
             })?;

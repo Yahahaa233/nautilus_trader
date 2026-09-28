@@ -51,6 +51,15 @@ pub const DEFAULT_POSITION_RECONCILIATION_TOLERANCE: Decimal =
 /// allows implementations to hold non-Send state for any Python interop.
 #[async_trait(?Send)]
 pub trait ExecutionClient {
+    /// Verify the supported pre-start recovery inventory without clearing state.
+    /// Connection status alone never establishes empty adapter work.
+    ///
+    /// # Errors
+    /// Unknown adapters refuse until they implement an explicit inventory contract.
+    fn verify_paused_recovery_inventory(&self) -> anyhow::Result<()> {
+        anyhow::bail!("adapter paused recovery inventory is unsupported")
+    }
+
     fn is_connected(&self) -> bool;
     fn client_id(&self) -> ClientId;
     fn account_id(&self) -> AccountId;

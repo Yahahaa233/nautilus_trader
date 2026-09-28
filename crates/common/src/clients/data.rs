@@ -47,6 +47,15 @@ use crate::messages::defi::{
 /// allows implementations to hold non-Send state for any Python interop.
 #[async_trait(?Send)]
 pub trait DataClient {
+    /// Verify the supported pre-start recovery inventory without clearing state.
+    /// Connection status alone never establishes empty adapter work.
+    ///
+    /// # Errors
+    /// Unknown adapters refuse until they implement an explicit inventory contract.
+    fn verify_paused_recovery_inventory(&self) -> anyhow::Result<()> {
+        anyhow::bail!("adapter paused recovery inventory is unsupported")
+    }
+
     /// Returns the unique identifier for this data client.
     fn client_id(&self) -> ClientId;
 

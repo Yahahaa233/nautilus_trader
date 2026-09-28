@@ -460,6 +460,41 @@ pub fn data_cmd_queue_is_empty() -> bool {
     DATA_CMD_QUEUE.with(|q| q.borrow().is_empty())
 }
 
+/// Runs a synchronous capture while both owner-thread command queues remain empty.
+/// Immutable queue borrows prevent enqueue/drain during the callback. This does
+/// not cover native async channels, external producers, or component internals.
+///
+/// # Errors
+/// Refuses nonempty queues or conflicting queue borrows without consuming messages.
+///
+/// # Panics
+/// Propagates callback panics, including attempted mutation of the borrowed queues.
+pub fn with_empty_sync_command_queues<T>(
+    capture: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    DATA_CMD_QUEUE.with(|data| {
+        TRADING_CMD_QUEUE.with(|trading| {
+            let data = data
+                .try_borrow()
+                .map_err(|_| anyhow::anyhow!("sync data queue borrowed"))?;
+            let trading = trading
+                .try_borrow()
+                .map_err(|_| anyhow::anyhow!("sync trading queue borrowed"))?;
+            anyhow::ensure!(
+                data.is_empty() && trading.is_empty(),
+                "synchronous commands remain pending"
+            );
+            let result = capture();
+            // Keep both immutable borrows alive through the entire callback.
+            anyhow::ensure!(
+                data.is_empty() && trading.is_empty(),
+                "synchronous queue changed during capture"
+            );
+            result
+        })
+    })
+}
+
 /// Gets the global data command sender.
 ///
 /// # Panics
@@ -863,6 +898,43 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
+
+    #[test]
+    fn paused_sync_inventory_retains_queues_and_borrows() {
+        std::thread::spawn(|| {
+            assert_eq!(with_empty_sync_command_queues(|| Ok(7)).unwrap(), 7);
+            DATA_CMD_QUEUE.with(|queue| {
+                let _held = queue.borrow_mut();
+                assert!(with_empty_sync_command_queues(|| Ok(())).is_err());
+            });
+            with_empty_sync_command_queues(|| {
+                DATA_CMD_QUEUE.with(|queue| assert!(queue.try_borrow_mut().is_err()));
+                TRADING_CMD_QUEUE.with(|queue| assert!(queue.try_borrow_mut().is_err()));
+                Ok(())
+            })
+            .unwrap();
+            let command = TradingCommand::QueryAccount(QueryAccount::new(
+                TraderId::from("TRADER-001"),
+                None,
+                AccountId::from("SIM-001"),
+                UUID4::new(),
+                UnixNanos::from(1),
+                None,
+                None,
+            ));
+            let message =
+                TradingCommandMessage::new(MessagingSwitchboard::exec_engine_execute(), command);
+            TRADING_CMD_QUEUE
+                .with(|queue| queue.borrow_mut().push(QueuedTradingCommand::new(message)));
+            assert!(
+                with_empty_sync_command_queues::<()>(|| panic!("must not collect pending queue"))
+                    .is_err()
+            );
+            TRADING_CMD_QUEUE.with(|queue| assert_eq!(queue.borrow().len(), 1));
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn replacing_trait_senders_calls_hook_without_borrowing_slot() {

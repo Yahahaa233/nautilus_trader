@@ -564,6 +564,35 @@ impl OKXWebSocketClient {
         !self.handler_tasks.is_empty()
     }
 
+    /// Inspect a fresh adapter's disconnected socket without draining its state.
+    /// The owner additionally proves it has never admitted lifecycle/request work.
+    pub(crate) fn verify_paused_recovery_inventory(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.is_active()
+                && !self.has_task()
+                && self.handler_tasks.is_open()
+                && !self.signal.load(Ordering::Acquire)
+                && !self.cancellation_token.is_cancelled()
+                && self.connect_lock.try_lock().is_ok()
+                && self
+                    .out_rx
+                    .as_ref()
+                    .is_none_or(|receiver| receiver.is_empty())
+                && self.pending_orders.is_empty()
+                && self.pending_cancels.is_empty()
+                && self.pending_amends.is_empty()
+                && self.subscriptions_state.is_empty()
+                && self.subscriptions_inst_type.is_empty()
+                && self.subscriptions_inst_family.is_empty()
+                && self.subscriptions_inst_id.is_empty()
+                && self.subscriptions_bare.is_empty()
+                && self.option_greeks_subs.load().is_empty()
+                && self.index_pair_subscribers.is_empty(),
+            "OKX socket has active or pending recovery state"
+        );
+        Ok(())
+    }
+
     /// Caches multiple instruments.
     ///
     /// Any existing instruments with the same symbols will be replaced.
@@ -3783,6 +3812,35 @@ mod tests {
             messages::{OKXOrderMsg, OKXWebSocketError, OKXWsFrame},
         },
     };
+
+    #[test]
+    fn paused_recovery_socket_inventory_preserves_pending_and_subscriptions() {
+        let socket = OKXWebSocketClient::default();
+        socket.verify_paused_recovery_inventory().unwrap();
+        socket.pending_orders.insert(
+            "test-order".into(),
+            PendingOrderInfo {
+                trader_id: TraderId::from("TESTER-001"),
+                strategy_id: StrategyId::from("TEST-001"),
+                instrument_id: InstrumentId::from("BTC-USDT-SWAP.OKX"),
+                command_id: None,
+            },
+        );
+        assert!(socket.verify_paused_recovery_inventory().is_err());
+        assert!(socket.pending_orders.contains_key("test-order"));
+        socket.pending_orders.clear();
+        socket
+            .index_pair_subscribers
+            .insert(Ustr::from("BTC-USDT"), 1);
+        assert!(socket.verify_paused_recovery_inventory().is_err());
+        assert_eq!(
+            *socket
+                .index_pair_subscribers
+                .get(&Ustr::from("BTC-USDT"))
+                .unwrap(),
+            1
+        );
+    }
 
     struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
 

@@ -195,6 +195,9 @@ enum StringOrU64 {
 /// OKX sends timestamp fields as strings, while `Serialize` for the typed
 /// `u64` model fields writes numbers. Recovery query evidence must accept both
 /// representations so a collected response can be inspected offline.
+///
+/// # Errors
+/// Returns an error for an unsupported input type or a nonempty string that is not a `u64`.
 pub fn deserialize_string_to_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
