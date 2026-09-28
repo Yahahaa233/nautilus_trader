@@ -28,8 +28,8 @@ use nautilus_common::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use nautilus_common::live::ingress::IngressSender;
 use crate::runner::AsyncRunner;
+use nautilus_common::live::ingress::IngressSender;
 
 /// Current wire schema for a recovery input sent to a runner channel.
 pub const RUNNER_RECOVERY_ENVELOPE_SCHEMA_VERSION: u16 = 1;
@@ -620,11 +620,70 @@ impl RunnerRecoveryEvent {
     }
 }
 
+/// Borrowed messages never transfer ownership to a snapshot codec.
+#[derive(Clone, Copy, Debug)]
+pub enum RunnerRecoveryEventRef<'a> {
+    TimeEvent(&'a TimeEventMessage),
+    SystemEvent(&'a SystemEvent),
+    SystemCommand(&'a SystemCommand),
+    ExecutionEvent(&'a ExecutionEvent),
+    ExecutionCommand(&'a TradingCommandMessage),
+    DataEvent(&'a DataEvent),
+    DataCommand(&'a DataCommand),
+}
+impl RunnerRecoveryEventRef<'_> {
+    /// Returns the exact native channel of the borrowed message.
+    #[must_use]
+    pub const fn channel(self) -> RunnerRecoveryChannel {
+        match self {
+            Self::TimeEvent(_) => RunnerRecoveryChannel::TimeEvent,
+            Self::SystemEvent(_) => RunnerRecoveryChannel::SystemEvent,
+            Self::SystemCommand(_) => RunnerRecoveryChannel::SystemCommand,
+            Self::ExecutionEvent(_) => RunnerRecoveryChannel::ExecutionEvent,
+            Self::ExecutionCommand(_) => RunnerRecoveryChannel::ExecutionCommand,
+            Self::DataEvent(_) => RunnerRecoveryChannel::DataEvent,
+            Self::DataCommand(_) => RunnerRecoveryChannel::DataCommand,
+        }
+    }
+}
+
+/// Encoded queue entry. Ordinals express only FIFO within one native channel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerPendingEntry {
+    pub channel: RunnerRecoveryChannel,
+    pub channel_ordinal: u64,
+    pub codec_id: String,
+    pub payload: Value,
+}
+
+/// Seven-channel queue evidence, not a complete component or timer inventory.
+/// No global dispatch order is inferred from the order of entries in this vector.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RunnerPendingSnapshot {
+    pub(crate) entries: Vec<RunnerPendingEntry>,
+}
+impl RunnerPendingSnapshot {
+    /// Borrows encoded entries without implying a global FIFO or execution grant.
+    #[must_use]
+    pub fn entries(&self) -> &[RunnerPendingEntry] {
+        &self.entries
+    }
+}
+
 /// A channel-specific decoder supplied by the application.
 ///
 /// Implementations are process-local and must reject payloads they do not
 /// understand.  The trait has no authorization method by design.
 pub trait RunnerRecoveryCodec: std::fmt::Debug {
+    /// Encodes a borrowed message without consuming or dispatching it.
+    ///
+    /// # Errors
+    /// Decode-only codecs reject capture until an explicit encoder is supplied.
+    fn encode(&self, _event: RunnerRecoveryEventRef<'_>) -> Result<Value> {
+        anyhow::bail!("recovery codec does not support borrowed capture")
+    }
+
     /// Declares the only channel this codec may populate.
     fn channel(&self) -> RunnerRecoveryChannel;
 
@@ -722,6 +781,35 @@ impl RunnerRecoveryCodecRegistry {
     #[must_use]
     pub const fn is_sealed(&self) -> bool {
         self.sealed
+    }
+
+    /// Encodes one native queue message through its sealed channel codec.
+    ///
+    /// # Errors
+    /// Rejects unsealed/missing codecs and all timer callbacks, which lack a
+    /// stable cross-process callback identity contract. Messages remain borrowed.
+    pub fn encode(
+        &self,
+        event: RunnerRecoveryEventRef<'_>,
+        channel_ordinal: u64,
+    ) -> Result<RunnerPendingEntry> {
+        ensure!(self.sealed, "runner recovery codec registry is not sealed");
+        let channel = event.channel();
+        ensure!(
+            channel != RunnerRecoveryChannel::TimeEvent,
+            "timer callback identity is not recoverably encoded"
+        );
+        let codec = self
+            .codecs
+            .get(&channel)
+            .context("no capture codec for native channel")?;
+        let payload = codec.encode(event)?;
+        Ok(RunnerPendingEntry {
+            channel,
+            channel_ordinal,
+            codec_id: codec.codec_id().to_owned(),
+            payload,
+        })
     }
 
     /// Decodes one envelope through its explicitly registered codec.
@@ -1404,7 +1492,11 @@ mod tests {
         let runner = AsyncRunner::new();
         let mut handoff = runner.recovery_handoff().unwrap();
         let frozen = runner.freeze_ingress().unwrap();
-        assert!(handoff.enqueue(&envelope(1, "endpoint-1"), &registry()).is_err());
+        assert!(
+            handoff
+                .enqueue(&envelope(1, "endpoint-1"), &registry())
+                .is_err()
+        );
         assert!(frozen.verify().is_err());
         assert!(frozen.finish().is_err());
         let mut channels = runner.take_channels();

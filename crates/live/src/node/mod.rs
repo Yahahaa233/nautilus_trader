@@ -133,7 +133,7 @@ use crate::{
         client::LiveExecutionClient,
         manager::{ExecutionManager, ExecutionManagerConfig, TargetedOrderReportResult},
     },
-    runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent},
+    runner::{AsyncRunner, AsyncRunnerChannels, PendingRunnerEvent, SnapshotReceiver},
     runner_recovery::RunnerRecoveryHandoff,
     socket::{SocketReconnectLookup, SocketReconnectRegistry},
 };
@@ -168,7 +168,10 @@ use reconciliation::{
     TargetedOrderReportTask,
 };
 use state::{EngineConnectionStatus, RunningTransition};
-pub use state::{LiveNodeHandle, NodeRunMode, NodeState, StartupReconciliationObservation, StartupReconciliationPhase};
+pub use state::{
+    LiveNodeHandle, NodeRunMode, NodeState, StartupReconciliationObservation,
+    StartupReconciliationPhase,
+};
 
 /// Dispatches the run loop performs before yielding to the executor.
 ///
@@ -795,10 +798,140 @@ impl LiveNode {
     ///
     /// # Errors
     /// Refuses non-idle nodes or unavailable receivers instead of reporting zero.
-    pub fn recovery_runner_queue_counts(&self) -> anyhow::Result<std::collections::BTreeMap<crate::runner_recovery::RunnerRecoveryChannel, usize>> {
-        anyhow::ensure!(self.state() == NodeState::Idle,
-            "recovery queue observation requires an idle node");
-        Ok(self.runner.as_ref().context("recovery queue receivers unavailable")?.pending_queue_counts())
+    pub fn recovery_runner_queue_counts(
+        &self,
+    ) -> anyhow::Result<
+        std::collections::BTreeMap<crate::runner_recovery::RunnerRecoveryChannel, usize>,
+    > {
+        anyhow::ensure!(
+            self.state() == NodeState::Idle,
+            "recovery queue observation requires an idle node"
+        );
+        Ok(self
+            .runner
+            .as_ref()
+            .context("recovery queue receivers unavailable")?
+            .pending_queue_counts())
+    }
+
+    /// Holds actual runner ingress frozen across synchronous component capture.
+    /// The snapshot covers seven native queues only; it grants no execution or
+    /// complete timer, external-bus, or component-internal inventory guarantee.
+    ///
+    /// # Errors
+    /// Refuses non-paused recovery, active dispatch, connected clients, pending
+    /// recovery callbacks, or invalidated admission. Capture failure poisons the node.
+    #[cfg(feature = "dispatch-observer")]
+    pub fn with_paused_recovery_queue_snapshot<T>(
+        &mut self,
+        registry: &crate::runner_recovery::RunnerRecoveryCodecRegistry,
+        collect: impl FnOnce(&crate::runner_recovery::RunnerPendingSnapshot) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.with_paused_recovery_queue_checkpoint(registry, collect, Ok)
+    }
+
+    /// Collects component state, validates the frozen boundary, then persists it.
+    /// `persist` must perform only durable IO, never callbacks or message delivery.
+    /// The boundary is revalidated after persistence; failed output remains unaccepted.
+    ///
+    /// # Errors
+    /// Refuses invalid recovery boundaries and collection/persistence failures.
+    /// Every failure after freezing invalidates admission and stops the node.
+    #[cfg(feature = "dispatch-observer")]
+    pub fn with_paused_recovery_queue_checkpoint<C, T>(
+        &mut self,
+        registry: &crate::runner_recovery::RunnerRecoveryCodecRegistry,
+        collect: impl FnOnce(&crate::runner_recovery::RunnerPendingSnapshot) -> anyhow::Result<C>,
+        persist: impl FnOnce(C) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let check = |node: &Self| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                node.state() == NodeState::Idle
+                    && !node.handle.should_stop()
+                    && node.recovery_requires_release
+                    && node.recovery_native_frontier.is_some(),
+                "queue capture requires completed paused native recovery"
+            );
+            anyhow::ensure!(
+                node.recovery_dispatch_queue.is_empty(),
+                "recovery callbacks remain queued"
+            );
+            anyhow::ensure!(
+                node.kernel.risk_engine.try_borrow()?.trading_state()
+                    == nautilus_model::enums::TradingState::Halted,
+                "queue capture requires halted admission"
+            );
+            anyhow::ensure!(
+                node.kernel.data_engine.try_borrow()?.check_disconnected()
+                    && node.kernel.exec_engine.try_borrow()?.check_disconnected(),
+                "queue capture requires disconnected clients"
+            );
+            Ok(())
+        };
+        check(self)?;
+        let observer = self
+            .dispatch_observer
+            .clone()
+            .context("queue capture requires observer")?;
+        let coverage = observer.coverage()?;
+        anyhow::ensure!(
+            coverage["active_depth"].as_u64() == Some(0) && coverage["failure"].is_null(),
+            "queue capture requires idle healthy observer"
+        );
+        let proof = observer.completion_proof()?;
+        anyhow::ensure!(
+            coverage["completed_root"].as_u64() == Some(0) || proof.is_some(),
+            "queue capture requires an uninvalidated completion frontier"
+        );
+        let ingress = self
+            .runner
+            .as_ref()
+            .context("runner receivers unavailable")?
+            .ingress_gate();
+        let guard = ingress.freeze()?;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check(self)?;
+            let snapshot = self
+                .runner
+                .as_mut()
+                .context("runner receivers unavailable")?
+                .snapshot_pending(&guard, registry)?;
+            let value = collect(&snapshot)?;
+            check(self)?;
+            guard.verify()?;
+            anyhow::ensure!(
+                observer.coverage()? == coverage,
+                "observer changed during queue capture"
+            );
+            if let Some(proof) = &proof {
+                proof.verify()?;
+            }
+            let value = persist(value)?;
+            check(self)?;
+            guard.verify()?;
+            anyhow::ensure!(
+                observer.coverage()? == coverage,
+                "observer changed during persistence"
+            );
+            if let Some(proof) = &proof {
+                proof.verify()?;
+            }
+            guard.finish()?;
+            Ok(value)
+        }));
+        match outcome {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => {
+                ingress.invalidate();
+                self.handle.stop();
+                Err(error)
+            }
+            Err(panic) => {
+                ingress.invalidate();
+                self.handle.stop();
+                std::panic::resume_unwind(panic)
+            }
+        }
     }
 
     fn ensure_recovery_start_permitted(&self) -> anyhow::Result<()> {
@@ -1318,25 +1451,30 @@ impl LiveNode {
     /// Returns an error if reconciliation fails or times out.
     async fn perform_startup_reconciliation(&mut self) -> anyhow::Result<()> {
         let clients = self.kernel.exec_engine.borrow().client_ids().len();
-        self.handle.observe_startup_reconciliation(StartupReconciliationObservation {
-            phase: StartupReconciliationPhase::Processing,
-            observed_at_ns: self.kernel.clock.borrow().timestamp_ns().as_u64(),
-            clients,
-            reason: None,
-        });
+        self.handle
+            .observe_startup_reconciliation(StartupReconciliationObservation {
+                phase: StartupReconciliationPhase::Processing,
+                observed_at_ns: self.kernel.clock.borrow().timestamp_ns().as_u64(),
+                clients,
+                reason: None,
+            });
         let result = self.perform_startup_reconciliation_inner().await;
-        self.handle.observe_startup_reconciliation(StartupReconciliationObservation {
-            phase: if result.is_err() {
-                StartupReconciliationPhase::Failed
-            } else if !self.config.exec_engine.reconciliation {
-                StartupReconciliationPhase::Disabled
-            } else {
-                StartupReconciliationPhase::Processed
-            },
-            observed_at_ns: self.kernel.clock.borrow().timestamp_ns().as_u64(),
-            clients,
-            reason: result.as_ref().err().map(|error| error.to_string().chars().take(1024).collect()),
-        });
+        self.handle
+            .observe_startup_reconciliation(StartupReconciliationObservation {
+                phase: if result.is_err() {
+                    StartupReconciliationPhase::Failed
+                } else if !self.config.exec_engine.reconciliation {
+                    StartupReconciliationPhase::Disabled
+                } else {
+                    StartupReconciliationPhase::Processed
+                },
+                observed_at_ns: self.kernel.clock.borrow().timestamp_ns().as_u64(),
+                clients,
+                reason: result
+                    .as_ref()
+                    .err()
+                    .map(|error| error.to_string().chars().take(1024).collect()),
+            });
         result
     }
 
@@ -3023,13 +3161,13 @@ impl LiveNode {
     )]
     fn drain_channels(
         &self,
-        time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-        system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
-        system_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
-        exec_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-        exec_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
-        data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-        data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
+        time_evt_rx: &mut SnapshotReceiver<TimeEventMessage>,
+        system_evt_rx: &mut SnapshotReceiver<SystemEvent>,
+        system_cmd_rx: &mut SnapshotReceiver<SystemCommand>,
+        exec_evt_rx: &mut SnapshotReceiver<ExecutionEvent>,
+        exec_cmd_rx: &mut SnapshotReceiver<TradingCommandMessage>,
+        data_evt_rx: &mut SnapshotReceiver<DataEvent>,
+        data_cmd_rx: &mut SnapshotReceiver<DataCommand>,
     ) {
         if !self.note_dispatch_gap("final_drain_discarded_system_inputs") {
             return;
@@ -3644,13 +3782,13 @@ async fn recv_external_msgbus_message(
 }
 
 struct RunnerReceivers<'a> {
-    time_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-    system_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
-    system_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
-    exec_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-    exec_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
-    data_evt: &'a mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    data_cmd: &'a mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
+    time_evt: &'a mut SnapshotReceiver<TimeEventMessage>,
+    system_evt: &'a mut SnapshotReceiver<SystemEvent>,
+    system_cmd: &'a mut SnapshotReceiver<SystemCommand>,
+    exec_evt: &'a mut SnapshotReceiver<ExecutionEvent>,
+    exec_cmd: &'a mut SnapshotReceiver<TradingCommandMessage>,
+    data_evt: &'a mut SnapshotReceiver<DataEvent>,
+    data_cmd: &'a mut SnapshotReceiver<DataCommand>,
 }
 
 /// Flushes data events and commands from both `pending` and the channel receivers
@@ -3661,8 +3799,8 @@ struct RunnerReceivers<'a> {
 /// that were not captured into `pending`.
 fn flush_pending_data(
     pending: &mut PendingEvents,
-    data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
+    data_evt_rx: &mut SnapshotReceiver<DataEvent>,
+    data_cmd_rx: &mut SnapshotReceiver<DataCommand>,
 ) {
     loop {
         let mut progressed = pending.drain_data();
@@ -3694,13 +3832,13 @@ fn flush_pending_data(
 )]
 fn flush_all_pending(
     pending: &mut PendingEvents,
-    time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-    system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
-    system_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
-    exec_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-    exec_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
-    data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
+    time_evt_rx: &mut SnapshotReceiver<TimeEventMessage>,
+    system_evt_rx: &mut SnapshotReceiver<SystemEvent>,
+    system_cmd_rx: &mut SnapshotReceiver<SystemCommand>,
+    exec_evt_rx: &mut SnapshotReceiver<ExecutionEvent>,
+    exec_cmd_rx: &mut SnapshotReceiver<TradingCommandMessage>,
+    data_evt_rx: &mut SnapshotReceiver<DataEvent>,
+    data_cmd_rx: &mut SnapshotReceiver<DataCommand>,
 ) {
     // Flush channel receivers into pending
     while let Ok(handler) = time_evt_rx.try_recv() {
@@ -3770,13 +3908,13 @@ fn flush_all_pending(
 async fn drive_with_event_buffering<F: std::future::Future>(
     future: F,
     pending: &mut PendingEvents,
-    time_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-    system_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
-    system_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
-    exec_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-    exec_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
-    data_evt_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    data_cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
+    time_evt_rx: &mut SnapshotReceiver<TimeEventMessage>,
+    system_evt_rx: &mut SnapshotReceiver<SystemEvent>,
+    system_cmd_rx: &mut SnapshotReceiver<SystemCommand>,
+    exec_evt_rx: &mut SnapshotReceiver<ExecutionEvent>,
+    exec_cmd_rx: &mut SnapshotReceiver<TradingCommandMessage>,
+    data_evt_rx: &mut SnapshotReceiver<DataEvent>,
+    data_cmd_rx: &mut SnapshotReceiver<DataCommand>,
 ) -> F::Output {
     tokio::pin!(future);
 
@@ -4487,7 +4625,10 @@ mod tests {
         node.dispose();
 
         let mut node = LiveNode::builder(TraderId::from("INGRESS-002"), Environment::Sandbox)
-            .unwrap().with_name("IngressBuilderStop").build().unwrap();
+            .unwrap()
+            .with_name("IngressBuilderStop")
+            .build()
+            .unwrap();
         let frozen = node.runner.as_ref().unwrap().freeze_ingress().unwrap();
         node.handle().stop();
         assert!(frozen.finish().is_err());
@@ -7212,10 +7353,18 @@ mod tests {
         let observation = node.handle().startup_reconciliation().unwrap();
         assert_eq!(observation.clients, 1);
         assert!(observation.observed_at_ns > 0);
-        assert_eq!(observation.phase, if complete == Some(true) && !missing_instrument {
-            StartupReconciliationPhase::Processed
-        } else { StartupReconciliationPhase::Failed });
-        assert_eq!(node.handle().clone().startup_reconciliation(), Some(observation));
+        assert_eq!(
+            observation.phase,
+            if complete == Some(true) && !missing_instrument {
+                StartupReconciliationPhase::Processed
+            } else {
+                StartupReconciliationPhase::Failed
+            }
+        );
+        assert_eq!(
+            node.handle().clone().startup_reconciliation(),
+            Some(observation)
+        );
         node.handle.set_starting();
         assert!(node.handle().startup_reconciliation().is_none());
     }
@@ -8634,8 +8783,10 @@ mod tests {
 
     #[rstest]
     fn test_flush_pending_data_drains_events_and_commands() {
-        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let mut evt_rx = SnapshotReceiver::from(evt_rx);
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let mut cmd_rx = SnapshotReceiver::from(cmd_rx);
 
         let mut pending = PendingEvents::default();
 
@@ -8657,8 +8808,10 @@ mod tests {
 
     #[rstest]
     fn test_flush_pending_data_drains_mixed_sources() {
-        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let mut evt_rx = SnapshotReceiver::from(evt_rx);
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let mut cmd_rx = SnapshotReceiver::from(cmd_rx);
 
         let mut pending = PendingEvents::default();
 
@@ -8777,17 +8930,22 @@ mod tests {
 
     #[rstest]
     fn test_flush_all_pending_drains_buffered_channels() {
-        let (time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (system_evt_tx, mut system_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
-        let (system_cmd_tx, mut system_cmd_rx) =
+        let (time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let mut time_rx = SnapshotReceiver::from(time_rx);
+        let (system_evt_tx, system_evt_rx) = tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+        let mut system_evt_rx = SnapshotReceiver::from(system_evt_rx);
+        let (system_cmd_tx, system_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
-        let (data_evt_tx, mut data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (data_cmd_tx, mut data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (exec_evt_tx, mut exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-        let (exec_cmd_tx, mut exec_cmd_rx) =
+        let mut system_cmd_rx = SnapshotReceiver::from(system_cmd_rx);
+        let (data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let mut data_evt_rx = SnapshotReceiver::from(data_evt_rx);
+        let (data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let mut data_cmd_rx = SnapshotReceiver::from(data_cmd_rx);
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let mut exec_evt_rx = SnapshotReceiver::from(exec_evt_rx);
+        let (exec_cmd_tx, exec_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let mut exec_cmd_rx = SnapshotReceiver::from(exec_cmd_rx);
 
         let mut pending = PendingEvents::default();
 
@@ -8871,17 +9029,22 @@ mod tests {
 
     #[rstest]
     fn test_flush_all_pending_routes_order_event_to_order_evts() {
-        let (_time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_system_evt_tx, mut system_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
-        let (_system_cmd_tx, mut system_cmd_rx) =
+        let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let mut time_rx = SnapshotReceiver::from(time_rx);
+        let (_system_evt_tx, system_evt_rx) = tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+        let mut system_evt_rx = SnapshotReceiver::from(system_evt_rx);
+        let (_system_cmd_tx, system_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
-        let (_data_evt_tx, mut data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_data_cmd_tx, mut data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (exec_evt_tx, mut exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-        let (_exec_cmd_tx, mut exec_cmd_rx) =
+        let mut system_cmd_rx = SnapshotReceiver::from(system_cmd_rx);
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let mut data_evt_rx = SnapshotReceiver::from(data_evt_rx);
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let mut data_cmd_rx = SnapshotReceiver::from(data_cmd_rx);
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let mut exec_evt_rx = SnapshotReceiver::from(exec_evt_rx);
+        let (_exec_cmd_tx, exec_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let mut exec_cmd_rx = SnapshotReceiver::from(exec_cmd_rx);
 
         let mut pending = PendingEvents::default();
 
@@ -8907,17 +9070,22 @@ mod tests {
 
     #[rstest]
     fn test_flush_all_pending_routes_account_event_immediately() {
-        let (_time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_system_evt_tx, mut system_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
-        let (_system_cmd_tx, mut system_cmd_rx) =
+        let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let mut time_rx = SnapshotReceiver::from(time_rx);
+        let (_system_evt_tx, system_evt_rx) = tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+        let mut system_evt_rx = SnapshotReceiver::from(system_evt_rx);
+        let (_system_cmd_tx, system_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
-        let (_data_evt_tx, mut data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_data_cmd_tx, mut data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (exec_evt_tx, mut exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-        let (_exec_cmd_tx, mut exec_cmd_rx) =
+        let mut system_cmd_rx = SnapshotReceiver::from(system_cmd_rx);
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let mut data_evt_rx = SnapshotReceiver::from(data_evt_rx);
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let mut data_cmd_rx = SnapshotReceiver::from(data_cmd_rx);
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let mut exec_evt_rx = SnapshotReceiver::from(exec_evt_rx);
+        let (_exec_cmd_tx, exec_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let mut exec_cmd_rx = SnapshotReceiver::from(exec_cmd_rx);
 
         let mut pending = PendingEvents::default();
 
@@ -9083,17 +9251,22 @@ mod tests {
 
     #[rstest]
     fn test_flush_all_pending_buffers_submitted_batch_as_individual_events() {
-        let (_time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_system_evt_tx, mut system_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
-        let (_system_cmd_tx, mut system_cmd_rx) =
+        let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let mut time_rx = SnapshotReceiver::from(time_rx);
+        let (_system_evt_tx, system_evt_rx) = tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+        let mut system_evt_rx = SnapshotReceiver::from(system_evt_rx);
+        let (_system_cmd_tx, system_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
-        let (_data_evt_tx, mut data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_data_cmd_tx, mut data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (exec_evt_tx, mut exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-        let (_exec_cmd_tx, mut exec_cmd_rx) =
+        let mut system_cmd_rx = SnapshotReceiver::from(system_cmd_rx);
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let mut data_evt_rx = SnapshotReceiver::from(data_evt_rx);
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let mut data_cmd_rx = SnapshotReceiver::from(data_cmd_rx);
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let mut exec_evt_rx = SnapshotReceiver::from(exec_evt_rx);
+        let (_exec_cmd_tx, exec_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let mut exec_cmd_rx = SnapshotReceiver::from(exec_cmd_rx);
 
         let mut pending = PendingEvents::default();
 
@@ -9117,17 +9290,22 @@ mod tests {
 
     #[rstest]
     fn test_flush_all_pending_buffers_canceled_batch_as_individual_events() {
-        let (_time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_system_evt_tx, mut system_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
-        let (_system_cmd_tx, mut system_cmd_rx) =
+        let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let mut time_rx = SnapshotReceiver::from(time_rx);
+        let (_system_evt_tx, system_evt_rx) = tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+        let mut system_evt_rx = SnapshotReceiver::from(system_evt_rx);
+        let (_system_cmd_tx, system_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
-        let (_data_evt_tx, mut data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_data_cmd_tx, mut data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (exec_evt_tx, mut exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-        let (_exec_cmd_tx, mut exec_cmd_rx) =
+        let mut system_cmd_rx = SnapshotReceiver::from(system_cmd_rx);
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let mut data_evt_rx = SnapshotReceiver::from(data_evt_rx);
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let mut data_cmd_rx = SnapshotReceiver::from(data_cmd_rx);
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let mut exec_evt_rx = SnapshotReceiver::from(exec_evt_rx);
+        let (_exec_cmd_tx, exec_cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let mut exec_cmd_rx = SnapshotReceiver::from(exec_cmd_rx);
 
         let mut pending = PendingEvents::default();
 
@@ -9153,8 +9331,8 @@ mod tests {
     fn test_flush_all_pending_expands_batch_into_order_evts_before_drain() {
         use nautilus_model::identifiers::ClientOrderId;
 
-        let (exec_evt_tx, mut exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let mut exec_evt_rx = SnapshotReceiver::from(exec_evt_rx);
 
         exec_evt_tx.send(stub_canceled_batch_event()).unwrap();
 

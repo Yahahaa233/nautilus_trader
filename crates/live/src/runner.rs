@@ -184,6 +184,10 @@ impl TradingCommandSender for AsyncTradingCommandSender {
     }
 }
 
+#[path = "runner_snapshot.rs"]
+mod snapshot;
+pub use snapshot::SnapshotReceiver;
+
 pub trait Runner {
     fn run(&mut self);
 }
@@ -194,13 +198,13 @@ pub trait Runner {
 /// the event loop directly on the same thread as the msgbus endpoints.
 #[derive(Debug)]
 pub struct AsyncRunnerChannels {
-    pub time_evt_rx: tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-    pub system_evt_rx: tokio::sync::mpsc::UnboundedReceiver<SystemEvent>,
-    pub system_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<SystemCommand>,
-    pub exec_evt_rx: tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-    pub exec_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
-    pub data_evt_rx: tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-    pub data_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
+    pub time_evt_rx: SnapshotReceiver<TimeEventMessage>,
+    pub system_evt_rx: SnapshotReceiver<SystemEvent>,
+    pub system_cmd_rx: SnapshotReceiver<SystemCommand>,
+    pub exec_evt_rx: SnapshotReceiver<ExecutionEvent>,
+    pub exec_cmd_rx: SnapshotReceiver<TradingCommandMessage>,
+    pub data_evt_rx: SnapshotReceiver<DataEvent>,
+    pub data_cmd_rx: SnapshotReceiver<DataCommand>,
 }
 
 #[cfg(feature = "node")]
@@ -287,13 +291,13 @@ impl AsyncRunner {
         Self {
             ingress,
             channels: AsyncRunnerChannels {
-                time_evt_rx,
-                system_evt_rx,
-                system_cmd_rx,
-                exec_evt_rx,
-                exec_cmd_rx,
-                data_evt_rx,
-                data_cmd_rx,
+                time_evt_rx: time_evt_rx.into(),
+                system_evt_rx: system_evt_rx.into(),
+                system_cmd_rx: system_cmd_rx.into(),
+                exec_evt_rx: exec_evt_rx.into(),
+                exec_cmd_rx: exec_cmd_rx.into(),
+                data_evt_rx: data_evt_rx.into(),
+                data_cmd_rx: data_cmd_rx.into(),
             },
             time_evt_tx,
             system_evt_tx,
@@ -334,6 +338,66 @@ impl AsyncRunner {
         self.ingress.freeze()
     }
 
+    /// Captures actual retained messages under this runner's live ingress guard.
+    /// Messages remain in their original channel FIFO, including on codec failure.
+    /// This covers seven queues only, not timers, component internals, or global order.
+    ///
+    /// # Errors
+    /// Refuses foreign/invalid guards, extracted receivers, and unsupported codecs.
+    /// Any failure after staging starts invalidates the ingress boundary.
+    pub fn snapshot_pending(
+        &mut self,
+        guard: &FrozenIngress,
+        registry: &crate::runner_recovery::RunnerRecoveryCodecRegistry,
+    ) -> anyhow::Result<crate::runner_recovery::RunnerPendingSnapshot> {
+        anyhow::ensure!(
+            guard.belongs_to(&self.ingress),
+            "foreign runner ingress guard"
+        );
+        guard.verify()?;
+        anyhow::ensure!(
+            self.recovery_handoff_available.load(Ordering::Acquire),
+            "runner receivers no longer available for paused capture"
+        );
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            anyhow::ensure!(registry.is_sealed(), "capture registry is not sealed");
+            let mut entries = Vec::new();
+            macro_rules! capture {
+                ($field:ident, $variant:ident) => {
+                    self.channels.$field.stage()?;
+                    for (ordinal, message) in self.channels.$field.pending().enumerate() {
+                        guard.verify()?;
+                        entries.push(registry.encode(
+                            crate::runner_recovery::RunnerRecoveryEventRef::$variant(message),
+                            u64::try_from(ordinal)?,
+                        )?);
+                        guard.verify()?;
+                    }
+                };
+            }
+            capture!(time_evt_rx, TimeEvent);
+            capture!(system_evt_rx, SystemEvent);
+            capture!(system_cmd_rx, SystemCommand);
+            capture!(exec_evt_rx, ExecutionEvent);
+            capture!(exec_cmd_rx, ExecutionCommand);
+            capture!(data_evt_rx, DataEvent);
+            capture!(data_cmd_rx, DataCommand);
+            guard.verify()?;
+            Ok(crate::runner_recovery::RunnerPendingSnapshot { entries })
+        }));
+        match outcome {
+            Ok(Ok(snapshot)) => Ok(snapshot),
+            Ok(Err(error)) => {
+                self.ingress.invalidate();
+                Err(error)
+            }
+            Err(panic) => {
+                self.ingress.invalidate();
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+
     /// Binds this runner's channel senders to thread-local storage.
     ///
     /// Call before creating clients that read from TLS (e.g., in the builder),
@@ -366,7 +430,9 @@ impl AsyncRunner {
     }
 
     /// Read-only per-channel counts. Publishers can race this observation; it is not a fence.
-    pub(crate) fn pending_queue_counts(&self) -> std::collections::BTreeMap<crate::runner_recovery::RunnerRecoveryChannel, usize> {
+    pub(crate) fn pending_queue_counts(
+        &self,
+    ) -> std::collections::BTreeMap<crate::runner_recovery::RunnerRecoveryChannel, usize> {
         use crate::runner_recovery::RunnerRecoveryChannel as Channel;
         std::collections::BTreeMap::from([
             (Channel::TimeEvent, self.channels.time_evt_rx.len()),
@@ -422,33 +488,23 @@ impl AsyncRunner {
         &self.recovery_handoff_available
     }
 
-    pub(crate) fn time_event_sender_clone(
-        &self,
-    ) -> IngressSender<TimeEventMessage> {
+    pub(crate) fn time_event_sender_clone(&self) -> IngressSender<TimeEventMessage> {
         self.time_evt_tx.clone()
     }
 
-    pub(crate) fn system_event_sender_clone(
-        &self,
-    ) -> IngressSender<SystemEvent> {
+    pub(crate) fn system_event_sender_clone(&self) -> IngressSender<SystemEvent> {
         self.system_evt_tx.clone()
     }
 
-    pub(crate) fn system_command_sender_clone(
-        &self,
-    ) -> IngressSender<SystemCommand> {
+    pub(crate) fn system_command_sender_clone(&self) -> IngressSender<SystemCommand> {
         self.system_cmd_tx.clone()
     }
 
-    pub(crate) fn execution_event_sender_clone(
-        &self,
-    ) -> IngressSender<ExecutionEvent> {
+    pub(crate) fn execution_event_sender_clone(&self) -> IngressSender<ExecutionEvent> {
         self.exec_evt_tx.clone()
     }
 
-    pub(crate) fn execution_command_sender_clone(
-        &self,
-    ) -> IngressSender<TradingCommandMessage> {
+    pub(crate) fn execution_command_sender_clone(&self) -> IngressSender<TradingCommandMessage> {
         self.exec_cmd_tx.clone()
     }
 
@@ -456,9 +512,7 @@ impl AsyncRunner {
         self.data_evt_tx.clone()
     }
 
-    pub(crate) fn data_command_sender_clone(
-        &self,
-    ) -> IngressSender<DataCommand> {
+    pub(crate) fn data_command_sender_clone(&self) -> IngressSender<DataCommand> {
         self.data_cmd_tx.clone()
     }
 
@@ -803,7 +857,7 @@ impl AsyncRunner {
 
 #[cfg(feature = "node")]
 fn poll_channel<T>(
-    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
+    receiver: &mut SnapshotReceiver<T>,
     pending: usize,
     event: impl Fn(T) -> PendingRunnerEvent,
     process: &mut impl FnMut(PendingRunnerEvent),
@@ -883,10 +937,16 @@ mod tests {
         assert!(runner.data_cmd_tx.belongs_to(&runner.ingress));
         runner.bind_senders();
         let sender = get_data_event_sender();
-        sender.send(DataEvent::Data(Data::Quote(test_quote()))).unwrap();
+        sender
+            .send(DataEvent::Data(Data::Quote(test_quote())))
+            .unwrap();
         let frozen = runner.freeze_ingress().unwrap();
         assert!(runner.verify_ingress().is_err());
-        assert!(sender.send(DataEvent::Data(Data::Quote(test_quote()))).is_err());
+        assert!(
+            sender
+                .send(DataEvent::Data(Data::Quote(test_quote())))
+                .is_err()
+        );
         assert!(frozen.finish().is_err());
         assert_eq!(runner.channels.data_evt_rx.len(), 1);
         assert!(runner.verify_ingress().is_err());
@@ -915,7 +975,10 @@ mod tests {
         let mut runner = AsyncRunner::new();
         runner.system_evt_tx.send(test_system_event()).unwrap();
         let frozen = runner.freeze_ingress().unwrap();
-        assert!(matches!(runner.recv().await, Some(PendingRunnerEvent::SystemEvent(_))));
+        assert!(matches!(
+            runner.recv().await,
+            Some(PendingRunnerEvent::SystemEvent(_))
+        ));
         assert!(frozen.finish().is_err());
     }
 
@@ -959,15 +1022,158 @@ mod tests {
         ))
     }
 
+    #[derive(Debug)]
+    struct SnapshotCodec {
+        calls: std::cell::Cell<usize>,
+        fail_second: bool,
+        panic_second: bool,
+    }
+    impl crate::runner_recovery::RunnerRecoveryCodec for SnapshotCodec {
+        fn channel(&self) -> crate::runner_recovery::RunnerRecoveryChannel {
+            crate::runner_recovery::RunnerRecoveryChannel::SystemEvent
+        }
+        fn codec_id(&self) -> &str {
+            "snapshot.test.v1"
+        }
+        fn decode(
+            &self,
+            _: &crate::runner_recovery::RunnerRecoveryEnvelope,
+        ) -> anyhow::Result<crate::runner_recovery::RunnerRecoveryEvent> {
+            anyhow::bail!("encoding fixture only")
+        }
+        fn encode(
+            &self,
+            event: crate::runner_recovery::RunnerRecoveryEventRef<'_>,
+        ) -> anyhow::Result<serde_json::Value> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            if call == 2 {
+                assert!(!self.panic_second, "injected codec panic");
+                anyhow::ensure!(!self.fail_second, "injected unsupported second message");
+            }
+            Ok(serde_json::json!(format!("{event:?}")))
+        }
+    }
+    fn snapshot_registry(
+        fail_second: bool,
+        panic_second: bool,
+    ) -> crate::runner_recovery::RunnerRecoveryCodecRegistry {
+        use crate::runner_recovery::{RunnerRecoveryChannel, RunnerRecoveryCodecRegistry};
+        let mut registry = RunnerRecoveryCodecRegistry::new([RunnerRecoveryChannel::SystemEvent]);
+        registry
+            .register(SnapshotCodec {
+                calls: std::cell::Cell::new(0),
+                fail_second,
+                panic_second,
+            })
+            .unwrap();
+        registry.seal().unwrap()
+    }
+    #[test]
+    fn queue_snapshot_repeated_capture_and_errors_preserve_original_fifo() {
+        for (fail, panic) in [(false, false), (true, false), (false, true)] {
+            let mut runner = AsyncRunner::new();
+            let first = test_system_event();
+            let second = SystemEvent::SocketState(SocketStateChange::new(
+                ClientId::from("OTHER"),
+                None,
+                Ustr::from("different-stream"),
+                SocketState::Connected,
+            ));
+            runner.system_evt_tx.send(first).unwrap();
+            runner.system_evt_tx.send(second).unwrap();
+            let guard = runner.freeze_ingress().unwrap();
+            let registry = snapshot_registry(fail, panic);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runner.snapshot_pending(&guard, &registry)
+            }));
+            if panic {
+                assert!(outcome.is_err());
+            } else if fail {
+                assert!(outcome.unwrap().is_err());
+            } else {
+                let first_snapshot = outcome.unwrap().unwrap();
+                let second_snapshot = runner.snapshot_pending(&guard, &registry).unwrap();
+                assert_eq!(first_snapshot, second_snapshot);
+                assert_eq!(first_snapshot.entries()[0].channel_ordinal, 0);
+                assert_eq!(first_snapshot.entries()[1].channel_ordinal, 1);
+                guard.verify().unwrap();
+            }
+            assert_eq!(runner.channels.system_evt_rx.try_recv().unwrap(), first);
+            assert_eq!(runner.channels.system_evt_rx.try_recv().unwrap(), second);
+            assert!(runner.channels.system_evt_rx.try_recv().is_err());
+        }
+    }
+    #[test]
+    fn queue_snapshot_rejects_timer_without_consuming_callback_or_other_queues() {
+        let mut runner = AsyncRunner::new();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = count.clone();
+        let event = TimeEvent::new(
+            Ustr::from("snapshot-timer"),
+            UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        );
+        runner
+            .time_evt_tx
+            .send(TimeEventMessage::new(
+                event,
+                TimeEventCallback::from(move |_: TimeEvent| {
+                    callback_count.fetch_add(1, Ordering::SeqCst);
+                }),
+            ))
+            .unwrap();
+        runner.system_evt_tx.send(test_system_event()).unwrap();
+        let guard = runner.freeze_ingress().unwrap();
+        assert!(
+            runner
+                .snapshot_pending(&guard, &snapshot_registry(false, false))
+                .is_err()
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(runner.channels.time_evt_rx.try_recv().unwrap().dispatch());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(runner.channels.time_evt_rx.try_recv().is_err());
+        assert_eq!(
+            runner.channels.system_evt_rx.try_recv().unwrap(),
+            test_system_event()
+        );
+    }
+    #[test]
+    fn queue_snapshot_refuses_foreign_or_stopped_boundary() {
+        let mut runner = AsyncRunner::new();
+        runner.system_evt_tx.send(test_system_event()).unwrap();
+        let other = IngressGate::new();
+        let foreign = other.freeze().unwrap();
+        assert!(
+            runner
+                .snapshot_pending(&foreign, &snapshot_registry(false, false))
+                .is_err()
+        );
+        foreign.finish().unwrap();
+        let guard = runner.freeze_ingress().unwrap();
+        runner.stop();
+        assert!(
+            runner
+                .snapshot_pending(&guard, &snapshot_registry(false, false))
+                .is_err()
+        );
+        assert_eq!(
+            runner.channels.system_evt_rx.try_recv().unwrap(),
+            test_system_event()
+        );
+    }
+
     // Test fixture to create AsyncRunner with manual channels.
     // Sender halves are dummies (not connected to the test receivers) since
     // these tests exercise the event loop, not TLS binding.
     fn create_test_runner(
-        time_evt_rx: tokio::sync::mpsc::UnboundedReceiver<TimeEventMessage>,
-        data_evt_rx: tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
-        data_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DataCommand>,
-        exec_evt_rx: tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-        exec_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<TradingCommandMessage>,
+        time_evt_rx: SnapshotReceiver<TimeEventMessage>,
+        data_evt_rx: SnapshotReceiver<DataEvent>,
+        data_cmd_rx: SnapshotReceiver<DataCommand>,
+        exec_evt_rx: SnapshotReceiver<ExecutionEvent>,
+        exec_cmd_rx: SnapshotReceiver<TradingCommandMessage>,
         signal_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
         signal_tx: tokio::sync::mpsc::UnboundedSender<()>,
     ) -> AsyncRunner {
@@ -984,8 +1190,8 @@ mod tests {
             ingress,
             channels: AsyncRunnerChannels {
                 time_evt_rx,
-                system_evt_rx,
-                system_cmd_rx,
+                system_evt_rx: system_evt_rx.into(),
+                system_cmd_rx: system_cmd_rx.into(),
                 exec_evt_rx,
                 exec_cmd_rx,
                 data_evt_rx,
@@ -1068,11 +1274,11 @@ mod tests {
             .unwrap();
 
         let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
+            time_evt_rx.into(),
+            data_evt_rx.into(),
+            data_cmd_rx.into(),
+            exec_evt_rx.into(),
+            exec_cmd_rx.into(),
             signal_rx,
             signal_tx,
         );
@@ -1156,11 +1362,11 @@ mod tests {
         let (_exec_cmd_tx, exec_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
+            time_evt_rx.into(),
+            data_evt_rx.into(),
+            data_cmd_rx.into(),
+            exec_evt_rx.into(),
+            exec_cmd_rx.into(),
             signal_rx,
             signal_tx,
         );
@@ -1342,11 +1548,11 @@ mod tests {
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
+            time_evt_rx.into(),
+            data_evt_rx.into(),
+            data_cmd_rx.into(),
+            exec_evt_rx.into(),
+            exec_cmd_rx.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -1375,11 +1581,11 @@ mod tests {
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
+            time_evt_rx.into(),
+            data_evt_rx.into(),
+            data_cmd_rx.into(),
+            exec_evt_rx.into(),
+            exec_cmd_rx.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -1416,11 +1622,11 @@ mod tests {
 
         // Setup runner
         let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
+            time_evt_rx.into(),
+            data_evt_rx.into(),
+            data_cmd_rx.into(),
+            exec_evt_rx.into(),
+            exec_cmd_rx.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -1692,11 +1898,11 @@ mod tests {
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
+            time_evt_rx.into(),
+            data_evt_rx.into(),
+            data_cmd_rx.into(),
+            exec_evt_rx.into(),
+            exec_cmd_rx.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -1742,11 +1948,11 @@ mod tests {
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
+            time_evt_rx.into(),
+            data_evt_rx.into(),
+            data_cmd_rx.into(),
+            exec_evt_rx.into(),
+            exec_cmd_rx.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -1946,11 +2152,11 @@ mod tests {
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
+            time_evt_rx.into(),
+            data_evt_rx.into(),
+            data_cmd_rx.into(),
+            exec_evt_rx.into(),
+            exec_cmd_rx.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -1977,11 +2183,11 @@ mod tests {
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
+            time_evt_rx.into(),
+            data_evt_rx.into(),
+            data_cmd_rx.into(),
+            exec_evt_rx.into(),
+            exec_cmd_rx.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -2130,11 +2336,11 @@ mod tests {
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
+            time_evt_rx.into(),
+            data_evt_rx.into(),
+            data_cmd_rx.into(),
+            exec_evt_rx.into(),
+            exec_cmd_rx.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -2156,7 +2362,10 @@ mod tests {
     #[tokio::test]
     async fn test_runner_handle_is_cloneable() {
         let (signal_tx, _signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let handle = AsyncRunnerHandle { signal_tx, ingress: IngressGate::new() };
+        let handle = AsyncRunnerHandle {
+            signal_tx,
+            ingress: IngressGate::new(),
+        };
 
         let handle2 = handle.clone();
 
@@ -2176,11 +2385,11 @@ mod tests {
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
+            time_evt_rx.into(),
+            data_evt_rx.into(),
+            data_cmd_rx.into(),
+            exec_evt_rx.into(),
+            exec_cmd_rx.into(),
             signal_rx,
             signal_tx.clone(),
         );
