@@ -544,3 +544,108 @@ async fn paused_timer_inventory_checks_registered_actor_and_retains_borrows() {
         .is_err()
     );
 }
+
+#[test]
+fn empty_bootstrap_receipt_requires_real_handoffs_and_never_invents_dispatch() {
+    use crate::dispatch::DispatchObserver;
+    use crate::runner_recovery::RunnerRecoveryCodecRegistry;
+    for mode in 0..3 {
+        let mut node =
+            LiveNode::builder(TraderId::from("EMPTY-BOOTSTRAP-001"), Environment::Sandbox)
+                .unwrap()
+                .with_reconciliation(false)
+                .build()
+                .unwrap();
+        node.kernel
+            .risk_engine
+            .borrow_mut()
+            .set_trading_state(nautilus_model::enums::TradingState::Halted);
+        let observer = DispatchObserver::new("empty-bootstrap".into(), |_| Ok(())).unwrap();
+        node.set_dispatch_observer(NodeDispatchObserver::new(observer.clone(), |_, _, _| {
+            anyhow::bail!("no dispatch")
+        }))
+        .unwrap();
+        let source = UUID4::new();
+        let digest = "a".repeat(64);
+        assert!(
+            node.complete_empty_bootstrap_recovery("original", 3, &digest, source)
+                .is_err()
+        );
+        node.restore_native_cache(Cache::default()).unwrap();
+        assert!(
+            node.complete_empty_bootstrap_recovery("original", 3, &digest, source)
+                .is_err()
+        );
+        node.restore_component_state(&CollectedComponentState {
+            actors: Default::default(),
+            strategies: Default::default(),
+        })
+        .unwrap();
+        if mode == 2 {
+            nautilus_common::live::runner::get_system_command_sender()
+                .send(stub_system_command())
+                .unwrap();
+        }
+        let receipt = node.complete_empty_bootstrap_recovery("original", 3, &digest, source);
+        if mode == 2 {
+            assert!(receipt.is_err());
+            assert_eq!(
+                node.runner
+                    .as_ref()
+                    .unwrap()
+                    .pending_queue_counts()
+                    .values()
+                    .sum::<usize>(),
+                1
+            );
+            assert!(node.handle.should_stop());
+            continue;
+        }
+        assert_eq!(
+            serde_json::to_value(receipt.unwrap()).unwrap()["checkpoint_sequence"],
+            3
+        );
+        assert!(node.recovery_native_frontier.is_none());
+        assert_eq!(observer.completed_root().unwrap(), 0);
+        assert!(
+            node.complete_empty_bootstrap_recovery("original", 3, &digest, source)
+                .is_err()
+        );
+        let persisted = std::cell::Cell::new(false);
+        let registry = RunnerRecoveryCodecRegistry::new([]).seal().unwrap();
+        let result = node.with_paused_recovery_inventory_checkpoint(
+            &registry,
+            |snapshot, inventory| {
+                assert!(snapshot.entries().is_empty());
+                let inventory = serde_json::to_value(inventory)?;
+                assert_eq!(inventory["runner_counts"].as_object().unwrap().len(), 7);
+                assert!(
+                    inventory["runner_counts"]
+                        .as_object()
+                        .unwrap()
+                        .values()
+                        .all(|v| *v == 0)
+                );
+                assert_eq!(inventory["timer_counts"]["kernel"], 0);
+                assert_eq!(inventory["message_bus_mode"], "local_only");
+                if mode == 1 {
+                    assert!(
+                        std::panic::catch_unwind(|| nautilus_common::msgbus::publish_any(
+                            "attempted".into(),
+                            &()
+                        ))
+                        .is_err()
+                    );
+                }
+                Ok(())
+            },
+            |()| {
+                persisted.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result.is_ok(), mode == 0);
+        assert_eq!(persisted.get(), mode == 0);
+        assert_eq!(observer.completed_root().unwrap(), 0);
+    }
+}

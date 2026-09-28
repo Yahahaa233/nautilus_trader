@@ -936,6 +936,7 @@ pub fn exact_subscriber_count_bars(topic: MStr<Topic>) -> usize {
 
 /// Publishes a message to the topic using runtime type dispatch (Any).
 pub fn publish_any(topic: MStr<Topic>, message: &dyn Any) {
+    let _dispatch_scope = super::BusDispatchScope::enter();
     dispatch_tap_publish(topic, message);
 
     // Take buffer (re-entrancy safe)
@@ -970,6 +971,7 @@ pub fn try_publish_any(topic: MStr<Topic>, message: &dyn Any) -> bool {
         return false;
     }
 
+    let _dispatch_scope = super::BusDispatchScope::enter();
     dispatch_tap_publish(topic, message);
 
     let Ok(mut bus) = bus_rc.try_borrow_mut() else {
@@ -1288,6 +1290,7 @@ fn publish_typed<T: 'static>(
     fill_fn: impl FnOnce(&mut MessageBus, &mut SmallVec<[TypedHandler<T>; HANDLER_BUFFER_CAP]>),
     message: &T,
 ) {
+    let _dispatch_scope = super::BusDispatchScope::enter();
     dispatch_tap_publish(topic, message);
 
     // Take buffer (re-entrancy safe)
@@ -1321,6 +1324,7 @@ pub fn send_any_value<T: 'static>(endpoint: MStr<Endpoint>, message: &T) {
 
 #[inline]
 fn send_any_inner(endpoint: MStr<Endpoint>, message: &dyn Any, fn_name: &str) {
+    let _dispatch_scope = super::BusDispatchScope::enter();
     dispatch_tap_send(endpoint, message);
 
     let handler = {
@@ -1342,6 +1346,7 @@ fn send_any_inner(endpoint: MStr<Endpoint>, message: &dyn Any, fn_name: &str) {
 
 /// Sends the [`DataResponse`] to the registered correlation ID handler.
 pub fn send_response(correlation_id: &UUID4, message: &DataResponse) {
+    let _dispatch_scope = super::BusDispatchScope::enter();
     dispatch_tap_response(correlation_id, message);
 
     let handler = {
@@ -1493,6 +1498,7 @@ fn send_endpoint_ref<T: 'static, F>(
 ) where
     F: FnOnce(&MessageBus) -> Option<&TypedHandler<T>>,
 {
+    let _dispatch_scope = super::BusDispatchScope::enter();
     dispatch_tap_send(endpoint, message);
 
     let handler = {
@@ -1535,6 +1541,7 @@ fn send_endpoint_owned_counted<T: 'static, F>(
     F: FnOnce(&MessageBus) -> Option<&TypedIntoHandler<T>>,
 {
     // Capture before the dispatch consumes `message`
+    let _dispatch_scope = super::BusDispatchScope::enter();
     dispatch_tap_send(endpoint, &message);
 
     let handler = {

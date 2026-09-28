@@ -504,6 +504,18 @@ impl MessageBus {
         self.streaming_types.clear();
     }
 
+    pub(super) fn verify_local_only_recovery_inventory(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.has_backing && self.external_egress.is_none() && !self.has_external_streams,
+            "external message bus inventory unsupported"
+        );
+        anyhow::ensure!(
+            self.correlation_index.is_empty(),
+            "message bus responses remain pending"
+        );
+        Ok(())
+    }
+
     #[must_use]
     pub(crate) fn has_external_egress(&self) -> bool {
         self.external_egress.is_some()

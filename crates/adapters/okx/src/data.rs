@@ -1792,6 +1792,11 @@ async fn reconcile_instruments(
 
 #[async_trait::async_trait(?Send)]
 impl DataClient for OKXDataClient {
+    fn paused_recovery_inventory_profile(&self) -> anyhow::Result<&'static str> {
+        self.verify_paused_recovery_inventory()?;
+        Ok("okx_fresh_disconnected_v1")
+    }
+
     fn verify_paused_recovery_inventory(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.recovery_pristine.load(Ordering::Acquire)
@@ -5049,6 +5054,10 @@ mod tests {
         let mut client =
             OKXDataClient::new(*OKX_CLIENT_ID, OKXDataClientConfig::default()).unwrap();
         client.verify_paused_recovery_inventory().unwrap();
+        assert_eq!(
+            client.paused_recovery_inventory_profile().unwrap(),
+            "okx_fresh_disconnected_v1"
+        );
         let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel();
         let signal = DropSignal(Some(drop_tx));
         client.spawn_ws(
@@ -5059,6 +5068,7 @@ mod tests {
             "recovery inventory test",
         );
         assert!(client.verify_paused_recovery_inventory().is_err());
+        assert!(client.paused_recovery_inventory_profile().is_err());
         assert!(!client.tasks.is_empty());
         assert!(matches!(
             drop_rx.try_recv(),
@@ -5070,6 +5080,7 @@ mod tests {
             .unwrap();
         assert!(client.tasks.is_empty());
         assert!(client.verify_paused_recovery_inventory().is_err());
+        assert!(client.paused_recovery_inventory_profile().is_err());
     }
 
     #[tokio::test]

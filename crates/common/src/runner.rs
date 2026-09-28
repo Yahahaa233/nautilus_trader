@@ -460,6 +460,18 @@ pub fn data_cmd_queue_is_empty() -> bool {
     DATA_CMD_QUEUE.with(|q| q.borrow().is_empty())
 }
 
+/// Observes both owner-thread synchronous queue lengths without consuming messages.
+/// The caller must retain the empty-queue capture guard for a stable inventory.
+///
+/// # Errors
+/// Refuses a conflicting mutable queue borrow.
+pub fn synchronous_command_queue_counts() -> anyhow::Result<(usize, usize)> {
+    DATA_CMD_QUEUE.with(|data| {
+        TRADING_CMD_QUEUE
+            .with(|trading| Ok((data.try_borrow()?.len(), trading.try_borrow()?.len())))
+    })
+}
+
 /// Runs a synchronous capture while both owner-thread command queues remain empty.
 /// Immutable queue borrows prevent enqueue/drain during the callback. This does
 /// not cover native async channels, external producers, or component internals.

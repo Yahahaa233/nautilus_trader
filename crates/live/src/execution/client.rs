@@ -178,6 +178,13 @@ impl LiveExecutionClient {
 
 #[async_trait(?Send)]
 impl ExecutionClient for LiveExecutionClient {
+    fn paused_recovery_inventory_profile(&self) -> anyhow::Result<&'static str> {
+        self.verify_paused_recovery_inventory()?;
+        self.client
+            .try_borrow()?
+            .paused_recovery_inventory_profile()
+    }
+
     fn verify_paused_recovery_inventory(&self) -> anyhow::Result<()> {
         let pending = self.pending_instruments.try_borrow()?;
         anyhow::ensure!(

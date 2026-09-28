@@ -197,6 +197,7 @@ impl Drop for SuppressExternalGuard {
 
 /// Sets the thread-local message bus, replacing any existing one.
 pub fn set_message_bus(msgbus: Rc<RefCell<MessageBus>>) {
+    reject_recovery_dispatch();
     HAS_EXTERNAL_EGRESS.with(|flag| flag.set(msgbus.borrow().has_external_egress()));
     MESSAGE_BUS.with(|bus| {
         *bus.borrow_mut() = Some(msgbus);
@@ -207,6 +208,9 @@ pub fn set_message_bus(msgbus: Rc<RefCell<MessageBus>>) {
 ///
 /// If no message bus has been set for this thread, a default one is created and initialized.
 pub fn get_message_bus() -> Rc<RefCell<MessageBus>> {
+    if let Some(bus) = try_get_message_bus() {
+        return bus;
+    }
     MESSAGE_BUS.with(|bus| {
         let mut slot = bus.borrow_mut();
         let rc = slot.get_or_insert_with(|| Rc::new(RefCell::new(MessageBus::default())));
@@ -248,6 +252,7 @@ thread_local! {
 /// are responsible for clearing the tap on shutdown via [`clear_bus_tap`] so a stale
 /// adapter does not outlive the writer it captures into.
 pub fn set_bus_tap(tap: Rc<dyn BusTap>) {
+    reject_recovery_dispatch();
     BUS_TAP.with(|slot| {
         *slot.borrow_mut() = Some(tap);
     });
@@ -257,6 +262,7 @@ pub fn set_bus_tap(tap: Rc<dyn BusTap>) {
 ///
 /// A no-op when no tap is installed.
 pub fn clear_bus_tap() {
+    reject_recovery_dispatch();
     BUS_TAP.with(|slot| {
         *slot.borrow_mut() = None;
     });
@@ -264,6 +270,7 @@ pub fn clear_bus_tap() {
 
 #[inline]
 pub(super) fn dispatch_tap_publish(topic: MStr<Topic>, message: &dyn Any) {
+    reject_recovery_dispatch();
     // Clone the Rc so the cell borrow is released before the tap runs. The tap is
     // single-threaded with the bus; a re-entrant `set_bus_tap` during dispatch would
     // otherwise panic on RefCell.
@@ -275,6 +282,7 @@ pub(super) fn dispatch_tap_publish(topic: MStr<Topic>, message: &dyn Any) {
 
 #[inline]
 pub(super) fn dispatch_tap_send(endpoint: MStr<Endpoint>, message: &dyn Any) {
+    reject_recovery_dispatch();
     let tap = BUS_TAP.with(|slot| slot.borrow().clone());
     if let Some(tap) = tap {
         tap.on_send(endpoint, message);
@@ -283,6 +291,7 @@ pub(super) fn dispatch_tap_send(endpoint: MStr<Endpoint>, message: &dyn Any) {
 
 #[inline]
 pub(super) fn dispatch_tap_response(correlation_id: &UUID4, message: &dyn Any) {
+    reject_recovery_dispatch();
     let tap = BUS_TAP.with(|slot| slot.borrow().clone());
     if let Some(tap) = tap {
         tap.on_response(correlation_id, message);
@@ -292,4 +301,172 @@ pub(super) fn dispatch_tap_response(correlation_id: &UUID4, message: &dyn Any) {
 #[inline]
 pub(crate) fn dispatch_tap_time_event(event: &TimeEvent) {
     dispatch_tap_publish(MessagingSwitchboard::time_event_topic(), event);
+}
+
+thread_local! {
+    static BUS_DISPATCH_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static RECOVERY_CAPTURE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static RECOVERY_CAPTURE_FAILED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Borrowed admission guard for a local-only, synchronous bus capture.
+/// Only the inventory callback can obtain this guard; it grants no dispatch permission.
+#[derive(Debug)]
+pub struct LocalOnlyRecoveryInventory {
+    _private: (),
+}
+impl LocalOnlyRecoveryInventory {
+    /// Confirms no bus dispatch was attempted during the capture.
+    ///
+    /// # Errors
+    /// Refuses an inactive boundary or any attempted publish/send/response.
+    pub fn verify(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            RECOVERY_CAPTURE_ACTIVE.get() && !RECOVERY_CAPTURE_FAILED.get(),
+            "message bus capture invalidated by dispatch"
+        );
+        Ok(())
+    }
+}
+impl Drop for LocalOnlyRecoveryInventory {
+    fn drop(&mut self) {
+        RECOVERY_CAPTURE_ACTIVE.set(false);
+    }
+}
+// Held by each central dispatch function through its full handler fanout.
+#[derive(Debug)]
+pub(super) struct BusDispatchScope;
+impl BusDispatchScope {
+    pub(super) fn enter() -> Self {
+        reject_recovery_dispatch();
+        BUS_DISPATCH_DEPTH.set(
+            BUS_DISPATCH_DEPTH
+                .get()
+                .checked_add(1)
+                .expect("message bus dispatch depth overflow"),
+        );
+        Self
+    }
+}
+impl Drop for BusDispatchScope {
+    fn drop(&mut self) {
+        BUS_DISPATCH_DEPTH.set(BUS_DISPATCH_DEPTH.get() - 1);
+    }
+}
+
+fn reject_recovery_dispatch() {
+    if RECOVERY_CAPTURE_ACTIVE.get() {
+        RECOVERY_CAPTURE_FAILED.set(true);
+        panic!("message bus dispatch during paused recovery capture");
+    }
+}
+
+/// Captures only a local bus with no external backing or outstanding responses.
+/// Retains immutable bus and TLS-slot borrows, rejecting registry mutation and replacement.
+/// Every dispatch attempt invalidates the guard even when its panic is caught.
+///
+/// # Errors
+/// Refuses missing/busy buses, external I/O, outstanding responses, nested capture,
+/// invalidated boundaries, and callback failures.
+///
+/// # Panics
+/// Propagates callback panics. Dispatch and bus mutation during capture panic.
+pub fn with_local_only_recovery_inventory<T>(
+    capture: impl FnOnce(&LocalOnlyRecoveryInventory) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    MESSAGE_BUS.with(|slot| {
+        let slot = slot.try_borrow()?;
+        let bus = slot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("message bus missing"))?;
+        let bus = bus.try_borrow()?;
+        bus.verify_local_only_recovery_inventory()?;
+        anyhow::ensure!(
+            BUS_DISPATCH_DEPTH.get() == 0,
+            "message bus dispatch remains active"
+        );
+        anyhow::ensure!(!RECOVERY_CAPTURE_ACTIVE.get(), "nested message bus capture");
+        RECOVERY_CAPTURE_FAILED.set(false);
+        RECOVERY_CAPTURE_ACTIVE.set(true);
+        let guard = LocalOnlyRecoveryInventory { _private: () };
+        let result = capture(&guard);
+        guard.verify()?;
+        bus.verify_local_only_recovery_inventory()?;
+        result
+    })
+}
+
+#[cfg(test)]
+mod recovery_inventory_tests {
+    use super::*;
+    #[test]
+    fn local_only_inventory_rejects_reentry_from_actual_handler() {
+        #[derive(Debug)]
+        struct CaptureHandler(Rc<Cell<bool>>);
+        impl Handler<dyn Any> for CaptureHandler {
+            fn id(&self) -> ustr::Ustr {
+                ustr::Ustr::from("capture-handler")
+            }
+            fn handle(&self, _: &dyn Any) {
+                self.0
+                    .set(with_local_only_recovery_inventory(|_| Ok(())).is_err());
+            }
+        }
+        std::thread::spawn(|| {
+            set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+            let refused = Rc::new(Cell::new(false));
+            register_any(
+                "capture-handler".into(),
+                typed_handler::shareable_handler(Rc::new(CaptureHandler(refused.clone()))),
+            );
+            send_any("capture-handler".into(), &());
+            assert!(refused.get());
+            with_local_only_recovery_inventory(|guard| guard.verify()).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn local_only_inventory_rejects_dispatch_replacement_and_pending_without_consuming() {
+        std::thread::spawn(|| {
+            let bus = Rc::new(RefCell::new(MessageBus::default()));
+            set_message_bus(bus.clone());
+            with_local_only_recovery_inventory(|guard| {
+                assert!(Rc::ptr_eq(&get_message_bus(), &bus));
+                assert!(bus.try_borrow_mut().is_err());
+                guard.verify()
+            })
+            .unwrap();
+            for operation in 0..4 {
+                let result = with_local_only_recovery_inventory(|guard| {
+                    let failed =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || match operation {
+                                0 => dispatch_tap_publish(MStr::from("capture"), &()),
+                                1 => dispatch_tap_send(MStr::from("capture"), &()),
+                                2 => dispatch_tap_response(&UUID4::new(), &()),
+                                _ => set_message_bus(Rc::new(RefCell::new(MessageBus::default()))),
+                            },
+                        ));
+                    assert!(failed.is_err());
+                    assert!(guard.verify().is_err());
+                    Ok(())
+                });
+                assert!(result.is_err());
+                assert!(Rc::ptr_eq(&get_message_bus(), &bus));
+            }
+            bus.borrow_mut().has_backing = true;
+            assert!(with_local_only_recovery_inventory(|_| Ok(())).is_err());
+            bus.borrow_mut().has_backing = false;
+            let correlation = UUID4::new();
+            bus.borrow_mut()
+                .register_response_handler(&correlation, stubs::get_stub_shareable_handler(None))
+                .unwrap();
+            assert!(with_local_only_recovery_inventory(|_| Ok(())).is_err());
+            assert!(bus.borrow().get_response_handler(&correlation).is_some());
+        })
+        .join()
+        .unwrap();
+    }
 }

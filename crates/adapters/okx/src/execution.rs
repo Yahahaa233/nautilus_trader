@@ -1806,6 +1806,11 @@ fn derive_trade_mode_for_instrument(
 
 #[async_trait(?Send)]
 impl ExecutionClient for OKXExecutionClient {
+    fn paused_recovery_inventory_profile(&self) -> anyhow::Result<&'static str> {
+        self.verify_paused_recovery_inventory()?;
+        Ok("okx_fresh_disconnected_v1")
+    }
+
     fn verify_paused_recovery_inventory(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.recovery_pristine
@@ -4336,6 +4341,10 @@ mod tests {
     async fn paused_recovery_execution_inventory_requires_pristine_adapter() {
         let mut client = build_test_exec_client();
         client.verify_paused_recovery_inventory().unwrap();
+        assert_eq!(
+            client.paused_recovery_inventory_profile().unwrap(),
+            "okx_fresh_disconnected_v1"
+        );
         let (drop_tx, mut drop_rx) = tokio::sync::oneshot::channel();
         let signal = DropSignal(Some(drop_tx));
         client.spawn_task("recovery inventory test", async move {
@@ -4343,6 +4352,7 @@ mod tests {
             std::future::pending::<anyhow::Result<()>>().await
         });
         assert!(client.verify_paused_recovery_inventory().is_err());
+        assert!(client.paused_recovery_inventory_profile().is_err());
         assert!(!client.pending_tasks.is_empty());
         assert!(matches!(
             drop_rx.try_recv(),
@@ -4354,6 +4364,7 @@ mod tests {
             .unwrap();
         assert!(client.pending_tasks.is_empty());
         assert!(client.verify_paused_recovery_inventory().is_err());
+        assert!(client.paused_recovery_inventory_profile().is_err());
     }
 
     #[rstest]

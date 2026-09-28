@@ -156,6 +156,8 @@ mod reconciliation;
 mod recovery;
 #[cfg(feature = "dispatch-observer")]
 mod recovery_quiescence;
+#[cfg(feature = "dispatch-observer")]
+pub use recovery_quiescence::{EmptyBootstrapRecoveryReceipt, PausedRecoveryInventory};
 mod state;
 
 use builder::ExternalMessageBusIngress;
@@ -206,6 +208,12 @@ pub struct LiveNode {
     recovery_requires_release: bool,
     #[cfg(feature = "dispatch-observer")]
     recovery_native_frontier: Option<crate::runner_recovery::RunnerRecoveryWatermark>,
+    #[cfg(feature = "dispatch-observer")]
+    recovery_cache_installed: bool,
+    #[cfg(feature = "dispatch-observer")]
+    recovery_restored_components: Option<(Vec<String>, Vec<String>)>,
+    #[cfg(feature = "dispatch-observer")]
+    recovery_empty_bootstrap: Option<EmptyBootstrapRecoveryReceipt>,
     runner: Option<AsyncRunner>,
     config: LiveNodeConfig,
     handle: LiveNodeHandle,
@@ -600,6 +608,12 @@ impl LiveNode {
             recovery_requires_release: false,
             #[cfg(feature = "dispatch-observer")]
             recovery_native_frontier: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_cache_installed: false,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_restored_components: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_empty_bootstrap: None,
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
@@ -685,6 +699,12 @@ impl LiveNode {
             recovery_requires_release: false,
             #[cfg(feature = "dispatch-observer")]
             recovery_native_frontier: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_cache_installed: false,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_restored_components: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_empty_bootstrap: None,
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
@@ -846,12 +866,35 @@ impl LiveNode {
         collect: impl FnOnce(&crate::runner_recovery::RunnerPendingSnapshot) -> anyhow::Result<C>,
         persist: impl FnOnce(C) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        self.with_paused_recovery_inventory_checkpoint(
+            registry,
+            |snapshot, _| collect(snapshot),
+            persist,
+        )
+    }
+
+    /// Captures actual native queue, timer, synchronous bus and adapter inventory.
+    /// Collection and persistence execute under the same paused admission guards.
+    ///
+    /// # Errors
+    /// Refuses unsupported or busy inventory, invalidated boundaries, and callback errors.
+    #[cfg(feature = "dispatch-observer")]
+    pub fn with_paused_recovery_inventory_checkpoint<C, T>(
+        &mut self,
+        registry: &crate::runner_recovery::RunnerRecoveryCodecRegistry,
+        collect: impl FnOnce(
+            &crate::runner_recovery::RunnerPendingSnapshot,
+            &PausedRecoveryInventory,
+        ) -> anyhow::Result<C>,
+        persist: impl FnOnce(C) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
         let check = |node: &Self| -> anyhow::Result<()> {
             anyhow::ensure!(
                 node.state() == NodeState::Idle
                     && !node.handle.should_stop()
                     && node.recovery_requires_release
-                    && node.recovery_native_frontier.is_some(),
+                    && (node.recovery_native_frontier.is_some()
+                        || node.recovery_empty_bootstrap.is_some()),
                 "queue capture requires completed paused native recovery"
             );
             anyhow::ensure!(
@@ -875,6 +918,10 @@ impl LiveNode {
                     .as_ref()
                     .is_none_or(Vec::is_empty),
                 "external data clients have no paused inventory proof"
+            );
+            anyhow::ensure!(
+                node.external_msgbus.is_none(),
+                "external message bus ingress inventory unsupported"
             );
             let data = node.kernel.data_engine.try_borrow()?;
             let execution = node.kernel.exec_engine.try_borrow()?;
@@ -916,40 +963,90 @@ impl LiveNode {
         let data_engine = self.kernel.data_engine.clone();
         let exec_engine = self.kernel.exec_engine.clone();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _data_inventory = data_engine.try_borrow()?;
-            let _execution_inventory = exec_engine.try_borrow()?;
-            recovery_quiescence::with_empty_registered_timers(&kernel_clock, &trader, || {
-                nautilus_common::runner::with_empty_sync_command_queues(|| {
-                    check(self)?;
-                    let snapshot = self
-                        .runner
-                        .as_mut()
-                        .context("runner receivers unavailable")?
-                        .snapshot_pending(&guard, registry)?;
-                    let value = collect(&snapshot)?;
-                    check(self)?;
-                    guard.verify()?;
-                    anyhow::ensure!(
-                        observer.coverage()? == coverage,
-                        "observer changed during queue capture"
-                    );
-                    if let Some(proof) = &proof {
-                        proof.verify()?;
-                    }
-                    let value = persist(value)?;
-                    check(self)?;
-                    guard.verify()?;
-                    anyhow::ensure!(
-                        observer.coverage()? == coverage,
-                        "observer changed during persistence"
-                    );
-                    if let Some(proof) = &proof {
-                        proof.verify()?;
-                    }
-                    guard.finish()?;
-                    Ok(value)
-                })
-            })
+            let data_inventory = data_engine.try_borrow()?;
+            let execution_inventory = exec_engine.try_borrow()?;
+            recovery_quiescence::with_registered_timer_inventory(
+                &kernel_clock,
+                &trader,
+                |timer_counts| {
+                    nautilus_common::msgbus::with_local_only_recovery_inventory(|bus_inventory| {
+                        nautilus_common::runner::with_empty_sync_command_queues(|| {
+                            check(self)?;
+                            let snapshot = self
+                                .runner
+                                .as_mut()
+                                .context("runner receivers unavailable")?
+                                .snapshot_pending(&guard, registry)?;
+                            let runner_counts = self
+                                .runner
+                                .as_ref()
+                                .context("runner missing")?
+                                .pending_queue_counts()
+                                .into_iter()
+                                .map(|(channel, count)| {
+                                    Ok((
+                                        serde_json::to_value(channel)?
+                                            .as_str()
+                                            .context("invalid channel name")?
+                                            .to_owned(),
+                                        count as u64,
+                                    ))
+                                })
+                                .collect::<anyhow::Result<_>>()?;
+                            let (data_count, trading_count) =
+                                nautilus_common::runner::synchronous_command_queue_counts()?;
+                            let mut adapter_profiles = std::collections::BTreeMap::new();
+                            for client in data_inventory.get_clients() {
+                                let client = client.get_client();
+                                adapter_profiles.insert(
+                                    format!("data:{}", client.client_id()),
+                                    client.paused_recovery_inventory_profile()?.to_owned(),
+                                );
+                            }
+                            for client in execution_inventory.get_all_clients() {
+                                adapter_profiles.insert(
+                                    format!("execution:{}", client.client_id()),
+                                    client.paused_recovery_inventory_profile()?.to_owned(),
+                                );
+                            }
+                            let inventory = PausedRecoveryInventory {
+                                runner_counts,
+                                timer_counts: timer_counts.clone(),
+                                synchronous_queue_counts: std::collections::BTreeMap::from([
+                                    ("data_command".to_owned(), data_count as u64),
+                                    ("trading_command".to_owned(), trading_count as u64),
+                                ]),
+                                adapter_profiles,
+                                message_bus_mode: "local_only",
+                            };
+                            let value = collect(&snapshot, &inventory)?;
+                            check(self)?;
+                            guard.verify()?;
+                            bus_inventory.verify()?;
+                            anyhow::ensure!(
+                                observer.coverage()? == coverage,
+                                "observer changed during queue capture"
+                            );
+                            if let Some(proof) = &proof {
+                                proof.verify()?;
+                            }
+                            let value = persist(value)?;
+                            check(self)?;
+                            guard.verify()?;
+                            bus_inventory.verify()?;
+                            anyhow::ensure!(
+                                observer.coverage()? == coverage,
+                                "observer changed during persistence"
+                            );
+                            if let Some(proof) = &proof {
+                                proof.verify()?;
+                            }
+                            guard.finish()?;
+                            Ok(value)
+                        })
+                    })
+                },
+            )
         }));
         match outcome {
             Ok(Ok(value)) => Ok(value),
@@ -3653,7 +3750,23 @@ impl LiveNode {
             "Cannot restore component state after node startup has begun"
         );
         self.recovery_requires_release = true;
-        nautilus_system::trader::Trader::restore_component_state(self.kernel.trader(), state)
+        #[cfg(feature = "dispatch-observer")]
+        {
+            anyhow::ensure!(
+                self.recovery_empty_bootstrap.is_none(),
+                "empty recovery already completed"
+            );
+            self.recovery_restored_components = None;
+        }
+        nautilus_system::trader::Trader::restore_component_state(self.kernel.trader(), state)?;
+        #[cfg(feature = "dispatch-observer")]
+        {
+            self.recovery_restored_components = Some((
+                state.actors.keys().map(ToString::to_string).collect(),
+                state.strategies.keys().map(ToString::to_string).collect(),
+            ));
+        }
+        Ok(())
     }
 
     /// Installs an isolated, validated native cache into a freshly assembled idle node.
@@ -3701,6 +3814,10 @@ impl LiveNode {
         );
         self.recovery_requires_release = true;
         *target = cache;
+        #[cfg(feature = "dispatch-observer")]
+        {
+            self.recovery_cache_installed = true;
+        }
         Ok(())
     }
 

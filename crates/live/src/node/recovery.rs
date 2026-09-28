@@ -26,41 +26,80 @@ impl LiveNode {
         config: &dyn nautilus_common::factories::ClientConfig,
     ) -> Result<()> {
         use nautilus_common::clients::ExecutionClient;
-        ensure!(self.state() == NodeState::Idle && !self.handle.should_stop()
-            && self.recovery_requires_release && self.recovery_native_frontier.is_some(),
-            "execution client attachment requires completed paused native recovery");
-        ensure!(self.exec_clients.is_empty()
-            && self.kernel.exec_engine.try_borrow().context("execution engine busy")?.client_ids().is_empty(),
-            "recovery execution clients already installed");
-        ensure!(self.kernel.risk_engine.try_borrow().context("risk engine busy")?.trading_state()
-            == nautilus_model::enums::TradingState::Halted,
-            "recovery execution attachment requires halted admission");
+        ensure!(
+            self.state() == NodeState::Idle
+                && !self.handle.should_stop()
+                && self.recovery_requires_release
+                && (self.recovery_native_frontier.is_some()
+                    || self.recovery_empty_bootstrap.is_some()),
+            "execution client attachment requires completed paused native recovery"
+        );
+        ensure!(
+            self.exec_clients.is_empty()
+                && self
+                    .kernel
+                    .exec_engine
+                    .try_borrow()
+                    .context("execution engine busy")?
+                    .client_ids()
+                    .is_empty(),
+            "recovery execution clients already installed"
+        );
+        ensure!(
+            self.kernel
+                .risk_engine
+                .try_borrow()
+                .context("risk engine busy")?
+                .trading_state()
+                == nautilus_model::enums::TradingState::Halted,
+            "recovery execution attachment requires halted admission"
+        );
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-            let mut client = self.socket_registry.scope(|| factory.create(
-                self.config.trader_id, factory.name(), config,
-                self.kernel.cache().into(), self.kernel.clock(),
-            ))?;
+            let mut client = self.socket_registry.scope(|| {
+                factory.create(
+                    self.config.trader_id,
+                    factory.name(),
+                    config,
+                    self.kernel.cache().into(),
+                    self.kernel.clock(),
+                )
+            })?;
             if client.is_connected() {
-                client.stop().context("connected recovery client could not be stopped")?;
+                client
+                    .stop()
+                    .context("connected recovery client could not be stopped")?;
                 anyhow::bail!("recovery client factory returned a connected client");
             }
             let client = crate::execution::client::LiveExecutionClient::new(client);
             let id = client.client_id();
             let venue = client.venue();
-            self.kernel.exec_engine.try_borrow_mut().context("execution engine busy")?
+            self.kernel
+                .exec_engine
+                .try_borrow_mut()
+                .context("execution engine busy")?
                 .register_client(Box::new(client.clone()))?;
             self.socket_registry.register_client(id);
             nautilus_execution::engine::ExecutionEngine::subscribe_venue_instruments(
-                &self.kernel.exec_engine, venue);
+                &self.kernel.exec_engine,
+                venue,
+            );
             self.exec_manager.set_position_reconciliation_tolerance(
-                client.account_id(), client.position_reconciliation_tolerance());
+                client.account_id(),
+                client.position_reconciliation_tolerance(),
+            );
             self.exec_clients.push(client);
             Ok(())
         }));
         match outcome {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => { self.handle.stop(); Err(error) }
-            Err(panic) => { self.handle.stop(); std::panic::resume_unwind(panic) }
+            Ok(Err(error)) => {
+                self.handle.stop();
+                Err(error)
+            }
+            Err(panic) => {
+                self.handle.stop();
+                std::panic::resume_unwind(panic)
+            }
         }
     }
 
@@ -99,6 +138,10 @@ impl LiveNode {
         ensure!(
             self.state() == NodeState::Idle && !self.handle.should_stop(),
             "native recovery requires an idle, non-failed node"
+        );
+        ensure!(
+            self.recovery_empty_bootstrap.is_none(),
+            "empty bootstrap cannot be mixed with dispatch replay"
         );
         ensure!(
             self.dispatch_observer.is_some(),
