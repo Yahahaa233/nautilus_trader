@@ -56,7 +56,7 @@ pub fn diff_and_emit_instruments(
     new_instruments: &[InstrumentAny],
     cached: &mut AHashMap<InstrumentId, InstrumentAny>,
     subscriptions: Option<&AHashSet<InstrumentId>>,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
 ) {
     let is_subscribed = |id: &InstrumentId| subscriptions.is_none_or(|subs| subs.contains(id));
 

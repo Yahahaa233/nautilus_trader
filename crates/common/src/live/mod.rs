@@ -20,6 +20,7 @@
 
 pub mod clock;
 pub mod dst;
+pub mod ingress;
 pub mod listener;
 pub mod runner;
 pub mod runtime;

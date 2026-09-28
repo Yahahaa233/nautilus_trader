@@ -595,9 +595,9 @@ impl LiveNode {
             recovery_requires_release: false,
             #[cfg(feature = "dispatch-observer")]
             recovery_native_frontier: None,
+            handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
-            handle: LiveNodeHandle::new(),
             exec_manager,
             exec_clients,
             socket_registry,
@@ -680,9 +680,9 @@ impl LiveNode {
             recovery_requires_release: false,
             #[cfg(feature = "dispatch-observer")]
             recovery_native_frontier: None,
+            handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
-            handle: LiveNodeHandle::new(),
             exec_manager,
             exec_clients: Vec::new(),
             socket_registry: SocketReconnectRegistry::default(),
@@ -747,7 +747,7 @@ impl LiveNode {
     ///
     /// While [`run`](Self::run) or [`run_with_mode`](Self::run_with_mode) services external ingress,
     /// the node invokes processors in registration order before normal inbound streaming filters
-    /// for JSON or MessagePack payloads when [`msgbus::BusPayloadType::is_typed_message`] returns
+    /// for JSON or `MessagePack` payloads when [`msgbus::BusPayloadType::is_typed_message`] returns
     /// `true`. Other encodings are skipped with a warning. Each callback receives the decoded
     /// concrete value as [`Any`], allowing it to downcast to the concrete payload type. External
     /// egress is suppressed while the processors run, so synchronous publications remain local.
@@ -807,6 +807,7 @@ impl LiveNode {
             "recovered node requires independently verified recovery release; startup denied"
         );
         if let Some(runner) = &self.runner {
+            runner.verify_ingress()?;
             let progress = runner.recovery_progress_handle().completion_watermark()?;
             anyhow::ensure!(
                 progress.watermark.is_none() && progress.sent_watermark.is_none(),
@@ -4473,6 +4474,24 @@ mod tests {
             UnixNanos::default(),
         )));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn paused_ingress_actual_node_handle_invalidates_runner_boundary() {
+        let mut node = LiveNode::build("IngressStop".to_string(), None).unwrap();
+        let frozen = node.runner.as_ref().unwrap().freeze_ingress().unwrap();
+        node.handle().stop();
+        assert!(node.handle().should_stop());
+        assert!(frozen.finish().is_err());
+        assert!(node.ensure_recovery_start_permitted().is_err());
+        node.dispose();
+
+        let mut node = LiveNode::builder(TraderId::from("INGRESS-002"), Environment::Sandbox)
+            .unwrap().with_name("IngressBuilderStop").build().unwrap();
+        let frozen = node.runner.as_ref().unwrap().freeze_ingress().unwrap();
+        node.handle().stop();
+        assert!(frozen.finish().is_err());
+        node.dispose();
     }
 
     #[rstest]

@@ -49,7 +49,7 @@ pub fn diff_and_emit_statuses(
     new_statuses: &AHashMap<InstrumentId, MarketStatusAction>,
     cached_statuses: &mut AHashMap<InstrumentId, MarketStatusAction>,
     subscriptions: Option<&AHashSet<InstrumentId>>,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) {
@@ -90,7 +90,7 @@ pub fn diff_and_emit_statuses(
 }
 
 pub(crate) fn emit_status(
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
     instrument_id: InstrumentId,
     action: MarketStatusAction,
     ts_event: UnixNanos,

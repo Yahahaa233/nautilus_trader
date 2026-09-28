@@ -356,7 +356,7 @@ pub fn republish_external_message(message: &BusMessage) -> anyhow::Result<()> {
 /// Decodes a supported typed payload and passes it to `processor` before applying normal inbound
 /// republishing rules.
 ///
-/// JSON or MessagePack payloads identified by [`BusPayloadType::is_typed_message`] reach
+/// JSON or `MessagePack` payloads identified by [`BusPayloadType::is_typed_message`] reach
 /// `processor` regardless of internal streaming registration. Internal republishing still requires
 /// registration. Unsupported type/encoding pairs are skipped with a warning. The processor mapping
 /// includes a `payload_type` field containing the [`BusPayloadType`] name. External egress is

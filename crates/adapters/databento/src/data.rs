@@ -177,7 +177,7 @@ pub struct DatabentoDataClient {
     cancellation_token: CancellationToken,
     publisher_venue_map: Arc<IndexMap<PublisherId, Venue>>,
     symbol_venue_map: Arc<AtomicMap<Symbol, Venue>>,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
 }
 
 impl DatabentoDataClient {
@@ -1350,7 +1350,7 @@ async fn seed_price_precision_if_needed(
 }
 
 fn send_data_response(
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
     response: DataResponse,
     label: &str,
 ) {

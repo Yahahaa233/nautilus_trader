@@ -101,7 +101,7 @@ impl Drop for NewMarketInflightGuard {
 
 pub(super) struct WsMessageContext {
     pub(super) clock: &'static AtomicTime,
-    pub(super) data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    pub(super) data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     pub(super) token_meta: Arc<DashMap<Ustr, TokenMeta>>,
     pub(super) instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     pub(super) instrument_update_state: Arc<Mutex<InstrumentUpdateState>>,

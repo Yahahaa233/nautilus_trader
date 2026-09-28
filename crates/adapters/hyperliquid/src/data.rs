@@ -96,7 +96,7 @@ pub struct HyperliquidDataClient {
     session_tasks: TaskGroup,
     pending_tasks: TaskGroup,
     shutdown_errors: Vec<String>,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     coin_to_instrument_id: Arc<AtomicMap<Ustr, InstrumentId>>,
     // serializes instrument fetch-and-apply passes, see `refresh_instruments`
@@ -1694,7 +1694,7 @@ async fn refresh_instruments(
     ws_client: &HyperliquidWebSocketClient,
     instruments_by_id: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     coin_to_instrument_id: &Arc<AtomicMap<Ustr, InstrumentId>>,
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
 ) -> anyhow::Result<InstrumentRefresh> {
     let _update_guard = update_lock.lock().await;
 
@@ -1732,7 +1732,7 @@ async fn reconcile_instruments(
     ws_client: &HyperliquidWebSocketClient,
     instruments_by_id: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     coin_to_instrument_id: &Arc<AtomicMap<Ustr, InstrumentId>>,
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
 ) -> InstrumentRefresh {
     let changed = changed_definitions(&fetched, instruments_by_id);
     let added = added_symbols(&changed, instruments_by_id);

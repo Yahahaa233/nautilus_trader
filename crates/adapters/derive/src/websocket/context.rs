@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 
 pub(crate) struct WsMessageContext {
     pub(crate) clock: &'static AtomicTime,
-    pub(crate) data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    pub(crate) data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     pub(crate) instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     pub(crate) active_book_delta_channels: Arc<AtomicMap<InstrumentId, String>>,
     pub(crate) active_book_depth10_channels: Arc<AtomicMap<InstrumentId, String>>,

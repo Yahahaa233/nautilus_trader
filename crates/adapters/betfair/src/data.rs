@@ -109,7 +109,7 @@ pub struct BetfairDataClient {
     config: BetfairDataClientConfig,
     currency: Currency,
     is_connected: AtomicBool,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     subscribed_market_ids: AHashSet<String>,
     session_tasks: TaskGroup,
@@ -299,7 +299,7 @@ impl BetfairDataClient {
     }
 
     fn create_stream_handler(
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
         instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
         currency: Currency,
         min_notional: Option<Money>,

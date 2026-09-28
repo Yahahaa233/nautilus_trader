@@ -32,7 +32,7 @@
 //! # Python Support
 //!
 //! When the `python` feature is enabled, the runtime initializes the Python interpreter
-//! before starting worker threads. The PyO3 module registers an `atexit` handler via
+//! before starting worker threads. The `PyO3` module registers an `atexit` handler via
 //! `shutdown_runtime()` to cleanly shut down when Python exits.
 //!
 //! A runtime passed to [`set_runtime`] is already built, so this module cannot run the default

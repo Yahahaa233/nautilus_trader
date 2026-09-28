@@ -67,6 +67,8 @@ use std::{
     },
 };
 
+use nautilus_common::live::ingress::{FrozenIngress, IngressGate, IngressSender};
+
 use nautilus_common::{
     live::runner::{
         replace_data_event_sender, replace_exec_event_sender, replace_system_command_sender,
@@ -91,14 +93,15 @@ use crate::node::{LiveNodeHandle, NodeState};
 /// Asynchronous implementation of `DataCommandSender` for live environments.
 #[derive(Debug)]
 pub struct AsyncDataCommandSender {
-    cmd_tx: tokio::sync::mpsc::UnboundedSender<DataCommand>,
+    cmd_tx: IngressSender<DataCommand>,
     #[cfg(feature = "node")]
     node_handle: Option<LiveNodeHandle>,
 }
 
 impl AsyncDataCommandSender {
     #[must_use]
-    pub const fn new(cmd_tx: tokio::sync::mpsc::UnboundedSender<DataCommand>) -> Self {
+    pub fn new(cmd_tx: impl Into<IngressSender<DataCommand>>) -> Self {
+        let cmd_tx = cmd_tx.into();
         Self {
             cmd_tx,
             #[cfg(feature = "node")]
@@ -108,6 +111,10 @@ impl AsyncDataCommandSender {
 }
 
 impl DataCommandSender for AsyncDataCommandSender {
+    fn invalidate_snapshot(&self) {
+        self.cmd_tx.invalidate_snapshot();
+    }
+
     fn execute(&self, command: DataCommand) {
         if let Err(e) = self.cmd_tx.send(command) {
             // Disposal releases retained subscriptions after the node drops its receivers
@@ -128,17 +135,22 @@ impl DataCommandSender for AsyncDataCommandSender {
 /// Asynchronous implementation of `TimeEventSender` for live environments.
 #[derive(Debug, Clone)]
 pub struct AsyncTimeEventSender {
-    time_tx: tokio::sync::mpsc::UnboundedSender<TimeEventMessage>,
+    time_tx: IngressSender<TimeEventMessage>,
 }
 
 impl AsyncTimeEventSender {
     #[must_use]
-    pub const fn new(time_tx: tokio::sync::mpsc::UnboundedSender<TimeEventMessage>) -> Self {
+    pub fn new(time_tx: impl Into<IngressSender<TimeEventMessage>>) -> Self {
+        let time_tx = time_tx.into();
         Self { time_tx }
     }
 }
 
 impl TimeEventSender for AsyncTimeEventSender {
+    fn invalidate_snapshot(&self) {
+        self.time_tx.invalidate_snapshot();
+    }
+
     fn send(&self, message: TimeEventMessage) {
         if let Err(e) = self.time_tx.send(message) {
             log::error!("Failed to send time event message: {e}");
@@ -149,17 +161,22 @@ impl TimeEventSender for AsyncTimeEventSender {
 /// Asynchronous implementation of `TradingCommandSender` for live environments.
 #[derive(Debug)]
 pub struct AsyncTradingCommandSender {
-    cmd_tx: tokio::sync::mpsc::UnboundedSender<TradingCommandMessage>,
+    cmd_tx: IngressSender<TradingCommandMessage>,
 }
 
 impl AsyncTradingCommandSender {
     #[must_use]
-    pub const fn new(cmd_tx: tokio::sync::mpsc::UnboundedSender<TradingCommandMessage>) -> Self {
+    pub fn new(cmd_tx: impl Into<IngressSender<TradingCommandMessage>>) -> Self {
+        let cmd_tx = cmd_tx.into();
         Self { cmd_tx }
     }
 }
 
 impl TradingCommandSender for AsyncTradingCommandSender {
+    fn invalidate_snapshot(&self) {
+        self.cmd_tx.invalidate_snapshot();
+    }
+
     fn execute(&self, message: TradingCommandMessage) {
         if let Err(e) = self.cmd_tx.send(message) {
             log::error!("Failed to send trading command: {e}");
@@ -202,16 +219,17 @@ pub(crate) enum PendingRunnerEvent {
 }
 
 pub struct AsyncRunner {
+    ingress: IngressGate,
     channels: AsyncRunnerChannels,
-    time_evt_tx: tokio::sync::mpsc::UnboundedSender<TimeEventMessage>,
-    system_evt_tx: tokio::sync::mpsc::UnboundedSender<SystemEvent>,
-    system_cmd_tx: tokio::sync::mpsc::UnboundedSender<SystemCommand>,
+    time_evt_tx: IngressSender<TimeEventMessage>,
+    system_evt_tx: IngressSender<SystemEvent>,
+    system_cmd_tx: IngressSender<SystemCommand>,
     signal_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     signal_tx: tokio::sync::mpsc::UnboundedSender<()>,
-    exec_evt_tx: tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
-    exec_cmd_tx: tokio::sync::mpsc::UnboundedSender<TradingCommandMessage>,
-    data_evt_tx: tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    data_cmd_tx: tokio::sync::mpsc::UnboundedSender<DataCommand>,
+    exec_evt_tx: IngressSender<ExecutionEvent>,
+    exec_cmd_tx: IngressSender<TradingCommandMessage>,
+    data_evt_tx: IngressSender<DataEvent>,
+    data_cmd_tx: IngressSender<DataCommand>,
     recovery_handoff_available: Arc<AtomicBool>,
     recovery_progress: crate::runner_recovery::RunnerRecoveryProgressHandle,
 }
@@ -219,12 +237,14 @@ pub struct AsyncRunner {
 /// Handle for stopping the `AsyncRunner` from another context.
 #[derive(Clone, Debug)]
 pub struct AsyncRunnerHandle {
+    ingress: IngressGate,
     signal_tx: tokio::sync::mpsc::UnboundedSender<()>,
 }
 
 impl AsyncRunnerHandle {
     /// Signals the runner to stop.
     pub fn stop(&self) {
+        self.ingress.stop_snapshot_admission();
         if let Err(e) = self.signal_tx.send(()) {
             log::error!("Failed to send shutdown signal: {e}");
         }
@@ -253,17 +273,19 @@ impl AsyncRunner {
     pub fn new() -> Self {
         use tokio::sync::mpsc::unbounded_channel; // tokio-import-ok
 
-        let (time_evt_tx, time_evt_rx) = unbounded_channel::<TimeEventMessage>();
-        let (system_evt_tx, system_evt_rx) = unbounded_channel::<SystemEvent>();
-        let (system_cmd_tx, system_cmd_rx) = unbounded_channel::<SystemCommand>();
+        let ingress = IngressGate::new();
+        let (time_evt_tx, time_evt_rx) = ingress.channel::<TimeEventMessage>();
+        let (system_evt_tx, system_evt_rx) = ingress.channel::<SystemEvent>();
+        let (system_cmd_tx, system_cmd_rx) = ingress.channel::<SystemCommand>();
         let (signal_tx, signal_rx) = unbounded_channel::<()>();
-        let (exec_evt_tx, exec_evt_rx) = unbounded_channel::<ExecutionEvent>();
-        let (exec_cmd_tx, exec_cmd_rx) = unbounded_channel::<TradingCommandMessage>();
-        let (data_evt_tx, data_evt_rx) = unbounded_channel::<DataEvent>();
-        let (data_cmd_tx, data_cmd_rx) = unbounded_channel::<DataCommand>();
+        let (exec_evt_tx, exec_evt_rx) = ingress.channel::<ExecutionEvent>();
+        let (exec_cmd_tx, exec_cmd_rx) = ingress.channel::<TradingCommandMessage>();
+        let (data_evt_tx, data_evt_rx) = ingress.channel::<DataEvent>();
+        let (data_cmd_tx, data_cmd_rx) = ingress.channel::<DataCommand>();
         let recovery_progress = crate::runner_recovery::RunnerRecoveryProgressHandle::new();
 
         Self {
+            ingress,
             channels: AsyncRunnerChannels {
                 time_evt_rx,
                 system_evt_rx,
@@ -285,6 +307,31 @@ impl AsyncRunner {
             recovery_handoff_available: Arc::new(AtomicBool::new(true)),
             recovery_progress,
         }
+    }
+
+    #[cfg(feature = "node")]
+    pub(crate) fn ingress_gate(&self) -> IngressGate {
+        self.ingress.clone()
+    }
+
+    /// Checks that admission has not failed or entered a snapshot freeze.
+    ///
+    /// # Errors
+    /// Returns an error after a rejected frozen send or abandoned snapshot.
+    pub fn verify_ingress(&self) -> anyhow::Result<()> {
+        self.ingress.verify_open()
+    }
+
+    /// Freezes admission through all clones of this runner's seven senders.
+    /// This is only a producer barrier, not a complete component checkpoint.
+    /// A send attempted during collection invalidates the guard and the gate.
+    /// The caller must finish the guard after successful collection; dropping
+    /// it without finishing leaves admission failed closed.
+    ///
+    /// # Errors
+    /// Refuses an unhealthy or already frozen gate.
+    pub fn freeze_ingress(&self) -> anyhow::Result<FrozenIngress> {
+        self.ingress.freeze()
     }
 
     /// Binds this runner's channel senders to thread-local storage.
@@ -377,46 +424,47 @@ impl AsyncRunner {
 
     pub(crate) fn time_event_sender_clone(
         &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<TimeEventMessage> {
+    ) -> IngressSender<TimeEventMessage> {
         self.time_evt_tx.clone()
     }
 
     pub(crate) fn system_event_sender_clone(
         &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<SystemEvent> {
+    ) -> IngressSender<SystemEvent> {
         self.system_evt_tx.clone()
     }
 
     pub(crate) fn system_command_sender_clone(
         &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<SystemCommand> {
+    ) -> IngressSender<SystemCommand> {
         self.system_cmd_tx.clone()
     }
 
     pub(crate) fn execution_event_sender_clone(
         &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<ExecutionEvent> {
+    ) -> IngressSender<ExecutionEvent> {
         self.exec_evt_tx.clone()
     }
 
     pub(crate) fn execution_command_sender_clone(
         &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<TradingCommandMessage> {
+    ) -> IngressSender<TradingCommandMessage> {
         self.exec_cmd_tx.clone()
     }
 
-    pub(crate) fn data_event_sender_clone(&self) -> tokio::sync::mpsc::UnboundedSender<DataEvent> {
+    pub(crate) fn data_event_sender_clone(&self) -> IngressSender<DataEvent> {
         self.data_evt_tx.clone()
     }
 
     pub(crate) fn data_command_sender_clone(
         &self,
-    ) -> tokio::sync::mpsc::UnboundedSender<DataCommand> {
+    ) -> IngressSender<DataCommand> {
         self.data_cmd_tx.clone()
     }
 
     /// Stops the runner with an internal shutdown signal.
     pub fn stop(&self) {
+        self.ingress.stop_snapshot_admission();
         if let Err(e) = self.signal_tx.send(()) {
             log::error!("Failed to send shutdown signal: {e}");
         }
@@ -426,6 +474,7 @@ impl AsyncRunner {
     #[must_use]
     pub fn handle(&self) -> AsyncRunnerHandle {
         AsyncRunnerHandle {
+            ingress: self.ingress.clone(),
             signal_tx: self.signal_tx.clone(),
         }
     }
@@ -436,6 +485,7 @@ impl AsyncRunner {
     /// endpoints (which use thread-local storage).
     #[must_use]
     pub fn take_channels(self) -> AsyncRunnerChannels {
+        self.ingress.invalidate_if_frozen();
         self.close_recovery_handoff();
         self.channels
     }
@@ -446,6 +496,7 @@ impl AsyncRunner {
     /// into the cache immediately. Used in `start()` where channels are
     /// not extracted.
     pub fn flush_pending_data(&mut self) {
+        self.ingress.invalidate_if_frozen();
         let mut total = 0;
 
         loop {
@@ -481,6 +532,7 @@ impl AsyncRunner {
 
     #[cfg(feature = "node")]
     pub(crate) fn drain_pending_system_events(&mut self) -> Vec<SystemEvent> {
+        self.ingress.invalidate_if_frozen();
         let mut events = Vec::new();
 
         while let Ok(event) = self.channels.system_evt_rx.try_recv() {
@@ -492,6 +544,7 @@ impl AsyncRunner {
 
     #[cfg(feature = "node")]
     pub(crate) fn drain_pending_system_commands(&mut self) -> Vec<SystemCommand> {
+        self.ingress.invalidate_if_frozen();
         let mut commands = Vec::new();
 
         while let Ok(command) = self.channels.system_cmd_rx.try_recv() {
@@ -506,6 +559,7 @@ impl AsyncRunner {
     /// This method processes time, system, execution, and data events in an async loop.
     /// It will run until a signal is received or the event streams are closed.
     pub async fn run(&mut self) {
+        self.ingress.invalidate_if_frozen();
         self.close_recovery_handoff();
         self.bind_senders();
 
@@ -658,6 +712,7 @@ impl AsyncRunner {
 #[cfg(feature = "node")]
 impl AsyncRunner {
     pub(crate) fn poll_pending(&mut self, mut process: impl FnMut(PendingRunnerEvent)) -> usize {
+        self.ingress.invalidate_if_frozen();
         self.bind_senders();
 
         let pending = (
@@ -716,6 +771,7 @@ impl AsyncRunner {
     }
 
     pub(crate) async fn recv(&mut self) -> Option<PendingRunnerEvent> {
+        self.ingress.invalidate_if_frozen();
         tokio::select! {
             biased;
 
@@ -815,6 +871,63 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn ingress_freeze_covers_retained_runner_clones_and_stop() {
+        let runner = AsyncRunner::new();
+        assert!(runner.time_evt_tx.belongs_to(&runner.ingress));
+        assert!(runner.system_evt_tx.belongs_to(&runner.ingress));
+        assert!(runner.system_cmd_tx.belongs_to(&runner.ingress));
+        assert!(runner.exec_evt_tx.belongs_to(&runner.ingress));
+        assert!(runner.exec_cmd_tx.belongs_to(&runner.ingress));
+        assert!(runner.data_evt_tx.belongs_to(&runner.ingress));
+        assert!(runner.data_cmd_tx.belongs_to(&runner.ingress));
+        runner.bind_senders();
+        let sender = get_data_event_sender();
+        sender.send(DataEvent::Data(Data::Quote(test_quote()))).unwrap();
+        let frozen = runner.freeze_ingress().unwrap();
+        assert!(runner.verify_ingress().is_err());
+        assert!(sender.send(DataEvent::Data(Data::Quote(test_quote()))).is_err());
+        assert!(frozen.finish().is_err());
+        assert_eq!(runner.channels.data_evt_rx.len(), 1);
+        assert!(runner.verify_ingress().is_err());
+
+        let runner = AsyncRunner::new();
+        let frozen = runner.freeze_ingress().unwrap();
+        runner.handle().stop();
+        assert!(frozen.finish().is_err());
+        let runner = AsyncRunner::new();
+        runner.stop();
+        runner.system_evt_tx.send(test_system_event()).unwrap();
+        assert_eq!(runner.channels.system_evt_rx.len(), 1);
+    }
+
+    #[test]
+    fn ingress_freeze_is_invalidated_by_receiver_extraction() {
+        let runner = AsyncRunner::new();
+        let frozen = runner.freeze_ingress().unwrap();
+        let _channels = runner.take_channels();
+        assert!(frozen.finish().is_err());
+    }
+
+    #[cfg(feature = "node")]
+    #[tokio::test]
+    async fn ingress_freeze_is_invalidated_by_receiver_consumption() {
+        let mut runner = AsyncRunner::new();
+        runner.system_evt_tx.send(test_system_event()).unwrap();
+        let frozen = runner.freeze_ingress().unwrap();
+        assert!(matches!(runner.recv().await, Some(PendingRunnerEvent::SystemEvent(_))));
+        assert!(frozen.finish().is_err());
+    }
+
+    #[test]
+    fn ingress_stop_prevents_later_snapshot_but_allows_shutdown_messages() {
+        let runner = AsyncRunner::new();
+        runner.handle().stop();
+        assert!(runner.freeze_ingress().is_err());
+        runner.system_evt_tx.send(test_system_event()).unwrap();
+        assert_eq!(runner.channels.system_evt_rx.len(), 1);
+    }
+
     // Test fixture for creating test quotes
     fn test_quote() -> QuoteTick {
         QuoteTick {
@@ -858,15 +971,17 @@ mod tests {
         signal_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
         signal_tx: tokio::sync::mpsc::UnboundedSender<()>,
     ) -> AsyncRunner {
-        let (time_evt_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (system_evt_tx, system_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (system_cmd_tx, system_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (data_evt_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (data_cmd_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (exec_evt_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (exec_cmd_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let ingress = IngressGate::new();
+        let (time_evt_tx, _) = ingress.channel();
+        let (system_evt_tx, system_evt_rx) = ingress.channel();
+        let (system_cmd_tx, system_cmd_rx) = ingress.channel();
+        let (data_evt_tx, _) = ingress.channel();
+        let (data_cmd_tx, _) = ingress.channel();
+        let (exec_evt_tx, _) = ingress.channel();
+        let (exec_cmd_tx, _) = ingress.channel();
 
         AsyncRunner {
+            ingress,
             channels: AsyncRunnerChannels {
                 time_evt_rx,
                 system_evt_rx,
@@ -2041,7 +2156,7 @@ mod tests {
     #[tokio::test]
     async fn test_runner_handle_is_cloneable() {
         let (signal_tx, _signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let handle = AsyncRunnerHandle { signal_tx };
+        let handle = AsyncRunnerHandle { signal_tx, ingress: IngressGate::new() };
 
         let handle2 = handle.clone();
 

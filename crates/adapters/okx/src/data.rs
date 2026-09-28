@@ -28,6 +28,7 @@ use nautilus_common::{
     clients::DataClient,
     live::{
         dst::time::{self, Duration, Instant},
+        ingress::IngressSender,
         runner::get_data_event_sender,
     },
     messages::{
@@ -110,7 +111,7 @@ pub struct OKXDataClient {
     is_connected: AtomicBool,
     transports_started: bool,
     tasks: TaskGroup,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: IngressSender<DataEvent>,
     // Shared instrument cache keyed by raw symbol so stream tasks, reconciliation,
     // and request paths all read and write one source of truth
     instruments_by_symbol: Arc<AtomicMap<Ustr, InstrumentAny>>,
@@ -269,7 +270,7 @@ impl OKXDataClient {
             .context("business websocket client not available (credentials required)")
     }
 
-    fn send_data(sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>, data: Data) {
+    fn send_data(sender: &IngressSender<DataEvent>, data: Data) {
         if let Err(e) = sender.send(DataEvent::Data(data)) {
             log::error!("Failed to emit data event: {e}");
         }
@@ -349,7 +350,7 @@ impl OKXDataClient {
     #[expect(clippy::too_many_arguments)]
     fn handle_ws_message(
         message: OKXWsMessage,
-        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: &IngressSender<DataEvent>,
         instruments_by_symbol: &Arc<AtomicMap<Ustr, InstrumentAny>>,
         http_client: &OKXHttpClient,
         config: &OKXDataClientConfig,
@@ -1360,7 +1361,7 @@ struct InstrumentUpdateLock {
 
 fn dispatch_parsed_data(
     msg: NautilusWsMessage,
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &IngressSender<DataEvent>,
     instruments_by_symbol: &Arc<AtomicMap<Ustr, InstrumentAny>>,
 ) {
     match msg {
@@ -1398,10 +1399,7 @@ fn dispatch_parsed_data(
     }
 }
 
-fn emit_funding_rates(
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    updates: Vec<FundingRateUpdate>,
-) {
+fn emit_funding_rates(sender: &IngressSender<DataEvent>, updates: Vec<FundingRateUpdate>) {
     for update in updates {
         if let Err(e) = sender.send(DataEvent::FundingRate(update)) {
             log::error!("Failed to emit funding rate event: {e}");
@@ -1410,7 +1408,7 @@ fn emit_funding_rates(
 }
 
 fn emit_instrument_status(
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &IngressSender<DataEvent>,
     instrument_id: InstrumentId,
     status_action: MarketStatusAction,
     is_live: bool,
@@ -1514,7 +1512,7 @@ fn publish_instrument_updates(
     ws_public: Option<&OKXWebSocketClient>,
     ws_business: Option<&OKXWebSocketClient>,
     instrument_update_lock: &InstrumentUpdateLock,
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &IngressSender<DataEvent>,
 ) {
     cache_instrument_updates(
         changed,
@@ -1734,7 +1732,7 @@ async fn reconcile_instruments(
     instrument_update_lock: &InstrumentUpdateLock,
     ws_public: Option<&OKXWebSocketClient>,
     ws_business: Option<&OKXWebSocketClient>,
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &IngressSender<DataEvent>,
 ) -> anyhow::Result<InstrumentReconciliation> {
     let seq_before = instrument_update_lock.write_seq.load(Ordering::SeqCst);
     let fetched = fetch_configured_instruments(http_client, config).await?;
@@ -3091,6 +3089,7 @@ mod tests {
     #[rstest]
     fn dispatch_parsed_data_emits_instrument_status() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let status = InstrumentStatus::new(
             InstrumentId::from("USDG-SGD.OKX"),
@@ -3135,6 +3134,7 @@ mod tests {
             .expect("subscription timestamp");
         book_sync.record_subscription(instrument_id, subscribed_at);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         let http = offline_http_client();
         let update_lock = InstrumentUpdateLock::default();
         let mut quote_cache = QuoteCache::new();
@@ -3197,6 +3197,7 @@ mod tests {
         let book_channels = Arc::new(AtomicMap::new());
         let book_sync = BookSyncTracker::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         let http = offline_http_client();
         let update_lock = InstrumentUpdateLock::default();
         let mut quote_cache = QuoteCache::new();
@@ -3360,6 +3361,7 @@ mod tests {
         let book_sync = BookSyncTracker::default();
         book_sync.record_subscription(instrument_id, Instant::now());
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         let http = offline_http_client();
         let update_lock = InstrumentUpdateLock::default();
         let index_ticker_map = Arc::new(AtomicMap::new());
@@ -3601,7 +3603,7 @@ mod tests {
     }
 
     fn handle_instruments_message(
-        sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        sender: &IngressSender<DataEvent>,
         instruments_by_symbol: &Arc<AtomicMap<Ustr, InstrumentAny>>,
         http_client: &OKXHttpClient,
         config: &OKXDataClientConfig,
@@ -3644,6 +3646,7 @@ mod tests {
     #[rstest]
     fn ws_instruments_publishes_new_definition_and_status() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
         let ws_public = offline_ws_client();
@@ -3702,6 +3705,7 @@ mod tests {
     #[rstest]
     fn ws_instruments_unchanged_definition_emits_status_only() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
 
@@ -3744,6 +3748,7 @@ mod tests {
     #[rstest]
     fn ws_instruments_changed_definition_is_republished() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
 
@@ -3803,6 +3808,7 @@ mod tests {
     #[rstest]
     fn ws_instruments_invalid_definition_emits_status_only() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
         let mut definition = swap_definition("0.1");
@@ -3840,6 +3846,7 @@ mod tests {
     #[rstest]
     fn ws_instruments_batch_publishes_each_valid_definition() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
         let mut eth_definition = swap_definition("0.01");
@@ -3894,6 +3901,7 @@ mod tests {
     #[rstest]
     fn ws_instruments_respects_contract_type_filter() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
         let config = OKXDataClientConfig::builder()
@@ -3957,6 +3965,7 @@ mod tests {
     #[rstest]
     fn ws_instruments_respects_family_filter() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
         let config = OKXDataClientConfig::builder()
@@ -4033,6 +4042,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
 
         let summary = reconcile_instruments(
             &http,
@@ -4078,6 +4088,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
 
         let summary = reconcile_instruments(
             &http,
@@ -4188,6 +4199,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
 
         reconcile_instruments(
             &http,
@@ -4436,6 +4448,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
 
         let summary = reconcile_instruments(
             &http,
@@ -4568,6 +4581,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
 
         let result = reconcile_instruments(
             &http,
@@ -4605,6 +4619,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
 
         let summary = reconcile_instruments(
             &http,
@@ -4662,6 +4677,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
 
         let summary = reconcile_instruments(
             &http,
@@ -4704,6 +4720,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
 
         let summary = reconcile_instruments(
             &http,
@@ -4737,6 +4754,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = Arc::new(InstrumentUpdateLock::default());
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         let ws = offline_ws_client();
         let ws_business = offline_ws_client();
 
@@ -4801,6 +4819,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = Arc::new(InstrumentUpdateLock::default());
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
 
         gate.add_permits(1);
         let summary = reconcile_instruments(
@@ -4902,6 +4921,7 @@ mod tests {
             .update_instruments_interval_mins(0)
             .build();
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let client = OKXDataClient::new(*OKX_CLIENT_ID, config).expect("data client");
 
@@ -4916,6 +4936,7 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_boundary_terminates_owned_data_task(#[case] boundary: DataTaskBoundary) {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let mut client = OKXDataClient::new(*OKX_CLIENT_ID, OKXDataClientConfig::default())
             .expect("data client");
@@ -4959,6 +4980,7 @@ mod tests {
         };
         let addr = start_refresh_server(state.clone()).await;
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let config = OKXDataClientConfig {
             instrument_types: vec![OKXInstrumentType::Spot],
@@ -5016,6 +5038,7 @@ mod tests {
             .update_instruments_interval_mins(60)
             .build();
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let client = OKXDataClient::new(*OKX_CLIENT_ID, config).expect("data client");
 
@@ -5032,6 +5055,7 @@ mod tests {
         let state = spot_refresh_state();
         let addr = start_refresh_server(state).await;
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let config = OKXDataClientConfig {
             instrument_types: vec![OKXInstrumentType::Spot],
@@ -5074,6 +5098,7 @@ mod tests {
         let state = spot_refresh_state();
         let addr = start_refresh_server(state).await;
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let config = OKXDataClientConfig {
             instrument_types: vec![OKXInstrumentType::Spot],
@@ -5105,6 +5130,7 @@ mod tests {
         let state = spot_refresh_state();
         let addr = start_refresh_server(state.clone()).await;
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let config = OKXDataClientConfig {
             instrument_types: vec![OKXInstrumentType::Spot],
@@ -5157,6 +5183,7 @@ mod tests {
         let state = spot_refresh_state();
         let addr = start_refresh_server(state).await;
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let config = OKXDataClientConfig {
             instrument_types: vec![OKXInstrumentType::Spot],
@@ -5189,6 +5216,7 @@ mod tests {
     async fn zero_interval_disables_refresh_on_connect() {
         let addr = start_refresh_server(spot_refresh_state()).await;
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender: IngressSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let config = OKXDataClientConfig {
             instrument_types: vec![OKXInstrumentType::Spot],

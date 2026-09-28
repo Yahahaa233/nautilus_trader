@@ -117,7 +117,7 @@ pub(super) async fn unsubscribe_channel(
 }
 
 pub(super) fn emit_ws_message(
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
     subscriptions: &DashMap<InstrumentId, MarketStatsSubscription>,
     message: &NautilusWsMessage,
 ) -> bool {

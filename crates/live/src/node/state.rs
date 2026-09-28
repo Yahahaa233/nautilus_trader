@@ -18,6 +18,8 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 
+use nautilus_common::live::ingress::IngressGate;
+
 use super::metrics::{RunnerMetrics, RunnerMetricsSnapshot};
 
 const STOP_REQUESTED: u8 = 1 << 7;
@@ -132,6 +134,7 @@ pub(super) enum RunningTransition {
 /// node itself to be Send + Sync.
 #[derive(Clone, Debug)]
 pub struct LiveNodeHandle {
+    ingress: IngressGate,
     control: Arc<AtomicU8>,
     startup_reconciliation: Arc<RwLock<Option<StartupReconciliationObservation>>>,
     pub(crate) metrics: Arc<RunnerMetrics>,
@@ -147,7 +150,12 @@ impl LiveNodeHandle {
     /// Creates a new handle with default (`Idle`) state.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_ingress(IngressGate::new())
+    }
+
+    pub(crate) fn with_ingress(ingress: IngressGate) -> Self {
         Self {
+            ingress,
             control: Arc::new(AtomicU8::new(NodeState::Idle.as_u8())),
             startup_reconciliation: Arc::new(RwLock::new(None)),
             metrics: Arc::new(RunnerMetrics::default()),
@@ -182,12 +190,14 @@ impl LiveNodeHandle {
     }
 
     pub(super) fn try_set_running(&self) -> RunningTransition {
-        match self.control.compare_exchange(
-            NodeState::Starting.as_u8(),
-            NodeState::Running.as_u8(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match self.ingress.with_lifecycle_transition(|| {
+            self.control.compare_exchange(
+                NodeState::Starting.as_u8(),
+                NodeState::Running.as_u8(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+        }) {
             Ok(_) => RunningTransition::Entered,
             Err(control) if control == (NodeState::Starting.as_u8() | STOP_REQUESTED) => {
                 RunningTransition::StopRequested
@@ -197,11 +207,11 @@ impl LiveNodeHandle {
     }
 
     fn set_state(&self, state: NodeState) {
-        let _ = self
-            .control
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |control| {
+        self.ingress.with_lifecycle_transition(|| {
+            let _ = self.control.try_update(Ordering::AcqRel, Ordering::Acquire, |control| {
                 Some((control & STOP_REQUESTED) | state.as_u8())
             });
+        });
     }
 
     /// Returns the current node state.
@@ -230,7 +240,9 @@ impl LiveNodeHandle {
 
     /// Signals the node to stop.
     pub fn stop(&self) {
-        self.control.fetch_or(STOP_REQUESTED, Ordering::AcqRel);
+        self.ingress.with_lifecycle_transition(|| {
+            self.control.fetch_or(STOP_REQUESTED, Ordering::AcqRel);
+        });
     }
 }
 
@@ -249,5 +261,62 @@ impl EngineConnectionStatus {
             Self::StopRequested => Some("Stop signal received during startup"),
             Self::ShutdownRequested => Some("Shutdown signal received during startup"),
         }
+    }
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::*;
+
+    #[test]
+    fn cloned_node_handle_stop_invalidates_shared_capture() {
+        let gate = IngressGate::new();
+        let handle = LiveNodeHandle::with_ingress(gate.clone());
+        let clone = handle.clone();
+        let frozen = gate.freeze().unwrap();
+        clone.stop();
+        assert!(handle.should_stop());
+        assert!(frozen.finish().is_err());
+        assert!(gate.verify_open().is_err());
+    }
+
+    #[test]
+    fn node_shutdown_transitions_invalidate_capture() {
+        for transition in [LiveNodeHandle::set_shutting_down, LiveNodeHandle::set_stopped] {
+            let gate = IngressGate::new();
+            let handle = LiveNodeHandle::with_ingress(gate.clone());
+            let frozen = gate.freeze().unwrap();
+            transition(&handle.clone());
+            assert!(frozen.finish().is_err());
+        }
+    }
+
+    #[test]
+    fn node_start_transitions_invalidate_capture() {
+        let gate = IngressGate::new();
+        let handle = LiveNodeHandle::with_ingress(gate.clone());
+        let frozen = gate.freeze().unwrap();
+        handle.set_starting();
+        assert!(frozen.finish().is_err());
+
+        let gate = IngressGate::new();
+        let handle = LiveNodeHandle::with_ingress(gate.clone());
+        handle.set_starting();
+        let frozen = gate.freeze().unwrap();
+        assert_eq!(handle.try_set_running(), RunningTransition::Entered);
+        assert!(frozen.finish().is_err());
+    }
+
+    #[test]
+    fn ordinary_node_shutdown_keeps_residual_ingress_open() {
+        let gate = IngressGate::new();
+        let handle = LiveNodeHandle::with_ingress(gate.clone());
+        let (sender, mut receiver) = gate.channel();
+        handle.stop();
+        handle.set_shutting_down();
+        handle.set_stopped();
+        gate.verify_open().unwrap();
+        sender.send(42).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), 42);
     }
 }

@@ -77,7 +77,7 @@ struct DerivPollState {
 pub(crate) struct DerivPollManager {
     polls: Arc<Mutex<AHashMap<InstrumentId, DerivPollState>>>,
     http_client: CoinbaseHttpClient,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     clock: &'static AtomicTime,
     interval_secs: u64,
     tasks: TaskGroup,
@@ -86,7 +86,7 @@ pub(crate) struct DerivPollManager {
 impl DerivPollManager {
     pub(crate) fn new(
         http_client: CoinbaseHttpClient,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
         clock: &'static AtomicTime,
         interval_secs: u64,
     ) -> Self {
@@ -309,7 +309,7 @@ pub(crate) fn emit_deriv_updates(
     emit_index: bool,
     emit_funding: bool,
     ts_now: UnixNanos,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
 ) {
     let Some(details) = product.future_product_details.as_ref() else {
         log::debug!("Skipping derivatives update for {instrument_id}: not a futures product");

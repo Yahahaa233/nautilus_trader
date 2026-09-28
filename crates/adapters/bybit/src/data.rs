@@ -106,7 +106,7 @@ pub struct BybitDataClient {
     session_tasks: TaskGroup,
     command_tasks: TaskGroup,
     shutdown_errors: Vec<String>,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     book_depths: Arc<AtomicMap<InstrumentId, u32>>,
     quote_subs: Arc<AtomicSet<InstrumentId>>,
@@ -427,7 +427,7 @@ impl BybitDataClient {
     }
 }
 
-fn send_data(sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>, data: Data) {
+fn send_data(sender: &nautilus_common::live::ingress::IngressSender<DataEvent>, data: Data) {
     if let Err(e) = sender.send(DataEvent::Data(data)) {
         log::error!("Failed to emit data event: {e}");
     }
@@ -447,7 +447,7 @@ type FundingCacheEntry = (Option<String>, Option<String>, Option<String>);
 #[expect(clippy::too_many_arguments)]
 fn handle_ws_message(
     message: &BybitWsMessage,
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
     instruments: &AHashMap<Ustr, InstrumentAny>,
     product_type: Option<BybitProductType>,
     trade_subs: &Arc<AtomicSet<InstrumentId>>,

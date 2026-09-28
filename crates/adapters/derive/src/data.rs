@@ -110,7 +110,7 @@ pub struct DeriveDataClient {
     session_tasks: TaskGroup,
     pending_tasks: TaskGroup,
     shutdown_errors: Vec<String>,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     active_book_delta_channels: Arc<AtomicMap<InstrumentId, String>>,
     active_book_depth10_channels: Arc<AtomicMap<InstrumentId, String>>,

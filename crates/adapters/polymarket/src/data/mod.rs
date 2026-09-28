@@ -123,7 +123,7 @@ pub struct PolymarketDataClient {
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
     tasks: TaskGroup,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     instrument_update_state: Arc<Mutex<InstrumentUpdateState>>,
     token_meta: Arc<DashMap<Ustr, TokenMeta>>,

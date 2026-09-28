@@ -99,7 +99,7 @@ pub struct KrakenSpotDataClient {
     session_tasks: TaskGroup,
     command_tasks: TaskGroup,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
 }
 
 impl KrakenSpotDataClient {
@@ -546,7 +546,7 @@ impl KrakenSpotDataClient {
 
     fn flush_ohlc_buffer(
         ohlc_buffer: &OhlcBuffer,
-        sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
     ) {
         let mut buffer = ohlc_buffer.lock();
         let bars: Vec<Bar> = buffer.drain().map(|(_, (bar, _))| bar).collect();
@@ -1238,7 +1238,7 @@ type OhlcBufferKey = (Ustr, u32);
 type OhlcBuffer = Arc<Mutex<AHashMap<OhlcBufferKey, (Bar, UnixNanos)>>>;
 
 struct DataEventSink<'a> {
-    sender: &'a tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &'a nautilus_common::live::ingress::IngressSender<DataEvent>,
 }
 
 impl L3Sink for DataEventSink<'_> {
@@ -1253,7 +1253,7 @@ impl L3Sink for DataEventSink<'_> {
 }
 
 struct SpotMessageContext<'a> {
-    sender: &'a tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &'a nautilus_common::live::ingress::IngressSender<DataEvent>,
     instruments: &'a Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     book_sequence: &'a Arc<AtomicU64>,
     l2_depths: &'a L2Depths,

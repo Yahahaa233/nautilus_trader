@@ -102,7 +102,7 @@ pub struct CoinbaseDataClient {
     session_tasks: TaskGroup,
     command_tasks: TaskGroup,
     shutdown_errors: Vec<String>,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     deriv_polls: DerivPollManager,
     clock: &'static AtomicTime,
@@ -357,7 +357,7 @@ impl CoinbaseDataClient {
 
 fn dispatch_ws_message(
     msg: NautilusWsMessage,
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
     status_subs: &Arc<Mutex<AHashSet<InstrumentId>>>,
 ) {
     match msg {

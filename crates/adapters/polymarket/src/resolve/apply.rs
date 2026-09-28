@@ -154,7 +154,7 @@ pub(crate) enum ResolveApplyResult {
 #[derive(Clone)]
 pub(crate) struct ResolveContext {
     pub(crate) clock: &'static AtomicTime,
-    pub(crate) data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    pub(crate) data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     pub(crate) instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     pub(crate) watchlist: Arc<AtomicMap<String, ResolveWatchEntry>>,
     pub(crate) apply_mutex: Arc<Mutex<()>>,

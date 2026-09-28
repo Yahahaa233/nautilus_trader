@@ -150,7 +150,7 @@ struct PolymarketRtdsFeedInner {
     proxy_url: Option<ProxyUrl>,
     transport_backend: TransportBackend,
     clock: &'static AtomicTime,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     socket_sink: Option<SocketStateSink>,
     socket_control: Option<SocketControl>,
     subscriptions: dashmap::DashMap<String, TrackedSubscription>,
@@ -350,7 +350,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     ) -> Self {
         Self::new_with_proxy(url, transport_backend, clock, data_sender, None)
     }
@@ -360,7 +360,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
         proxy_url: Option<ProxyUrl>,
     ) -> Self {
         Self::new_with_proxy_and_state_sink(
@@ -378,7 +378,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
         proxy_url: Option<ProxyUrl>,
         state_sink: Option<SocketStateSink>,
     ) -> Self {
@@ -397,7 +397,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
         proxy_url: Option<ProxyUrl>,
         socket_control: Option<SocketControl>,
     ) -> Self {
@@ -416,7 +416,7 @@ impl PolymarketRtdsFeed {
         url: String,
         transport_backend: TransportBackend,
         clock: &'static AtomicTime,
-        data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
         proxy_url: Option<ProxyUrl>,
         socket_sink: Option<SocketStateSink>,
         socket_control: Option<SocketControl>,

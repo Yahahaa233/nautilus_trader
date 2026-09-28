@@ -447,7 +447,7 @@ pub enum SerializationEncoding {
     #[default]
     #[serde(rename = "json")]
     Json = 0,
-    /// The MessagePack encoding.
+    /// The `MessagePack` encoding.
     #[serde(rename = "msgpack")]
     MsgPack = 1,
     /// The Cap'n Proto encoding.

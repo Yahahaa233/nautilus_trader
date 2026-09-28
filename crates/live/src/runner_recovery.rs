@@ -28,6 +28,7 @@ use nautilus_common::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use nautilus_common::live::ingress::IngressSender;
 use crate::runner::AsyncRunner;
 
 /// Current wire schema for a recovery input sent to a runner channel.
@@ -763,26 +764,26 @@ impl RunnerRecoveryCodecRegistry {
 pub struct RunnerRecoveryHandoff {
     available: Arc<AtomicBool>,
     progress: RunnerRecoveryProgressHandle,
-    time_evt_tx: tokio::sync::mpsc::UnboundedSender<TimeEventMessage>,
-    system_evt_tx: tokio::sync::mpsc::UnboundedSender<SystemEvent>,
-    system_cmd_tx: tokio::sync::mpsc::UnboundedSender<SystemCommand>,
-    exec_evt_tx: tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
-    exec_cmd_tx: tokio::sync::mpsc::UnboundedSender<TradingCommandMessage>,
-    data_evt_tx: tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    data_cmd_tx: tokio::sync::mpsc::UnboundedSender<DataCommand>,
+    time_evt_tx: IngressSender<TimeEventMessage>,
+    system_evt_tx: IngressSender<SystemEvent>,
+    system_cmd_tx: IngressSender<SystemCommand>,
+    exec_evt_tx: IngressSender<ExecutionEvent>,
+    exec_cmd_tx: IngressSender<TradingCommandMessage>,
+    data_evt_tx: IngressSender<DataEvent>,
+    data_cmd_tx: IngressSender<DataCommand>,
     last_dispatch_sequence: Option<u64>,
     watermark: Option<RunnerRecoveryWatermark>,
 }
 
 #[derive(Debug)]
 struct RunnerRecoverySenders {
-    time_event: tokio::sync::mpsc::UnboundedSender<TimeEventMessage>,
-    system_event: tokio::sync::mpsc::UnboundedSender<SystemEvent>,
-    system_command: tokio::sync::mpsc::UnboundedSender<SystemCommand>,
-    execution_event: tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
-    execution_command: tokio::sync::mpsc::UnboundedSender<TradingCommandMessage>,
-    data_event: tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    data_command: tokio::sync::mpsc::UnboundedSender<DataCommand>,
+    time_event: IngressSender<TimeEventMessage>,
+    system_event: IngressSender<SystemEvent>,
+    system_command: IngressSender<SystemCommand>,
+    execution_event: IngressSender<ExecutionEvent>,
+    execution_command: IngressSender<TradingCommandMessage>,
+    data_event: IngressSender<DataEvent>,
+    data_command: IngressSender<DataCommand>,
 }
 
 impl RunnerRecoveryHandoff {
@@ -1396,6 +1397,18 @@ mod tests {
         assert_eq!(received.received_watermark, Some(4));
         let processed = binding.acknowledge_processed().unwrap();
         assert_eq!(processed.processed_watermark, Some(4));
+    }
+
+    #[test]
+    fn frozen_ingress_rejects_previously_issued_recovery_handoff() {
+        let runner = AsyncRunner::new();
+        let mut handoff = runner.recovery_handoff().unwrap();
+        let frozen = runner.freeze_ingress().unwrap();
+        assert!(handoff.enqueue(&envelope(1, "endpoint-1"), &registry()).is_err());
+        assert!(frozen.verify().is_err());
+        assert!(frozen.finish().is_err());
+        let mut channels = runner.take_channels();
+        assert!(channels.system_cmd_rx.try_recv().is_err());
     }
 
     #[test]

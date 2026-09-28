@@ -103,7 +103,7 @@ pub struct DydxDataClient {
     session_tasks: TaskGroup,
     command_tasks: TaskGroup,
     shutdown_errors: Vec<String>,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     instrument_cache: Arc<InstrumentCache>,
     order_books: Arc<DashMap<InstrumentId, OrderBook>>,
     last_quotes: Arc<DashMap<InstrumentId, QuoteTick>>,
@@ -1579,7 +1579,7 @@ impl DydxDataClient {
 
     fn handle_data_message(
         payloads: Vec<NautilusData>,
-        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
         incomplete_bars: &Arc<DashMap<BarType, Bar>>,
         clock: &'static AtomicTime,
     ) {
@@ -1594,7 +1594,7 @@ impl DydxDataClient {
 
     fn handle_bar_message(
         bar: Bar,
-        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
         incomplete_bars: &Arc<DashMap<BarType, Bar>>,
         clock: &'static AtomicTime,
     ) {
@@ -1785,7 +1785,7 @@ impl DydxDataClient {
 
     fn handle_deltas_message(
         deltas: OrderBookDeltas,
-        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        data_sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
         order_books: &Arc<DashMap<InstrumentId, OrderBook>>,
         last_quotes: &Arc<DashMap<InstrumentId, QuoteTick>>,
         instrument_cache: &Arc<InstrumentCache>,
@@ -1878,7 +1878,7 @@ impl DydxDataClient {
 
 struct WsMessageContext {
     clock: &'static AtomicTime,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     instrument_cache: Arc<InstrumentCache>,
     order_books: Arc<DashMap<InstrumentId, OrderBook>>,
     last_quotes: Arc<DashMap<InstrumentId, QuoteTick>>,

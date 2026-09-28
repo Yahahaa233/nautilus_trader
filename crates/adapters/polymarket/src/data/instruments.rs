@@ -188,7 +188,7 @@ pub(super) fn publish_cached_condition_closed(
     condition_id: &str,
     instrument_update_state: &Arc<Mutex<InstrumentUpdateState>>,
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
 ) -> usize {
     let update_state = instrument_update_state.lock();
     if update_state.retired {
@@ -251,7 +251,7 @@ pub(super) fn cache_and_publish_instruments(
     instrument_update_state: &Arc<Mutex<InstrumentUpdateState>>,
     instruments_cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
     now_ns: UnixNanos,
     instruments: Vec<InstrumentAny>,
 ) -> usize {
@@ -299,7 +299,7 @@ pub(super) async fn refresh_scoped_instruments(
     instrument_update_state: &Arc<Mutex<InstrumentUpdateState>>,
     instruments_cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
-    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
     clock: &'static AtomicTime,
 ) -> anyhow::Result<usize> {
     // Defaulted rather than returning early: a client can carry registered filters with
@@ -399,7 +399,7 @@ async fn probe_closed_condition_ids(
 pub(super) async fn refresh_expired_market_closure(
     http: &PolymarketGammaHttpClient,
     cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
     now_ns: UnixNanos,
     closed_condition_ids: &Arc<parking_lot::Mutex<AHashSet<String>>>,
     ws_sub_mutex: &Arc<tokio::sync::Mutex<()>>,

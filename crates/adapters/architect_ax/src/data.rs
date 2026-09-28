@@ -108,7 +108,7 @@ pub struct AxDataClient {
     session_tasks: TaskGroup,
     pending_tasks: TaskGroup,
     shutdown_errors: Vec<String>,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
     clock: &'static AtomicTime,
     funding_rate_cancellations: AHashMap<InstrumentId, CancellationToken>,
@@ -1164,7 +1164,7 @@ fn drain_status_invalidations(
 #[expect(clippy::too_many_arguments)]
 fn handle_ws_message(
     msg: AxDataWsMessage,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
     instruments: &Arc<AtomicMap<Ustr, InstrumentAny>>,
     symbol_data_types: &Arc<AtomicMap<String, SymbolDataTypes>>,
     book_sequences: &mut AHashMap<Ustr, u64>,
@@ -1199,7 +1199,7 @@ fn handle_ws_message(
 #[expect(clippy::too_many_arguments)]
 fn handle_md_message(
     message: AxMdMessage,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &nautilus_common::live::ingress::IngressSender<DataEvent>,
     instruments: &Arc<AtomicMap<Ustr, InstrumentAny>>,
     symbol_data_types: &Arc<AtomicMap<String, SymbolDataTypes>>,
     book_sequences: &mut AHashMap<Ustr, u64>,

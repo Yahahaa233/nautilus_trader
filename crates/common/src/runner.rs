@@ -391,6 +391,11 @@ pub(crate) fn purge_closed_time_event_callbacks() {
 
 /// Trait for data command sending that can be implemented for both sync and async runners.
 pub trait DataCommandSender {
+    /// Invalidates an active snapshot before TLS replacement.
+    /// Implementations must only update their short ingress gate state; they
+    /// must not send, invoke callbacks, or replace thread-local senders.
+    fn invalidate_snapshot(&self) {}
+
     /// Executes a data command.
     ///
     /// - **Sync runners** send the command to a queue for synchronous execution.
@@ -490,7 +495,13 @@ pub fn set_data_cmd_sender(sender: Arc<dyn DataCommandSender>) {
 /// Replaces the global data command sender for the current thread.
 pub fn replace_data_cmd_sender(sender: Arc<dyn DataCommandSender>) {
     DATA_CMD_SENDER.with(|s| {
-        *s.borrow_mut() = Some(sender);
+        // Keep the old slot visible while calling its hook without a RefCell borrow.
+        let previous = s.borrow().clone();
+        if let Some(previous) = &previous {
+            previous.invalidate_snapshot();
+        }
+        let displaced = s.borrow_mut().replace(sender);
+        drop(displaced);
     });
 }
 
@@ -499,6 +510,11 @@ pub fn replace_data_cmd_sender(sender: Arc<dyn DataCommandSender>) {
 /// Implementations may transfer messages across threads, but messages for
 /// `RustLocal` callbacks must be dispatched on the callback's owner thread.
 pub trait TimeEventSender: Debug + Send + Sync {
+    /// Invalidates an active snapshot before TLS replacement.
+    /// Implementations must only update their short ingress gate state; they
+    /// must not send, invoke callbacks, or replace thread-local senders.
+    fn invalidate_snapshot(&self) {}
+
     /// Sends a live time event message.
     fn send(&self, message: TimeEventMessage);
 }
@@ -545,7 +561,13 @@ pub fn set_time_event_sender(sender: Arc<dyn TimeEventSender>) {
 /// Replaces the global time event sender for the current thread.
 pub fn replace_time_event_sender(sender: Arc<dyn TimeEventSender>) {
     TIME_EVENT_SENDER.with(|s| {
-        *s.borrow_mut() = Some(sender);
+        // Keep the old slot visible while calling its hook without a RefCell borrow.
+        let previous = s.borrow().clone();
+        if let Some(previous) = &previous {
+            previous.invalidate_snapshot();
+        }
+        let displaced = s.borrow_mut().replace(sender);
+        drop(displaced);
     });
 }
 
@@ -667,6 +689,11 @@ pub fn capture_trading_cmd(message: TradingCommandMessage) {
 
 /// Trait for trading command sending that can be implemented for both sync and async runners.
 pub trait TradingCommandSender {
+    /// Invalidates an active snapshot before TLS replacement.
+    /// Implementations must only update their short ingress gate state; they
+    /// must not send, invoke callbacks, or replace thread-local senders.
+    fn invalidate_snapshot(&self) {}
+
     /// Defers a trading command message.
     ///
     /// - **Sync runners** enqueue the message for synchronous execution.
@@ -802,7 +829,13 @@ pub fn set_exec_cmd_sender(sender: Arc<dyn TradingCommandSender>) {
 /// Replaces the global trading command sender for the current thread.
 pub fn replace_exec_cmd_sender(sender: Arc<dyn TradingCommandSender>) {
     EXEC_CMD_SENDER.with(|s| {
-        *s.borrow_mut() = Some(sender);
+        // Keep the old slot visible while calling its hook without a RefCell borrow.
+        let previous = s.borrow().clone();
+        if let Some(previous) = &previous {
+            previous.invalidate_snapshot();
+        }
+        let displaced = s.borrow_mut().replace(sender);
+        drop(displaced);
     });
 }
 
@@ -830,6 +863,47 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
+
+    #[test]
+    fn replacing_trait_senders_calls_hook_without_borrowing_slot() {
+        #[derive(Debug)]
+        struct SenderHook(Arc<std::sync::atomic::AtomicUsize>);
+        impl DataCommandSender for SenderHook {
+            fn execute(&self, _: DataCommand) {}
+            fn invalidate_snapshot(&self) {
+                let _current = get_data_cmd_sender();
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        impl TimeEventSender for SenderHook {
+            fn send(&self, _: TimeEventMessage) {}
+            fn invalidate_snapshot(&self) {
+                let _current = get_time_event_sender();
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        impl TradingCommandSender for SenderHook {
+            fn execute(&self, _: TradingCommandMessage) {}
+            fn invalidate_snapshot(&self) {
+                let _current = get_trading_cmd_sender();
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        std::thread::spawn(|| {
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            replace_data_cmd_sender(Arc::new(SenderHook(count.clone())));
+            replace_time_event_sender(Arc::new(SenderHook(count.clone())));
+            replace_exec_cmd_sender(Arc::new(SenderHook(count.clone())));
+            assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
+            replace_data_cmd_sender(Arc::new(SenderHook(count.clone())));
+            replace_time_event_sender(Arc::new(SenderHook(count.clone())));
+            replace_exec_cmd_sender(Arc::new(SenderHook(count.clone())));
+            assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 3);
+        })
+        .join()
+        .unwrap();
+    }
+
     use crate::messages::execution::QueryAccount;
 
     #[derive(Debug)]

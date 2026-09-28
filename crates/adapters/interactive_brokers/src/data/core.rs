@@ -103,7 +103,7 @@ pub struct InteractiveBrokersDataClient {
     cancellation_token: CancellationToken,
     session_tasks: TaskGroup,
     command_tasks: TaskGroup,
-    data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    data_sender: nautilus_common::live::ingress::IngressSender<DataEvent>,
     subscriptions: Arc<tokio::sync::Mutex<AHashMap<InstrumentId, SubscriptionInfo>>>,
     option_greeks_subscriptions: Arc<tokio::sync::Mutex<AHashMap<InstrumentId, CancellationToken>>>,
     quote_cache: Arc<tokio::sync::Mutex<QuoteCache>>,

@@ -235,7 +235,7 @@ impl SubmitTrackingState {
         &self,
         order_id: i32,
         account_id: AccountId,
-        exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+        exec_sender: &nautilus_common::live::ingress::IngressSender<ExecutionEvent>,
     ) -> bool {
         InteractiveBrokersExecutionClient::emit_order_accepted_if_needed(
             order_id,
@@ -262,7 +262,7 @@ impl SubmitTrackingState {
 async fn process_submitted_status(
     order_id: i32,
     state: &SubmitTrackingState,
-    exec_sender: &tokio::sync::mpsc::UnboundedSender<ExecutionEvent>,
+    exec_sender: &nautilus_common::live::ingress::IngressSender<ExecutionEvent>,
 ) {
     InteractiveBrokersExecutionClient::handle_order_status(
         &create_test_order_status(order_id, "Submitted"),

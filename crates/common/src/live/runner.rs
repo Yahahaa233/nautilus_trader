@@ -17,6 +17,7 @@
 //!
 //! This module provides thread-local storage for tokio mpsc channels used in live trading.
 
+use super::ingress::IngressSender;
 use std::cell::RefCell;
 
 use crate::messages::{DataEvent, ExecutionEvent, SystemCommand, SystemEvent};
@@ -27,7 +28,7 @@ use crate::messages::{DataEvent, ExecutionEvent, SystemCommand, SystemEvent};
 ///
 /// Panics if the sender is uninitialized.
 #[must_use]
-pub fn get_data_event_sender() -> tokio::sync::mpsc::UnboundedSender<DataEvent> {
+pub fn get_data_event_sender() -> IngressSender<DataEvent> {
     DATA_EVENT_SENDER.with(|sender| {
         sender
             .borrow()
@@ -42,7 +43,7 @@ pub fn get_data_event_sender() -> tokio::sync::mpsc::UnboundedSender<DataEvent> 
 /// Returns `None` if the sender is not initialized (e.g., in Python/v1 bridge environments
 /// before a runner or adapter bridge has registered a sender).
 #[must_use]
-pub fn try_get_data_event_sender() -> Option<tokio::sync::mpsc::UnboundedSender<DataEvent>> {
+pub fn try_get_data_event_sender() -> Option<IngressSender<DataEvent>> {
     DATA_EVENT_SENDER.with(|sender| sender.borrow().as_ref().cloned())
 }
 
@@ -53,7 +54,8 @@ pub fn try_get_data_event_sender() -> Option<tokio::sync::mpsc::UnboundedSender<
 /// # Panics
 ///
 /// Panics if a sender has already been set.
-pub fn set_data_event_sender(sender: tokio::sync::mpsc::UnboundedSender<DataEvent>) {
+pub fn set_data_event_sender(sender: impl Into<IngressSender<DataEvent>>) {
+    let sender = sender.into();
     DATA_EVENT_SENDER.with(|s| {
         let mut slot = s.borrow_mut();
         assert!(slot.is_none(), "Data event sender can only be set once");
@@ -62,9 +64,15 @@ pub fn set_data_event_sender(sender: tokio::sync::mpsc::UnboundedSender<DataEven
 }
 
 /// Replaces the data event sender for the current thread.
-pub fn replace_data_event_sender(sender: tokio::sync::mpsc::UnboundedSender<DataEvent>) {
+pub fn replace_data_event_sender(sender: impl Into<IngressSender<DataEvent>>) {
+    let sender = sender.into();
     DATA_EVENT_SENDER.with(|s| {
-        *s.borrow_mut() = Some(sender);
+        let previous = s.borrow().clone();
+        if let Some(previous) = &previous {
+            previous.invalidate_snapshot();
+        }
+        let displaced = s.borrow_mut().replace(sender);
+        drop(displaced);
     });
 }
 
@@ -74,7 +82,7 @@ pub fn replace_data_event_sender(sender: tokio::sync::mpsc::UnboundedSender<Data
 ///
 /// Panics if the sender is uninitialized.
 #[must_use]
-pub fn get_system_event_sender() -> tokio::sync::mpsc::UnboundedSender<SystemEvent> {
+pub fn get_system_event_sender() -> IngressSender<SystemEvent> {
     SYSTEM_EVENT_SENDER.with(|sender| {
         sender
             .borrow()
@@ -88,7 +96,7 @@ pub fn get_system_event_sender() -> tokio::sync::mpsc::UnboundedSender<SystemEve
 ///
 /// Returns `None` if the sender is not initialized (e.g., in test environments).
 #[must_use]
-pub fn try_get_system_event_sender() -> Option<tokio::sync::mpsc::UnboundedSender<SystemEvent>> {
+pub fn try_get_system_event_sender() -> Option<IngressSender<SystemEvent>> {
     SYSTEM_EVENT_SENDER.with(|sender| sender.borrow().as_ref().cloned())
 }
 
@@ -99,7 +107,8 @@ pub fn try_get_system_event_sender() -> Option<tokio::sync::mpsc::UnboundedSende
 /// # Panics
 ///
 /// Panics if a sender has already been set.
-pub fn set_system_event_sender(sender: tokio::sync::mpsc::UnboundedSender<SystemEvent>) {
+pub fn set_system_event_sender(sender: impl Into<IngressSender<SystemEvent>>) {
+    let sender = sender.into();
     SYSTEM_EVENT_SENDER.with(|s| {
         let mut slot = s.borrow_mut();
         assert!(slot.is_none(), "System event sender can only be set once");
@@ -108,9 +117,15 @@ pub fn set_system_event_sender(sender: tokio::sync::mpsc::UnboundedSender<System
 }
 
 /// Replaces the system event sender for the current thread.
-pub fn replace_system_event_sender(sender: tokio::sync::mpsc::UnboundedSender<SystemEvent>) {
+pub fn replace_system_event_sender(sender: impl Into<IngressSender<SystemEvent>>) {
+    let sender = sender.into();
     SYSTEM_EVENT_SENDER.with(|s| {
-        *s.borrow_mut() = Some(sender);
+        let previous = s.borrow().clone();
+        if let Some(previous) = &previous {
+            previous.invalidate_snapshot();
+        }
+        let displaced = s.borrow_mut().replace(sender);
+        drop(displaced);
     });
 }
 
@@ -120,7 +135,7 @@ pub fn replace_system_event_sender(sender: tokio::sync::mpsc::UnboundedSender<Sy
 ///
 /// Panics if the sender is uninitialized.
 #[must_use]
-pub fn get_system_command_sender() -> tokio::sync::mpsc::UnboundedSender<SystemCommand> {
+pub fn get_system_command_sender() -> IngressSender<SystemCommand> {
     SYSTEM_COMMAND_SENDER.with(|sender| {
         sender
             .borrow()
@@ -134,8 +149,7 @@ pub fn get_system_command_sender() -> tokio::sync::mpsc::UnboundedSender<SystemC
 ///
 /// Returns `None` if the sender is not initialized.
 #[must_use]
-pub fn try_get_system_command_sender() -> Option<tokio::sync::mpsc::UnboundedSender<SystemCommand>>
-{
+pub fn try_get_system_command_sender() -> Option<IngressSender<SystemCommand>> {
     SYSTEM_COMMAND_SENDER.with(|sender| sender.borrow().as_ref().cloned())
 }
 
@@ -146,7 +160,8 @@ pub fn try_get_system_command_sender() -> Option<tokio::sync::mpsc::UnboundedSen
 /// # Panics
 ///
 /// Panics if a sender has already been set.
-pub fn set_system_command_sender(sender: tokio::sync::mpsc::UnboundedSender<SystemCommand>) {
+pub fn set_system_command_sender(sender: impl Into<IngressSender<SystemCommand>>) {
+    let sender = sender.into();
     SYSTEM_COMMAND_SENDER.with(|s| {
         let mut slot = s.borrow_mut();
         assert!(slot.is_none(), "System command sender can only be set once");
@@ -155,9 +170,15 @@ pub fn set_system_command_sender(sender: tokio::sync::mpsc::UnboundedSender<Syst
 }
 
 /// Replaces the system command sender for the current thread.
-pub fn replace_system_command_sender(sender: tokio::sync::mpsc::UnboundedSender<SystemCommand>) {
+pub fn replace_system_command_sender(sender: impl Into<IngressSender<SystemCommand>>) {
+    let sender = sender.into();
     SYSTEM_COMMAND_SENDER.with(|s| {
-        *s.borrow_mut() = Some(sender);
+        let previous = s.borrow().clone();
+        if let Some(previous) = &previous {
+            previous.invalidate_snapshot();
+        }
+        let displaced = s.borrow_mut().replace(sender);
+        drop(displaced);
     });
 }
 
@@ -167,7 +188,7 @@ pub fn replace_system_command_sender(sender: tokio::sync::mpsc::UnboundedSender<
 ///
 /// Panics if the sender is uninitialized.
 #[must_use]
-pub fn get_exec_event_sender() -> tokio::sync::mpsc::UnboundedSender<ExecutionEvent> {
+pub fn get_exec_event_sender() -> IngressSender<ExecutionEvent> {
     EXEC_EVENT_SENDER.with(|sender| {
         sender
             .borrow()
@@ -181,7 +202,7 @@ pub fn get_exec_event_sender() -> tokio::sync::mpsc::UnboundedSender<ExecutionEv
 ///
 /// Returns `None` if the sender is not initialized (e.g., in test environments).
 #[must_use]
-pub fn try_get_exec_event_sender() -> Option<tokio::sync::mpsc::UnboundedSender<ExecutionEvent>> {
+pub fn try_get_exec_event_sender() -> Option<IngressSender<ExecutionEvent>> {
     EXEC_EVENT_SENDER.with(|sender| sender.borrow().as_ref().cloned())
 }
 
@@ -192,7 +213,8 @@ pub fn try_get_exec_event_sender() -> Option<tokio::sync::mpsc::UnboundedSender<
 /// # Panics
 ///
 /// Panics if a sender has already been set.
-pub fn set_exec_event_sender(sender: tokio::sync::mpsc::UnboundedSender<ExecutionEvent>) {
+pub fn set_exec_event_sender(sender: impl Into<IngressSender<ExecutionEvent>>) {
+    let sender = sender.into();
     EXEC_EVENT_SENDER.with(|s| {
         let mut slot = s.borrow_mut();
         assert!(
@@ -204,17 +226,23 @@ pub fn set_exec_event_sender(sender: tokio::sync::mpsc::UnboundedSender<Executio
 }
 
 /// Replaces the execution event sender for the current thread.
-pub fn replace_exec_event_sender(sender: tokio::sync::mpsc::UnboundedSender<ExecutionEvent>) {
+pub fn replace_exec_event_sender(sender: impl Into<IngressSender<ExecutionEvent>>) {
+    let sender = sender.into();
     EXEC_EVENT_SENDER.with(|s| {
-        *s.borrow_mut() = Some(sender);
+        let previous = s.borrow().clone();
+        if let Some(previous) = &previous {
+            previous.invalidate_snapshot();
+        }
+        let displaced = s.borrow_mut().replace(sender);
+        drop(displaced);
     });
 }
 
 thread_local! {
-    static DATA_EVENT_SENDER: RefCell<Option<tokio::sync::mpsc::UnboundedSender<DataEvent>>> = const { RefCell::new(None) };
-    static EXEC_EVENT_SENDER: RefCell<Option<tokio::sync::mpsc::UnboundedSender<ExecutionEvent>>> = const { RefCell::new(None) };
-    static SYSTEM_EVENT_SENDER: RefCell<Option<tokio::sync::mpsc::UnboundedSender<SystemEvent>>> = const { RefCell::new(None) };
-    static SYSTEM_COMMAND_SENDER: RefCell<Option<tokio::sync::mpsc::UnboundedSender<SystemCommand>>> = const { RefCell::new(None) };
+    static DATA_EVENT_SENDER: RefCell<Option<IngressSender<DataEvent>>> = const { RefCell::new(None) };
+    static EXEC_EVENT_SENDER: RefCell<Option<IngressSender<ExecutionEvent>>> = const { RefCell::new(None) };
+    static SYSTEM_EVENT_SENDER: RefCell<Option<IngressSender<SystemEvent>>> = const { RefCell::new(None) };
+    static SYSTEM_COMMAND_SENDER: RefCell<Option<IngressSender<SystemCommand>>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -256,8 +284,8 @@ mod tests {
     #[rstest]
     fn test_set_data_event_sender_panics_on_double_set() {
         let result = std::thread::spawn(|| {
-            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-            let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+            let (tx1, _rx1) = super::super::ingress::IngressGate::new().channel();
+            let (tx2, _rx2) = super::super::ingress::IngressGate::new().channel();
             set_data_event_sender(tx1);
             set_data_event_sender(tx2);
         })
@@ -268,8 +296,8 @@ mod tests {
     #[rstest]
     fn test_set_exec_event_sender_panics_on_double_set() {
         let result = std::thread::spawn(|| {
-            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-            let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+            let (tx1, _rx1) = super::super::ingress::IngressGate::new().channel();
+            let (tx2, _rx2) = super::super::ingress::IngressGate::new().channel();
             set_exec_event_sender(tx1);
             set_exec_event_sender(tx2);
         })
@@ -280,8 +308,8 @@ mod tests {
     #[rstest]
     fn test_set_system_event_sender_panics_on_double_set() {
         let result = std::thread::spawn(|| {
-            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-            let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+            let (tx1, _rx1) = super::super::ingress::IngressGate::new().channel();
+            let (tx2, _rx2) = super::super::ingress::IngressGate::new().channel();
             set_system_event_sender(tx1);
             set_system_event_sender(tx2);
         })
@@ -292,8 +320,8 @@ mod tests {
     #[rstest]
     fn test_set_system_command_sender_panics_on_double_set() {
         let result = std::thread::spawn(|| {
-            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-            let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+            let (tx1, _rx1) = super::super::ingress::IngressGate::new().channel();
+            let (tx2, _rx2) = super::super::ingress::IngressGate::new().channel();
             set_system_command_sender(tx1);
             set_system_command_sender(tx2);
         })
@@ -325,13 +353,40 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[test]
+    fn replacing_event_tls_invalidates_only_active_snapshot() {
+        fn check<T: Send + 'static>(replace: fn(IngressSender<T>)) {
+            std::thread::spawn(move || {
+                let gate = super::super::ingress::IngressGate::new();
+                let (first, _receiver) = gate.channel();
+                replace(first);
+                let frozen = gate.freeze().unwrap();
+                let (second, _receiver) = super::super::ingress::IngressGate::new().channel();
+                replace(second);
+                assert!(frozen.finish().is_err());
+                let ordinary = super::super::ingress::IngressGate::new();
+                let (third, _receiver) = ordinary.channel();
+                replace(third);
+                let (fourth, _receiver) = super::super::ingress::IngressGate::new().channel();
+                replace(fourth);
+                ordinary.verify_open().unwrap();
+            })
+            .join()
+            .unwrap();
+        }
+        check(replace_data_event_sender);
+        check(replace_exec_event_sender);
+        check(replace_system_event_sender);
+        check(replace_system_command_sender);
+    }
+
     fn assert_sender_replaced<T: Send + 'static>(
-        replace: fn(tokio::sync::mpsc::UnboundedSender<T>),
-        get: fn() -> tokio::sync::mpsc::UnboundedSender<T>,
+        replace: fn(IngressSender<T>),
+        get: fn() -> IngressSender<T>,
     ) {
         std::thread::spawn(move || {
-            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-            let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+            let (tx1, _rx1) = super::super::ingress::IngressGate::new().channel();
+            let (tx2, _rx2) = super::super::ingress::IngressGate::new().channel();
 
             replace(tx1.clone());
             replace(tx2.clone());
@@ -345,12 +400,12 @@ mod tests {
     }
 
     fn assert_sender_thread_local<T: Send + 'static>(
-        replace: fn(tokio::sync::mpsc::UnboundedSender<T>),
-        get: fn() -> tokio::sync::mpsc::UnboundedSender<T>,
+        replace: fn(IngressSender<T>),
+        get: fn() -> IngressSender<T>,
     ) {
         let barrier = Arc::new(Barrier::new(2));
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        let (tx1, _rx1) = super::super::ingress::IngressGate::new().channel();
+        let (tx2, _rx2) = super::super::ingress::IngressGate::new().channel();
         let expected1 = tx1.clone();
         let expected2 = tx2.clone();
 
