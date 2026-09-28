@@ -790,6 +790,17 @@ impl LiveNode {
             .recovery_handoff()
     }
 
+    /// Observes all seven normal runner queues without consuming messages.
+    /// Counts are sampled sequentially and do not establish producer quiescence.
+    ///
+    /// # Errors
+    /// Refuses non-idle nodes or unavailable receivers instead of reporting zero.
+    pub fn recovery_runner_queue_counts(&self) -> anyhow::Result<std::collections::BTreeMap<crate::runner_recovery::RunnerRecoveryChannel, usize>> {
+        anyhow::ensure!(self.state() == NodeState::Idle,
+            "recovery queue observation requires an idle node");
+        Ok(self.runner.as_ref().context("recovery queue receivers unavailable")?.pending_queue_counts())
+    }
+
     fn ensure_recovery_start_permitted(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.recovery_requires_release,

@@ -318,6 +318,20 @@ impl AsyncRunner {
         replace_data_cmd_sender(Arc::new(sender));
     }
 
+    /// Read-only per-channel counts. Publishers can race this observation; it is not a fence.
+    pub(crate) fn pending_queue_counts(&self) -> std::collections::BTreeMap<crate::runner_recovery::RunnerRecoveryChannel, usize> {
+        use crate::runner_recovery::RunnerRecoveryChannel as Channel;
+        std::collections::BTreeMap::from([
+            (Channel::TimeEvent, self.channels.time_evt_rx.len()),
+            (Channel::SystemEvent, self.channels.system_evt_rx.len()),
+            (Channel::SystemCommand, self.channels.system_cmd_rx.len()),
+            (Channel::ExecutionEvent, self.channels.exec_evt_rx.len()),
+            (Channel::ExecutionCommand, self.channels.exec_cmd_rx.len()),
+            (Channel::DataEvent, self.channels.data_evt_rx.len()),
+            (Channel::DataCommand, self.channels.data_cmd_rx.len()),
+        ])
+    }
+
     /// Returns a pre-start handoff into this runner's internal channels.
     ///
     /// # Errors
