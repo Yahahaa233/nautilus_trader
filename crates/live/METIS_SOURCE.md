@@ -1,6 +1,3 @@
-> Current fork base: NautilusTrader v2.0.0rc5, upstream commit 1b0a49d2792a9432a3aca3fcb617ce7a630d905e.
-> Imported from Metis vendor manifest; earlier versions below are historical provenance.
-
 # Managed source and opt-in dispatch protocol
 
 Source: NautilusTrader v2.0.0rc4, a0400251110653b6d8ae6a9b5b89c4543fa85a2d,
@@ -151,3 +148,15 @@ shutdown. Startup still refuses an already failed store. The default remains
 shutdown on persistence halt for owners that do not opt in. `persistence_degraded`
 distinguishes this condition from healthy operation; normal shutdown still reports
 the persistence failure. This is not trading recovery authorization.
+
+# Execution-client attachment after isolated recovery
+
+A completed native event frontier (including a validated empty batch) may install
+one disconnected execution client through its factory while the node remains
+idle, startup-blocked and risk-halted. Registration uses the native engine,
+socket registry, instrument subscription and reconciliation tolerance paths.
+Existing clients, incomplete/failed recovery and connected factory results are
+refused; a connected result is stopped before refusal. Factory/registration
+errors or unwind poison the node. Attachment never clears the recovery release
+fence or connects the venue. Metis tests cover empty/nonempty replay, duplicate
+attachment, factory error/panic and connected-result refusal.

@@ -14,6 +14,56 @@ use nautilus_common::messages::ExecutionEvent;
 use nautilus_model::{events::OrderEventAny, orders::Order};
 
 impl LiveNode {
+    /// Installs one disconnected venue client after isolated native event recovery.
+    /// This preserves the recovery startup fence and halted risk admission.
+    ///
+    /// # Errors
+    /// Refuses incomplete recovery, active/stopped nodes, existing clients, connected
+    /// factory results, or registration failure. Failed installation poisons the node.
+    pub fn attach_execution_client_after_recovery(
+        &mut self,
+        factory: &dyn nautilus_common::factories::ExecutionClientFactory,
+        config: &dyn nautilus_common::factories::ClientConfig,
+    ) -> Result<()> {
+        use nautilus_common::clients::ExecutionClient;
+        ensure!(self.state() == NodeState::Idle && !self.handle.should_stop()
+            && self.recovery_requires_release && self.recovery_native_frontier.is_some(),
+            "execution client attachment requires completed paused native recovery");
+        ensure!(self.exec_clients.is_empty()
+            && self.kernel.exec_engine.try_borrow().context("execution engine busy")?.client_ids().is_empty(),
+            "recovery execution clients already installed");
+        ensure!(self.kernel.risk_engine.try_borrow().context("risk engine busy")?.trading_state()
+            == nautilus_model::enums::TradingState::Halted,
+            "recovery execution attachment requires halted admission");
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+            let mut client = self.socket_registry.scope(|| factory.create(
+                self.config.trader_id, factory.name(), config,
+                self.kernel.cache().into(), self.kernel.clock(),
+            ))?;
+            if client.is_connected() {
+                client.stop().context("connected recovery client could not be stopped")?;
+                anyhow::bail!("recovery client factory returned a connected client");
+            }
+            let client = crate::execution::client::LiveExecutionClient::new(client);
+            let id = client.client_id();
+            let venue = client.venue();
+            self.kernel.exec_engine.try_borrow_mut().context("execution engine busy")?
+                .register_client(Box::new(client.clone()))?;
+            self.socket_registry.register_client(id);
+            nautilus_execution::engine::ExecutionEngine::subscribe_venue_instruments(
+                &self.kernel.exec_engine, venue);
+            self.exec_manager.set_position_reconciliation_tolerance(
+                client.account_id(), client.position_reconciliation_tolerance());
+            self.exec_clients.push(client);
+            Ok(())
+        }));
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => { self.handle.stop(); Err(error) }
+            Err(panic) => { self.handle.stop(); std::panic::resume_unwind(panic) }
+        }
+    }
+
     /// Replays a frozen, contiguous batch through the actual native event handlers.
     ///
     /// The complete batch is decoded before any mutation. Envelope identity stays
@@ -213,6 +263,10 @@ impl LiveNode {
                 checkpoint_sequence: boundary.checkpoint_sequence,
                 dispatch_watermark: envelope.dispatch_sequence,
             });
+        }
+        if envelopes.is_empty() {
+            self.recovery_requires_release = true;
+            self.recovery_native_frontier = Some(boundary.clone());
         }
         Ok(frontier)
     }
