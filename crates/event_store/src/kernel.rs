@@ -472,9 +472,28 @@ pub enum KernelError {
     /// Cache state reconstruction from a recovered event-store run failed.
     #[error("event store cache replay failed: {0}")]
     CacheReplay(#[from] CacheReplayError),
+    /// A cross-instance continuation source failed validation.
+    #[error("external journal parent rejected: {0}")]
+    ExternalParent(String),
     /// The writer signaled fail-stop after the kernel was already started.
     #[error("event store halted: {0:?}")]
     EventStoreHalted(HaltReason),
+}
+
+#[derive(Debug)]
+struct ExternalJournalParent {
+    directory: PathBuf,
+    instance: UUID4,
+    run_id: String,
+    watermark: u64,
+    fingerprint: String,
+}
+
+impl ExternalJournalParent {
+    fn verify(&self) -> anyhow::Result<String> {
+        let backend = RedbBackend::open_sealed(&self.directory, &self.instance.to_string(), &self.run_id)?;
+        EventStoreLifecycle::sealed_backend_fingerprint(Box::new(backend), self.instance, &self.run_id, self.watermark)
+    }
 }
 
 /// Kernel-facing wrapper that bundles every event-store concern: predecessor recovery,
@@ -488,6 +507,9 @@ pub enum KernelError {
 /// `BacktestEngine`).
 #[derive(Debug)]
 pub struct EventStoreLifecycle {
+    instance_id: UUID4,
+    opened_once: bool,
+    external_parent: Option<ExternalJournalParent>,
     config: Option<EventStoreConfig>,
     options: EventStoreLifecycleOptions,
     recovered: Vec<RecoveredRun>,
@@ -552,6 +574,9 @@ impl EventStoreLifecycle {
             (Vec::new(), None)
         };
         Ok(Self {
+            instance_id,
+            opened_once: false,
+            external_parent: None,
             config,
             options,
             recovered,
@@ -560,6 +585,84 @@ impl EventStoreLifecycle {
             halt: HaltSignal::new(),
             clock,
         })
+    }
+
+    /// Verifies a sealed source and fingerprints its manifest and ordered entry hashes.
+    ///
+    /// # Errors
+    /// Rejects an invalid reference, source identity, status, watermark or integrity scan.
+    pub fn sealed_run_fingerprint(
+        source_base_dir: &Path,
+        source_instance: UUID4,
+        source_run_id: &str,
+        expected_high_watermark: u64,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(expected_high_watermark > 0 && !source_run_id.is_empty()
+            && source_run_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'), "invalid external parent reference");
+        ExternalJournalParent { directory: source_base_dir.into(), instance: source_instance,
+            run_id: source_run_id.into(), watermark: expected_high_watermark, fingerprint: String::new() }.verify()
+    }
+
+    /// Verifies and fingerprints the caller's already-open sealed source handle.
+    /// Use this when checkpoint validation must share the same backend snapshot.
+    ///
+    /// # Errors
+    /// Rejects invalid references, mismatched identity/watermark, unsealed or corrupt sources.
+    pub fn sealed_backend_fingerprint(
+        backend: Box<dyn EventStore>,
+        source_instance: UUID4,
+        source_run_id: &str,
+        expected_high_watermark: u64,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(expected_high_watermark > 0 && !source_run_id.is_empty()
+            && source_run_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'), "invalid external parent reference");
+        let manifest = backend.manifest()?;
+        anyhow::ensure!(manifest.instance_id == source_instance.to_string() && manifest.run_id == source_run_id,
+            "external parent identity mismatch");
+        anyhow::ensure!(matches!(manifest.status, RunStatus::Ended | RunStatus::CrashedRecovered),
+            "external parent must be sealed and usable");
+        anyhow::ensure!(backend.high_watermark()? == expected_high_watermark, "external parent watermark changed");
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"nautilus-external-journal-parent/v1");
+        let manifest_bytes = rmp_serde::to_vec_named(&manifest)?;
+        hash.update(&(manifest_bytes.len() as u64).to_le_bytes());
+        hash.update(&manifest_bytes);
+        for sequence in 1..=expected_high_watermark {
+            let entry = backend.scan_seq(sequence)?.ok_or_else(|| anyhow::anyhow!("external parent sequence missing"))?;
+            hash.update(entry.entry_hash.as_bytes());
+        }
+        let report = crate::verifier::Verifier::new(backend).verify()?;
+        anyhow::ensure!(report.is_clean(), "external parent integrity verification failed: {:?}", report.findings);
+        Ok(hash.finalize().to_hex().to_string())
+    }
+
+    /// Binds a sealed journal from a different native instance for composite recovery.
+    /// This records lineage only; the caller must restore business state independently.
+    /// The complete parent is verified now and again before opening the child journal.
+    ///
+    /// # Errors
+    /// Rejects replay mixing, existing lineage, reuse, invalid sources and same-instance parents.
+    pub fn bind_external_parent(
+        &mut self,
+        source_base_dir: &Path,
+        source_instance: UUID4,
+        source_run_id: &str,
+        expected_high_watermark: u64,
+        expected_fingerprint: &str,
+    ) -> anyhow::Result<()> {
+        let config = self.config.as_ref().ok_or_else(|| anyhow::anyhow!("journal configuration required"))?;
+        anyhow::ensure!(!self.opened_once && self.session.is_none() && !self.is_halted(), "external parent requires a pristine healthy lifecycle");
+        anyhow::ensure!(self.external_parent.is_none() && self.parent_run_id.is_none() && config.replay_from_run_id.is_none(),
+            "external parent cannot replace or mix with existing lineage or replay");
+        anyhow::ensure!(source_instance != self.instance_id, "external parent must have a different instance");
+        anyhow::ensure!(expected_high_watermark > 0 && !source_run_id.is_empty()
+            && source_run_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'), "invalid external parent reference");
+        let mut parent = ExternalJournalParent { directory: source_base_dir.into(), instance: source_instance,
+            run_id: source_run_id.into(), watermark: expected_high_watermark, fingerprint: String::new() };
+        parent.fingerprint = parent.verify()?;
+        anyhow::ensure!(parent.fingerprint == expected_fingerprint, "external parent differs from verified recovery source");
+        self.external_parent = Some(parent);
+        Ok(())
     }
 
     /// Opens a fresh run on kernel `start()`. Idempotent against reset/rerun: a
@@ -586,6 +689,19 @@ impl EventStoreLifecycle {
             return Ok(());
         };
 
+        if let Some(parent) = &self.external_parent {
+            if instance_id != self.instance_id || self.opened_once || self.is_halted() {
+                return Err(KernelError::ExternalParent("continuation target changed or already used".into()));
+            }
+            self.opened_once = true;
+            let fingerprint = parent.verify().map_err(|error| KernelError::ExternalParent(format!("{error:#}")))?;
+            if fingerprint != parent.fingerprint {
+                return Err(KernelError::ExternalParent("external parent contents changed".into()));
+            }
+        } else {
+            self.opened_once = true;
+        }
+
         if self.session.is_some() {
             // Reset/rerun (BacktestEngine::run -> reset -> run) reuses the kernel
             // across runs. Seal the leftover session before opening a fresh one.
@@ -609,7 +725,7 @@ impl EventStoreLifecycle {
             )?;
             Some(replay_run_id.to_string())
         } else {
-            self.parent_run_id.clone()
+            self.external_parent.as_ref().map(|parent| parent.run_id.clone()).or_else(|| self.parent_run_id.clone())
         };
         let session = open_run_with_options(
             &config,
@@ -650,6 +766,9 @@ impl EventStoreLifecycle {
         instance_id: UUID4,
         cache: &mut Cache,
     ) -> Result<Option<CacheReplayReport>, KernelError> {
+        if self.external_parent.is_some() {
+            return Err(KernelError::ExternalParent("external parent requires composite recovery; native cache replay denied".into()));
+        }
         let Some(config) = self.config.as_ref() else {
             return Ok(None);
         };
@@ -725,6 +844,7 @@ impl EventStoreLifecycle {
         self.config
             .as_ref()
             .and_then(|config| config.replay_from_run_id.as_deref())
+            .or_else(|| self.external_parent.as_ref().map(|parent| parent.run_id.as_str()))
             .or(self.parent_run_id.as_deref())
     }
 
@@ -2409,6 +2529,94 @@ mod tests {
             suffix.chars().all(|c| c.is_ascii_hexdigit()),
             "suffix must be hex, was {suffix:?}",
         );
+    }
+
+    #[test]
+    fn external_parent_continuation_verifies_source_and_persists_lineage() -> anyhow::Result<()> {
+        let source_dir = TempDir::new()?;
+        let target_dir = TempDir::new()?;
+        let source_instance = UUID4::new();
+        let target_instance = UUID4::new();
+        let source_config = make_config(source_dir.path().into());
+        let mut source = open_run(&source_config, &source_instance.to_string(),
+            build_run_id(10_000u64.into()), None, 10_000u64.into(),
+            &RegisteredComponents::default(), HaltSignal::new(), get_atomic_clock_static())?;
+        let source_id = source.run_id().to_owned();
+        source.close(20_000u64.into())?;
+        drop(source);
+        let parent = RedbBackend::open_sealed(source_dir.path(), &source_instance.to_string(), &source_id)?;
+        let watermark = parent.high_watermark()?;
+        drop(parent);
+        let fingerprint = EventStoreLifecycle::sealed_run_fingerprint(source_dir.path(), source_instance, &source_id, watermark)?;
+        let new_lifecycle = |instance, config| EventStoreLifecycle::boot(Some(config), instance,
+            Rc::new(RefCell::new(TestClock::new())));
+        let mut child = new_lifecycle(target_instance, make_config(target_dir.path().into()))?;
+        assert!(child.bind_external_parent(source_dir.path(), target_instance, &source_id, watermark, &fingerprint).is_err());
+        assert!(child.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark + 1, &fingerprint).is_err());
+        assert!(child.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark, "incorrect").is_err());
+        child.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark, &fingerprint)?;
+        assert_eq!(child.parent_run_id(), Some(source_id.as_str()));
+        assert!(child.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark, &fingerprint).is_err());
+        assert!(child.restore_parent_cache(target_instance, &mut Cache::default()).is_err());
+        child.open(target_instance, &RegisteredComponents::default(), Environment::Backtest)?;
+        let child_id = child.run_id().unwrap().to_owned();
+        assert!(child.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark, &fingerprint).is_err());
+        child.seal(30_000u64.into());
+        assert!(child.open(target_instance, &RegisteredComponents::default(), Environment::Backtest).is_err());
+        let backend = RedbBackend::open_sealed(target_dir.path(), &target_instance.to_string(), &child_id)?;
+        let manifest = backend.manifest()?;
+        assert_eq!(manifest.parent_run_id.as_deref(), Some(source_id.as_str()));
+        assert_eq!(manifest.instance_id, target_instance.to_string());
+        assert_eq!(backend.scan_seq(1)?.unwrap().payload_type.as_str(), "RunStarted");
+        assert!(crate::verifier::Verifier::new(Box::new(backend)).verify()?.is_clean());
+        assert_eq!(EventStoreLifecycle::sealed_run_fingerprint(source_dir.path(), source_instance, &source_id, watermark)?, fingerprint);
+        let mut replay_config = make_config(target_dir.path().into());
+        replay_config.replay_from_run_id = Some(source_id.clone());
+        let mut replay = new_lifecycle(UUID4::new(), replay_config)?;
+        assert!(replay.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark, &fingerprint).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn external_parent_continuation_rechecks_source_and_target_at_open() -> anyhow::Result<()> {
+        let source_dir = TempDir::new()?;
+        let target_dir = TempDir::new()?;
+        let source_instance = UUID4::new();
+        let mut source = open_run(&make_config(source_dir.path().into()), &source_instance.to_string(),
+            build_run_id(10_000u64.into()), None, 10_000u64.into(),
+            &RegisteredComponents::default(), HaltSignal::new(), get_atomic_clock_static())?;
+        let source_id = source.run_id().to_owned();
+        source.close(20_000u64.into())?;
+        drop(source);
+        let backend = RedbBackend::open_sealed(source_dir.path(), &source_instance.to_string(), &source_id)?;
+        let watermark = backend.high_watermark()?;
+        drop(backend);
+        let fingerprint = EventStoreLifecycle::sealed_run_fingerprint(source_dir.path(), source_instance, &source_id, watermark)?;
+        let instance = UUID4::new();
+        let mut child = EventStoreLifecycle::boot(Some(make_config(target_dir.path().into())), instance,
+            Rc::new(RefCell::new(TestClock::new())))?;
+        child.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark, &fingerprint)?;
+        assert!(child.open(UUID4::new(), &RegisteredComponents::default(), Environment::Backtest).is_err());
+        // Replace a sealed source with a different valid journal retaining the same identity
+        // and watermark. Integrity alone must not substitute for the original content proof.
+        let verified_handle = RedbBackend::open_sealed(source_dir.path(), &source_instance.to_string(), &source_id)?;
+        let prior_instance_path = source_dir.path().join(source_instance.to_string());
+        std::fs::rename(&prior_instance_path, source_dir.path().join("saved-original"))?;
+        let mut changed_config = make_config(source_dir.path().into());
+        changed_config.identity.binary_hash = "different-binary".into();
+        let mut replacement = open_run(&changed_config, &source_instance.to_string(), source_id.clone(),
+            None, 10_000u64.into(), &RegisteredComponents::default(), HaltSignal::new(), get_atomic_clock_static())?;
+        replacement.close(20_000u64.into())?;
+        drop(replacement);
+        let changed = EventStoreLifecycle::sealed_run_fingerprint(source_dir.path(), source_instance, &source_id, watermark)?;
+        assert_ne!(changed, fingerprint);
+        assert_eq!(EventStoreLifecycle::sealed_backend_fingerprint(Box::new(verified_handle),
+            source_instance, &source_id, watermark)?, fingerprint,
+            "already-validated source handle must not adopt a replacement path's fingerprint");
+        let error = child.open(instance, &RegisteredComponents::default(), Environment::Backtest).unwrap_err();
+        assert!(error.to_string().contains("contents changed"));
+        assert!(child.run_id().is_none());
+        Ok(())
     }
 
     #[rstest]

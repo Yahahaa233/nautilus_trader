@@ -126,6 +126,7 @@ pub struct NautilusKernel {
     event_store: Option<Box<dyn KernelEventStore>>,
     event_store_replay: bool,
     state_save_armed: bool,
+    start_attempted: bool,
     #[cfg(feature = "streaming")]
     streaming_writer: Option<Rc<RefCell<FeatherWriter>>>,
     #[cfg(feature = "streaming")]
@@ -435,6 +436,7 @@ impl NautilusKernel {
             shutdown_requested,
             event_store_replay: false,
             state_save_armed: false,
+            start_attempted: false,
             #[cfg(feature = "streaming")]
             streaming_writer,
             #[cfg(feature = "streaming")]
@@ -677,8 +679,81 @@ impl NautilusKernel {
         &self.trader
     }
 
+    /// Opens capture for a paused, unstarted kernel without starting components.
+    /// A continuation caller must first bind and verify its recovery parent; this
+    /// method can also open a fresh journal and does not itself prove restoration.
+    /// This deliberately does not perform the legacy event-store cache replay.
+    pub fn open_event_store_for_paused_recovery(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.ts_started.is_none()
+                && self.ts_shutdown.is_none()
+                && !self.shutdown_requested.get()
+                && !self.start_attempted,
+            "paused recovery requires an unstarted kernel"
+        );
+        let idle = |state| {
+            matches!(
+                state,
+                ComponentState::PreInitialized | ComponentState::Ready
+            )
+        };
+        anyhow::ensure!(
+            idle(self.trader.try_borrow()?.state())
+                && self.data_engine.try_borrow()?.check_disconnected()
+                && self.exec_engine.try_borrow()?.check_disconnected(),
+            "paused recovery requires an unused trader and disconnected clients"
+        );
+        anyhow::ensure!(
+            self.risk_engine.try_borrow()?.trading_state()
+                == nautilus_model::enums::TradingState::Halted,
+            "paused recovery requires halted trading admission"
+        );
+        let components = Self::collect_registered_components(&self.trader);
+        let environment = self.config.environment();
+        let mut execution = self.exec_engine.try_borrow_mut()?;
+        let store = self
+            .event_store
+            .as_deref_mut()
+            .ok_or_else(|| anyhow::anyhow!("paused recovery requires an event store"))?;
+        anyhow::ensure!(
+            store.run_id().is_none() && !store.is_halted(),
+            "paused recovery requires an unopened healthy event store"
+        );
+        anyhow::ensure!(
+            !store.is_event_store_replay_configured(),
+            "paused recovery cannot use implicit event-store cache replay"
+        );
+        execution.set_snapshot_anchorer(None);
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<_> {
+                store.open(self.instance_id, &components, environment)?;
+                anyhow::ensure!(
+                    store.run_id().is_some() && !store.is_halted(),
+                    "paused recovery event store did not open a healthy run"
+                );
+                Ok(store.snapshot_anchorer())
+            }));
+        match outcome {
+            Ok(Ok(anchorer)) => {
+                execution.set_snapshot_anchorer(anchorer);
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                self.shutdown_requested.set(true);
+                store.seal(self.clock.borrow().timestamp_ns());
+                Err(error)
+            }
+            Err(panic) => {
+                self.shutdown_requested.set(true);
+                // A panic may leave the store inconsistent; disposal owns its cleanup.
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+
     /// Starts the Nautilus system kernel synchronously (for backtest use).
     pub fn start(&mut self) {
+        self.start_attempted = true;
         arm_shutdown_on_error(self.config.shutdown_on_error());
         log::info!("Starting");
 
@@ -1519,6 +1594,123 @@ mod lifecycle_tests {
 
         fn is_halted(&self) -> bool {
             false
+        }
+    }
+
+    #[derive(Debug)]
+    struct PausedRecoveryStore {
+        opened: bool,
+        fail: bool,
+        calls: Rc<RefCell<Vec<String>>>,
+        manifest: Rc<RefCell<Option<(UUID4, RegisteredComponents, Environment)>>>,
+    }
+
+    impl KernelEventStore for PausedRecoveryStore {
+        fn restore_parent_cache(&mut self, _: UUID4, _: &mut Cache) -> anyhow::Result<()> {
+            panic!("paused opening must not restore cache")
+        }
+        fn open(
+            &mut self,
+            id: UUID4,
+            components: &RegisteredComponents,
+            environment: Environment,
+        ) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push("open".into());
+            self.opened = true;
+            *self.manifest.borrow_mut() = Some((id, components.clone(), environment));
+            anyhow::ensure!(!self.fail, "injected partial open failure");
+            Ok(())
+        }
+        fn snapshot_anchorer(&self) -> Option<SnapshotAnchorer> {
+            None
+        }
+        fn seal(&mut self, _: UnixNanos) {
+            self.calls.borrow_mut().push("seal".into());
+            self.opened = false;
+        }
+        fn run_id(&self) -> Option<&str> {
+            self.opened.then_some("paused-child")
+        }
+        fn parent_run_id(&self) -> Option<&str> {
+            Some("verified-parent")
+        }
+        fn is_halted(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn paused_recovery_opens_actual_manifest_without_starting_or_replaying() {
+        for fail in [false, true] {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let manifest = Rc::new(RefCell::new(None));
+            let store = PausedRecoveryStore {
+                opened: false,
+                fail,
+                calls: calls.clone(),
+                manifest: manifest.clone(),
+            };
+            let mut kernel = NautilusKernelBuilder::default()
+                .with_event_store(move |_, _| Ok(Box::new(store)))
+                .build()
+                .unwrap();
+            let (_, control) = TestCacheDatabaseControl::create();
+            let actor_id = ActorId::from("PAUSED-ACTOR");
+            let strategy_id = StrategyId::from("PAUSED-STRATEGY-001");
+            add_state_components(
+                &kernel,
+                &control,
+                StateActor::new(actor_id, control.clone(), IndexMap::new()),
+                StateStrategy::new(strategy_id, control.clone(), IndexMap::new()),
+            );
+            let before = SelfStates::of(&kernel);
+            assert!(kernel.open_event_store_for_paused_recovery().is_err());
+            assert!(calls.borrow().is_empty());
+            kernel
+                .risk_engine
+                .borrow_mut()
+                .set_trading_state(nautilus_model::enums::TradingState::Halted);
+            let result = kernel.open_event_store_for_paused_recovery();
+            assert_eq!(result.is_err(), fail);
+            assert!(kernel.ts_started.is_none());
+            assert!(!kernel.is_event_store_replay());
+            assert_eq!(SelfStates::of(&kernel), before);
+            let captured = manifest.borrow();
+            let (instance, components, environment) = captured.as_ref().unwrap();
+            assert_eq!(*instance, kernel.instance_id);
+            assert_eq!(
+                *components,
+                NautilusKernel::collect_registered_components(&kernel.trader)
+            );
+            assert_eq!(*environment, kernel.config.environment());
+            assert!(components.actors.contains_key(&actor_id.to_string()));
+            assert!(components.strategies.contains_key(&strategy_id.to_string()));
+            assert_eq!(control.events(), vec!["components.registered"]);
+            drop(captured);
+            assert!(kernel.open_event_store_for_paused_recovery().is_err());
+            assert_eq!(
+                *calls.borrow(),
+                if fail {
+                    vec!["open", "seal"]
+                } else {
+                    vec!["open"]
+                }
+            );
+            assert_eq!(kernel.is_shutdown_requested(), fail);
+            kernel.dispose();
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct SelfStates(ComponentState, bool, bool, bool);
+    impl SelfStates {
+        fn of(kernel: &NautilusKernel) -> Self {
+            Self(
+                kernel.trader.borrow().state(),
+                kernel.data_engine.borrow().check_disconnected(),
+                kernel.exec_engine.borrow().check_disconnected(),
+                kernel.start_attempted,
+            )
         }
     }
 
