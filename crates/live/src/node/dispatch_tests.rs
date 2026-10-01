@@ -649,3 +649,121 @@ fn empty_bootstrap_receipt_requires_real_handoffs_and_never_invents_dispatch() {
         assert_eq!(observer.completed_root().unwrap(), 0);
     }
 }
+
+#[test]
+fn empty_bootstrap_adapter_faults_block_receipt_and_child_checkpoint() {
+    use crate::{dispatch::DispatchObserver, runner_recovery::RunnerRecoveryCodecRegistry};
+    for mode in 0..4 {
+        let mut node =
+            LiveNode::builder(TraderId::from("ADAPTER-RECEIPT-001"), Environment::Sandbox)
+                .unwrap()
+                .with_reconciliation(false)
+                .build()
+                .unwrap();
+        node.kernel
+            .risk_engine
+            .borrow_mut()
+            .set_trading_state(nautilus_model::enums::TradingState::Halted);
+        let observer = DispatchObserver::new("adapter-receipt".into(), |_| Ok(())).unwrap();
+        node.set_dispatch_observer(NodeDispatchObserver::new(observer.clone(), |_, _, _| {
+            anyhow::bail!("bootstrap must not dispatch")
+        }))
+        .unwrap();
+        // Real production handoffs; never assign the private recovery flags.
+        node.restore_native_cache(Cache::default()).unwrap();
+        node.restore_component_state(&CollectedComponentState {
+            actors: Default::default(),
+            strategies: Default::default(),
+        })
+        .unwrap();
+        if mode == 1 {
+            node.config.data_engine.external_clients = Some(vec![ClientId::from("EXTERNAL")]);
+        } else if mode == 2 {
+            node.kernel
+                .exec_engine
+                .borrow_mut()
+                .register_client(Box::new(StubExecutionClient::new(
+                    ClientId::from("UNKNOWN"),
+                    AccountId::from("UNKNOWN-001"),
+                    Venue::from("TEST"),
+                    OmsType::Netting,
+                    None,
+                )))
+                .unwrap();
+            assert!(node.kernel.exec_engine.borrow().check_disconnected());
+        }
+        let engine = node.kernel.exec_engine.clone();
+        let held = (mode == 3).then(|| engine.borrow_mut());
+        let gate = node.runner.as_ref().unwrap().ingress_gate();
+        let source = UUID4::new();
+        let digest = "a".repeat(64);
+        let outcome = node.complete_empty_bootstrap_recovery("source-run", 7, &digest, source);
+        drop(held);
+        assert_eq!(observer.completed_root().unwrap(), 0);
+        assert!(node.recovery_native_frontier.is_none());
+        assert_eq!(
+            node.kernel.risk_engine.borrow().trading_state(),
+            nautilus_model::enums::TradingState::Halted
+        );
+        if mode == 0 {
+            let receipt = serde_json::to_value(outcome.unwrap()).unwrap();
+            assert_eq!(receipt["recovery_id"], "source-run");
+            assert_eq!(receipt["checkpoint_sequence"], 7);
+            assert_eq!(receipt["payload_sha256"], digest);
+            assert_eq!(receipt["source_instance_id"], source.to_string());
+            assert!(node.recovery_empty_bootstrap.is_some());
+            assert!(!node.handle.should_stop());
+            gate.verify_open().unwrap();
+            assert!(
+                node.complete_empty_bootstrap_recovery("source-run", 7, &digest, source)
+                    .is_err()
+            );
+            continue;
+        }
+        let error = outcome.unwrap_err().to_string();
+        if mode == 1 {
+            assert!(error.contains("external data"), "{error}");
+        }
+        if mode == 2 {
+            assert!(error.contains("unsupported"), "{error}");
+        }
+        assert!(node.recovery_empty_bootstrap.is_none());
+        assert!(node.handle.should_stop());
+        assert!(gate.verify_open().is_err());
+        assert_eq!(
+            engine.borrow().get_all_clients().len(),
+            usize::from(mode == 2)
+        );
+        if mode == 1 {
+            assert_eq!(
+                node.config.data_engine.external_clients.as_ref().unwrap(),
+                &vec![ClientId::from("EXTERNAL")]
+            );
+        }
+        // Failure cannot be retried into a receipt or feed a persisted child.
+        assert!(
+            node.complete_empty_bootstrap_recovery("source-run", 7, &digest, source)
+                .is_err()
+        );
+        let collected = std::cell::Cell::new(0);
+        let persisted = std::cell::Cell::new(0);
+        let registry = RunnerRecoveryCodecRegistry::new([]).seal().unwrap();
+        assert!(
+            node.with_paused_recovery_inventory_checkpoint(
+                &registry,
+                |_, _| {
+                    collected.set(collected.get() + 1);
+                    Ok(())
+                },
+                |_| {
+                    persisted.set(persisted.get() + 1);
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(collected.get(), 0);
+        assert_eq!(persisted.get(), 0);
+        assert!(node.recovery_empty_bootstrap.is_none());
+    }
+}

@@ -1,5 +1,5 @@
 //! Explicit no-timer subset for paused recovery capture.
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use nautilus_common::clock::Clock;
 use nautilus_system::trader::Trader;
 use std::{any::TypeId, cell::RefCell, rc::Rc};
@@ -95,6 +95,37 @@ pub struct EmptyBootstrapRecoveryReceipt {
 }
 
 impl super::LiveNode {
+    fn verify_empty_bootstrap_adapter_inventory(&self) -> Result<()> {
+        ensure!(
+            self.config
+                .data_engine
+                .external_clients
+                .as_ref()
+                .is_none_or(Vec::is_empty),
+            "empty bootstrap external data clients have no paused inventory proof"
+        );
+        let data = self.kernel.data_engine.try_borrow()?;
+        let execution = self.kernel.exec_engine.try_borrow()?;
+        ensure!(
+            execution.get_external_client_ids().is_empty(),
+            "empty bootstrap external execution clients have no paused inventory proof"
+        );
+        ensure!(
+            data.check_disconnected() && execution.check_disconnected(),
+            "empty bootstrap clients connected"
+        );
+        for client in data.get_clients() {
+            let client = client.get_client();
+            client.verify_paused_recovery_inventory()?;
+            client.paused_recovery_inventory_profile()?;
+        }
+        for client in execution.get_all_clients() {
+            client.verify_paused_recovery_inventory()?;
+            client.paused_recovery_inventory_profile()?;
+        }
+        Ok(())
+    }
+
     /// Completes an empty bootstrap without fabricating an event or dispatch watermark.
     /// Source identity must already have been authenticated by the application loader.
     ///
@@ -168,6 +199,11 @@ impl super::LiveNode {
         let gate = runner.ingress_gate();
         let guard = gate.freeze()?;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Retain registration borrows through guard.finish, just as child
+            // checkpoint capture does. Disconnection alone is not empty inventory.
+            let _data_inventory = self.kernel.data_engine.try_borrow()?;
+            let _execution_inventory = self.kernel.exec_engine.try_borrow()?;
+            self.verify_empty_bootstrap_adapter_inventory()?;
             with_registered_timer_inventory(&self.kernel.clock, &self.kernel.trader, |_| {
                 nautilus_common::msgbus::with_local_only_recovery_inventory(|bus| {
                     nautilus_common::runner::with_empty_sync_command_queues(|| {
@@ -178,11 +214,7 @@ impl super::LiveNode {
                                 .all(|count| *count == 0),
                             "empty bootstrap runner messages remain pending"
                         );
-                        ensure!(
-                            self.kernel.data_engine.try_borrow()?.check_disconnected()
-                                && self.kernel.exec_engine.try_borrow()?.check_disconnected(),
-                            "empty bootstrap clients connected"
-                        );
+                        self.verify_empty_bootstrap_adapter_inventory()?;
                         bus.verify()?;
                         guard.verify()?;
                         ensure!(!self.handle.should_stop(), "empty bootstrap stop requested");
@@ -212,5 +244,68 @@ impl super::LiveNode {
         };
         self.recovery_empty_bootstrap = Some(receipt.clone());
         Ok(receipt)
+    }
+}
+
+#[cfg(test)]
+mod adapter_inventory_tests {
+    use nautilus_common::enums::Environment;
+    use nautilus_execution::engine::stubs::StubExecutionClient;
+    use nautilus_model::{
+        enums::OmsType,
+        identifiers::{AccountId, ClientId, TraderId, Venue},
+    };
+
+    #[tokio::test]
+    async fn empty_bootstrap_rejects_disconnected_unknown_adapter_without_consuming_it() {
+        let node =
+            super::super::LiveNode::builder(TraderId::from("INVENTORY-001"), Environment::Sandbox)
+                .unwrap()
+                .with_reconciliation(false)
+                .build()
+                .unwrap();
+        node.verify_empty_bootstrap_adapter_inventory().unwrap();
+        node.kernel
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(StubExecutionClient::new(
+                ClientId::from("UNKNOWN"),
+                AccountId::from("UNKNOWN-001"),
+                Venue::from("TEST"),
+                OmsType::Netting,
+                None,
+            )))
+            .unwrap();
+        assert!(node.kernel.exec_engine.borrow().check_disconnected());
+        let before = node.kernel.exec_engine.borrow().get_all_clients().len();
+        let error = node.verify_empty_bootstrap_adapter_inventory().unwrap_err();
+        assert!(error.to_string().contains("unsupported"), "{error:#}");
+        assert_eq!(
+            node.kernel.exec_engine.borrow().get_all_clients().len(),
+            before
+        );
+        assert!(node.recovery_empty_bootstrap.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_bootstrap_rejects_external_data_ids_and_busy_registration() {
+        let mut node =
+            super::super::LiveNode::builder(TraderId::from("INVENTORY-002"), Environment::Sandbox)
+                .unwrap()
+                .with_reconciliation(false)
+                .build()
+                .unwrap();
+        node.config.data_engine.external_clients = Some(vec![ClientId::from("EXTERNAL")]);
+        assert!(node
+            .verify_empty_bootstrap_adapter_inventory()
+            .unwrap_err()
+            .to_string()
+            .contains("external data"));
+        node.config.data_engine.external_clients = None;
+        let held = node.kernel.exec_engine.borrow_mut();
+        assert!(node.verify_empty_bootstrap_adapter_inventory().is_err());
+        drop(held);
+        node.verify_empty_bootstrap_adapter_inventory().unwrap();
+        assert!(node.recovery_empty_bootstrap.is_none());
     }
 }
