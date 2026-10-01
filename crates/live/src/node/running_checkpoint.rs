@@ -238,6 +238,7 @@ pub(super) struct RunningCheckpointRegistration {
     persist: Rc<Persist>,
     fence: Rc<Fence>,
     last_root: u64,
+    last_request: u64,
     last_capture: dst::time::Instant,
 }
 
@@ -300,6 +301,7 @@ impl LiveNode {
             }),
             fence: Rc::new(fence),
             last_root: 0,
+            last_request: 0,
             last_capture: dst::time::Instant::now(),
         });
         Ok(())
@@ -328,7 +330,8 @@ impl LiveNode {
             return Ok(());
         }
         let now = dst::time::Instant::now();
-        let due = self.handle.checkpoint_requested()
+        let request_sequence = self.handle.checkpoint_requested();
+        let due = request_sequence > registration.last_request
             || match registration.schedule {
                 RunningCheckpointSchedule::Requested => false,
                 RunningCheckpointSchedule::Interval(interval) => {
@@ -349,7 +352,6 @@ impl LiveNode {
             registration.persist.clone(),
             registration.fence.clone(),
         );
-        self.handle.complete_checkpoint_request();
         let ingress = self.handle.ingress_gate();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
             ensure!(
@@ -543,7 +545,9 @@ impl LiveNode {
         }));
         match outcome {
             Ok(Ok(())) => {
-                self.running_checkpoint.as_mut().unwrap().last_capture = now;
+                let registration = self.running_checkpoint.as_mut().unwrap();
+                registration.last_capture = now;
+                registration.last_request = request_sequence;
                 Ok(())
             }
             outcome => {

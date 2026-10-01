@@ -78,9 +78,12 @@ impl<T> RetainedInbox<T> {
     pub(crate) async fn recv(&self) -> Option<T> {
         std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) fn len(&self) -> usize {
         let inbox = self.0.lock();
-        inbox.prefix.is_empty() && inbox.receiver.is_empty()
+        inbox.prefix.len() + inbox.receiver.len()
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
     }
     // Captures only the pre-cut retained prefix. Messages arriving after this
     // staging remain in the actual receiver as post-cut inputs; they are never

@@ -15,7 +15,7 @@
 
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicU8, AtomicU64, Ordering},
 };
 
 use nautilus_common::live::ingress::IngressGate;
@@ -136,7 +136,7 @@ pub(super) enum RunningTransition {
 pub struct LiveNodeHandle {
     ingress: IngressGate,
     control: Arc<AtomicU8>,
-    checkpoint_requested: Arc<AtomicBool>,
+    checkpoint_requested: Arc<AtomicU64>,
     startup_reconciliation: Arc<RwLock<Option<StartupReconciliationObservation>>>,
     pub(crate) metrics: Arc<RunnerMetrics>,
 }
@@ -158,7 +158,7 @@ impl LiveNodeHandle {
         Self {
             ingress,
             control: Arc::new(AtomicU8::new(NodeState::Idle.as_u8())),
-            checkpoint_requested: Arc::new(AtomicBool::new(false)),
+            checkpoint_requested: Arc::new(AtomicU64::new(0)),
             startup_reconciliation: Arc::new(RwLock::new(None)),
             metrics: Arc::new(RunnerMetrics::default()),
         }
@@ -176,17 +176,19 @@ impl LiveNodeHandle {
     /// Requests collection at the next completed root on the node's own thread.
     /// This only marks a request; it never collects state or grants permission.
     pub fn request_running_checkpoint(&self) {
-        self.checkpoint_requested.store(true, Ordering::Release);
+        let _ =
+            self.checkpoint_requested
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_add(1)
+                });
     }
 
-    pub(super) fn checkpoint_requested(&self) -> bool {
+    #[cfg(feature = "dispatch-observer")]
+    pub(super) fn checkpoint_requested(&self) -> u64 {
         self.checkpoint_requested.load(Ordering::Acquire)
     }
 
-    pub(super) fn complete_checkpoint_request(&self) {
-        self.checkpoint_requested.swap(false, Ordering::AcqRel);
-    }
-
+    #[cfg(feature = "dispatch-observer")]
     pub(super) fn ingress_gate(&self) -> IngressGate {
         self.ingress.clone()
     }

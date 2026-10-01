@@ -479,6 +479,53 @@ mod tests {
         clock.cancel_timers();
     }
 
+    #[derive(Debug)]
+    struct CheckpointQueuedSender(mpsc::Sender<TimeEventMessage>);
+    impl TimeEventSender for CheckpointQueuedSender {
+        fn send(&self, message: TimeEventMessage) {
+            self.0
+                .send(message)
+                .expect("checkpoint timer receiver alive");
+        }
+    }
+
+    #[rstest]
+    fn active_registered_timer_checkpoint_retains_nominal_event_until_release() {
+        let (sender, receiver) = mpsc::channel();
+        let callback_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let called = callback_count.clone();
+        let mut clock = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(sender))));
+        let due = clock.timestamp_ns() + DurationNanos::from_millis(25);
+        clock
+            .set_time_alert_ns(
+                "checkpoint-owned-alert",
+                due,
+                Some(TimeEventCallback::RustLocal(std::rc::Rc::new(move |_| {
+                    called.set(called.get() + 1)
+                }))),
+                None,
+            )
+            .unwrap();
+        let guard = clock.freeze_running_timer_checkpoint().unwrap();
+        assert_eq!(
+            guard.inventory()["timers"][0]["callback_kind"],
+            "registered_owner_thread"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            receiver.try_recv().is_err(),
+            "frozen actual timer emitted a callback"
+        );
+        guard.verify().unwrap();
+        assert_eq!(callback_count.get(), 0);
+        guard.finish().unwrap();
+        let event = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(event.event().ts_event, due);
+        event.dispatch();
+        assert_eq!(callback_count.get(), 1);
+        clock.cancel_timers();
+    }
+
     #[rstest]
     fn test_live_clock_time_alert_persists_callback() {
         let events = Arc::new(Mutex::new(Vec::new()));

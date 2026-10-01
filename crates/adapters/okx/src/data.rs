@@ -5316,6 +5316,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_okx_data_checkpoint_keeps_real_socket_arrivals_after_the_cut() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let http_addr = start_refresh_server(spot_refresh_state()).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let websocket_addr = listener.local_addr().unwrap();
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut frame_receiver = Some(frames_rx);
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut websocket = accept_async(socket).await.unwrap();
+                let frames = frame_receiver.take();
+                tokio::spawn(async move {
+                    let mut frames = frames;
+                    loop {
+                        tokio::select! {
+                            frame = async {
+                                match &mut frames {
+                                    Some(receiver) => receiver.recv().await,
+                                    None => std::future::pending::<Option<String>>().await,
+                                }
+                            } => {
+                                match frame {
+                                    Some(frame) => websocket.send(Message::Text(frame.into())).await.unwrap(),
+                                    None => frames = None,
+                                }
+                            }
+                            message = websocket.next() => {
+                                let Some(Ok(message)) = message else { break; };
+                                if let Message::Text(text) = message {
+                                    if text == "ping" {
+                                        websocket.send(Message::Text("pong".into())).await.unwrap();
+                                    } else if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                                        if let Some(op) = value["op"].as_str() {
+                                            if op == "subscribe" || op == "unsubscribe" {
+                                                for arg in value["args"].as_array().unwrap() {
+                                                    websocket.send(Message::Text(json!({
+                                                        "event":op,"arg":arg,"connId":"local-checkpoint"
+                                                    }).to_string().into())).await.unwrap();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_data_event_sender(sender);
+        let config = OKXDataClientConfig {
+            instrument_types: vec![OKXInstrumentType::Spot],
+            base_url_http: Some(format!("http://{http_addr}")),
+            base_url_ws_public: Some(format!("ws://{websocket_addr}")),
+            base_url_ws_business: Some(format!("ws://{websocket_addr}")),
+            environment: OKXEnvironment::Live,
+            http_timeout_secs: 5,
+            max_retries: 0,
+            book_stale_check_interval_secs: 0,
+            update_instruments_interval_mins: 0,
+            ..OKXDataClientConfig::default()
+        };
+        let mut client = OKXDataClient::new(*OKX_CLIENT_ID, config).unwrap();
+        client.connect().await.unwrap();
+        wait_until_async(
+            || async {
+                client
+                    .ws_public
+                    .as_ref()
+                    .unwrap()
+                    .running_checkpoint_inventory()
+                    .is_ok()
+                    && client
+                        .ws_business
+                        .as_ref()
+                        .unwrap()
+                        .running_checkpoint_inventory()
+                        .is_ok()
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        while receiver.try_recv().is_ok() {}
+        let guard = client.freeze_running_checkpoint().unwrap();
+        assert_eq!(guard.inventory()["public_socket"]["active"], true);
+        assert_eq!(guard.inventory()["business_socket"]["active"], true);
+        let original = guard.inventory().clone();
+        let first = test_payload("ws_bbo_tbt.json");
+        let mut second = first.clone();
+        second["data"][0]["asks"][0][0] = json!("8477.98");
+        second["data"][0]["bids"][0][0] = json!("8477.97");
+        second["data"][0]["ts"] = json!("1597026383086");
+        frames_tx.send(first.to_string()).unwrap();
+        frames_tx.send(second.to_string()).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        guard.verify().unwrap();
+        assert_eq!(guard.inventory(), &original);
+        assert!(
+            receiver.try_recv().is_err(),
+            "frozen adapter published a real arrival"
+        );
+        guard.finish().unwrap();
+        let quotes = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut quotes = Vec::new();
+            while quotes.len() < 2 {
+                if let Some(DataEvent::Data(Data::Quote(quote))) = receiver.recv().await {
+                    quotes.push(quote);
+                }
+            }
+            quotes
+        })
+        .await
+        .unwrap();
+        assert_eq!(quotes[0].bid_price.to_string(), "8476.97");
+        assert_eq!(quotes[1].bid_price.to_string(), "8477.97");
+        client.disconnect().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn reconnect_does_not_leak_refresh_tasks() {
         let state = spot_refresh_state();
         let addr = start_refresh_server(state).await;
