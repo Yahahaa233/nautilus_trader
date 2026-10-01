@@ -377,7 +377,9 @@ rcgen = { version = "0.14.10", default-features = false, features = [
   "crypto",
   "pem",
 ] }
-rstest = { version = "0.27.0", default-features = false }
+# Preserve the managed Metis baseline's test/stub dependency and feature set
+# during the source cutover; upgrade it separately with upstream regression.
+rstest = "0.26.1"
 tempfile = "3.27.0"
 turmoil = "0.7.2"
 
