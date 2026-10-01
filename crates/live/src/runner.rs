@@ -282,6 +282,17 @@ pub(crate) struct RunningReceivers<'a> {
 
 #[cfg(feature = "node")]
 impl RunningReceivers<'_> {
+    pub(crate) fn reborrow(&mut self) -> RunningReceivers<'_> {
+        RunningReceivers {
+            time_evt_rx: self.time_evt_rx,
+            system_evt_rx: self.system_evt_rx,
+            system_cmd_rx: self.system_cmd_rx,
+            exec_evt_rx: self.exec_evt_rx,
+            exec_cmd_rx: self.exec_cmd_rx,
+            data_evt_rx: self.data_evt_rx,
+            data_cmd_rx: self.data_cmd_rx,
+        }
+    }
     pub(crate) fn snapshot(
         &mut self,
         ingress: &IngressGate,

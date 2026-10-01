@@ -33,6 +33,83 @@ use crate::{
     timer::{TimeEventCallback, create_valid_interval},
 };
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimerRestoreSpec {
+    name: String,
+    interval_ns: u64,
+    start_time_ns: UnixNanos,
+    stop_time_ns: Option<UnixNanos>,
+    next_time_ns: u64,
+    fire_immediately: bool,
+    status: String,
+    callback_kind: String,
+    callback_source: String,
+    binding: serde_json::Value,
+    execution_authorized: bool,
+}
+
+struct LiveRestoredTimers {
+    pause: super::checkpoint::PausedCallbacks,
+    source: serde_json::Value,
+    tokens: BTreeMap<u64, (String, u64, u64, crate::runner::TimeEventCallbackToken)>,
+    inspectors: Vec<TimerInspector>,
+    restored: std::cell::RefCell<serde_json::Value>,
+}
+impl std::fmt::Debug for LiveRestoredTimers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveRestoredTimers")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
+    fn source_inventory(&self) -> &serde_json::Value {
+        &self.source
+    }
+    fn verify(&self) -> anyhow::Result<()> {
+        self.pause.verify()?;
+        anyhow::ensure!(
+            running_timer_inventory(&self.inspectors)? == *self.restored.try_borrow()?,
+            "restored native timer schedules changed while retained"
+        );
+        Ok(())
+    }
+    fn restore_message(
+        &self,
+        event: crate::timer::TimeEvent,
+        source_binding_id: u64,
+        cleanup: bool,
+    ) -> anyhow::Result<crate::runner::TimeEventMessage> {
+        self.verify()?;
+        let (name, interval, next, token) =
+            self.tokens.get(&source_binding_id).ok_or_else(|| {
+                anyhow::anyhow!("source timer callback binding is not in this actual clock")
+            })?;
+        anyhow::ensure!(
+            event.name.as_str() == name
+                && event.ts_event.as_u64() <= *next
+                && (*next - event.ts_event.as_u64()) % interval == 0,
+            "pending time event does not match its source owner schedule"
+        );
+        let lease = token
+            .acquire()
+            .ok_or_else(|| anyhow::anyhow!("restored timer callback closed"))?;
+        // Acquiring this actual queued message increments the same native token
+        // lease count. Only this known change becomes the next retained state.
+        *self.restored.try_borrow_mut()? = running_timer_inventory(&self.inspectors)?;
+        Ok(if cleanup {
+            crate::runner::TimeEventMessage::cleanup(event, lease)
+        } else {
+            crate::runner::TimeEventMessage::registered(event, lease)
+        })
+    }
+    fn resume(self: Box<Self>) -> anyhow::Result<()> {
+        self.verify()?;
+        self.pause.finish()
+    }
+}
+
 /// A real-time clock which uses system time.
 ///
 /// Timestamps are guaranteed to be unique and monotonically increasing.
@@ -159,6 +236,130 @@ impl Deref for LiveClock {
 }
 
 impl Clock for LiveClock {
+    fn restore_running_timer_checkpoint(
+        &mut self,
+        inventory: &serde_json::Value,
+    ) -> anyhow::Result<Box<dyn crate::clock::RestoredTimerCheckpoint>> {
+        anyhow::ensure!(
+            self.timers.is_empty() && self.checkpoint_read_time.get().is_none(),
+            "timer restoration requires an empty actual clock outside a capture"
+        );
+        anyhow::ensure!(
+            inventory.get("profile").and_then(|v| v.as_str())
+                == Some("live_clock_frozen_registered_schedules.v1"),
+            "unsupported native timer source profile"
+        );
+        let entries = inventory
+            .get("timers")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("source timer entries missing"))?;
+        let specs = entries
+            .iter()
+            .cloned()
+            .map(serde_json::from_value::<TimerRestoreSpec>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut names = std::collections::BTreeSet::new();
+        let mut bindings = std::collections::BTreeSet::new();
+        for spec in &specs {
+            anyhow::ensure!(
+                !spec.name.trim().is_empty()
+                    && names.insert(spec.name.clone())
+                    && spec.interval_ns > 0
+                    && spec.next_time_ns > 0
+                    && !spec.execution_authorized,
+                "invalid or duplicate source timer schedule"
+            );
+            anyhow::ensure!(
+                spec.callback_kind == "registered_owner_thread"
+                    && spec.callback_source == "registered_clock_default.v1"
+                    && matches!(spec.status.as_str(), "active" | "exhausted"),
+                "source timer callback/owner restoration contract unsupported"
+            );
+            let id = spec
+                .binding
+                .get("binding_id")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("source callback binding missing"))?;
+            anyhow::ensure!(
+                id > 0
+                    && bindings.insert(id)
+                    && spec
+                        .binding
+                        .get("owner_thread_only")
+                        .and_then(|v| v.as_bool())
+                        == Some(true),
+                "source callback owner binding invalid"
+            );
+            if spec.status == "active"
+                && let Some(stop) = spec.stop_time_ns
+            {
+                anyhow::ensure!(
+                    spec.next_time_ns <= stop.as_u64(),
+                    "active source timer follows stop bound"
+                );
+            }
+        }
+        let callback = if specs.is_empty() {
+            None
+        } else {
+            let callback = self.callbacks.default_handler().ok_or_else(|| {
+                anyhow::anyhow!("actual registered owner default timer callback missing")
+            })?;
+            anyhow::ensure!(
+                callback.is_local(),
+                "timer restore requires actual owner-thread default callback"
+            );
+            Some(callback)
+        };
+        let sender = self.resolve_time_event_sender();
+        anyhow::ensure!(
+            specs.is_empty() || sender.is_some(),
+            "actual timer event sender missing"
+        );
+        let pause = self.checkpoint_gate.pause_producers()?;
+        let mut tokens = BTreeMap::new();
+        for spec in specs {
+            let mut timer = LiveTimer::new(
+                Ustr::from(spec.name.as_str()),
+                std::num::NonZeroU64::new(spec.interval_ns).unwrap(),
+                spec.start_time_ns,
+                spec.stop_time_ns,
+                callback.as_ref().unwrap().clone(),
+                spec.fire_immediately,
+                sender.clone(),
+            )
+            .with_callback_source("registered_clock_default.v1")
+            .with_checkpoint_gate(self.checkpoint_gate.clone());
+            timer.start_restored(
+                UnixNanos::from(spec.next_time_ns),
+                spec.status == "exhausted",
+            );
+            let id = spec.binding["binding_id"].as_u64().unwrap();
+            tokens.insert(
+                id,
+                (
+                    spec.name.clone(),
+                    spec.interval_ns,
+                    spec.next_time_ns,
+                    timer.registered_checkpoint_token()?,
+                ),
+            );
+            self.timers.insert(Ustr::from(spec.name.as_str()), timer);
+        }
+        let inspectors = self
+            .timers
+            .values()
+            .map(LiveTimer::checkpoint_inspector)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let restored = running_timer_inventory(&inspectors)?;
+        Ok(Box::new(LiveRestoredTimers {
+            pause,
+            source: inventory.clone(),
+            tokens,
+            inspectors,
+            restored: std::cell::RefCell::new(restored),
+        }))
+    }
     fn freeze_running_timer_checkpoint(
         &self,
     ) -> anyhow::Result<Box<dyn crate::clock::TimerCheckpoint>> {
@@ -261,6 +462,7 @@ impl Clock for LiveClock {
 
         self.replace_existing_timer_if_needed(&name);
 
+        let callback_source = self.callbacks.callback_source(&name, callback.is_some());
         let callback = if let Some(callback) = callback {
             self.callbacks.register_callback(name, callback.clone());
             callback
@@ -284,7 +486,8 @@ impl Clock for LiveClock {
             fire_immediately,
             sender,
         )
-        .with_checkpoint_gate(self.checkpoint_gate.clone());
+        .with_checkpoint_gate(self.checkpoint_gate.clone())
+        .with_callback_source(callback_source);
 
         timer.start();
 
@@ -323,6 +526,7 @@ impl Clock for LiveClock {
 
         self.replace_existing_timer_if_needed(&name);
 
+        let callback_source = self.callbacks.callback_source(&name, callback.is_some());
         let callback = if let Some(callback) = callback {
             self.callbacks.register_callback(name, callback.clone());
             callback
@@ -344,7 +548,8 @@ impl Clock for LiveClock {
             fire_immediately,
             sender,
         )
-        .with_checkpoint_gate(self.checkpoint_gate.clone());
+        .with_checkpoint_gate(self.checkpoint_gate.clone())
+        .with_callback_source(callback_source);
         timer.start();
 
         self.clear_expired_timers();
@@ -597,6 +802,116 @@ mod tests {
         event.dispatch();
         assert_eq!(callback_count.get(), 1);
         clock.cancel_timers();
+    }
+
+    #[rstest]
+    fn actual_checkpoint_timer_restore_preserves_overdue_frontier_and_owner_callback_fifo() {
+        let (source_tx, source_rx) = mpsc::channel();
+        let mut source = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(source_tx))));
+        source.register_default_handler(TimeEventCallback::RustLocal(std::rc::Rc::new(|_| {})));
+        source
+            .set_timer_ns(
+                "same-name",
+                DurationNanos::from_millis(100),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let source_message = source_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let source_event = source_message.event().clone();
+        let source_binding = source_message.checkpoint_callback_binding()["binding_id"]
+            .as_u64()
+            .unwrap();
+        let freeze = source.freeze_running_timer_checkpoint().unwrap();
+        let inventory = freeze.inventory().clone();
+        let nominal_next = inventory["timers"][0]["next_time_ns"].as_u64().unwrap();
+        freeze.finish().unwrap();
+        source.cancel_timers();
+
+        let (restored_tx, restored_rx) = mpsc::channel();
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let called = count.clone();
+        let mut restored =
+            LiveClock::new(Some(Arc::new(CheckpointQueuedSender(restored_tx.clone()))));
+        restored.register_default_handler(TimeEventCallback::RustLocal(std::rc::Rc::new(
+            move |_| called.set(called.get() + 1),
+        )));
+        let receipt = restored
+            .restore_running_timer_checkpoint(&inventory)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(220));
+        assert!(restored.timestamp_ns().as_u64() > nominal_next);
+        assert!(
+            restored_rx.try_recv().is_err(),
+            "restored producer must remain paused"
+        );
+        assert_eq!(
+            restored.next_time_ns("same-name").unwrap().as_u64(),
+            nominal_next,
+            "recovery must not clamp an overdue source frontier to now"
+        );
+        let frozen = restored.freeze_running_timer_checkpoint().unwrap();
+        frozen.verify().unwrap();
+        receipt.verify().unwrap();
+        frozen.finish().unwrap();
+        assert!(
+            receipt
+                .restore_message(source_event.clone(), source_binding + 9999, false)
+                .is_err()
+        );
+        let pending = receipt
+            .restore_message(source_event.clone(), source_binding, false)
+            .unwrap();
+        assert_ne!(
+            pending.checkpoint_callback_binding()["binding_id"]
+                .as_u64()
+                .unwrap(),
+            source_binding
+        );
+        restored_tx.send(pending).unwrap();
+        receipt.resume().unwrap();
+        let first = restored_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(first.event(), &source_event);
+        assert!(first.dispatch());
+        let next = restored_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(next.event().ts_event.as_u64(), nominal_next);
+        assert!(next.dispatch());
+        assert_eq!(count.get(), 2);
+        restored.cancel_timers();
+        drop(source_message);
+    }
+
+    #[rstest]
+    fn checkpoint_timer_restore_rejects_unregistered_or_changed_callback_contract() {
+        let (sender, _) = mpsc::channel();
+        let mut source = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(sender))));
+        source.register_default_handler(TimeEventCallback::RustLocal(std::rc::Rc::new(|_| {})));
+        source
+            .set_timer_ns(
+                "future",
+                DurationNanos::from_secs(60),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let frozen = source.freeze_running_timer_checkpoint().unwrap();
+        let inventory = frozen.inventory().clone();
+        frozen.finish().unwrap();
+        source.cancel_timers();
+        let (sender, _) = mpsc::channel();
+        let mut target = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(sender))));
+        assert!(target.restore_running_timer_checkpoint(&inventory).is_err());
+        target.register_default_handler(TimeEventCallback::RustLocal(std::rc::Rc::new(|_| {})));
+        let mut changed = inventory;
+        changed["timers"][0]["callback_source"] = serde_json::json!("unknown-source");
+        assert!(target.restore_running_timer_checkpoint(&changed).is_err());
+        assert_eq!(target.timer_count(), 0);
     }
 
     #[rstest]

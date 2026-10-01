@@ -716,6 +716,7 @@ pub(super) struct ReconciliationCheckState<'a> {
 }
 
 /// Report completion or expiry of its collection deadline.
+#[derive(serde::Serialize)]
 pub(super) enum ReportTaskOutcome<T> {
     Completed(T),
     TimedOut,
@@ -730,6 +731,7 @@ pub(super) struct OpenOrderReportTask {
 }
 
 /// Bulk order reports, client outcomes, and their preparation snapshot.
+#[derive(serde::Serialize)]
 pub(super) struct OpenOrderReportResult {
     pub(super) check: OpenOrderReportCheck,
     pub(super) reports: Vec<SourcedOrderStatusReport>,
@@ -761,6 +763,7 @@ pub(super) struct PositionReportTask {
 }
 
 /// Position reports, client outcomes, and their preparation snapshot.
+#[derive(serde::Serialize)]
 pub(super) struct PositionReportResult {
     pub(super) check: PositionReportCheck,
     pub(super) reports: Vec<PositionStatusReport>,
@@ -782,14 +785,17 @@ impl PositionReportResult {
 }
 
 /// Completed position reports or subsequent authoritative fill reports.
+#[derive(serde::Serialize)]
 pub(super) enum PositionReportTaskResult {
     Positions(PositionReportResult),
     Fills(PositionFillReportResult),
 }
 
 /// Authoritative fills and the position snapshot that prompted their queries.
+#[derive(serde::Serialize)]
 pub(super) struct PositionFillReportResult {
     pub(super) position_result: PositionReportResult,
+    #[serde(serialize_with = "crate::execution::serialize_ordered_pairs")]
     pub(super) reports: IndexMap<InstrumentAccountKey, Vec<FillReport>>,
     pub(super) successful_keys: IndexSet<InstrumentAccountKey>,
 }

@@ -150,8 +150,10 @@ mod dispatch;
 pub use dispatch::NodeDispatchObserver;
 
 mod metrics;
+mod mutation;
 mod queue;
 mod reconciliation;
+pub use mutation::NativeMutationInput;
 #[cfg(feature = "dispatch-observer")]
 mod recovery;
 #[cfg(feature = "dispatch-observer")]
@@ -161,9 +163,13 @@ pub use recovery_quiescence::{EmptyBootstrapRecoveryReceipt, PausedRecoveryInven
 #[cfg(feature = "dispatch-observer")]
 mod recovery_observation;
 #[cfg(feature = "dispatch-observer")]
+mod recovery_timers;
+#[cfg(feature = "dispatch-observer")]
 pub use recovery_observation::{
     RecoveryObservationBoundary, RecoveryReleaseBoundary, RecoveryStartupBoundary,
 };
+#[cfg(feature = "dispatch-observer")]
+pub use recovery_timers::{RetainedRecoveryTimerHandoff, RetainedRecoveryTimerInput};
 #[cfg(feature = "dispatch-observer")]
 mod running_checkpoint;
 #[cfg(feature = "dispatch-observer")]
@@ -230,6 +236,8 @@ pub struct LiveNode {
     running_checkpoint: Option<running_checkpoint::RunningCheckpointRegistration>,
     #[cfg(feature = "dispatch-observer")]
     recovery_observation: Option<recovery_observation::RecoveryObservationRegistration>,
+    #[cfg(feature = "dispatch-observer")]
+    recovery_timers: Option<recovery_timers::RetainedNodeTimers>,
     runner: Option<AsyncRunner>,
     config: LiveNodeConfig,
     handle: LiveNodeHandle,
@@ -572,8 +580,19 @@ impl LiveNode {
     #[allow(clippy::unused_unit)]
     fn process_time_event(&self, message: TimeEventMessage) -> bool {
         #[cfg(feature = "dispatch-observer")]
+        let retained_event_id = message.event().event_id;
+        #[cfg(feature = "dispatch-observer")]
+        let cleanup = message.checkpoint_callback_binding()["kind"] == "registered_cleanup";
+        #[cfg(feature = "dispatch-observer")]
         if self.state() == NodeState::Observing {
             if let Err(error) = self.verify_observation_timer_admission(&message) {
+                self.fail_recovery_observation(&format!("{error:#}"));
+                return false;
+            }
+        }
+        #[cfg(feature = "dispatch-observer")]
+        if let Some(timers) = &self.recovery_timers {
+            if let Err(error) = timers.received(&message) {
                 self.fail_recovery_observation(&format!("{error:#}"));
                 return false;
             }
@@ -581,13 +600,30 @@ impl LiveNode {
         let guard = begin_node_dispatch!(self, Time, &message, false);
         let dispatched = AsyncRunner::handle_time_event(message);
         #[cfg(feature = "dispatch-observer")]
-        if !dispatched {
+        if !dispatched && !cleanup {
             if let Some(guard) = guard {
                 let _ = guard.rejected();
                 self.handle.stop();
             }
             return false;
         }
+        #[cfg(feature = "dispatch-observer")]
+        {
+            if let Some(guard) = guard
+                && let Err(error) = guard.complete()
+            {
+                log::error!("Timer dispatch completion failed: {error:#}");
+                self.handle.stop();
+                return false;
+            }
+            if let Some(timers) = &self.recovery_timers
+                && let Err(error) = timers.processed(retained_event_id)
+            {
+                self.fail_recovery_observation(&format!("{error:#}"));
+                return false;
+            }
+        }
+        #[cfg(not(feature = "dispatch-observer"))]
         complete_node_dispatch!(self, guard);
         dispatched
     }
@@ -641,6 +677,8 @@ impl LiveNode {
             running_checkpoint: None,
             #[cfg(feature = "dispatch-observer")]
             recovery_observation: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_timers: None,
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
@@ -736,6 +774,8 @@ impl LiveNode {
             running_checkpoint: None,
             #[cfg(feature = "dispatch-observer")]
             recovery_observation: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_timers: None,
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
@@ -1141,6 +1181,13 @@ impl LiveNode {
             );
         }
 
+        let startup_input = self.native_lifecycle_input("startup.connect_reconcile_start")?;
+        let startup_guard = begin_node_dispatch!(
+            self,
+            Lifecycle,
+            &startup_input,
+            Err(anyhow::anyhow!("startup lifecycle dispatch begin failed"))
+        );
         self.prepare_cache().await?;
 
         if let Some(runner) = self.runner.as_ref() {
@@ -1149,10 +1196,6 @@ impl LiveNode {
 
         self.handle.set_starting();
 
-        anyhow::ensure!(
-            self.note_dispatch_gap("startup_lifecycle_buffering_and_flush"),
-            "startup dispatch coverage recording failed"
-        );
         self.kernel.reset_shutdown_flag();
         self.kernel.start_async().await;
 
@@ -1264,6 +1307,7 @@ impl LiveNode {
             return Ok(());
         }
 
+        complete_node_dispatch!(self, startup_guard);
         Ok(())
     }
 
@@ -1610,6 +1654,15 @@ impl LiveNode {
     ///
     /// Returns an error if reconciliation fails or times out.
     async fn perform_startup_reconciliation(&mut self) -> anyhow::Result<()> {
+        let reconciliation_input = self.native_lifecycle_input("startup.reconciliation")?;
+        let reconciliation_guard = begin_node_dispatch!(
+            self,
+            Reconciliation,
+            &reconciliation_input,
+            Err(anyhow::anyhow!(
+                "startup reconciliation dispatch begin failed"
+            ))
+        );
         let clients = self.kernel.exec_engine.borrow().client_ids().len();
         self.handle
             .observe_startup_reconciliation(StartupReconciliationObservation {
@@ -1635,6 +1688,9 @@ impl LiveNode {
                     .err()
                     .map(|error| error.to_string().chars().take(1024).collect()),
             });
+        if result.is_ok() {
+            complete_node_dispatch!(self, reconciliation_guard);
+        }
         result
     }
 
@@ -1696,6 +1752,16 @@ impl LiveNode {
 
             match mass_status_result {
                 Ok(Some(mass_status)) => {
+                    let report_input = self.native_mutation_input(
+                        "query.startup_mass_status",
+                        &(&client_id, &mass_status),
+                    )?;
+                    let report_guard = begin_node_dispatch!(
+                        self,
+                        QueryResult,
+                        &report_input,
+                        Err(anyhow::anyhow!("startup mass status dispatch begin failed"))
+                    );
                     anyhow::ensure!(
                         mass_status.reports_complete(),
                         "Startup reconciliation requires complete mass status from {client_id}"
@@ -1760,6 +1826,7 @@ impl LiveNode {
                             );
                         }
                     }
+                    complete_node_dispatch!(self, report_guard);
                 }
                 Ok(None) => {
                     anyhow::bail!(
@@ -1848,6 +1915,14 @@ impl LiveNode {
             "cannot run with undrained recovery dispatch queue"
         );
 
+        let startup_input = self.native_lifecycle_input("startup.connect_reconcile_start")?;
+        let startup_guard = begin_node_dispatch!(
+            self,
+            Lifecycle,
+            &startup_input,
+            Err(anyhow::anyhow!("startup lifecycle dispatch begin failed"))
+        );
+
         // Authenticated recovery cache must not be flushed/reloaded at observation startup.
         if !observing_recovery {
             self.prepare_cache().await?;
@@ -1872,10 +1947,7 @@ impl LiveNode {
         log::info!("Event loop starting");
 
         self.handle.set_starting();
-        anyhow::ensure!(
-            self.note_dispatch_gap("startup_lifecycle_buffering_and_flush"),
-            "startup dispatch coverage recording failed"
-        );
+
         self.kernel.reset_shutdown_flag();
         self.kernel.start_async().await;
 
@@ -2197,6 +2269,8 @@ impl LiveNode {
             }
         }
 
+        complete_node_dispatch!(self, startup_guard);
+
         let exec_config = &self.config.exec_engine;
         let inflight_interval =
             Duration::from_millis(u64::from(exec_config.inflight_check_interval_ms));
@@ -2420,12 +2494,8 @@ impl LiveNode {
                         None => std::future::pending::<ReportTaskOutcome<OpenOrderReportResult>>().await,
                     }
                 }, if open_order_report_task.is_some() => {
-                    if !self.note_dispatch_gap("http_open_order_query_result") {
-                        // The observer has latched a durable coverage failure and stopped the
-                        // node.  Do not `continue`: the task remains ready and this biased
-                        // branch would otherwise spin forever without reaching shutdown.
-                        break;
-                    }
+                    let query_input = self.native_mutation_input("query.open_order", &result)?;
+                    let query_guard = begin_node_dispatch!(self, QueryResult, &query_input, Err(anyhow::anyhow!("query dispatch begin failed")));
                     let maintenance_start = dst::time::Instant::now();
 
                     drop(open_order_report_task.take());
@@ -2461,6 +2531,7 @@ impl LiveNode {
                             );
                         }
                     }
+                    complete_node_dispatch!(self, query_guard);
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
                 result = async {
@@ -2469,9 +2540,8 @@ impl LiveNode {
                         None => std::future::pending::<ReportTaskOutcome<Vec<TargetedOrderReportResult>>>().await,
                     }
                 }, if targeted_order_report_task.is_some() => {
-                    if !self.note_dispatch_gap("http_targeted_query_result") {
-                        break;
-                    }
+                    let query_input = self.native_mutation_input("query.targeted", &(&result, targeted_order_report_task.as_ref().map(|task| &task.planned_client_order_ids)))?;
+                    let query_guard = begin_node_dispatch!(self, QueryResult, &query_input, Err(anyhow::anyhow!("query dispatch begin failed")));
                     let maintenance_start = dst::time::Instant::now();
 
                     let planned_client_order_ids = targeted_order_report_task
@@ -2500,6 +2570,7 @@ impl LiveNode {
                             );
                         }
                     }
+                    complete_node_dispatch!(self, query_guard);
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
                 result = async {
@@ -2508,9 +2579,8 @@ impl LiveNode {
                         None => std::future::pending::<ReportTaskOutcome<PositionReportTaskResult>>().await,
                     }
                 }, if position_report_task.is_some() => {
-                    if !self.note_dispatch_gap("http_position_query_result") {
-                        break;
-                    }
+                    let query_input = self.native_mutation_input("query.position", &result)?;
+                    let query_guard = begin_node_dispatch!(self, QueryResult, &query_input, Err(anyhow::anyhow!("query dispatch begin failed")));
                     let maintenance_start = dst::time::Instant::now();
 
                     drop(position_report_task.take());
@@ -2530,15 +2600,25 @@ impl LiveNode {
                             );
                         }
                     }
+                    complete_node_dispatch!(self, query_guard);
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
 
                 // Maintenance dispatcher (before event processing to avoid
                 // starvation). See module docs for design rationale.
                 _ = maintenance_timer.tick(), if is_running => {
-                    if !self.note_dispatch_gap("maintenance_mutations") {
-                        break;
-                    }
+                    let maintenance_now = dst::time::Instant::now();
+                    let maintenance_input = self.native_mutation_input("maintenance.tick", &serde_json::json!({
+                        "reconciliation_due":recon_enabled && maintenance_now >= recon_next,
+                        "purge_orders_due":maintenance_now >= purge_orders_next,
+                        "purge_positions_due":maintenance_now >= purge_positions_next,
+                        "purge_account_due":maintenance_now >= purge_account_next,
+                        "own_books_due":maintenance_now >= own_books_next,
+                        "prune_fills_due":maintenance_now >= prune_fills_next,
+                        "report_tasks":{"open_order":open_order_report_task.is_some(),"targeted_order":targeted_order_report_task.is_some(),"position":position_report_task.is_some()},
+                        "queue_depths":RunnerChannelQueueDepths::from_receivers(&time_evt_rx,&exec_evt_rx,&exec_cmd_rx,&data_evt_rx,&data_cmd_rx),
+                    }))?;
+                    let maintenance_guard = begin_node_dispatch!(self, Maintenance, &maintenance_input, Err(anyhow::anyhow!("maintenance dispatch begin failed")));
                     let maintenance_start = dst::time::Instant::now();
                     metrics.publish_queue_depths(
                         RunnerChannelQueueDepths::from_receivers(
@@ -2556,7 +2636,7 @@ impl LiveNode {
                         self.publish_queue_state_transitions(&transitions);
                     }
 
-                    let mut now = dst::time::Instant::now();
+                    let now = maintenance_now;
 
                     if recon_enabled && now >= recon_next {
                         let recon_intervals = ReconciliationCheckIntervals {
@@ -2579,8 +2659,7 @@ impl LiveNode {
                             &mut recon_state,
                         );
 
-                        now = dst::time::Instant::now();
-                        recon_next = now + recon_interval;
+                        recon_next = dst::time::Instant::now() + recon_interval;
                     }
 
                     if now >= purge_orders_next {
@@ -2610,6 +2689,7 @@ impl LiveNode {
                         prune_fills_next = now + prune_fills_interval;
                     }
 
+                    complete_node_dispatch!(self, maintenance_guard);
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
 
@@ -3303,6 +3383,15 @@ impl LiveNode {
     }
 
     fn initiate_shutdown(&mut self) {
+        let input = match self.native_lifecycle_input("stop.trader") {
+            Ok(input) => input,
+            Err(error) => {
+                log::error!("Stop lifecycle input failed: {error:#}");
+                self.handle.stop();
+                return;
+            }
+        };
+        let guard = begin_node_dispatch!(self, Lifecycle, &input, ());
         #[cfg(feature = "plugin")]
         if let Err(e) = self.plugins.stop_controllers() {
             log::error!("Error stopping plug-in controllers: {e}");
@@ -3314,9 +3403,17 @@ impl LiveNode {
 
         self.shutdown_deadline = Some(dst::time::Instant::now() + delay);
         self.handle.set_shutting_down();
+        complete_node_dispatch!(self, guard);
     }
 
     async fn finalize_stop(&mut self) -> anyhow::Result<()> {
+        let input = self.native_lifecycle_input("stop.disconnect_finalize")?;
+        let guard = begin_node_dispatch!(
+            self,
+            Lifecycle,
+            &input,
+            Err(anyhow::anyhow!("stop lifecycle dispatch begin failed"))
+        );
         self.close_external_ingress();
 
         let timeout = self.config.timeout_disconnection;
@@ -3337,7 +3434,6 @@ impl LiveNode {
         let readiness_result = self.await_engines_disconnected(deadline).await;
         let kernel_result = self.kernel.finalize_stop().await;
 
-        self.note_dispatch_gap("shutdown_lifecycle");
         self.handle.set_stopped();
 
         let mut errors = Vec::new();
@@ -3358,6 +3454,7 @@ impl LiveNode {
         }
 
         if errors.is_empty() {
+            complete_node_dispatch!(self, guard);
             Ok(())
         } else {
             anyhow::bail!("{}", errors.join("; "))

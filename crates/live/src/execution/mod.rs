@@ -32,3 +32,4 @@ pub(crate) mod client;
 
 mod recency;
 mod reconciliation;
+pub(crate) use reconciliation::serialize_ordered_pairs;

@@ -80,6 +80,13 @@ impl<T> SnapshotReceiver<T> {
     pub(super) fn pending(&self) -> impl Iterator<Item = &T> {
         self.prefix.iter()
     }
+    pub(crate) fn prepend_retained(&mut self, retained: &mut VecDeque<T>) -> anyhow::Result<()> {
+        self.prefix.try_reserve(retained.len())?;
+        while let Some(message) = retained.pop_back() {
+            self.prefix.push_front(message);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

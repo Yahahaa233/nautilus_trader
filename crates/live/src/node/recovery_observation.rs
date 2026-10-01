@@ -330,6 +330,9 @@ impl LiveNode {
                 .context("observation execution gate missing")?
                 .verify()?;
             let started_at_ns = self.kernel.clock.try_borrow()?.timestamp_ns().as_u64();
+            if let Some(timers) = self.recovery_timers.as_mut() {
+                timers.resume_observers(&registration.observer_ids)?;
+            }
             (registration.begin)()?;
             ensure!(
                 matches!(self.handle.try_set_observing(), RunningTransition::Entered),
@@ -400,7 +403,7 @@ impl LiveNode {
 
     pub(super) fn observation_after_completed_root(
         &mut self,
-        receivers: RunningReceivers<'_>,
+        mut receivers: RunningReceivers<'_>,
         pending_report_tasks: bool,
     ) -> Result<()> {
         if self.state() != NodeState::Observing {
@@ -448,9 +451,9 @@ impl LiveNode {
                 self.kernel.risk_engine.try_borrow()?.trading_state() == TradingState::Halted,
                 "observation round changed native risk admission"
             );
-            self.checkpoint_after_completed_root(receivers, pending_report_tasks)?;
+            self.checkpoint_after_completed_root(receivers.reborrow(), pending_report_tasks)?;
             if self.recovery_observation.as_ref().unwrap().ready.get() {
-                self.complete_recovery_observation_startup()?;
+                self.complete_recovery_observation_startup(&mut receivers)?;
             }
             Ok(())
         }))
@@ -461,7 +464,10 @@ impl LiveNode {
         result
     }
 
-    fn complete_recovery_observation_startup(&mut self) -> Result<()> {
+    fn complete_recovery_observation_startup(
+        &mut self,
+        receivers: &mut RunningReceivers<'_>,
+    ) -> Result<()> {
         ensure!(
             self.state() == NodeState::Observing && !self.handle.should_stop(),
             "recovery startup lifecycle changed"
@@ -483,11 +489,13 @@ impl LiveNode {
                 .verify()?;
             // This is synchronous: no input callback is serviced between the
             // checked handoff and restored on_start. All venue writes remain gated.
-            ensure!(
-                self.note_dispatch_gap("recovery_restored_trader_start"),
-                "recovery lifecycle gap could not be recorded"
-            );
+            let lifecycle = self.native_lifecycle_input("recovery.restored_trader_start")?;
+            let lifecycle_guard =
+                self.begin_node_dispatch(crate::dispatch::DispatchSource::Lifecycle, &lifecycle)?;
             self.kernel.start_trader_after_recovery_observation()?;
+            if let Some(guard) = lifecycle_guard {
+                guard.complete()?;
+            }
             self.validate_recovery_startup_freshness(&registration)?;
             ensure!(
                 !self.handle.should_stop(),
@@ -501,6 +509,7 @@ impl LiveNode {
                 ),
                 "sealed recovery transition failed"
             );
+            self.handoff_recovered_timers(receivers)?;
             registration.execution_gate.take().unwrap().finish()?;
             registration.admission.take().unwrap().finish()?;
             self.recovery_requires_release = false;
@@ -520,6 +529,14 @@ impl LiveNode {
         &self,
         registration: &RecoveryObservationRegistration,
     ) -> Result<()> {
+        let dispatch = self
+            .dispatch_observer
+            .as_ref()
+            .context("release dispatch observer missing")?;
+        let generation = dispatch
+            .completed_root_boundary_proof()?
+            .context("release actual lifecycle completion missing")?;
+        generation.verify()?;
         super::recovery_quiescence::with_running_registered_timer_inventory(
             &self.kernel.clock,
             &self.kernel.trader,
@@ -545,10 +562,12 @@ impl LiveNode {
                     node_instance_id: self.kernel.instance_id,
                     recovery_frontier: &self.recovery_native_frontier,
                 };
+                generation.verify()?;
                 // The callback sees actual actor Clock now, even if an earlier
                 // durable write took longer than the evidence's valid lifetime.
                 with_actual_reads(&|| (registration.validate_release)(&boundary))?;
                 verify_timers()?;
+                generation.verify()?;
                 ensure!(
                     nautilus_system::trader::Trader::collect_component_state(&self.kernel.trader)?
                         == components,
@@ -720,6 +739,62 @@ mod tests {
         quote_ns: u64,
     }
 
+    #[derive(Debug)]
+    struct ActualObservationQueueCodec(crate::runner_recovery::RunnerRecoveryChannel);
+    impl crate::runner_recovery::RunnerRecoveryCodec for ActualObservationQueueCodec {
+        fn channel(&self) -> crate::runner_recovery::RunnerRecoveryChannel {
+            self.0
+        }
+        fn codec_id(&self) -> &str {
+            match self.0 {
+                crate::runner_recovery::RunnerRecoveryChannel::DataEvent => {
+                    "actual-observation-quote.v1"
+                }
+                _ => "actual-observation-subscription.v1",
+            }
+        }
+        fn encode(
+            &self,
+            event: crate::runner_recovery::RunnerRecoveryEventRef<'_>,
+        ) -> Result<serde_json::Value> {
+            use crate::runner_recovery::RunnerRecoveryEventRef;
+            match event {
+                RunnerRecoveryEventRef::DataEvent(DataEvent::Data(Data::Quote(quote))) => {
+                    Ok(serde_json::to_value(quote)?)
+                }
+                RunnerRecoveryEventRef::DataCommand(
+                    nautilus_common::messages::data::DataCommand::Subscribe(command),
+                ) => Ok(serde_json::json!({"Subscribe":command})),
+                _ => anyhow::bail!("unsupported actual observation test input"),
+            }
+        }
+        fn decode(
+            &self,
+            _: &crate::runner_recovery::RunnerRecoveryEnvelope,
+        ) -> Result<crate::runner_recovery::RunnerRecoveryEvent> {
+            anyhow::bail!("this actual-source test registry is capture-only")
+        }
+    }
+
+    fn actual_observation_queue_registry() -> RunnerRecoveryCodecRegistry {
+        use crate::runner_recovery::RunnerRecoveryChannel;
+        let mut registry = RunnerRecoveryCodecRegistry::new([
+            RunnerRecoveryChannel::DataEvent,
+            RunnerRecoveryChannel::DataCommand,
+        ]);
+        registry
+            .register(ActualObservationQueueCodec(
+                RunnerRecoveryChannel::DataEvent,
+            ))
+            .unwrap();
+        registry
+            .register(ActualObservationQueueCodec(
+                RunnerRecoveryChannel::DataCommand,
+            ))
+            .unwrap();
+        registry.seal().unwrap()
+    }
+
     #[rstest]
     #[case(false)]
     #[case(true)]
@@ -810,11 +885,7 @@ mod tests {
         let fenced = fences.clone();
         node.set_recovery_observation_handler(
             vec![actor_id],
-            Rc::new(
-                RunnerRecoveryCodecRegistry::new(std::iter::empty())
-                    .seal()
-                    .unwrap(),
-            ),
+            Rc::new(actual_observation_queue_registry()),
             RunningCheckpointSchedule::EveryCompletedRoot,
             move || {
                 let mut actor = get_actor_unchecked::<NativeObserver>(&actor_id.inner());

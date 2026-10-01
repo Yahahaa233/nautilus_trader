@@ -57,6 +57,36 @@ mod tests {
         node::{NodeDispatchObserver, NodeRunMode},
     };
 
+    #[derive(Debug)]
+    struct ActualInstrumentQueueCodec;
+    impl crate::runner_recovery::RunnerRecoveryCodec for ActualInstrumentQueueCodec {
+        fn channel(&self) -> crate::runner_recovery::RunnerRecoveryChannel {
+            crate::runner_recovery::RunnerRecoveryChannel::DataEvent
+        }
+        fn codec_id(&self) -> &str {
+            "actual-native-instrument.v1"
+        }
+        fn encode(
+            &self,
+            event: crate::runner_recovery::RunnerRecoveryEventRef<'_>,
+        ) -> Result<serde_json::Value> {
+            match event {
+                crate::runner_recovery::RunnerRecoveryEventRef::DataEvent(
+                    DataEvent::Instrument(instrument),
+                ) => Ok(serde_json::to_value(instrument)?),
+                _ => anyhow::bail!("unsupported actual instrument test input"),
+            }
+        }
+        fn decode(
+            &self,
+            envelope: &crate::runner_recovery::RunnerRecoveryEnvelope,
+        ) -> Result<crate::runner_recovery::RunnerRecoveryEvent> {
+            Ok(crate::runner_recovery::RunnerRecoveryEvent::DataEvent(
+                DataEvent::Instrument(serde_json::from_value(envelope.payload.clone())?),
+            ))
+        }
+    }
+
     #[rstest]
     #[case(false)]
     #[case(true)]
@@ -102,12 +132,12 @@ mod tests {
         let written = writes.clone();
         let fences = Rc::new(Cell::new(0));
         let fenced = fences.clone();
+        let mut registry = RunnerRecoveryCodecRegistry::new([
+            crate::runner_recovery::RunnerRecoveryChannel::DataEvent,
+        ]);
+        registry.register(ActualInstrumentQueueCodec).unwrap();
         node.set_running_checkpoint_handler(
-            Rc::new(
-                RunnerRecoveryCodecRegistry::new(std::iter::empty())
-                    .seal()
-                    .unwrap(),
-            ),
+            Rc::new(registry.seal().unwrap()),
             RunningCheckpointSchedule::Requested,
             |boundary| {
                 boundary.completion_proof().verify()?;
@@ -149,7 +179,7 @@ mod tests {
             assert_eq!(
                 writes.get(),
                 0,
-                "startup must not manufacture a completed root"
+                "requested capture must wait for an explicit request"
             );
             driving_handle.request_running_checkpoint();
             nautilus_common::live::runner::get_data_event_sender()
@@ -197,6 +227,7 @@ pub struct RunningCheckpointInventory {
     captured_at_ns: u64,
     recovery_frontier: Option<crate::runner_recovery::RunnerRecoveryWatermark>,
     empty_bootstrap: Option<super::EmptyBootstrapRecoveryReceipt>,
+    retained_recovery_timers: Option<serde_json::Value>,
     message_bus_mode: &'static str,
     execution_authorized: bool,
 }
@@ -229,6 +260,10 @@ impl RunningCheckpointInventory {
     #[must_use]
     pub const fn registered_timers(&self) -> &BTreeMap<String, serde_json::Value> {
         &self.timers
+    }
+    #[must_use]
+    pub const fn retained_recovery_timers(&self) -> Option<&serde_json::Value> {
+        self.retained_recovery_timers.as_ref()
     }
 }
 
@@ -504,7 +539,28 @@ impl LiveNode {
                     );
                     nautilus_common::msgbus::with_local_only_recovery_inventory(|bus| {
                         nautilus_common::runner::with_empty_sync_command_queues(|| {
-                            let pending = receivers.snapshot(&ingress, &guard, &registry)?;
+                            let mut pending = receivers.snapshot(&ingress, &guard, &registry)?;
+                            let retained_timers = self
+                                .recovery_timers
+                                .as_ref()
+                                .map(|timers| timers.inventory(&registry))
+                                .transpose()?;
+                            if let Some(timers) = &self.recovery_timers {
+                                let mut retained = timers.pending_entries(&registry)?;
+                                let count = retained.len() as u64;
+                                for entry in &mut pending.entries {
+                                    if entry.channel
+                                        == crate::runner_recovery::RunnerRecoveryChannel::TimeEvent
+                                    {
+                                        entry.channel_ordinal = entry
+                                            .channel_ordinal
+                                            .checked_add(count)
+                                            .context("timer FIFO ordinal exhausted")?;
+                                    }
+                                }
+                                retained.append(&mut pending.entries);
+                                pending.entries = retained;
+                            }
                             let mut runner_counts = [
                                 "time_event",
                                 "system_event",
@@ -554,6 +610,7 @@ impl LiveNode {
                                     .as_u64(),
                                 recovery_frontier: self.recovery_native_frontier.clone(),
                                 empty_bootstrap: self.recovery_empty_bootstrap.clone(),
+                                retained_recovery_timers: retained_timers.clone(),
                                 message_bus_mode: "local_only",
                                 execution_authorized: false,
                             };
@@ -561,6 +618,14 @@ impl LiveNode {
                                 ensure!(
                                     self.state() == capture_state && !self.handle.should_stop(),
                                     "node lifecycle changed during checkpoint"
+                                );
+                                ensure!(
+                                    self.recovery_timers
+                                        .as_ref()
+                                        .map(|timers| timers.inventory(&registry))
+                                        .transpose()?
+                                        == retained_timers,
+                                    "retained native timer handoff changed during checkpoint"
                                 );
                                 verify_timers()?;
                                 guard.verify()?;

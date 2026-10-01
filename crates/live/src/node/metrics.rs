@@ -345,7 +345,7 @@ impl RunnerMetrics {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct RunnerChannelQueueDepths {
     time_events: usize,
     exec_events: usize,

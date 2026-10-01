@@ -79,7 +79,30 @@ impl TimerCheckpoint for EmptyTimerCheckpoint {
     }
 }
 
+/// Actual restored schedules held behind a native producer pause. Historical
+/// callback IDs select validated source entries, never executable callbacks.
+pub trait RestoredTimerCheckpoint: Debug {
+    fn source_inventory(&self) -> &serde_json::Value;
+    fn verify(&self) -> anyhow::Result<()>;
+    fn restore_message(
+        &self,
+        event: TimeEvent,
+        source_binding_id: u64,
+        cleanup: bool,
+    ) -> anyhow::Result<crate::runner::TimeEventMessage>;
+    fn resume(self: Box<Self>) -> anyhow::Result<()>;
+}
+
 pub trait Clock: Debug + Any {
+    /// Rebuilds validated source schedules with this actual registered clock's
+    /// default owner callback. Producers remain paused until the opaque receipt
+    /// is consumed. Unknown/named callback contracts fail closed.
+    fn restore_running_timer_checkpoint(
+        &mut self,
+        _inventory: &serde_json::Value,
+    ) -> anyhow::Result<Box<dyn RestoredTimerCheckpoint>> {
+        anyhow::bail!("clock timer restoration unsupported")
+    }
     /// Freezes actual native timer production, retaining registered schedules.
     ///
     /// # Errors
@@ -796,6 +819,23 @@ impl CallbackRegistry {
             .get(name)
             .cloned()
             .or_else(|| self.default_callback.clone())
+    }
+
+    /// Actual registered default callback; no source token is deserialized.
+    #[must_use]
+    pub fn default_handler(&self) -> Option<TimeEventCallback> {
+        self.default_callback.clone()
+    }
+
+    #[must_use]
+    pub fn callback_source(&self, name: &Ustr, explicit: bool) -> &'static str {
+        if explicit || self.callbacks.contains_key(name) {
+            "named_or_explicit_unsupported"
+        } else if self.default_callback.is_some() {
+            "registered_clock_default.v1"
+        } else {
+            "unregistered"
+        }
     }
 
     /// Creates a handler for `event` using its named callback or the default callback.

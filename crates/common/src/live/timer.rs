@@ -85,6 +85,7 @@ const TASK_EXHAUSTED: u8 = 3;
 #[derive(Debug)]
 pub struct LiveTimer {
     checkpoint_gate: super::checkpoint::CheckpointGate,
+    callback_source: &'static str,
     /// The name of the timer.
     pub name: Ustr,
     /// The interval between timer events in nanoseconds.
@@ -105,6 +106,16 @@ pub struct LiveTimer {
 }
 
 impl LiveTimer {
+    pub(crate) fn with_callback_source(mut self, source: &'static str) -> Self {
+        self.callback_source = source;
+        self
+    }
+    pub(crate) fn registered_checkpoint_token(&self) -> anyhow::Result<TimeEventCallbackToken> {
+        match &self.callback {
+            OwnerCallback::Registered { token, .. } => Ok(token.clone()),
+            _ => anyhow::bail!("restored timer requires actual owner-thread callback"),
+        }
+    }
     pub(crate) fn with_checkpoint_gate(mut self, gate: super::checkpoint::CheckpointGate) -> Self {
         self.checkpoint_gate = gate;
         self
@@ -127,6 +138,7 @@ impl LiveTimer {
         let start = self.start_time_ns;
         let stop = self.stop_time_ns;
         let fire_immediately = self.fire_immediately;
+        let callback_source = self.callback_source;
         let token = match &self.callback {
             OwnerCallback::Registered { token, .. } => Some(token.clone()),
             OwnerCallback::Direct(_) => None,
@@ -150,6 +162,7 @@ impl LiveTimer {
                     "stop_time_ns":stop,"next_time_ns":next,"fire_immediately":fire_immediately,
                     "status":if status == TASK_ACTIVE {"active"} else {"exhausted"},
                     "callback_kind":if token.is_some() {"registered_owner_thread"} else {"thread_safe_callback"},
+                    "callback_source":callback_source,
                     "binding":token.as_ref().map(TimeEventCallbackToken::checkpoint_inventory),
                     "execution_authorized":false,
                 }),
@@ -199,6 +212,7 @@ impl LiveTimer {
 
         Self {
             checkpoint_gate: Default::default(),
+            callback_source: "named_or_explicit_unsupported",
             name,
             interval_ns,
             start_time_ns,
@@ -253,6 +267,25 @@ impl LiveTimer {
     /// Panics if using a Rust callback (`Rust` or `RustLocal`) without a `TimeEventSender`.
     #[allow(unused_variables)]
     pub fn start(&mut self) {
+        self.start_internal(None);
+    }
+
+    /// Reconstructs the exact nominal source frontier. Unlike normal startup,
+    /// an overdue source deadline is never replaced or rounded to current time.
+    pub(crate) fn start_restored(&mut self, next: UnixNanos, exhausted: bool) {
+        self.next_time_ns
+            .store(next.as_u64(), atomic::Ordering::SeqCst);
+        if exhausted {
+            let state = Arc::new(TimerTaskState::new(next.as_u64()));
+            state.status.store(TASK_EXHAUSTED, atomic::Ordering::SeqCst);
+            self.task_state = Some(state);
+            self.exhausted = true;
+        } else {
+            self.start_internal(Some(next));
+        }
+    }
+
+    fn start_internal(&mut self, restored_next: Option<UnixNanos>) {
         if let OwnerCallback::Senderless(callback) = &self.callback {
             match callback {
                 #[cfg(feature = "python")]
@@ -314,7 +347,9 @@ impl LiveTimer {
         // Check if the timer's alert time is in the past and adjust if needed
         let now_raw = now_ns.as_u64();
 
-        if should_adjust_past_due_time(observed_next, now_ns, stop_time_ns) {
+        if restored_next.is_none()
+            && should_adjust_past_due_time(observed_next, now_ns, stop_time_ns)
+        {
             if observed_next < now_raw {
                 let original = UnixNanos::from(observed_next);
                 log::warn!(
@@ -327,7 +362,8 @@ impl LiveTimer {
         }
 
         // Floor the next time to the nearest microsecond which is within the timers accuracy
-        let mut next_time_ns = normalize_start_time_ns(observed_next, now_ns, stop_time_ns);
+        let mut next_time_ns = restored_next
+            .unwrap_or_else(|| normalize_start_time_ns(observed_next, now_ns, stop_time_ns));
         let next_time_atomic = Arc::new(AtomicU64::new(next_time_ns.as_u64()));
         let task_state = Arc::new(TimerTaskState::new(next_time_ns.as_u64()));
         self.next_time_ns = next_time_atomic.clone();

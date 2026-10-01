@@ -31,6 +31,8 @@ struct State {
     epoch: u64,
     active: usize,
     frozen: bool,
+    paused: bool,
+    pause_epoch: u64,
     poisoned: bool,
     waiters: Vec<Waker>,
 }
@@ -54,7 +56,7 @@ impl CheckpointGate {
             state.poisoned = true;
         }
         ensure!(
-            !state.frozen && !state.poisoned,
+            !state.frozen && !state.paused && !state.poisoned,
             "adapter request admission frozen or failed"
         );
         state.active = state
@@ -94,6 +96,33 @@ impl CheckpointGate {
         })
     }
 
+    /// Retains actual producer futures across recovery without holding a capture
+    /// freeze. A checkpoint can still freeze and verify this paused producer.
+    /// Only the returned same-gate capability can resume it.
+    ///
+    /// # Errors
+    /// Rejects active work, overlapping pauses/freezes or a failed producer.
+    pub fn pause_producers(&self) -> Result<PausedCallbacks> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint gate mutex poisoned"))?;
+        ensure!(
+            !state.paused && !state.frozen && !state.poisoned && state.active == 0,
+            "producer recovery pause unavailable"
+        );
+        state.pause_epoch = state
+            .pause_epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("pause epoch exhausted"))?;
+        state.paused = true;
+        Ok(PausedCallbacks {
+            gate: self.clone(),
+            epoch: state.pause_epoch,
+            finished: false,
+        })
+    }
+
     fn poll_callback<F: Future>(
         &self,
         cx: &mut Context<'_>,
@@ -103,7 +132,7 @@ impl CheckpointGate {
             let mut state = self.0.lock().expect("checkpoint gate mutex poisoned");
             // A failed boundary never resumes producer callbacks. Shutdown owns
             // task cancellation; waking here cannot reopen failed admission.
-            if state.frozen || state.poisoned {
+            if state.frozen || state.paused || state.poisoned {
                 if !state
                     .waiters
                     .iter()
@@ -133,6 +162,62 @@ impl CheckpointGate {
     pub async fn callback<F: Future>(&self, future: F) -> (F::Output, CallbackLease) {
         let mut future = std::pin::pin!(future);
         std::future::poll_fn(|cx| self.poll_callback(cx, future.as_mut())).await
+    }
+}
+
+/// Non-deserializable producer pause, independent of checkpoint epochs.
+#[derive(Debug)]
+pub struct PausedCallbacks {
+    gate: CheckpointGate,
+    epoch: u64,
+    finished: bool,
+}
+impl PausedCallbacks {
+    /// # Errors
+    /// Rejects a changed, busy or failed native producer.
+    pub fn verify(&self) -> Result<()> {
+        let state = self
+            .gate
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint gate mutex poisoned"))?;
+        ensure!(
+            state.paused && state.pause_epoch == self.epoch && !state.poisoned && state.active == 0,
+            "recovery producer pause changed or failed"
+        );
+        Ok(())
+    }
+    /// Resumes only this actual paused producer. This is not trading admission.
+    /// # Errors
+    /// Rejects an outstanding capture freeze, changed state or permanent failure.
+    pub fn finish(mut self) -> Result<()> {
+        self.verify()?;
+        let waiters = {
+            let mut state = self
+                .gate
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("checkpoint gate mutex poisoned"))?;
+            ensure!(!state.frozen, "producer capture freeze remains active");
+            state.paused = false;
+            self.finished = true;
+            std::mem::take(&mut state.waiters)
+        };
+        for waker in waiters {
+            waker.wake();
+        }
+        Ok(())
+    }
+}
+impl Drop for PausedCallbacks {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.gate
+                .0
+                .lock()
+                .expect("checkpoint gate mutex poisoned")
+                .poisoned = true;
+        }
     }
 }
 
@@ -249,6 +334,30 @@ mod tests {
         drop(lease);
         let (value, lease) = gate.callback(rx.recv()).await;
         assert_eq!(value, Some(42));
+        drop(lease);
+        gate.freeze().unwrap().finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_pause_allows_real_capture_and_retains_future_until_private_resume() {
+        let gate = CheckpointGate::default();
+        let pause = gate.pause_producers().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(31).unwrap();
+        let mut callback = Box::pin(gate.callback(rx.recv()));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(callback.as_mut().poll(cx).is_pending())).await
+        );
+        let frozen = gate.freeze().unwrap();
+        pause.verify().unwrap();
+        frozen.finish().unwrap();
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(callback.as_mut().poll(cx).is_pending())).await
+        );
+        assert!(gate.enter_request().is_err());
+        pause.finish().unwrap();
+        let (value, lease) = callback.await;
+        assert_eq!(value, Some(31));
         drop(lease);
         gate.freeze().unwrap().finish().unwrap();
     }

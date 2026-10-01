@@ -79,3 +79,44 @@ observed peak tree RSS was 2533024 KiB with two jobs. Actual cross-process timer
 and adapter restoration, final Stop drain/checkpoint/seal, the remaining native
 mutation producer roots and consumer integration still need their own positive
 and adversarial verification before S3 is complete.
+
+
+The next timer/mutation batch ran 73 tests: 73 passed, 5695 outside the scoped
+filter skipped, final wrapper exit 0. LiveClock restore preserves the source
+next deadline even when it is now in the past, binds the actual registered
+current-process default Rust callback, pauses producers, and retains source
+events ahead of current-process events. Unknown explicit callback sources are
+refused. The node-owned handoff distinguishes retained, queued, received and
+processed; only actual callback dispatch completion marks processed.
+
+The compiled public entry is
+`restore_registered_timer_checkpoint(source, pending, watermark)` returning
+`RetainedRecoveryTimerHandoff`. Source owners are `kernel` and `component:<id>`;
+the exact owner set must match actual registered clocks. `pending` carries the
+source owner, callback binding, FIFO ordinal and full TimeEvent headers. It is
+not executable authority. The completed native recovery frontier must already
+be installed. Observer clock producers resume during observation; strategy
+clock producers and source pending callbacks remain retained until sealed
+restored startup, then move as the actual runner prefix. Consumer lifecycle
+hooks must preserve existing restored timer schedules instead of replacing
+their original next deadline. These SDK tests do not prove the consumer's
+original source artifact or full node timer recovery integration.
+
+Actual startup, startup reconciliation, HTTP query completion, maintenance and
+restored trader startup producers now emit `NativeMutationInput` before state
+mutation. The source codec can downcast this native-only type and serialize
+`canonical_payload()`. The payload includes its fixed schema, producer kind,
+actual node instance and actual wall time; it is Serialize-only and excludes
+full configuration/credential contents. Existing reconciliation batches still
+carry their actual typed order events. No Debug/no-op fallback closes coverage.
+The tests include real embedded startup roots and durable input-writer rejection
+before kernel startup. Full historical mutation replay and remaining runtime
+state restoration are still required; this work does not erase older gaps.
+
+Authoritative record:
+`/Volumes/My PSSD/CQS/trading-checkpoint-validation/timer-mutations-5/`.
+Log SHA256: `c65f3c50abe1a3948dddd1eb41374122faffa6205d32a60729acb2b22e2ac357`.
+Tracked diff and both new module hashes were unchanged during the wrapper.
+Observed peak tree RSS was 2580528 KiB with two jobs. Active OKX restoration,
+remaining native state/replay integration, the final Stop drain/checkpoint/seal
+and consumer pin/migration are not certified by this scoped batch.

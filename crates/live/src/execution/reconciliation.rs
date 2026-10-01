@@ -66,7 +66,7 @@ pub(super) type AccountInstrumentStrategyKey = (AccountId, InstrumentId, Strateg
 pub(super) type FillKey = (AccountId, InstrumentId, TradeId);
 
 /// Execution clients responsible for reporting one cached entity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum ReportClientCoverage {
     /// Every identified client provides the required report coverage.
     Resolved(IndexSet<ClientId>),
@@ -132,7 +132,7 @@ impl TargetedOrderQuery {
 }
 
 /// Targeted status query result with fills and coverage completeness.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct TargetedOrderReportResult {
     pub(super) client_order_id: ClientOrderId,
     pub(super) client_id: Option<ClientId>,
@@ -142,14 +142,14 @@ pub(crate) struct TargetedOrderReportResult {
 }
 
 /// Order status report paired with its source execution client.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub(crate) struct SourcedOrderStatusReport {
     pub client_id: ClientId,
     pub report: OrderStatusReport,
 }
 
 /// Snapshot and command for one continuous open-order reconciliation check.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct OpenOrderReportCheck {
     pub command: GenerateOrderStatusReports,
     pub filtered_orders: Vec<OrderAny>,
@@ -157,13 +157,15 @@ pub(crate) struct OpenOrderReportCheck {
 }
 
 /// Prepare-time state and command for one continuous position reconciliation check.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PositionReportCheck {
     /// The bulk position query.
     pub command: GeneratePositionStatusReports,
     /// Responsible clients by instrument and account.
+    #[serde(serialize_with = "serialize_ordered_pairs")]
     pub client_coverage: IndexMap<InstrumentAccountKey, ReportClientCoverage>,
     /// Activity revisions captured before the query.
+    #[serde(serialize_with = "serialize_ordered_pairs")]
     pub activity_revisions: IndexMap<InstrumentAccountKey, u64>,
 }
 
@@ -1436,4 +1438,16 @@ pub(super) mod tests {
             prop_assert_eq!(reversed, (-net, short, long));
         }
     }
+}
+
+/// Tuple identity keys remain ordered pairs instead of lossy JSON object keys.
+pub(crate) fn serialize_ordered_pairs<
+    K: serde::Serialize,
+    V: serde::Serialize,
+    S: serde::Serializer,
+>(
+    values: &IndexMap<K, V>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&values.iter().collect::<Vec<_>>(), serializer)
 }
