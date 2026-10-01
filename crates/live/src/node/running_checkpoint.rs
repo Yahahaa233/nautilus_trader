@@ -70,6 +70,8 @@ mod tests {
         )
         .unwrap()
         .with_reconciliation(false)
+        .with_delay_shutdown_secs(0)
+        .with_delay_post_stop_secs(0)
         .build()
         .unwrap();
         let observer = DispatchObserver::new("running-checkpoint".into(), |_| Ok(())).unwrap();
@@ -166,7 +168,7 @@ mod tests {
             tokio::join!(node.run_with_mode(NodeRunMode::Hosted), driver)
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| panic!("running boundary timed out: state={:?}, stop={}, metrics={:?}, coverage={:?}, request={}", node.state(), handle.should_stop(), handle.metrics_snapshot(), node.dispatch_observer.as_ref().unwrap().coverage(), handle.checkpoint_requested()));
         assert_eq!(writes.get(), 1);
         assert_eq!(fences.get(), u32::from(fail_writer));
         assert_eq!(node.state(), NodeState::Stopped);
@@ -189,6 +191,12 @@ pub struct RunningCheckpointInventory {
     synchronous_queue_counts: BTreeMap<String, u64>,
     adapters: BTreeMap<String, serde_json::Value>,
     execution_manager: serde_json::Value,
+    dispatch_coverage: serde_json::Value,
+    startup_reconciliation: Option<super::StartupReconciliationObservation>,
+    node_instance_id: nautilus_core::UUID4,
+    captured_at_ns: u64,
+    recovery_frontier: Option<crate::runner_recovery::RunnerRecoveryWatermark>,
+    empty_bootstrap: Option<super::EmptyBootstrapRecoveryReceipt>,
     message_bus_mode: &'static str,
     execution_authorized: bool,
 }
@@ -323,7 +331,7 @@ impl LiveNode {
             .as_ref()
             .context("checkpoint observer missing")?
             .clone();
-        let Some(proof) = observer.completion_proof()? else {
+        let Some(proof) = observer.completed_root_boundary_proof()? else {
             return Ok(());
         };
         if proof.root_sequence() <= registration.last_root {
@@ -478,6 +486,17 @@ impl LiveNode {
                                     .map(|(id, guard)| (id.clone(), guard.inventory().clone()))
                                     .collect(),
                                 execution_manager: manager.clone(),
+                                dispatch_coverage: coverage.clone(),
+                                startup_reconciliation: self.handle.startup_reconciliation(),
+                                node_instance_id: self.kernel.instance_id,
+                                captured_at_ns: self
+                                    .kernel
+                                    .clock
+                                    .try_borrow()?
+                                    .timestamp_ns()
+                                    .as_u64(),
+                                recovery_frontier: self.recovery_native_frontier.clone(),
+                                empty_bootstrap: self.recovery_empty_bootstrap.clone(),
                                 message_bus_mode: "local_only",
                                 execution_authorized: false,
                             };

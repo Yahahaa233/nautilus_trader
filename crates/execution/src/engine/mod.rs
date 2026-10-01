@@ -108,6 +108,36 @@ const TIMER_PURGE_CLOSED_ORDERS: &str = "ExecEngine_PURGE_CLOSED_ORDERS";
 const TIMER_PURGE_CLOSED_POSITIONS: &str = "ExecEngine_PURGE_CLOSED_POSITIONS";
 const TIMER_PURGE_ACCOUNT_EVENTS: &str = "ExecEngine_PURGE_ACCOUNT_EVENTS";
 
+/// A node-owned phase gate, distinct from permanent failure containment.
+/// Only its unique holder can release this phase after native observation.
+/// It cannot clear an existing permanent fence and carries no trading grant.
+#[derive(Debug)]
+pub struct RecoveryObservationExecutionGate {
+    phase: Rc<Cell<bool>>,
+    permanent_failure: Rc<Cell<bool>>,
+    finished: bool,
+}
+impl RecoveryObservationExecutionGate {
+    /// # Errors
+    /// Refuses a released or failure-contained engine.
+    pub fn verify(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.phase.get() && !self.finished && !self.permanent_failure.get(),
+            "observation execution gate changed or failed"
+        );
+        Ok(())
+    }
+    /// Consumes the unique capability; ordinary submission guards remain intact.
+    /// # Errors
+    /// A permanent failure fence is never cleared by observation release.
+    pub fn finish(mut self) -> anyhow::Result<()> {
+        self.verify()?;
+        self.phase.set(false);
+        self.finished = true;
+        Ok(())
+    }
+}
+
 /// Central execution engine responsible for orchestrating order routing and execution.
 ///
 /// The execution engine manages the entire order lifecycle from submission to completion,
@@ -130,7 +160,8 @@ pub struct ExecutionEngine {
     filtered_unclaimed_external_order_count: u64,
     snapshot_anchorer: Option<SnapshotAnchorer>,
     submission_guard: Option<SubmissionGuard>,
-    submissions_fenced: Cell<bool>,
+    submissions_fenced: Rc<Cell<bool>>,
+    recovery_observation_gate: Rc<Cell<bool>>,
 }
 
 impl Debug for ExecutionEngine {
@@ -170,7 +201,8 @@ impl ExecutionEngine {
             filtered_unclaimed_external_order_count: 0,
             snapshot_anchorer: None,
             submission_guard: None,
-            submissions_fenced: Cell::new(false),
+            submissions_fenced: Rc::new(Cell::new(false)),
+            recovery_observation_gate: Rc::new(Cell::new(false)),
         }
     }
 
@@ -307,6 +339,29 @@ impl ExecutionEngine {
         self.submission_guard = guard;
     }
 
+    /// Closes all venue writes while queries and real private reports remain admitted.
+    /// The node retains the returned capability through its observation lifecycle.
+    ///
+    /// # Errors
+    /// Refuses an existing observation phase or permanent containment.
+    pub fn begin_recovery_observation(&self) -> anyhow::Result<RecoveryObservationExecutionGate> {
+        anyhow::ensure!(
+            !self.recovery_observation_gate.get() && !self.submissions_fenced.get(),
+            "execution observation admission unavailable"
+        );
+        self.recovery_observation_gate.set(true);
+        Ok(RecoveryObservationExecutionGate {
+            phase: self.recovery_observation_gate.clone(),
+            permanent_failure: self.submissions_fenced.clone(),
+            finished: false,
+        })
+    }
+
+    #[must_use]
+    pub fn recovery_observation_fenced(&self) -> bool {
+        self.recovery_observation_gate.get()
+    }
+
     /// Permanently prohibits submission and modification on this engine instance.
     /// A new engine/run is required to clear the fence; remediation stays available.
     pub fn fence_submissions(&self) {
@@ -327,7 +382,7 @@ impl ExecutionEngine {
 
     fn check_submission_guard(&self, command: &TradingCommand) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !self.submissions_fenced.get(),
+            !self.submissions_fenced.get() && !self.recovery_observation_gate.get(),
             "execution submissions fenced"
         );
         if let Some(guard) = &self.submission_guard {
@@ -1955,6 +2010,15 @@ impl ExecutionEngine {
     }
 
     fn execute_command(&self, command: TradingCommand) {
+        if self.recovery_observation_gate.get()
+            && !matches!(
+                &command,
+                TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_)
+            )
+        {
+            log::error!("Venue write refused during read-only recovery observation");
+            return;
+        }
         self.command_count.set(self.command_count.get() + 1);
 
         if matches!(
@@ -2217,12 +2281,18 @@ impl ExecutionEngine {
         &self,
         command: &TradingCommand,
     ) -> anyhow::Result<Option<(ClientId, AccountId)>> {
-        if command.client_id().is_some_and(|id| self.external_clients.contains(&id)) {
+        if command
+            .client_id()
+            .is_some_and(|id| self.external_clients.contains(&id))
+        {
             return Ok(None);
         }
-        let _cache = self.cache.try_borrow()
+        let _cache = self
+            .cache
+            .try_borrow()
             .map_err(|_| anyhow::anyhow!("execution route cache is busy"))?;
-        Ok(self.find_client_for_command(command)
+        Ok(self
+            .find_client_for_command(command)
             .map(|adapter| (adapter.client.client_id(), adapter.client.account_id())))
     }
 
@@ -2249,7 +2319,11 @@ impl ExecutionEngine {
         {
             return Some(adapter);
         }
-        self.find_client_for_route(command.client_id(), self.account_id_for_command(command), Self::instrument_id_for_command(command))
+        self.find_client_for_route(
+            command.client_id(),
+            self.account_id_for_command(command),
+            Self::instrument_id_for_command(command),
+        )
     }
 
     fn find_client_for_route(
@@ -4854,6 +4928,26 @@ mod tests {
     use rstest::*;
 
     use super::*;
+
+    #[rstest]
+    fn checkpoint_observation_execution_gate_is_reversible_without_clearing_failure() {
+        let engine = ExecutionEngine::new(
+            Rc::new(RefCell::new(TestClock::default())),
+            Rc::new(RefCell::new(Cache::default())),
+            None,
+        );
+        let gate = engine.begin_recovery_observation().unwrap();
+        assert!(engine.recovery_observation_fenced());
+        assert!(engine.begin_recovery_observation().is_err());
+        gate.finish().unwrap();
+        assert!(!engine.recovery_observation_fenced());
+        assert!(!engine.submissions_fenced());
+        let gate = engine.begin_recovery_observation().unwrap();
+        engine.fence_submissions();
+        assert!(gate.finish().is_err());
+        assert!(engine.submissions_fenced());
+        assert!(engine.recovery_observation_fenced());
+    }
 
     #[rstest]
     fn netting_positions_open_for_report_scopes_positions_by_account() {

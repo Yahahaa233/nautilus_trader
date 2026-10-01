@@ -1354,6 +1354,11 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        if !nautilus_common::actor::recovery_observation::callback_admitted(
+            &StrategyNative::strategy_core(self).actor.actor_id.inner(),
+        ) {
+            return;
+        }
         let state = {
             let core = StrategyNative::strategy_core_mut(self);
             let id = &core.actor.actor_id;
@@ -1518,6 +1523,11 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        if !nautilus_common::actor::recovery_observation::callback_admitted(
+            &StrategyNative::strategy_core(self).actor.actor_id.inner(),
+        ) {
+            return;
+        }
         let state = {
             let core = StrategyNative::strategy_core_mut(self);
 

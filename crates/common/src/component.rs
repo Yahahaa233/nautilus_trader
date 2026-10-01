@@ -61,6 +61,7 @@ pub trait Component {
     /// Returns whether the component is *not* running.
     fn not_running(&self) -> bool {
         !self.is_running()
+            && !crate::actor::recovery_observation::is_observer(&self.component_id().inner())
     }
 
     /// Returns whether the component is running.

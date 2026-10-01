@@ -26,7 +26,8 @@ const STOP_REQUESTED: u8 = 1 << 7;
 const STATE_MASK: u8 = !STOP_REQUESTED;
 
 /// Native startup processing evidence, not an account reconciliation certificate.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StartupReconciliationPhase {
     Disabled,
     Processing,
@@ -34,7 +35,7 @@ pub enum StartupReconciliationPhase {
     Failed,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct StartupReconciliationObservation {
     pub phase: StartupReconciliationPhase,
     pub observed_at_ns: u64,

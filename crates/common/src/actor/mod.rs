@@ -29,6 +29,7 @@ use ustr::Ustr;
 pub mod binding;
 pub mod data_actor;
 pub mod indicators;
+pub mod recovery_observation;
 pub mod registry;
 
 mod access;

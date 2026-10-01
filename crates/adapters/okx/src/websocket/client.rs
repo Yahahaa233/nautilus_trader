@@ -541,6 +541,19 @@ impl OKXWebSocketClient {
                 "pending_orders":0,"pending_cancels":0,"pending_amends":0,
                 "pending_commands":0,"pending_decoded_outbox":0,"pending_handler_messages":0,
                 "confirmed_subscriptions":subscriptions,"raw_input":raw,
+                "desired_instrument_type_subscriptions":self.subscriptions_inst_type.iter().map(|entry| {
+                    let mut values=entry.value().iter().map(ToString::to_string).collect::<Vec<_>>(); values.sort();
+                    (entry.key().to_string(), values)
+                }).collect::<std::collections::BTreeMap<_,_>>(),
+                "desired_instrument_family_subscriptions":self.subscriptions_inst_family.iter().map(|entry| {
+                    let mut values=entry.value().iter().map(ToString::to_string).collect::<Vec<_>>(); values.sort();
+                    (entry.key().to_string(), values)
+                }).collect::<std::collections::BTreeMap<_,_>>(),
+                "desired_instrument_id_subscriptions":self.subscriptions_inst_id.iter().map(|entry| {
+                    let mut values=entry.value().iter().map(ToString::to_string).collect::<Vec<_>>(); values.sort();
+                    (entry.key().to_string(), values)
+                }).collect::<std::collections::BTreeMap<_,_>>(),
+                "desired_bare_subscriptions":self.subscriptions_bare.iter().map(|entry| (entry.key().to_string(),*entry.value())).collect::<std::collections::BTreeMap<_,_>>(),
                 "instruments":&**self.instruments_cache.load(),
                 "inst_id_codes":&**self.inst_id_code_cache.load(),
                 "trade_quote_ccy_lists":&**self.trade_quote_ccy_lists.load(),

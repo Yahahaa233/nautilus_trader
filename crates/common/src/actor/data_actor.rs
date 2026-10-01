@@ -991,6 +991,9 @@ pub trait DataActor {
     where
         Self: DataActorNative + Component,
     {
+        if !super::recovery_observation::callback_admitted(&self.core().actor_id().inner()) {
+            return;
+        }
         log_received(&quote);
 
         if let Err(e) = self.core().handle_indicators_for_quote(quote) {
@@ -1013,6 +1016,9 @@ pub trait DataActor {
     where
         Self: DataActorNative + Component,
     {
+        if !super::recovery_observation::callback_admitted(&self.core().actor_id().inner()) {
+            return;
+        }
         log_received(&trade);
 
         if let Err(e) = self.core().handle_indicators_for_trade(trade) {
@@ -1035,6 +1041,9 @@ pub trait DataActor {
     where
         Self: DataActorNative + Component,
     {
+        if !super::recovery_observation::callback_admitted(&self.core().actor_id().inner()) {
+            return;
+        }
         log_received(&bar);
 
         if let Err(e) = self.core().handle_indicators_for_bar(bar) {
@@ -1432,6 +1441,9 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |data: &CustomData| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_data(data);
             } else {
@@ -1466,6 +1478,9 @@ pub trait DataActor {
         // the inner value so subscribers receive the typed `Signal` in `on_signal`.
         let handler = ShareableMessageHandler::from_typed(move |data: &CustomData| {
             if let Some(signal) = data.data.as_any().downcast_ref::<Signal>() {
+                if !super::recovery_observation::callback_admitted(&actor_id) {
+                    return;
+                }
                 if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                     actor.handle_signal(signal);
                 } else {
@@ -1491,6 +1506,9 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |event: &QueueStateChanged| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_queue_state(event);
             } else {
@@ -1520,6 +1538,9 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |event: &SocketStateChanged| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_socket_state(event);
             } else {
@@ -1550,6 +1571,9 @@ pub trait DataActor {
         let topic = get_quotes_topic(instrument_id);
 
         let handler = TypedHandler::from(move |quote: &QuoteTick| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_quote(quote);
             } else {
@@ -1581,6 +1605,9 @@ pub trait DataActor {
         let pattern = get_instruments_pattern(venue);
 
         let handler = TypedHandler::from(move |instrument: &InstrumentAny| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_instrument(instrument);
             } else {
@@ -1612,6 +1639,9 @@ pub trait DataActor {
         let topic = get_instrument_topic(instrument_id);
 
         let handler = TypedHandler::from(move |instrument: &InstrumentAny| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_instrument(instrument);
             } else {
@@ -1655,6 +1685,9 @@ pub trait DataActor {
         };
 
         let handler = TypedHandler::from(move |deltas: &OrderBookDeltas| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_book_deltas(deltas);
             } else {
@@ -1699,6 +1732,9 @@ pub trait DataActor {
         };
 
         let handler = TypedHandler::from(move |depth: &OrderBookDepth10| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_book_depth(depth);
             } else {
@@ -1735,6 +1771,9 @@ pub trait DataActor {
         let topic = get_book_snapshots_topic(instrument_id, interval_ms);
 
         let handler = TypedHandler::from(move |book: &OrderBook| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_book(book);
             } else {
@@ -1769,6 +1808,9 @@ pub trait DataActor {
         let topic = get_trades_topic(instrument_id);
 
         let handler = TypedHandler::from(move |trade: &TradeTick| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_trade(trade);
             } else {
@@ -1801,6 +1843,9 @@ pub trait DataActor {
         let topic = get_bars_topic(bar_type.standard());
 
         let handler = TypedHandler::from(move |bar: &Bar| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_bar(bar);
             } else {
@@ -1825,6 +1870,9 @@ pub trait DataActor {
         let topic = get_mark_price_topic(instrument_id);
 
         let handler = TypedHandler::from(move |mark_price: &MarkPriceUpdate| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_mark_price(mark_price);
             } else {
@@ -1856,6 +1904,9 @@ pub trait DataActor {
         let topic = get_index_price_topic(instrument_id);
 
         let handler = TypedHandler::from(move |index_price: &IndexPriceUpdate| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_index_price(index_price);
             } else {
@@ -1887,6 +1938,9 @@ pub trait DataActor {
         let topic = get_funding_rate_topic(instrument_id);
 
         let handler = TypedHandler::from(move |funding_rate: &FundingRateUpdate| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_funding_rate(funding_rate);
             } else {
@@ -1918,6 +1972,9 @@ pub trait DataActor {
         let topic = get_option_greeks_topic(instrument_id);
 
         let handler = TypedHandler::from(move |option_greeks: &OptionGreeks| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_option_greeks(option_greeks);
             } else {
@@ -1949,6 +2006,9 @@ pub trait DataActor {
         let topic = get_instrument_status_topic(instrument_id);
 
         let handler = ShareableMessageHandler::from_typed(move |status: &InstrumentStatus| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_instrument_status(status);
             } else {
@@ -1980,6 +2040,9 @@ pub trait DataActor {
         let topic = get_instrument_close_topic(instrument_id);
 
         let handler = ShareableMessageHandler::from_typed(move |close: &InstrumentClose| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_instrument_close(close);
             } else {
@@ -2016,6 +2079,9 @@ pub trait DataActor {
         let topic = get_option_chain_topic(series_id);
 
         let handler = TypedHandler::from(move |slice: &OptionChainSlice| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_option_chain(slice);
             } else {
@@ -2050,6 +2116,9 @@ pub trait DataActor {
         let topic = defi::switchboard::get_defi_blocks_topic(chain);
 
         let handler = TypedHandler::from(move |block: &Block| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_block(block);
             } else {
@@ -2075,6 +2144,9 @@ pub trait DataActor {
         let topic = defi::switchboard::get_defi_pool_topic(instrument_id);
 
         let handler = TypedHandler::from(move |pool: &Pool| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_pool(pool);
             } else {
@@ -2107,6 +2179,9 @@ pub trait DataActor {
         let topic = defi::switchboard::get_defi_pool_swaps_topic(instrument_id);
 
         let handler = TypedHandler::from(move |swap: &PoolSwap| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_pool_swap(swap);
             } else {
@@ -2139,6 +2214,9 @@ pub trait DataActor {
         let topic = defi::switchboard::get_defi_liquidity_topic(instrument_id);
 
         let handler = TypedHandler::from(move |update: &PoolLiquidityUpdate| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_pool_liquidity_update(update);
             } else {
@@ -2171,6 +2249,9 @@ pub trait DataActor {
         let topic = defi::switchboard::get_defi_collect_topic(instrument_id);
 
         let handler = TypedHandler::from(move |collect: &PoolFeeCollect| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_pool_fee_collect(collect);
             } else {
@@ -2203,6 +2284,9 @@ pub trait DataActor {
         let topic = defi::switchboard::get_defi_flash_topic(instrument_id);
 
         let handler = TypedHandler::from(move |flash: &PoolFlash| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_pool_flash(flash);
             } else {
@@ -2591,6 +2675,9 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &CustomDataResponse| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_data_response(resp);
             } else {
@@ -2629,6 +2716,9 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &InstrumentResponse| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_instrument_response(resp);
             } else {
@@ -2666,6 +2756,9 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &InstrumentsResponse| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_instruments_response(resp);
             } else {
@@ -2702,6 +2795,9 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &BookResponse| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_book_response(resp);
             } else {
@@ -2739,6 +2835,9 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &BookDeltasResponse| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_book_deltas_response(resp);
             } else {
@@ -2780,6 +2879,9 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &BookDepthResponse| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_book_depth_response(resp);
             } else {
@@ -2820,6 +2922,9 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &QuotesResponse| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_quotes_response(resp);
             } else {
@@ -2859,6 +2964,9 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &TradesResponse| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_trades_response(resp);
             } else {
@@ -2898,6 +3006,9 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &BarsResponse| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_bars_response(resp);
             } else {
@@ -2937,6 +3048,9 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let handler = ShareableMessageHandler::from_typed(move |resp: &FundingRatesResponse| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_funding_rates_response(resp);
             } else {
@@ -3038,6 +3152,9 @@ where
         // Register default time event handler for this actor
         let actor_id = self.core().actor_id().inner();
         let callback = TimeEventCallback::from(move |event: TimeEvent| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
             if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
                 actor.handle_time_event(&event);
             } else {

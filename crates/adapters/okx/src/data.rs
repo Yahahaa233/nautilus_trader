@@ -5320,7 +5320,15 @@ mod tests {
         use futures_util::SinkExt;
         use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-        let http_addr = start_refresh_server(spot_refresh_state()).await;
+        let mut instrument_payload = test_payload("http_get_instruments_spot.json");
+        instrument_payload["data"][0]["instId"] = json!("BTC-USDT");
+        instrument_payload["data"][0]["quoteCcy"] = json!("USDT");
+        instrument_payload["data"][0]["tickSz"] = json!("0.01");
+        let http_addr = start_refresh_server(RefreshServerState {
+            instruments_payload: Arc::new(tokio::sync::Mutex::new(instrument_payload)),
+            ..RefreshServerState::default()
+        })
+        .await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let websocket_addr = listener.local_addr().unwrap();
         let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -5384,6 +5392,13 @@ mod tests {
         };
         let mut client = OKXDataClient::new(*OKX_CLIENT_ID, config).unwrap();
         client.connect().await.unwrap();
+        client
+            .ws_public
+            .as_ref()
+            .unwrap()
+            .subscribe_quotes(InstrumentId::from("BTC-USDT.OKX"))
+            .await
+            .unwrap();
         wait_until_async(
             || async {
                 client
@@ -5432,7 +5447,7 @@ mod tests {
             quotes
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| panic!("actual socket release did not publish both quotes: public_state={:?}, instruments={:?}, socket={:?}", client.public_stream_state.lock().snapshot(), client.instruments_by_symbol.load().keys().collect::<Vec<_>>(), client.ws_public.as_ref().unwrap().running_checkpoint_inventory()));
         assert_eq!(quotes[0].bid_price.to_string(), "8476.97");
         assert_eq!(quotes[1].bid_price.to_string(), "8477.97");
         client.disconnect().await.unwrap();

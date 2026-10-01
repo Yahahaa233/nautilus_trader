@@ -72,9 +72,16 @@ pub struct DispatchCompletionProof {
     run_id: String,
     input_sequence: u64,
     root_sequence: u64,
+    current_root_only: bool,
 }
 
 impl DispatchCompletionProof {
+    /// True for a current-root cut; historical gaps remain unresolved.
+    #[must_use]
+    pub fn current_root_only(&self) -> bool {
+        self.current_root_only
+    }
+
     #[must_use]
     pub fn run_id(&self) -> &str {
         &self.run_id
@@ -151,6 +158,7 @@ struct State {
     completed_root: u64,
     completed_input: Option<u64>,
     proof_invalidated: bool,
+    boundary_invalidated: bool,
     stack: Vec<DispatchToken>,
     failure: Option<String>,
     sink: Sink,
@@ -181,6 +189,7 @@ impl DispatchObserver {
             completed_root: 0,
             completed_input: None,
             proof_invalidated: false,
+            boundary_invalidated: false,
             stack: Vec::new(),
             failure: None,
             sink: Box::new(sink),
@@ -252,6 +261,7 @@ impl DispatchObserver {
         if outermost {
             state.completed_root = token.root_sequence;
             state.completed_input = Some(token.input_sequence);
+            state.boundary_invalidated = false;
         }
         Ok(())
     }
@@ -290,6 +300,7 @@ impl DispatchObserver {
         };
         state.write(&record)?;
         state.proof_invalidated = true;
+        state.boundary_invalidated = true;
         Ok(())
     }
 
@@ -330,6 +341,7 @@ impl DispatchObserver {
         state.next_input = next_input;
         state.next_root = next_root;
         state.proof_invalidated = true;
+        state.boundary_invalidated = true;
         Ok(())
     }
 
@@ -367,6 +379,32 @@ impl DispatchObserver {
                 run_id: state.run_id.clone(),
                 input_sequence,
                 root_sequence: state.completed_root,
+                current_root_only: false,
+            }))
+    }
+
+    /// Returns evidence for only the latest actually completed root. This does
+    /// not repair historical coverage or infer prior queue/callback state.
+    /// A checkpoint caller must capture the complete native inventory separately.
+    ///
+    /// # Errors
+    /// Refuses active callbacks, discarded/uncovered work after the latest root,
+    /// reentrancy or a failed durable observer.
+    pub fn completed_root_boundary_proof(&self) -> Result<Option<DispatchCompletionProof>> {
+        let state = self.0.try_borrow().context("dispatch observer reentered")?;
+        state.check()?;
+        if !state.stack.is_empty() || state.boundary_invalidated {
+            return Ok(None);
+        }
+        Ok(state
+            .completed_input
+            .map(|input_sequence| DispatchCompletionProof {
+                observer: self.clone(),
+                observer_id: state.id,
+                run_id: state.run_id.clone(),
+                input_sequence,
+                root_sequence: state.completed_root,
+                current_root_only: true,
             }))
     }
 
@@ -423,7 +461,7 @@ impl State {
             "dispatch input proof mismatch"
         );
         ensure!(
-            !self.proof_invalidated,
+            !self.boundary_invalidated && (proof.current_root_only || !self.proof_invalidated),
             "dispatch completion proof invalidated"
         );
         ensure!(proof.run_id == self.run_id, "dispatch run proof mismatch");
@@ -452,6 +490,32 @@ mod tests {
             payload: serde_json::json!({"event":"fixture"}),
             batch_index: None,
         }
+    }
+
+    #[test]
+    fn completed_root_cut_preserves_historical_gap_and_never_reuses_a_stale_boundary() {
+        let observer = DispatchObserver::new("cut-only".into(), |_| Ok(())).unwrap();
+        observer.record_uncovered("startup".into()).unwrap();
+        assert!(observer.completed_root_boundary_proof().unwrap().is_none());
+        let root = observer.begin(input()).unwrap();
+        observer.complete(&root).unwrap();
+        assert!(observer.completion_proof().unwrap().is_none());
+        let cut = observer.completed_root_boundary_proof().unwrap().unwrap();
+        assert!(cut.current_root_only());
+        cut.verify().unwrap();
+        observer.record_uncovered("maintenance".into()).unwrap();
+        assert!(cut.verify().is_err());
+        assert!(observer.completed_root_boundary_proof().unwrap().is_none());
+        let next = observer.begin(input()).unwrap();
+        observer.complete(&next).unwrap();
+        assert!(observer.completion_proof().unwrap().is_none());
+        assert!(cut.verify().is_err());
+        observer
+            .completed_root_boundary_proof()
+            .unwrap()
+            .unwrap()
+            .verify()
+            .unwrap();
     }
 
     #[test]

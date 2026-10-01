@@ -80,6 +80,13 @@ impl NodeDispatchObserver {
         self.observer.completion_proof()
     }
 
+    /// Current-root cut only; unresolved historical coverage remains in `coverage`.
+    /// # Errors
+    /// Refuses changed, active or failed dispatch boundaries.
+    pub fn completed_root_boundary_proof(&self) -> Result<Option<DispatchCompletionProof>> {
+        self.observer.completed_root_boundary_proof()
+    }
+
     /// Records a coverage gap for a path that has not yet got a replay codec.
     /// This is durable evidence of an uncovered path, never a successful
     /// dispatch or a recovery permit.
