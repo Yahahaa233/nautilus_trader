@@ -201,18 +201,68 @@ pub struct RunningCheckpointInventory {
     execution_authorized: bool,
 }
 
+impl RunningCheckpointInventory {
+    #[must_use]
+    pub const fn startup_reconciliation(&self) -> Option<&super::StartupReconciliationObservation> {
+        self.startup_reconciliation.as_ref()
+    }
+    #[must_use]
+    pub const fn node_instance_id(&self) -> nautilus_core::UUID4 {
+        self.node_instance_id
+    }
+    #[must_use]
+    pub const fn captured_at_ns(&self) -> u64 {
+        self.captured_at_ns
+    }
+    #[must_use]
+    pub fn recovery_frontier(&self) -> Option<&crate::runner_recovery::RunnerRecoveryWatermark> {
+        self.recovery_frontier.as_ref()
+    }
+    #[must_use]
+    pub const fn empty_bootstrap(&self) -> Option<&super::EmptyBootstrapRecoveryReceipt> {
+        self.empty_bootstrap.as_ref()
+    }
+    #[must_use]
+    pub const fn dispatch_coverage(&self) -> &serde_json::Value {
+        &self.dispatch_coverage
+    }
+    #[must_use]
+    pub const fn registered_timers(&self) -> &BTreeMap<String, serde_json::Value> {
+        &self.timers
+    }
+}
+
 /// Sealed borrowed boundary. Applications cannot construct or retain this value.
 /// Its proof, seven queues, cache and component state share one native freeze.
-#[derive(Debug)]
 pub struct RunningCheckpointBoundary<'a> {
     proof: &'a DispatchCompletionProof,
     pending: &'a RunnerPendingSnapshot,
     inventory: &'a RunningCheckpointInventory,
     cache: &'a Cache,
     components: &'a CollectedComponentState,
+    verify_frozen: &'a dyn Fn() -> Result<()>,
+}
+
+impl Debug for RunningCheckpointBoundary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunningCheckpointBoundary")
+            .field("proof", &self.proof)
+            .field("pending", &self.pending)
+            .field("inventory", &self.inventory)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RunningCheckpointBoundary<'_> {
+    /// Rechecks actual native registrations, adapters, timers, queues and same
+    /// completed root while this borrowed boundary's freeze remains held.
+    ///
+    /// # Errors
+    /// Refuses any changed or failed part of the actual native boundary.
+    pub fn verify(&self) -> Result<()> {
+        (self.verify_frozen)()
+    }
+
     #[must_use]
     pub const fn completion_proof(&self) -> &DispatchCompletionProof {
         self.proof
@@ -235,19 +285,19 @@ impl RunningCheckpointBoundary<'_> {
     }
 }
 
-type Collect = dyn Fn(&RunningCheckpointBoundary<'_>) -> Result<Box<dyn Any>>;
-type Persist = dyn Fn(Box<dyn Any>) -> Result<()>;
-type Fence = dyn Fn(&str);
+pub(super) type Collect = dyn Fn(&RunningCheckpointBoundary<'_>) -> Result<Box<dyn Any>>;
+pub(super) type Persist = dyn Fn(&RunningCheckpointBoundary<'_>, Box<dyn Any>) -> Result<()>;
+pub(super) type Fence = dyn Fn(&str);
 
 pub(super) struct RunningCheckpointRegistration {
-    registry: Rc<RunnerRecoveryCodecRegistry>,
-    schedule: RunningCheckpointSchedule,
-    collect: Rc<Collect>,
-    persist: Rc<Persist>,
-    fence: Rc<Fence>,
-    last_root: u64,
-    last_request: u64,
-    last_capture: dst::time::Instant,
+    pub(super) registry: Rc<RunnerRecoveryCodecRegistry>,
+    pub(super) schedule: RunningCheckpointSchedule,
+    pub(super) collect: Rc<Collect>,
+    pub(super) persist: Rc<Persist>,
+    pub(super) fence: Rc<Fence>,
+    pub(super) last_root: u64,
+    pub(super) last_request: u64,
+    pub(super) last_capture: dst::time::Instant,
 }
 
 impl Debug for RunningCheckpointRegistration {
@@ -301,7 +351,7 @@ impl LiveNode {
             registry,
             schedule,
             collect: Rc::new(move |boundary| Ok(Box::new(collect(boundary)?) as Box<dyn Any>)),
-            persist: Rc::new(move |value| {
+            persist: Rc::new(move |_, value| {
                 let value = value
                     .downcast::<T>()
                     .map_err(|_| anyhow::anyhow!("checkpoint payload type changed"))?;
@@ -323,7 +373,9 @@ impl LiveNode {
         let Some(registration) = self.running_checkpoint.as_ref() else {
             return Ok(());
         };
-        if self.state() != NodeState::Running || self.handle.should_stop() {
+        if !matches!(self.state(), NodeState::Running | NodeState::Observing)
+            || self.handle.should_stop()
+        {
             return Ok(());
         }
         let observer = self
@@ -361,6 +413,7 @@ impl LiveNode {
             registration.fence.clone(),
         );
         let ingress = self.handle.ingress_gate();
+        let capture_state = self.state();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
             ensure!(
                 !pending_report_tasks,
@@ -421,7 +474,7 @@ impl LiveNode {
             recovery_quiescence::with_running_registered_timer_inventory(
                 &self.kernel.clock,
                 &self.kernel.trader,
-                |timers, timer_state, verify_timers| {
+                |timers, timer_state, verify_timers, _| {
                     let guard = ingress.freeze()?;
                     let coverage = observer.coverage()?;
                     proof.verify()?;
@@ -473,7 +526,11 @@ impl LiveNode {
                             }
                             let inventory = RunningCheckpointInventory {
                                 profile: "running_completed_root_local_bus_registered_live_timers.v1",
-                                node_state: "running",
+                                node_state: if capture_state == NodeState::Observing {
+                                    "observing"
+                                } else {
+                                    "running"
+                                },
                                 runner_counts,
                                 timer_counts: timers.clone(),
                                 timers: timer_state.clone(),
@@ -502,8 +559,7 @@ impl LiveNode {
                             };
                             let verify = || -> Result<()> {
                                 ensure!(
-                                    self.state() == NodeState::Running
-                                        && !self.handle.should_stop(),
+                                    self.state() == capture_state && !self.handle.should_stop(),
                                     "node lifecycle changed during checkpoint"
                                 );
                                 verify_timers()?;
@@ -539,15 +595,17 @@ impl LiveNode {
                                 Ok(())
                             };
                             verify()?;
-                            let value = collect(&RunningCheckpointBoundary {
+                            let boundary = RunningCheckpointBoundary {
                                 proof: &proof,
                                 pending: &pending,
                                 inventory: &inventory,
                                 cache: &cache,
                                 components: &components,
-                            })?;
+                                verify_frozen: &verify,
+                            };
+                            let value = collect(&boundary)?;
                             verify()?;
-                            persist(value)?;
+                            persist(&boundary, value)?;
                             verify()?;
                             guard.finish()?;
                             Ok(())

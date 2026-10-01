@@ -54,6 +54,15 @@ pub trait TimerCheckpoint: Debug {
     /// # Errors
     /// Reopens production only on the same verified boundary.
     fn finish(self: Box<Self>) -> anyhow::Result<()>;
+    /// Temporarily exposes actual time for independent freshness checks while
+    /// producer admission stays frozen. It never changes the underlying clock.
+    fn pause_read_view(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Restores the same capture-only time view before comparing on_save state.
+    fn resume_read_view(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]

@@ -43,6 +43,7 @@ use crate::{
 #[derive(Debug)]
 pub struct LiveClock {
     checkpoint_gate: super::checkpoint::CheckpointGate,
+    checkpoint_read_time: std::rc::Rc<std::cell::Cell<Option<UnixNanos>>>,
     time: &'static AtomicTime,
     timers: BTreeMap<Ustr, LiveTimer>,
     callbacks: CallbackRegistry,
@@ -56,6 +57,7 @@ impl LiveClock {
     pub fn new(sender: Option<Arc<dyn TimeEventSender>>) -> Self {
         Self {
             checkpoint_gate: Default::default(),
+            checkpoint_read_time: Default::default(),
             time: get_atomic_clock_realtime(),
             timers: BTreeMap::new(),
             callbacks: CallbackRegistry::new(),
@@ -91,6 +93,8 @@ struct LiveClockCheckpoint {
     frozen: super::checkpoint::FrozenCallbacks,
     inventory: serde_json::Value,
     inspectors: Vec<TimerInspector>,
+    read_time: std::rc::Rc<std::cell::Cell<Option<UnixNanos>>>,
+    captured_time: UnixNanos,
 }
 impl std::fmt::Debug for LiveClockCheckpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -113,14 +117,36 @@ impl crate::clock::TimerCheckpoint for LiveClockCheckpoint {
     fn verify(&self) -> anyhow::Result<()> {
         self.frozen.verify()?;
         anyhow::ensure!(
+            self.read_time.get() == Some(self.captured_time),
+            "clock checkpoint read view changed"
+        );
+        anyhow::ensure!(
             running_timer_inventory(&self.inspectors)? == self.inventory,
             "registered timer state changed during checkpoint"
         );
         self.frozen.verify()
     }
+    fn pause_read_view(&self) -> anyhow::Result<()> {
+        self.verify()?;
+        self.read_time.set(None);
+        Ok(())
+    }
+    fn resume_read_view(&self) -> anyhow::Result<()> {
+        self.frozen.verify()?;
+        anyhow::ensure!(
+            self.read_time.get().is_none(),
+            "actual clock read scope changed"
+        );
+        self.read_time.set(Some(self.captured_time));
+        self.verify()
+    }
     fn finish(self: Box<Self>) -> anyhow::Result<()> {
         self.verify()?;
-        self.frozen.finish()
+        let read_time = self.read_time.clone();
+        self.frozen.finish()?;
+        // Do not set or rewind AtomicTime. Readers resume the actual real clock.
+        read_time.set(None);
+        Ok(())
     }
 }
 
@@ -137,6 +163,12 @@ impl Clock for LiveClock {
         &self,
     ) -> anyhow::Result<Box<dyn crate::clock::TimerCheckpoint>> {
         let frozen = self.checkpoint_gate.freeze()?;
+        anyhow::ensure!(
+            self.checkpoint_read_time.get().is_none(),
+            "clock checkpoint read view already active"
+        );
+        let captured_time = self.time.get_time_ns();
+        self.checkpoint_read_time.set(Some(captured_time));
         let inspectors = self
             .timers
             .values()
@@ -148,23 +180,34 @@ impl Clock for LiveClock {
             frozen,
             inventory,
             inspectors,
+            read_time: self.checkpoint_read_time.clone(),
+            captured_time,
         }))
     }
 
     fn timestamp_ns(&self) -> UnixNanos {
-        self.time.get_time_ns()
+        self.checkpoint_read_time
+            .get()
+            .unwrap_or_else(|| self.time.get_time_ns())
     }
 
     fn timestamp_us(&self) -> u64 {
-        self.time.get_time_us()
+        self.checkpoint_read_time
+            .get()
+            .map_or_else(|| self.time.get_time_us(), |time| time.as_u64() / 1_000)
     }
 
     fn timestamp_ms(&self) -> u64 {
-        self.time.get_time_ms()
+        self.checkpoint_read_time
+            .get()
+            .map_or_else(|| self.time.get_time_ms(), |time| time.as_u64() / 1_000_000)
     }
 
     fn timestamp(&self) -> f64 {
-        self.time.get_time()
+        self.checkpoint_read_time.get().map_or_else(
+            || self.time.get_time(),
+            |time| time.as_u64() as f64 / 1_000_000_000.0,
+        )
     }
 
     fn timer_names(&self) -> Vec<&str> {
@@ -507,6 +550,7 @@ mod tests {
             )
             .unwrap();
         let guard = clock.freeze_running_timer_checkpoint().unwrap();
+        let read_time = clock.timestamp_ns();
         assert_eq!(
             guard.inventory()["timers"][0]["callback_kind"],
             "registered_owner_thread"
@@ -517,8 +561,37 @@ mod tests {
             "frozen actual timer emitted a callback"
         );
         guard.verify().unwrap();
+        assert_eq!(
+            clock.timestamp_ns(),
+            read_time,
+            "component save reads must share the actual boundary time"
+        );
+        assert!(
+            get_atomic_clock_realtime().get_time_ns() > read_time,
+            "underlying actual clock was not advanced by the read view"
+        );
         assert_eq!(callback_count.get(), 0);
+        guard.pause_read_view().unwrap();
+        assert!(
+            clock.timestamp_ns() > read_time,
+            "independent freshness checks must see actual now"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "actual time reads must not open timer producers"
+        );
+        guard.resume_read_view().unwrap();
+        assert_eq!(
+            clock.timestamp_ns(),
+            read_time,
+            "only capture reads resume the same boundary view"
+        );
+        guard.verify().unwrap();
         guard.finish().unwrap();
+        assert!(
+            clock.timestamp_ns() > read_time,
+            "release must resume actual time without rollback"
+        );
         let event = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(event.event().ts_event, due);
         event.dispatch();

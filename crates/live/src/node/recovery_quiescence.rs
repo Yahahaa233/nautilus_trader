@@ -14,6 +14,7 @@ pub(super) fn with_running_registered_timer_inventory<T>(
         &std::collections::BTreeMap<String, u64>,
         &std::collections::BTreeMap<String, serde_json::Value>,
         &dyn Fn() -> Result<()>,
+        &dyn Fn(&dyn Fn() -> Result<()>) -> Result<()>,
     ) -> Result<T>,
 ) -> Result<T> {
     let trader = trader
@@ -37,10 +38,17 @@ pub(super) fn with_running_registered_timer_inventory<T>(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut guards = Vec::new();
+    let mut guards: Vec<Box<dyn nautilus_common::clock::TimerCheckpoint>> = Vec::new();
     let mut counts = std::collections::BTreeMap::new();
     let mut inventories = std::collections::BTreeMap::new();
-    for (id, clock) in &held {
+    let mut frozen_clocks = std::collections::BTreeMap::<usize, usize>::new();
+    for (index, (id, clock)) in held.iter().enumerate() {
+        let address = Rc::as_ptr(&clocks[index].1) as *const () as usize;
+        if let Some(guard_index) = frozen_clocks.get(&address) {
+            counts.insert((*id).clone(), clock.timer_count() as u64);
+            inventories.insert((*id).clone(), guards[*guard_index].inventory().clone());
+            continue;
+        }
         let kind = (**clock).type_id();
         ensure!(
             kind == TypeId::of::<nautilus_common::clock::TestClock>()
@@ -54,6 +62,7 @@ pub(super) fn with_running_registered_timer_inventory<T>(
         let guard = clock.freeze_running_timer_checkpoint()?;
         counts.insert((*id).clone(), clock.timer_count() as u64);
         inventories.insert((*id).clone(), guard.inventory().clone());
+        frozen_clocks.insert(address, guards.len());
         guards.push(guard);
     }
     let verify = || -> Result<()> {
@@ -72,8 +81,20 @@ pub(super) fn with_running_registered_timer_inventory<T>(
         }
         Ok(())
     };
+    let with_actual_clock_reads = |read: &dyn Fn() -> Result<()>| -> Result<()> {
+        verify()?;
+        for guard in &guards {
+            guard.pause_read_view()?;
+        }
+        let result = read();
+        for guard in &guards {
+            guard.resume_read_view()?;
+        }
+        verify()?;
+        result
+    };
     verify()?;
-    let result = capture(&counts, &inventories, &verify)?;
+    let result = capture(&counts, &inventories, &verify, &with_actual_clock_reads)?;
     verify()?;
     for guard in guards {
         guard.finish()?;

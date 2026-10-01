@@ -68,6 +68,8 @@ pub enum NodeState {
     Running = 2,
     ShuttingDown = 3,
     Stopped = 4,
+    /// Actual clients and cache run while restored strategy admission is closed.
+    Observing = 5,
 }
 
 impl NodeState {
@@ -75,7 +77,7 @@ impl NodeState {
     ///
     /// # Panics
     ///
-    /// Panics if the value is not a valid `NodeState` discriminant (0-4).
+    /// Panics if the value is not a valid `NodeState` discriminant (0-5).
     #[must_use]
     pub const fn from_u8(value: u8) -> Self {
         match value {
@@ -84,6 +86,7 @@ impl NodeState {
             2 => Self::Running,
             3 => Self::ShuttingDown,
             4 => Self::Stopped,
+            5 => Self::Observing,
             _ => panic!("Invalid NodeState value"),
         }
     }
@@ -229,6 +232,34 @@ impl LiveNodeHandle {
         }) {
             Ok(_) => RunningTransition::Entered,
             Err(control) if control == (NodeState::Starting.as_u8() | STOP_REQUESTED) => {
+                RunningTransition::StopRequested
+            }
+            Err(control) => RunningTransition::Invalid(control),
+        }
+    }
+
+    #[cfg(feature = "dispatch-observer")]
+    pub(super) fn try_set_observing(&self) -> RunningTransition {
+        self.try_transition(NodeState::Starting, NodeState::Observing)
+    }
+
+    #[cfg(feature = "dispatch-observer")]
+    pub(super) fn try_release_observing(&self) -> RunningTransition {
+        self.try_transition(NodeState::Observing, NodeState::Running)
+    }
+
+    #[cfg(feature = "dispatch-observer")]
+    fn try_transition(&self, from: NodeState, to: NodeState) -> RunningTransition {
+        match self.ingress.with_lifecycle_transition(|| {
+            self.control.compare_exchange(
+                from.as_u8(),
+                to.as_u8(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+        }) {
+            Ok(_) => RunningTransition::Entered,
+            Err(control) if control == (from.as_u8() | STOP_REQUESTED) => {
                 RunningTransition::StopRequested
             }
             Err(control) => RunningTransition::Invalid(control),

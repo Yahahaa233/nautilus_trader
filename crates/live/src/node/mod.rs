@@ -159,6 +159,12 @@ mod recovery_quiescence;
 #[cfg(feature = "dispatch-observer")]
 pub use recovery_quiescence::{EmptyBootstrapRecoveryReceipt, PausedRecoveryInventory};
 #[cfg(feature = "dispatch-observer")]
+mod recovery_observation;
+#[cfg(feature = "dispatch-observer")]
+pub use recovery_observation::{
+    RecoveryObservationBoundary, RecoveryReleaseBoundary, RecoveryStartupBoundary,
+};
+#[cfg(feature = "dispatch-observer")]
 mod running_checkpoint;
 #[cfg(feature = "dispatch-observer")]
 pub use running_checkpoint::{
@@ -222,6 +228,8 @@ pub struct LiveNode {
     recovery_empty_bootstrap: Option<EmptyBootstrapRecoveryReceipt>,
     #[cfg(feature = "dispatch-observer")]
     running_checkpoint: Option<running_checkpoint::RunningCheckpointRegistration>,
+    #[cfg(feature = "dispatch-observer")]
+    recovery_observation: Option<recovery_observation::RecoveryObservationRegistration>,
     runner: Option<AsyncRunner>,
     config: LiveNodeConfig,
     handle: LiveNodeHandle,
@@ -563,6 +571,13 @@ impl LiveNode {
 
     #[allow(clippy::unused_unit)]
     fn process_time_event(&self, message: TimeEventMessage) -> bool {
+        #[cfg(feature = "dispatch-observer")]
+        if self.state() == NodeState::Observing {
+            if let Err(error) = self.verify_observation_timer_admission(&message) {
+                self.fail_recovery_observation(&format!("{error:#}"));
+                return false;
+            }
+        }
         let guard = begin_node_dispatch!(self, Time, &message, false);
         let dispatched = AsyncRunner::handle_time_event(message);
         #[cfg(feature = "dispatch-observer")]
@@ -624,6 +639,8 @@ impl LiveNode {
             recovery_empty_bootstrap: None,
             #[cfg(feature = "dispatch-observer")]
             running_checkpoint: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_observation: None,
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
@@ -717,6 +734,8 @@ impl LiveNode {
             recovery_empty_bootstrap: None,
             #[cfg(feature = "dispatch-observer")]
             running_checkpoint: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_observation: None,
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
@@ -1805,7 +1824,17 @@ impl LiveNode {
     ///
     /// Returns an error if the node fails to start or encounters a runtime error.
     pub async fn run_with_mode(&mut self, mode: NodeRunMode) -> anyhow::Result<()> {
-        self.ensure_recovery_start_permitted()?;
+        #[cfg(feature = "dispatch-observer")]
+        let observing_recovery =
+            self.recovery_requires_release && self.recovery_observation.is_some();
+        #[cfg(not(feature = "dispatch-observer"))]
+        let observing_recovery = false;
+        if !observing_recovery {
+            self.ensure_recovery_start_permitted()?;
+        } else {
+            #[cfg(feature = "dispatch-observer")]
+            self.install_recovery_observation_admission()?;
+        }
         if self.state().is_running() {
             anyhow::bail!("Already running");
         }
@@ -1819,7 +1848,10 @@ impl LiveNode {
             "cannot run with undrained recovery dispatch queue"
         );
 
-        self.prepare_cache().await?;
+        // Authenticated recovery cache must not be flushed/reloaded at observation startup.
+        if !observing_recovery {
+            self.prepare_cache().await?;
+        }
 
         let Some(runner) = self.runner.take() else {
             anyhow::bail!("Runner already consumed - run() called twice");
@@ -2098,59 +2130,70 @@ impl LiveNode {
             return result;
         }
 
-        if let Err(e) = self.kernel.start_trader() {
-            let result = self.abort_after_trader_start_failure(e).await;
-            self.drain_channels(
-                &mut time_evt_rx,
-                &mut system_evt_rx,
-                &mut system_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-            );
-            log::info!("Event loop stopped");
-            return result;
-        }
+        if observing_recovery {
+            #[cfg(feature = "dispatch-observer")]
+            if let Err(error) = self.begin_recovery_input_observation() {
+                return self
+                    .abort_startup_with_error("Recovery input observation failed", error)
+                    .await;
+            }
+            self.process_system_events(startup_system_events);
+            self.process_system_commands(startup_system_commands);
+        } else {
+            if let Err(e) = self.kernel.start_trader() {
+                let result = self.abort_after_trader_start_failure(e).await;
+                self.drain_channels(
+                    &mut time_evt_rx,
+                    &mut system_evt_rx,
+                    &mut system_cmd_rx,
+                    &mut exec_evt_rx,
+                    &mut exec_cmd_rx,
+                    &mut data_evt_rx,
+                    &mut data_cmd_rx,
+                );
+                log::info!("Event loop stopped");
+                return result;
+            }
 
-        #[cfg(feature = "plugin")]
-        if let Err(e) = self.plugins.start_controllers() {
-            let result = self.abort_after_trader_start_failure(e).await;
-            self.drain_channels(
-                &mut time_evt_rx,
-                &mut system_evt_rx,
-                &mut system_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-            );
-            log::info!("Event loop stopped");
-            return result;
-        }
+            #[cfg(feature = "plugin")]
+            if let Err(e) = self.plugins.start_controllers() {
+                let result = self.abort_after_trader_start_failure(e).await;
+                self.drain_channels(
+                    &mut time_evt_rx,
+                    &mut system_evt_rx,
+                    &mut system_cmd_rx,
+                    &mut exec_evt_rx,
+                    &mut exec_cmd_rx,
+                    &mut data_evt_rx,
+                    &mut data_cmd_rx,
+                );
+                log::info!("Event loop stopped");
+                return result;
+            }
 
-        self.process_system_events(startup_system_events);
-        self.process_system_commands(startup_system_commands);
+            self.process_system_events(startup_system_events);
+            self.process_system_commands(startup_system_commands);
 
-        let finish_result = {
-            let mut receivers = RunnerReceivers {
-                time_evt: &mut time_evt_rx,
-                system_evt: &mut system_evt_rx,
-                system_cmd: &mut system_cmd_rx,
-                data_evt: &mut data_evt_rx,
-                data_cmd: &mut data_cmd_rx,
-                exec_evt: &mut exec_evt_rx,
-                exec_cmd: &mut exec_cmd_rx,
+            let finish_result = {
+                let mut receivers = RunnerReceivers {
+                    time_evt: &mut time_evt_rx,
+                    system_evt: &mut system_evt_rx,
+                    system_cmd: &mut system_cmd_rx,
+                    data_evt: &mut data_evt_rx,
+                    data_cmd: &mut data_cmd_rx,
+                    exec_evt: &mut exec_evt_rx,
+                    exec_cmd: &mut exec_cmd_rx,
+                };
+
+                self.finish_startup_trader(Some(&mut receivers)).await
             };
 
-            self.finish_startup_trader(Some(&mut receivers)).await
-        };
-
-        match finish_result {
-            Ok(true) => {}
-            result => {
-                log::info!("Event loop stopped");
-                return result.map(|_| ());
+            match finish_result {
+                Ok(true) => {}
+                result => {
+                    log::info!("Event loop stopped");
+                    return result.map(|_| ());
+                }
             }
         }
 
@@ -2323,7 +2366,7 @@ impl LiveNode {
         loop {
             let shutdown_deadline = self.shutdown_deadline;
             let is_shutting_down = self.state() == NodeState::ShuttingDown;
-            let is_running = self.state() == NodeState::Running;
+            let is_running = matches!(self.state(), NodeState::Running | NodeState::Observing);
 
             tokio::select! {
                 biased;
@@ -2698,7 +2741,7 @@ impl LiveNode {
             }
 
             #[cfg(feature = "dispatch-observer")]
-            if let Err(error) = self.checkpoint_after_completed_root(
+            if let Err(error) = self.observation_after_completed_root(
                 crate::runner::RunningReceivers {
                     time_evt_rx: &mut time_evt_rx,
                     system_evt_rx: &mut system_evt_rx,
@@ -7349,12 +7392,13 @@ mod tests {
     #[case(2, NodeState::Running)]
     #[case(3, NodeState::ShuttingDown)]
     #[case(4, NodeState::Stopped)]
+    #[case(5, NodeState::Observing)]
     fn test_node_state_from_u8_valid(#[case] value: u8, #[case] expected: NodeState) {
         assert_eq!(NodeState::from_u8(value), expected);
     }
 
     #[rstest]
-    #[case(5)]
+    #[case(6)]
     #[case(255)]
     #[should_panic(expected = "Invalid NodeState value")]
     fn test_node_state_from_u8_invalid_panics(#[case] value: u8) {
@@ -7369,6 +7413,7 @@ mod tests {
             NodeState::Running,
             NodeState::ShuttingDown,
             NodeState::Stopped,
+            NodeState::Observing,
         ] {
             assert_eq!(NodeState::from_u8(state.as_u8()), state);
         }
@@ -7381,6 +7426,7 @@ mod tests {
         assert!(NodeState::Running.is_running());
         assert!(!NodeState::ShuttingDown.is_running());
         assert!(!NodeState::Stopped.is_running());
+        assert!(!NodeState::Observing.is_running());
     }
 
     #[rstest]

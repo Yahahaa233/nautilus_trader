@@ -855,6 +855,24 @@ impl NautilusKernel {
     /// Returns an error if the trader or a registered component fails to start. A failed partial
     /// start is stopped immediately before the error is returned.
     pub fn start_trader(&mut self) -> anyhow::Result<()> {
+        self.start_trader_internal(false)
+    }
+
+    /// Starts already restored registered components without loading a second
+    /// database state over the authenticated recovery handoff. The node must
+    /// retain its recovery observation admission during this lifecycle call.
+    ///
+    /// # Errors
+    /// Returns component start/rollback errors, or refuses a missing phase gate.
+    pub fn start_trader_after_recovery_observation(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.exec_engine.borrow().recovery_observation_fenced(),
+            "recovered trader startup requires native observation execution admission"
+        );
+        self.start_trader_internal(true)
+    }
+
+    fn start_trader_internal(&mut self, already_restored: bool) -> anyhow::Result<()> {
         log::info!("Starting trader...");
 
         let load_state = self.config.load_state();
@@ -866,7 +884,7 @@ impl NautilusKernel {
             );
         }
 
-        if load_state {
+        if load_state && !already_restored {
             Trader::load_state(&self.trader)
                 .map_err(|e| anyhow::anyhow!("Failed to load actor and strategy state: {e:#}"))?;
         }
