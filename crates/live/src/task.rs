@@ -196,6 +196,14 @@ impl Default for TaskGroup {
 }
 
 impl TaskGroup {
+    /// Captures ownership of the actual task generation for checkpoint revalidation.
+    /// The owner must separately freeze the tasks' callback/request admission.
+    pub fn checkpoint_observation(&self) -> TaskGroupCheckpointObservation {
+        TaskGroupCheckpointObservation {
+            inner: self.inner.clone(),
+            generation: self.inner.current(),
+        }
+    }
     /// Creates an open initial task generation.
     #[must_use]
     pub fn new() -> Self {
@@ -370,6 +378,34 @@ impl TaskGroup {
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.current().tasks.len()
+    }
+}
+
+/// Actual task-generation inventory; no task is cancelled or removed for capture.
+#[derive(Clone, Debug)]
+pub struct TaskGroupCheckpointObservation {
+    inner: Arc<TaskGroupInner>,
+    generation: Arc<TaskGeneration>,
+}
+impl TaskGroupCheckpointObservation {
+    /// # Errors
+    /// Refuses replaced/closing generations, cancellation or recorded task failure.
+    pub fn inventory(&self) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            Arc::ptr_eq(&self.inner.current(), &self.generation)
+                && self.generation.is_open()
+                && !self.generation.cancellation.is_cancelled()
+                && !self.generation.force.is_cancelled(),
+            "task generation changed or closed"
+        );
+        anyhow::ensure!(
+            self.generation.failures.lock().is_empty(),
+            "adapter task failure recorded"
+        );
+        Ok(
+            serde_json::json!({"phase":"open","owned_tasks":self.generation.tasks.len(),
+            "recorded_failures":0,"cancelled":false}),
+        )
     }
 }
 

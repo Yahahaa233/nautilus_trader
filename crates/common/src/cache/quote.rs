@@ -45,6 +45,14 @@ pub struct QuoteCache {
 }
 
 impl QuoteCache {
+    /// Returns actual merge state while the adapter callback gate is frozen.
+    #[must_use]
+    pub fn checkpoint_entries(&self) -> Vec<QuoteTick> {
+        let mut quotes = self.quotes.values().copied().collect::<Vec<_>>();
+        quotes.sort_by_key(|quote| quote.instrument_id);
+        quotes
+    }
+
     /// Creates a new empty [`QuoteCache`].
     #[must_use]
     pub fn new() -> Self {

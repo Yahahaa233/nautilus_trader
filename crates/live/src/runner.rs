@@ -267,6 +267,56 @@ impl Debug for AsyncRunner {
     }
 }
 
+/// Borrowed receiver inventory owned by the running node loop. This cannot be
+/// constructed by an application and cannot replace the actual channel receivers.
+#[cfg(feature = "node")]
+pub(crate) struct RunningReceivers<'a> {
+    pub time_evt_rx: &'a mut SnapshotReceiver<TimeEventMessage>,
+    pub system_evt_rx: &'a mut SnapshotReceiver<SystemEvent>,
+    pub system_cmd_rx: &'a mut SnapshotReceiver<SystemCommand>,
+    pub exec_evt_rx: &'a mut SnapshotReceiver<ExecutionEvent>,
+    pub exec_cmd_rx: &'a mut SnapshotReceiver<TradingCommandMessage>,
+    pub data_evt_rx: &'a mut SnapshotReceiver<DataEvent>,
+    pub data_cmd_rx: &'a mut SnapshotReceiver<DataCommand>,
+}
+
+#[cfg(feature = "node")]
+impl RunningReceivers<'_> {
+    pub(crate) fn snapshot(
+        &mut self,
+        ingress: &IngressGate,
+        guard: &FrozenIngress,
+        registry: &crate::runner_recovery::RunnerRecoveryCodecRegistry,
+    ) -> anyhow::Result<crate::runner_recovery::RunnerPendingSnapshot> {
+        anyhow::ensure!(guard.belongs_to(ingress), "foreign running ingress guard");
+        guard.verify()?;
+        anyhow::ensure!(registry.is_sealed(), "capture registry is not sealed");
+        let mut entries = Vec::new();
+        macro_rules! capture {
+            ($field:ident, $variant:ident) => {
+                self.$field.stage()?;
+                for (ordinal, message) in self.$field.pending().enumerate() {
+                    guard.verify()?;
+                    entries.push(registry.encode(
+                        crate::runner_recovery::RunnerRecoveryEventRef::$variant(message),
+                        u64::try_from(ordinal)?,
+                    )?);
+                    guard.verify()?;
+                }
+            };
+        }
+        capture!(time_evt_rx, TimeEvent);
+        capture!(system_evt_rx, SystemEvent);
+        capture!(system_cmd_rx, SystemCommand);
+        capture!(exec_evt_rx, ExecutionEvent);
+        capture!(exec_cmd_rx, ExecutionCommand);
+        capture!(data_evt_rx, DataEvent);
+        capture!(data_cmd_rx, DataCommand);
+        guard.verify()?;
+        Ok(crate::runner_recovery::RunnerPendingSnapshot { entries })
+    }
+}
+
 impl AsyncRunner {
     /// Creates a new [`AsyncRunner`] instance.
     ///

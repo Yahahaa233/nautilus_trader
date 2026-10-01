@@ -18,6 +18,7 @@
 //! This module contains components that require the tokio async runtime and are
 //! used for live trading scenarios. These are gated behind the `live` feature flag.
 
+pub mod checkpoint;
 pub mod clock;
 pub mod dst;
 pub mod ingress;

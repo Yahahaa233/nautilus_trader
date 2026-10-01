@@ -23,7 +23,7 @@ use nautilus_model::{
 };
 
 /// Identifies an order when live execution tasks cannot access the engine cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OrderIdentity {
     /// The client order ID.
     pub client_order_id: ClientOrderId,
@@ -50,7 +50,7 @@ impl From<&OrderAny> for OrderIdentity {
 }
 
 /// Common order terms captured for live execution tasks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OrderContext {
     /// The order identity.
     pub identity: OrderIdentity,

@@ -23,6 +23,23 @@ mod execution;
 
 use std::fmt::{Debug, Display};
 
+/// A live adapter's owned, bounded freeze. Inventories are generated from its
+/// actual request/session state, never supplied by a checkpoint caller.
+pub trait RunningAdapterCheckpoint: Debug {
+    /// Replay state and the exact restricted adapter profile under this freeze.
+    fn inventory(&self) -> &serde_json::Value;
+    /// Revalidates the same freeze before and after durable persistence.
+    ///
+    /// # Errors
+    /// Refuses changes, rejected admission, and unhealthy session boundaries.
+    fn verify(&self) -> anyhow::Result<()>;
+    /// Reopens callback admission only after successful verification.
+    ///
+    /// # Errors
+    /// Refuses an invalid freeze; dropping unfinished guards fails closed.
+    fn finish(self: Box<Self>) -> anyhow::Result<()>;
+}
+
 pub use data::DataClient;
 pub use execution::{
     DEFAULT_POSITION_RECONCILIATION_TOLERANCE, ExecutionClient, generate_mass_status,

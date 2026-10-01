@@ -90,6 +90,12 @@ struct TimeEventCallbackEntry {
 pub(crate) struct TimeEventCallbackToken(Arc<TimeEventCallbackTokenInner>);
 
 impl TimeEventCallbackToken {
+    pub(crate) fn checkpoint_inventory(&self) -> serde_json::Value {
+        serde_json::json!({"binding_id":self.0.id.0.get(),
+            "state":self.0.state.load(Ordering::Acquire),
+            "owner_thread_only":true,"execution_authorized":false})
+    }
+
     fn register(callback: TimeEventCallback) -> Self {
         debug_assert!(callback.is_local());
         purge_closed_time_event_callbacks();
@@ -307,6 +313,22 @@ impl TimeEventMessage {
     #[must_use]
     pub const fn event(&self) -> &TimeEvent {
         &self.event
+    }
+
+    /// Actual callback binding evidence. Identifiers bind this process only and
+    /// cannot be deserialized into callback or execution authority.
+    #[must_use]
+    pub fn checkpoint_callback_binding(&self) -> serde_json::Value {
+        match &self.dispatch {
+            TimeEventDispatch::Direct(_) => serde_json::json!({"kind":"thread_safe_callback"}),
+            TimeEventDispatch::Registered(lease) => {
+                serde_json::json!({"kind":"registered_owner_thread",
+                "binding_id":lease.0.id.0.get(),"owner_thread_matches":lease.0.owner == thread::current().id()})
+            }
+            #[cfg(any(feature = "live", test))]
+            TimeEventDispatch::Cleanup(lease) => serde_json::json!({"kind":"registered_cleanup",
+                "binding_id":lease.0.id.0.get(),"owner_thread_matches":lease.0.owner == thread::current().id()}),
+        }
     }
 
     pub(crate) const fn registered(event: TimeEvent, lease: TimeEventCallbackLease) -> Self {

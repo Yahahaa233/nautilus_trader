@@ -84,6 +84,7 @@ const TASK_EXHAUSTED: u8 = 3;
 /// The timer runs on the runtime thread that created it and dispatches events across threads as needed.
 #[derive(Debug)]
 pub struct LiveTimer {
+    checkpoint_gate: super::checkpoint::CheckpointGate,
     /// The name of the timer.
     pub name: Ustr,
     /// The interval between timer events in nanoseconds.
@@ -104,6 +105,58 @@ pub struct LiveTimer {
 }
 
 impl LiveTimer {
+    pub(crate) fn with_checkpoint_gate(mut self, gate: super::checkpoint::CheckpointGate) -> Self {
+        self.checkpoint_gate = gate;
+        self
+    }
+
+    pub(crate) fn checkpoint_inspector(
+        &self,
+    ) -> anyhow::Result<Box<dyn Fn() -> anyhow::Result<serde_json::Value>>> {
+        anyhow::ensure!(
+            self.sender.is_some(),
+            "senderless timer checkpoint unsupported"
+        );
+        let state = self
+            .task_state
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("timer was not started"))?;
+        let next = self.next_time_ns.clone();
+        let name = self.name;
+        let interval = self.interval_ns.get();
+        let start = self.start_time_ns;
+        let stop = self.stop_time_ns;
+        let fire_immediately = self.fire_immediately;
+        let token = match &self.callback {
+            OwnerCallback::Registered { token, .. } => Some(token.clone()),
+            OwnerCallback::Direct(_) => None,
+            OwnerCallback::Senderless(_) => {
+                anyhow::bail!("senderless timer checkpoint unsupported")
+            }
+        };
+        Ok(Box::new(move || {
+            let status = state.status.load(atomic::Ordering::SeqCst);
+            anyhow::ensure!(
+                status == TASK_ACTIVE || status == TASK_EXHAUSTED,
+                "timer callback/lifecycle not quiescent"
+            );
+            let next = next.load(atomic::Ordering::SeqCst);
+            anyhow::ensure!(
+                next == state.next_time_ns.load(atomic::Ordering::SeqCst),
+                "timer published schedules disagree"
+            );
+            Ok(
+                serde_json::json!({"name":name,"interval_ns":interval,"start_time_ns":start,
+                    "stop_time_ns":stop,"next_time_ns":next,"fire_immediately":fire_immediately,
+                    "status":if status == TASK_ACTIVE {"active"} else {"exhausted"},
+                    "callback_kind":if token.is_some() {"registered_owner_thread"} else {"thread_safe_callback"},
+                    "binding":token.as_ref().map(TimeEventCallbackToken::checkpoint_inventory),
+                    "execution_authorized":false,
+                }),
+            )
+        }))
+    }
+
     /// Creates a new [`LiveTimer`] instance.
     ///
     /// # Panics
@@ -145,6 +198,7 @@ impl LiveTimer {
         };
 
         Self {
+            checkpoint_gate: Default::default(),
             name,
             interval_ns,
             start_time_ns,
@@ -280,6 +334,7 @@ impl LiveTimer {
         self.task_state = Some(task_state.clone());
 
         let sender = self.sender.clone();
+        let checkpoint_gate = self.checkpoint_gate.clone();
         let now_ns = clock.get_time_ns();
         let start = Instant::now() + timer_start_delay(next_time_ns, now_ns);
 
@@ -294,6 +349,8 @@ impl LiveTimer {
                 // enforced on the scheduled time (matching `TestTimer`), not on
                 // the wall-clock read used only for `ts_init`.
                 if !should_fire_scheduled_time(next_time_ns, stop_time_ns) {
+                    let (_, _checkpoint_callback) =
+                        checkpoint_gate.callback(std::future::ready(())).await;
                     if let (Some(sender), WorkerDispatch::Registered(token)) =
                         (sender.as_ref(), &worker_dispatch)
                         && let Some(lease) = token.acquire()
@@ -308,7 +365,7 @@ impl LiveTimer {
 
                 // `timer.tick` is cancellation safe, if the cancel branch completes
                 // first then no tick has been consumed (no event was ready).
-                timer.tick().await;
+                let (_, _checkpoint_callback) = checkpoint_gate.callback(timer.tick()).await;
                 let now_ns = clock.get_time_ns();
 
                 let event = TimeEvent::new(event_name, UUID4::new(), next_time_ns, now_ns);

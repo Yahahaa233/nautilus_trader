@@ -43,6 +43,21 @@ where
         self.inner.insert(key, dst::time::Instant::now());
     }
 
+    pub(crate) fn checkpoint_entries(
+        &self,
+        at: dst::time::Instant,
+    ) -> anyhow::Result<Vec<(&K, u64)>> {
+        self.inner
+            .iter()
+            .map(|(key, marked)| {
+                let elapsed = at
+                    .checked_duration_since(*marked)
+                    .ok_or_else(|| anyhow::anyhow!("recency mark follows checkpoint boundary"))?;
+                Ok((key, u64::try_from(elapsed.as_nanos())?))
+            })
+            .collect()
+    }
+
     #[must_use]
     pub(crate) fn contains_key(&self, key: &K) -> bool {
         self.inner.contains_key(key)

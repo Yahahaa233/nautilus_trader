@@ -178,6 +178,16 @@ impl LiveExecutionClient {
 
 #[async_trait(?Send)]
 impl ExecutionClient for LiveExecutionClient {
+    fn freeze_running_checkpoint(
+        &self,
+    ) -> anyhow::Result<Box<dyn nautilus_common::clients::RunningAdapterCheckpoint>> {
+        anyhow::ensure!(
+            self.pending_instruments.try_borrow()?.is_empty(),
+            "live execution instrument updates remain pending"
+        );
+        self.client.try_borrow()?.freeze_running_checkpoint()
+    }
+
     fn paused_recovery_inventory_profile(&self) -> anyhow::Result<&'static str> {
         self.verify_paused_recovery_inventory()?;
         self.client

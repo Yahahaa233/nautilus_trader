@@ -158,6 +158,12 @@ mod recovery;
 mod recovery_quiescence;
 #[cfg(feature = "dispatch-observer")]
 pub use recovery_quiescence::{EmptyBootstrapRecoveryReceipt, PausedRecoveryInventory};
+#[cfg(feature = "dispatch-observer")]
+mod running_checkpoint;
+#[cfg(feature = "dispatch-observer")]
+pub use running_checkpoint::{
+    RunningCheckpointBoundary, RunningCheckpointInventory, RunningCheckpointSchedule,
+};
 mod state;
 
 use builder::ExternalMessageBusIngress;
@@ -214,6 +220,8 @@ pub struct LiveNode {
     recovery_restored_components: Option<(Vec<String>, Vec<String>)>,
     #[cfg(feature = "dispatch-observer")]
     recovery_empty_bootstrap: Option<EmptyBootstrapRecoveryReceipt>,
+    #[cfg(feature = "dispatch-observer")]
+    running_checkpoint: Option<running_checkpoint::RunningCheckpointRegistration>,
     runner: Option<AsyncRunner>,
     config: LiveNodeConfig,
     handle: LiveNodeHandle,
@@ -614,6 +622,8 @@ impl LiveNode {
             recovery_restored_components: None,
             #[cfg(feature = "dispatch-observer")]
             recovery_empty_bootstrap: None,
+            #[cfg(feature = "dispatch-observer")]
+            running_checkpoint: None,
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
@@ -705,6 +715,8 @@ impl LiveNode {
             recovery_restored_components: None,
             #[cfg(feature = "dispatch-observer")]
             recovery_empty_bootstrap: None,
+            #[cfg(feature = "dispatch-observer")]
+            running_checkpoint: None,
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
@@ -2305,6 +2317,8 @@ impl LiveNode {
             .as_ref()
             .map(|config| QueueMonitor::new(config, metrics.snapshot()));
         let mut dispatches_since_yield = 0usize;
+        #[cfg(feature = "dispatch-observer")]
+        let mut checkpoint_error = None;
 
         loop {
             let shutdown_deadline = self.shutdown_deadline;
@@ -2683,6 +2697,25 @@ impl LiveNode {
                 }
             }
 
+            #[cfg(feature = "dispatch-observer")]
+            if let Err(error) = self.checkpoint_after_completed_root(
+                crate::runner::RunningReceivers {
+                    time_evt_rx: &mut time_evt_rx,
+                    system_evt_rx: &mut system_evt_rx,
+                    system_cmd_rx: &mut system_cmd_rx,
+                    exec_evt_rx: &mut exec_evt_rx,
+                    exec_cmd_rx: &mut exec_cmd_rx,
+                    data_evt_rx: &mut data_evt_rx,
+                    data_cmd_rx: &mut data_cmd_rx,
+                },
+                open_order_report_task.is_some()
+                    || targeted_order_report_task.is_some()
+                    || position_report_task.is_some(),
+            ) {
+                checkpoint_error = Some(error);
+                break;
+            }
+
             dispatches_since_yield += 1;
             if dispatches_since_yield >= DISPATCHES_PER_YIELD {
                 dispatches_since_yield = 0;
@@ -2716,6 +2749,11 @@ impl LiveNode {
         );
 
         log::info!("Event loop stopped");
+
+        #[cfg(feature = "dispatch-observer")]
+        if let Some(error) = checkpoint_error {
+            return Err(error);
+        }
 
         stop_result
     }

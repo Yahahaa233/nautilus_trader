@@ -180,6 +180,64 @@ impl Debug for ExecutionManager {
 }
 
 impl ExecutionManager {
+    /// Collects actual reconciliation/deduplication state at one monotonic instant.
+    /// Pending venue queries cannot be serialized as completed facts.
+    pub(crate) fn checkpoint_inventory(
+        &self,
+        at: dst::time::Instant,
+    ) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            self.order_query_pending.is_empty(),
+            "execution manager has pending venue queries"
+        );
+        let age = |instant: dst::time::Instant| -> anyhow::Result<u64> {
+            Ok(u64::try_from(
+                at.checked_duration_since(instant)
+                    .ok_or_else(|| anyhow::anyhow!("manager state follows checkpoint boundary"))?
+                    .as_nanos(),
+            )?)
+        };
+        let inflight = self
+            .order_inflight_checks
+            .iter()
+            .map(|(id, state)| {
+                Ok(serde_json::json!({"client_order_id":id,
+                "submitted_age_ns":age(state.submitted_at)?,
+                "retry_count":state.retry_count,
+                "last_query_age_ns":state.last_query_at.map(age).transpose()?}))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let positions = self
+            .position_recon
+            .iter()
+            .map(|(key, state)| {
+                serde_json::json!({"key":key,"retries":state.retries,
+                "report_shape":match state.report_shape {
+                    PositionReportShape::Unambiguous => "unambiguous",
+                    PositionReportShape::MultiLeg => "multi_leg",
+                }})
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::json!({
+            "schema":"NautilusExecutionManagerCheckpoint.v1",
+            "monotonic_offsets":"age_ns_at_common_boundary",
+            "order_activity":self.order_activity.checkpoint_entries(at)?,
+            "order_inflight_checks":inflight,
+            "order_query_recency":self.order_query_recency.checkpoint_entries(at)?,
+            "order_query_pending":[],
+            "order_recon_retries":self.order_recon_retries.iter().collect::<Vec<_>>(),
+            "order_coverage_unresolved":self.order_coverage_unresolved,
+            "order_coverage_warnings":self.order_coverage_warnings,
+            "order_lookback_warnings":self.order_lookback_warnings,
+            "fills_processed":self.fills_processed.checkpoint_entries(at)?,
+            "fills_recent":self.fills_recent.checkpoint_entries(at)?,
+            "position_activity":self.position_activity.checkpoint_entries(at)?,
+            "position_activity_revisions":self.position_activity_revisions.iter().collect::<Vec<_>>(),
+            "position_recon":positions,
+            "position_recon_tolerances":self.position_recon_tolerances,
+        }))
+    }
+
     /// Creates a new [`ExecutionManager`] instance.
     ///
     /// # Errors

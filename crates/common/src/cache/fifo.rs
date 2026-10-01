@@ -151,6 +151,12 @@ where
         self.order.clear();
         self.index.clear();
     }
+
+    /// Returns exact eviction order, newest first, for a frozen owner checkpoint.
+    #[must_use]
+    pub fn checkpoint_entries(&self) -> Vec<T> {
+        self.order.iter().cloned().collect()
+    }
 }
 
 impl<T, const N: usize> Default for FifoCache<T, N>
@@ -205,6 +211,26 @@ impl<K, V, const N: usize> FifoCacheMap<K, V, N>
 where
     K: Clone + Debug + Eq + Hash,
 {
+    /// Returns exact eviction order and values from a frozen owner checkpoint.
+    #[must_use]
+    pub fn checkpoint_entries(&self) -> Vec<(K, V)>
+    where
+        V: Clone,
+    {
+        self.order
+            .iter()
+            .map(|key| {
+                (
+                    key.clone(),
+                    self.index
+                        .get(key)
+                        .expect("FIFO index agrees with order")
+                        .clone(),
+                )
+            })
+            .collect()
+    }
+
     /// Creates a new empty [`FifoCacheMap`] with capacity `N`.
     ///
     /// # Panics

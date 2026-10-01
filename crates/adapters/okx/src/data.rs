@@ -110,9 +110,12 @@ pub struct OKXDataClient {
     http_client: OKXHttpClient,
     ws_public: Option<OKXWebSocketClient>,
     ws_business: Option<OKXWebSocketClient>,
-    is_connected: AtomicBool,
+    is_connected: Arc<AtomicBool>,
     transports_started: bool,
     tasks: TaskGroup,
+    checkpoint_gate: nautilus_common::live::checkpoint::CheckpointGate,
+    public_stream_state: Arc<parking_lot::Mutex<crate::checkpoint::DataStreamState>>,
+    business_stream_state: Arc<parking_lot::Mutex<crate::checkpoint::DataStreamState>>,
     data_sender: IngressSender<DataEvent>,
     // Shared instrument cache keyed by raw symbol so stream tasks, reconciliation,
     // and request paths all read and write one source of truth
@@ -138,6 +141,7 @@ impl OKXDataClient {
     ///
     /// Returns an error if the client fails to initialize.
     pub fn new(client_id: ClientId, config: OKXDataClientConfig) -> anyhow::Result<Self> {
+        let checkpoint_gate = nautilus_common::live::checkpoint::CheckpointGate::default();
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
         let api_key = config
@@ -182,6 +186,7 @@ impl OKXDataClient {
             )?
         };
 
+        let http_client = http_client.with_checkpoint_gate(checkpoint_gate.clone());
         let ws_public = OKXWebSocketClient::new(
             Some(config.ws_public_url()),
             None,
@@ -200,6 +205,7 @@ impl OKXDataClient {
             "okx-public-data-streams",
         ));
 
+        let ws_public = ws_public.with_checkpoint_gate(checkpoint_gate.clone());
         let ws_business = if config.requires_business_ws() {
             let ws = OKXWebSocketClient::new(
                 Some(config.ws_business_url()),
@@ -218,7 +224,7 @@ impl OKXDataClient {
                 Some(*OKX_VENUE),
                 "okx-business-data-streams",
             ));
-            Some(ws)
+            Some(ws.with_checkpoint_gate(checkpoint_gate.clone()))
         } else {
             None
         };
@@ -238,9 +244,12 @@ impl OKXDataClient {
             http_client,
             ws_public: Some(ws_public),
             ws_business,
-            is_connected: AtomicBool::new(false),
+            is_connected: Arc::new(AtomicBool::new(false)),
             transports_started: false,
             tasks: TaskGroup::new(),
+            checkpoint_gate,
+            public_stream_state: Default::default(),
+            business_stream_state: Default::default(),
             data_sender,
             instruments_by_symbol: Arc::new(AtomicMap::new()),
             instrument_update_lock: Arc::new(InstrumentUpdateLock::default()),
@@ -295,6 +304,14 @@ impl OKXDataClient {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let Ok(checkpoint_request) = self.checkpoint_gate.enter_request() else {
+            log::error!("Data request refused during checkpoint");
+            return;
+        };
+        let fut = async move {
+            let _checkpoint_request = checkpoint_request;
+            fut.await
+        };
         self.recovery_pristine
             .store(false, std::sync::atomic::Ordering::Release);
         match self.tasks.spawner() {
@@ -324,6 +341,7 @@ impl OKXDataClient {
             return Ok(());
         }
 
+        let checkpoint_gate = self.checkpoint_gate.clone();
         let book_sync = self.book_sync.clone();
         let tasks = self
             .tasks
@@ -341,7 +359,7 @@ impl OKXDataClient {
                         log::debug!("Book health monitor task cancelled");
                         break;
                     }
-                    _ = interval.tick() => {
+                    (_, _checkpoint_callback) = checkpoint_gate.callback(interval.tick()) => {
                         handle_book_sync_signals(
                             book_sync.stale_books(threshold, Instant::now())
                         );
@@ -950,11 +968,11 @@ impl OKXDataClient {
             let cancel = tasks.cancellation_token();
             let snapshot_timeout = Duration::from_secs(self.config.book_snapshot_timeout_secs);
             let clock = self.clock;
+            let checkpoint_gate = self.checkpoint_gate.clone();
+            let stream_state = self.public_stream_state.clone();
 
             tasks
                 .spawn(async move {
-                    let mut quote_cache = QuoteCache::new();
-                    let mut funding_cache: AHashMap<Ustr, (Ustr, u64)> = AHashMap::new();
 
                     pin_mut!(stream);
 
@@ -965,7 +983,10 @@ impl OKXDataClient {
                                 log::debug!("Public websocket stream task cancelled");
                                 break;
                             }
-                            Some(message) = stream.next() => {
+                            (message, _checkpoint_callback) = checkpoint_gate.callback(stream.next()) => {
+                                let Some(message) = message else { break; };
+                                let mut stream_state = stream_state.lock();
+                                let crate::checkpoint::DataStreamState { quotes: quote_cache, funding: funding_cache } = &mut *stream_state;
                                 Self::handle_ws_message(
                                     message,
                                     &sender,
@@ -977,8 +998,8 @@ impl OKXDataClient {
                                     &book_sync,
                                     Some(&recovery_ws),
                                     business_ws.as_ref(),
-                                    &mut quote_cache,
-                                    &mut funding_cache,
+                                    quote_cache,
+                                    funding_cache,
                                     &idx_map,
                                     &greeks_subs,
                                     BookChannelScope::Public,
@@ -1028,11 +1049,11 @@ impl OKXDataClient {
             let cancel = tasks.cancellation_token();
             let snapshot_timeout = Duration::from_secs(self.config.book_snapshot_timeout_secs);
             let clock = self.clock;
+            let checkpoint_gate = self.checkpoint_gate.clone();
+            let stream_state = self.business_stream_state.clone();
 
             tasks
                 .spawn(async move {
-                    let mut quote_cache = QuoteCache::new();
-                    let mut funding_cache: AHashMap<Ustr, (Ustr, u64)> = AHashMap::new();
 
                     pin_mut!(stream);
 
@@ -1043,7 +1064,10 @@ impl OKXDataClient {
                                 log::debug!("Business websocket stream task cancelled");
                                 break;
                             }
-                            Some(message) = stream.next() => {
+                            (message, _checkpoint_callback) = checkpoint_gate.callback(stream.next()) => {
+                                let Some(message) = message else { break; };
+                                let mut stream_state = stream_state.lock();
+                                let crate::checkpoint::DataStreamState { quotes: quote_cache, funding: funding_cache } = &mut *stream_state;
                                 Self::handle_ws_message(
                                     message,
                                     &sender,
@@ -1055,8 +1079,8 @@ impl OKXDataClient {
                                     &book_sync,
                                     None,
                                     Some(&business_ws),
-                                    &mut quote_cache,
-                                    &mut funding_cache,
+                                    quote_cache,
+                                    funding_cache,
                                     &idx_map,
                                     &greeks_subs,
                                     BookChannelScope::Business,
@@ -1102,6 +1126,7 @@ impl OKXDataClient {
         let ws_business = self.ws_business.clone();
         let data_sender = self.data_sender.clone();
         let client_id = self.client_id;
+        let checkpoint_gate = self.checkpoint_gate.clone();
 
         tasks.spawn(async move {
             loop {
@@ -1114,6 +1139,7 @@ impl OKXDataClient {
                     () = &mut sleep => {}
                 }
 
+                let (_ready, _checkpoint_refresh) = checkpoint_gate.callback(std::future::ready(())).await;
                 let result = tokio::select! {
                     biased;
                     () = cancel.cancelled() => break,
@@ -1792,6 +1818,77 @@ async fn reconcile_instruments(
 
 #[async_trait::async_trait(?Send)]
 impl DataClient for OKXDataClient {
+    fn freeze_running_checkpoint(
+        &self,
+    ) -> anyhow::Result<Box<dyn nautilus_common::clients::RunningAdapterCheckpoint>> {
+        anyhow::ensure!(
+            self.is_connected.load(Ordering::Acquire),
+            "OKX running data checkpoint requires connected client"
+        );
+        let frozen = self.checkpoint_gate.freeze()?;
+        let public = self
+            .ws_public
+            .clone()
+            .context("OKX public socket missing")?;
+        let business = self.ws_business.clone();
+        public.stage_checkpoint_raw_input()?;
+        if let Some(socket) = &business {
+            socket.stage_checkpoint_raw_input()?;
+        }
+        let http = self.http_client.clone();
+        let connected = self.is_connected.clone();
+        let instruments = self.instruments_by_symbol.clone();
+        let update = self.instrument_update_lock.clone();
+        let books = self.book_channels.clone();
+        let book_sync = self.book_sync.clone();
+        let index = self.index_ticker_map.clone();
+        let greeks = self.option_greeks_subs.clone();
+        let summaries = self.option_summary_family_subs.clone();
+        let public_state = self.public_stream_state.clone();
+        let business_state = self.business_stream_state.clone();
+        let tasks = self.tasks.checkpoint_observation();
+        let expected_tasks = 1
+            + usize::from(business.is_some())
+            + usize::from(
+                self.config.book_stale_check_interval_secs > 0
+                    && self.config.book_stale_threshold_secs > 0,
+            )
+            + usize::from(self.config.update_instruments_interval_mins > 0);
+        let client_id = self.client_id;
+        Ok(Box::new(crate::checkpoint::OKXCheckpointGuard::new(
+            frozen,
+            move || {
+                anyhow::ensure!(
+                    connected.load(Ordering::Acquire),
+                    "OKX data client disconnected during checkpoint"
+                );
+                anyhow::ensure!(
+                    books.load().is_empty(),
+                    "OKX active order-book checkpoint unsupported"
+                );
+                book_sync.verify_empty_checkpoint_profile()?;
+                let tasks = tasks.inventory()?;
+                anyhow::ensure!(
+                    tasks["owned_tasks"].as_u64() == Some(expected_tasks as u64),
+                    "OKX data request/recovery tasks remain owned"
+                );
+                Ok(
+                    serde_json::json!({"profile":"okx_connected_data_quiescent_retained_inputs_no_books.v1",
+                        "client_id":client_id,"tasks":tasks,"public_socket":public.running_checkpoint_inventory()?,
+                        "business_socket":business.as_ref().map(OKXWebSocketClient::running_checkpoint_inventory).transpose()?,
+                        "http":http.running_checkpoint_inventory(),"instruments":&**instruments.load(),
+                        "instrument_write_sequence":update.write_seq.load(Ordering::SeqCst),
+                        "book_pipeline":"verified_empty_unsupported_active",
+                        "index_ticker_map":&**index.load(),"option_greeks_subscriptions":&**greeks.load(),
+                        "option_summary_family_subscriptions":&*summaries.lock(),
+                        "public_stream":public_state.lock().snapshot(),"business_stream":business_state.lock().snapshot(),
+                        "execution_authorized":false,
+                    }),
+                )
+            },
+        )?))
+    }
+
     fn paused_recovery_inventory_profile(&self) -> anyhow::Result<&'static str> {
         self.verify_paused_recovery_inventory()?;
         Ok("okx_fresh_disconnected_v1")

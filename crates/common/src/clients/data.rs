@@ -47,6 +47,16 @@ use crate::messages::defi::{
 /// allows implementations to hold non-Send state for any Python interop.
 #[async_trait(?Send)]
 pub trait DataClient {
+    /// Freezes actual running adapter work for a restricted checkpoint.
+    ///
+    /// # Errors
+    /// Unknown adapters are unsupported; connected status is insufficient.
+    fn freeze_running_checkpoint(
+        &self,
+    ) -> anyhow::Result<Box<dyn super::RunningAdapterCheckpoint>> {
+        anyhow::bail!("running data adapter checkpoint is unsupported")
+    }
+
     /// Returns the verified adapter-specific paused recovery profile.
     ///
     /// # Errors

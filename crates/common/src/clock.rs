@@ -46,7 +46,39 @@ use crate::timer::{
 /// Provides time access, timer scheduling, and callback registration.
 ///
 /// An active timer is one that has not expired.
+pub trait TimerCheckpoint: Debug {
+    fn inventory(&self) -> &serde_json::Value;
+    /// # Errors
+    /// Refuses callback, lifecycle or schedule changes across the frozen boundary.
+    fn verify(&self) -> anyhow::Result<()>;
+    /// # Errors
+    /// Reopens production only on the same verified boundary.
+    fn finish(self: Box<Self>) -> anyhow::Result<()>;
+}
+
+#[derive(Debug)]
+struct EmptyTimerCheckpoint(serde_json::Value);
+impl TimerCheckpoint for EmptyTimerCheckpoint {
+    fn inventory(&self) -> &serde_json::Value {
+        &self.0
+    }
+    fn verify(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn finish(self: Box<Self>) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 pub trait Clock: Debug + Any {
+    /// Freezes actual native timer production, retaining registered schedules.
+    ///
+    /// # Errors
+    /// Unknown implementations cannot establish timer checkpoint coverage.
+    fn freeze_running_timer_checkpoint(&self) -> anyhow::Result<Box<dyn TimerCheckpoint>> {
+        anyhow::bail!("clock running timer checkpoint unsupported")
+    }
+
     /// Returns the current UTC timestamp.
     fn utc_now(&self) -> Timestamp {
         self.timestamp_ns().to_datetime_utc()
@@ -1076,6 +1108,16 @@ impl Deref for TestClock {
 }
 
 impl Clock for TestClock {
+    fn freeze_running_timer_checkpoint(&self) -> anyhow::Result<Box<dyn TimerCheckpoint>> {
+        anyhow::ensure!(
+            self.timer_count() == 0,
+            "active TestClock timer checkpoint unsupported"
+        );
+        Ok(Box::new(EmptyTimerCheckpoint(
+            serde_json::json!({"profile":"test_clock_empty.v1","timers":[]}),
+        )))
+    }
+
     fn timestamp_ns(&self) -> UnixNanos {
         self.time.get_time_ns()
     }

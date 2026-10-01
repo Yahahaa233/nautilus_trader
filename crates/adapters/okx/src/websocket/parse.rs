@@ -134,7 +134,7 @@ pub enum ParsedOrderEvent {
 }
 
 /// Snapshot of order state for detecting updates.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OrderStateSnapshot {
     pub venue_order_id: VenueOrderId,
     pub quantity: Quantity,

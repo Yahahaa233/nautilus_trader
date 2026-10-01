@@ -800,6 +800,7 @@ pub struct OKXResponse<T> {
 /// specific to OKX, such as request signing (for authenticated endpoints),
 /// forming request URLs, and deserializing responses into OKX specific data models.
 pub struct OKXRawHttpClient {
+    checkpoint_gate: nautilus_common::live::checkpoint::CheckpointGate,
     clock: &'static AtomicTime,
     base_url: String,
     client: HttpClient,
@@ -827,6 +828,13 @@ impl Debug for OKXRawHttpClient {
 }
 
 impl OKXRawHttpClient {
+    pub(crate) fn set_checkpoint_gate(
+        &mut self,
+        gate: nautilus_common::live::checkpoint::CheckpointGate,
+    ) {
+        self.checkpoint_gate = gate;
+    }
+
     fn rate_limiter_quotas() -> Vec<(String, Quota)> {
         vec![
             (OKX_GLOBAL_RATE_KEY.to_string(), *OKX_REST_QUOTA),
@@ -1066,6 +1074,7 @@ impl OKXRawHttpClient {
         let retry_manager = RetryManager::new(retry_config);
 
         Ok(Self {
+            checkpoint_gate: Default::default(),
             clock: get_atomic_clock_realtime(),
             base_url: base_url.unwrap_or(OKX_HTTP_URL.to_string()),
             client: HttpClient::builder()
@@ -1119,6 +1128,7 @@ impl OKXRawHttpClient {
         let retry_manager = RetryManager::new(retry_config);
 
         Ok(Self {
+            checkpoint_gate: Default::default(),
             clock: get_atomic_clock_realtime(),
             base_url,
             client: HttpClient::builder()
@@ -1208,6 +1218,10 @@ impl OKXRawHttpClient {
         body: Option<Vec<u8>>,
         authenticate: bool,
     ) -> Result<Vec<T>, OKXHttpError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXHttpError::Canceled(error.to_string()))?;
         let query_string = params
             .map(serde_urlencoded::to_string)
             .transpose()
@@ -2354,6 +2368,25 @@ impl Default for OKXHttpClient {
 }
 
 impl OKXHttpClient {
+    pub(crate) fn running_checkpoint_inventory(&self) -> serde_json::Value {
+        serde_json::json!({"instruments":&**self.instruments_cache.load(),
+            "trade_quote_ccy_lists":&**self.trade_quote_ccy_lists.load(),
+            "spot_trade_quote_ccy":*self.spot_trade_quote_ccy.lock().expect("quote currency mutex poisoned"),
+            "cache_initialized":self.cache_initialized.load(Ordering::Acquire),
+            "environment":self.inner.environment,
+        })
+    }
+
+    pub(crate) fn with_checkpoint_gate(
+        mut self,
+        gate: nautilus_common::live::checkpoint::CheckpointGate,
+    ) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("checkpoint gate set before cloning HTTP client")
+            .set_checkpoint_gate(gate);
+        self
+    }
+
     /// Creates a new [`OKXHttpClient`] using the default OKX HTTP URL,
     /// optionally overridden with a custom base url.
     ///
@@ -2641,6 +2674,10 @@ impl OKXHttpClient {
     ///
     /// Any existing instruments with the same symbols will be replaced.
     pub fn cache_instruments(&self, instruments: &[InstrumentAny]) {
+        let Ok(_checkpoint_write) = self.inner.checkpoint_gate.enter_request() else {
+            log::error!("HTTP cache mutation refused during checkpoint");
+            return;
+        };
         self.instruments_cache.rcu(|m| {
             for inst in instruments {
                 m.insert(inst.raw_symbol().inner(), inst.clone());
@@ -2653,6 +2690,10 @@ impl OKXHttpClient {
     ///
     /// Any existing instrument with the same symbol will be replaced.
     pub fn cache_instrument(&self, instrument: InstrumentAny) {
+        let Ok(_checkpoint_write) = self.inner.checkpoint_gate.enter_request() else {
+            log::error!("HTTP cache mutation refused during checkpoint");
+            return;
+        };
         self.instruments_cache
             .insert(instrument.raw_symbol().inner(), instrument);
         self.cache_initialized.store(true, Ordering::Release);
@@ -2665,6 +2706,10 @@ impl OKXHttpClient {
 
     /// Sets the optional SPOT `tradeQuoteCcy` override for subsequent order placement.
     pub fn set_spot_trade_quote_ccy(&self, ccy: Option<String>) {
+        let Ok(_checkpoint_write) = self.inner.checkpoint_gate.enter_request() else {
+            log::error!("HTTP cache mutation refused during checkpoint");
+            return;
+        };
         *self
             .spot_trade_quote_ccy
             .lock()
@@ -2677,6 +2722,10 @@ impl OKXHttpClient {
         &self,
         mappings: impl IntoIterator<Item = (Ustr, Vec<Ustr>)>,
     ) {
+        let Ok(_checkpoint_write) = self.inner.checkpoint_gate.enter_request() else {
+            log::error!("HTTP cache mutation refused during checkpoint");
+            return;
+        };
         let entries: Vec<_> = mappings.into_iter().collect();
         self.trade_quote_ccy_lists.rcu(|m| {
             for (inst_id, list) in &entries {

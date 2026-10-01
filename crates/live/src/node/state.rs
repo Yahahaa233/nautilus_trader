@@ -15,7 +15,7 @@
 
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 use nautilus_common::live::ingress::IngressGate;
@@ -136,6 +136,7 @@ pub(super) enum RunningTransition {
 pub struct LiveNodeHandle {
     ingress: IngressGate,
     control: Arc<AtomicU8>,
+    checkpoint_requested: Arc<AtomicBool>,
     startup_reconciliation: Arc<RwLock<Option<StartupReconciliationObservation>>>,
     pub(crate) metrics: Arc<RunnerMetrics>,
 }
@@ -157,6 +158,7 @@ impl LiveNodeHandle {
         Self {
             ingress,
             control: Arc::new(AtomicU8::new(NodeState::Idle.as_u8())),
+            checkpoint_requested: Arc::new(AtomicBool::new(false)),
             startup_reconciliation: Arc::new(RwLock::new(None)),
             metrics: Arc::new(RunnerMetrics::default()),
         }
@@ -165,10 +167,34 @@ impl LiveNodeHandle {
     /// Returns the original observation without renewing its timestamp.
     #[must_use]
     pub fn startup_reconciliation(&self) -> Option<StartupReconciliationObservation> {
-        self.startup_reconciliation.read().ok().and_then(|value| value.clone())
+        self.startup_reconciliation
+            .read()
+            .ok()
+            .and_then(|value| value.clone())
     }
 
-    pub(super) fn observe_startup_reconciliation(&self, observation: StartupReconciliationObservation) {
+    /// Requests collection at the next completed root on the node's own thread.
+    /// This only marks a request; it never collects state or grants permission.
+    pub fn request_running_checkpoint(&self) {
+        self.checkpoint_requested.store(true, Ordering::Release);
+    }
+
+    pub(super) fn checkpoint_requested(&self) -> bool {
+        self.checkpoint_requested.load(Ordering::Acquire)
+    }
+
+    pub(super) fn complete_checkpoint_request(&self) {
+        self.checkpoint_requested.swap(false, Ordering::AcqRel);
+    }
+
+    pub(super) fn ingress_gate(&self) -> IngressGate {
+        self.ingress.clone()
+    }
+
+    pub(super) fn observe_startup_reconciliation(
+        &self,
+        observation: StartupReconciliationObservation,
+    ) {
         if let Ok(mut value) = self.startup_reconciliation.write() {
             *value = Some(observation);
         }
@@ -208,9 +234,11 @@ impl LiveNodeHandle {
 
     fn set_state(&self, state: NodeState) {
         self.ingress.with_lifecycle_transition(|| {
-            let _ = self.control.try_update(Ordering::AcqRel, Ordering::Acquire, |control| {
-                Some((control & STOP_REQUESTED) | state.as_u8())
-            });
+            let _ = self
+                .control
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |control| {
+                    Some((control & STOP_REQUESTED) | state.as_u8())
+                });
         });
     }
 
@@ -282,7 +310,10 @@ mod ingress_tests {
 
     #[test]
     fn node_shutdown_transitions_invalidate_capture() {
-        for transition in [LiveNodeHandle::set_shutting_down, LiveNodeHandle::set_stopped] {
+        for transition in [
+            LiveNodeHandle::set_shutting_down,
+            LiveNodeHandle::set_stopped,
+        ] {
             let gate = IngressGate::new();
             let handle = LiveNodeHandle::with_ingress(gate.clone());
             let frozen = gate.freeze().unwrap();

@@ -1,8 +1,85 @@
 //! Explicit no-timer subset for paused recovery capture.
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use nautilus_common::clock::Clock;
 use nautilus_system::trader::Trader;
 use std::{any::TypeId, cell::RefCell, rc::Rc};
+
+/// Holds actual registered clocks and producer gates before runner ingress closes.
+/// Timer futures retain scheduled ticks until release, without emitting into a
+/// frozen runner or fabricating empty callback inventory.
+pub(super) fn with_running_registered_timer_inventory<T>(
+    kernel_clock: &Rc<RefCell<dyn Clock>>,
+    trader: &Rc<RefCell<Trader>>,
+    capture: impl FnOnce(
+        &std::collections::BTreeMap<String, u64>,
+        &std::collections::BTreeMap<String, serde_json::Value>,
+        &dyn Fn() -> Result<()>,
+    ) -> Result<T>,
+) -> Result<T> {
+    let trader = trader
+        .try_borrow()
+        .context("trader busy during running timer capture")?;
+    let mut clocks = vec![("kernel".to_owned(), kernel_clock.clone())];
+    clocks.extend(
+        trader
+            .registered_component_clocks()?
+            .into_iter()
+            .map(|(id, clock)| (format!("component:{id}"), clock)),
+    );
+    let held = clocks
+        .iter()
+        .map(|(id, clock)| {
+            Ok((
+                id,
+                clock
+                    .try_borrow()
+                    .with_context(|| format!("registered clock busy: {id}"))?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut guards = Vec::new();
+    let mut counts = std::collections::BTreeMap::new();
+    let mut inventories = std::collections::BTreeMap::new();
+    for (id, clock) in &held {
+        let kind = (**clock).type_id();
+        ensure!(
+            kind == TypeId::of::<nautilus_common::clock::TestClock>()
+                || kind == TypeId::of::<nautilus_common::live::clock::LiveClock>(),
+            "unsupported running clock implementation: {id}"
+        );
+        ensure!(
+            clock.timer_names().len() == clock.timer_count(),
+            "timer names/count disagree: {id}"
+        );
+        let guard = clock.freeze_running_timer_checkpoint()?;
+        counts.insert((*id).clone(), clock.timer_count() as u64);
+        inventories.insert((*id).clone(), guard.inventory().clone());
+        guards.push(guard);
+    }
+    let verify = || -> Result<()> {
+        ensure!(
+            trader.component_count() + 1 == clocks.len(),
+            "registered clocks changed"
+        );
+        for (id, clock) in &held {
+            ensure!(
+                counts.get(*id) == Some(&(clock.timer_count() as u64)),
+                "active timer count changed: {id}"
+            );
+        }
+        for guard in &guards {
+            guard.verify()?;
+        }
+        Ok(())
+    };
+    verify()?;
+    let result = capture(&counts, &inventories, &verify)?;
+    verify()?;
+    for guard in guards {
+        guard.finish()?;
+    }
+    Ok(result)
+}
 
 pub(super) fn with_registered_timer_inventory<T>(
     kernel_clock: &Rc<RefCell<dyn Clock>>,
@@ -296,11 +373,12 @@ mod adapter_inventory_tests {
                 .build()
                 .unwrap();
         node.config.data_engine.external_clients = Some(vec![ClientId::from("EXTERNAL")]);
-        assert!(node
-            .verify_empty_bootstrap_adapter_inventory()
-            .unwrap_err()
-            .to_string()
-            .contains("external data"));
+        assert!(
+            node.verify_empty_bootstrap_adapter_inventory()
+                .unwrap_err()
+                .to_string()
+                .contains("external data")
+        );
         node.config.data_engine.external_clients = None;
         let held = node.kernel.exec_engine.borrow_mut();
         assert!(node.verify_empty_bootstrap_adapter_inventory().is_err());

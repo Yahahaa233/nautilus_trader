@@ -276,7 +276,13 @@ pub struct OKXWebSocketClient {
     signal: Arc<AtomicBool>,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
-    out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<OKXWsMessage>>>,
+    out_rx: Option<crate::checkpoint::RetainedInbox<OKXWsMessage>>,
+    checkpoint_gate: nautilus_common::live::checkpoint::CheckpointGate,
+    checkpoint_raw:
+        Option<crate::checkpoint::RetainedInbox<tokio_tungstenite::tungstenite::Message>>,
+    checkpoint_commands: Option<crate::checkpoint::RetainedInbox<HandlerCommand>>,
+    checkpoint_outbox: Option<crate::checkpoint::RetainedInbox<OKXWsMessage>>,
+    checkpoint_pending: Arc<parking_lot::Mutex<std::collections::VecDeque<OKXWsMessage>>>,
     handler_tasks: Arc<TaskGroup>,
     connect_lock: Arc<tokio::sync::Mutex<()>>,
     handler_abort: Arc<Mutex<CancellationToken>>,
@@ -425,6 +431,11 @@ impl OKXWebSocketClient {
                 Arc::new(tokio::sync::RwLock::new(tx))
             },
             out_rx: None,
+            checkpoint_gate: Default::default(),
+            checkpoint_raw: None,
+            checkpoint_commands: None,
+            checkpoint_outbox: None,
+            checkpoint_pending: Default::default(),
             handler_tasks: Arc::new(TaskGroup::new()),
             connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             handler_abort: Arc::new(Mutex::new(CancellationToken::new())),
@@ -449,6 +460,96 @@ impl OKXWebSocketClient {
             cancellation_token: CancellationToken::new(),
             socket_control: None,
         })
+    }
+
+    pub(crate) fn with_checkpoint_gate(
+        mut self,
+        gate: nautilus_common::live::checkpoint::CheckpointGate,
+    ) -> Self {
+        self.checkpoint_gate = gate;
+        self
+    }
+
+    pub(crate) fn stage_checkpoint_raw_input(&self) -> anyhow::Result<()> {
+        if let Some(raw) = &self.checkpoint_raw {
+            raw.freeze_raw_prefix()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn running_checkpoint_inventory(&self) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            !self.signal.load(Ordering::Acquire) && !self.cancellation_token.is_cancelled(),
+            "OKX socket shutdown has begun"
+        );
+        anyhow::ensure!(
+            self.pending_orders.is_empty()
+                && self.pending_cancels.is_empty()
+                && self.pending_amends.is_empty(),
+            "OKX socket has unarchived in-flight requests"
+        );
+        anyhow::ensure!(
+            self.checkpoint_pending.lock().is_empty()
+                && self
+                    .checkpoint_commands
+                    .as_ref()
+                    .is_none_or(crate::checkpoint::RetainedInbox::is_empty)
+                && self
+                    .checkpoint_outbox
+                    .as_ref()
+                    .is_none_or(crate::checkpoint::RetainedInbox::is_empty),
+            "OKX socket command or decoded outbox has pending work"
+        );
+        anyhow::ensure!(
+            self.subscriptions_state.pending_subscribe().is_empty()
+                && self.subscriptions_state.pending_unsubscribe().is_empty(),
+            "OKX socket subscription acknowledgement is pending"
+        );
+        let active = self.is_active();
+        anyhow::ensure!(
+            !active || self.handler_tasks.len() == 1,
+            "OKX socket reconnect/auth task inventory unsupported"
+        );
+        anyhow::ensure!(
+            !active || self.credential.is_none() || self.auth_tracker.is_authenticated(),
+            "OKX socket authentication not confirmed"
+        );
+        anyhow::ensure!(
+            self.connect_lock.try_lock().is_ok(),
+            "OKX socket lifecycle operation in flight"
+        );
+        let subscriptions = self
+            .subscriptions_state
+            .confirmed()
+            .iter()
+            .map(|(key, values)| {
+                let mut values = values.iter().map(ToString::to_string).collect::<Vec<_>>();
+                values.sort();
+                (key.to_string(), values)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let raw = self
+            .checkpoint_raw
+            .as_ref()
+            .map(crate::checkpoint::RetainedInbox::raw_prefix)
+            .transpose()?;
+        Ok(
+            serde_json::json!({"profile":"okx_live_socket_retained_raw_prefix.v1",
+                "active":active,"authenticated":self.auth_tracker.is_authenticated(),
+                "tasks":self.handler_tasks.checkpoint_observation().inventory()?,
+                "request_id_counter":self.request_id_counter.load(Ordering::Acquire),
+                "pending_orders":0,"pending_cancels":0,"pending_amends":0,
+                "pending_commands":0,"pending_decoded_outbox":0,"pending_handler_messages":0,
+                "confirmed_subscriptions":subscriptions,"raw_input":raw,
+                "instruments":&**self.instruments_cache.load(),
+                "inst_id_codes":&**self.inst_id_code_cache.load(),
+                "trade_quote_ccy_lists":&**self.trade_quote_ccy_lists.load(),
+                "spot_trade_quote_ccy":*self.spot_trade_quote_ccy.lock(),
+                "option_greeks_subscriptions":&**self.option_greeks_subs.load(),
+                "index_pair_subscribers":self.index_pair_subscribers.iter()
+                    .map(|entry| (*entry.key(), *entry.value())).collect::<std::collections::BTreeMap<_,_>>(),
+            }),
+        )
     }
 
     /// Configures socket state reporting and reconnect control.
@@ -597,6 +698,10 @@ impl OKXWebSocketClient {
     ///
     /// Any existing instruments with the same symbols will be replaced.
     pub fn cache_instruments(&self, instruments: &[InstrumentAny]) {
+        let Ok(_checkpoint_write) = self.checkpoint_gate.enter_request() else {
+            log::error!("Socket metadata mutation refused during checkpoint");
+            return;
+        };
         self.instruments_cache.rcu(|m| {
             for inst in instruments {
                 m.insert(inst.symbol().inner(), inst.clone());
@@ -608,6 +713,10 @@ impl OKXWebSocketClient {
     ///
     /// Any existing instrument with the same symbol will be replaced.
     pub fn cache_instrument(&self, instrument: InstrumentAny) {
+        let Ok(_checkpoint_write) = self.checkpoint_gate.enter_request() else {
+            log::error!("Socket metadata mutation refused during checkpoint");
+            return;
+        };
         self.instruments_cache
             .insert(instrument.symbol().inner(), instrument);
     }
@@ -626,6 +735,10 @@ impl OKXWebSocketClient {
     ///
     /// The instIdCode is required for WebSocket order operations per OKX API deprecation.
     pub fn cache_inst_id_code(&self, inst_id: Ustr, inst_id_code: u64) {
+        let Ok(_checkpoint_write) = self.checkpoint_gate.enter_request() else {
+            log::error!("Socket metadata mutation refused during checkpoint");
+            return;
+        };
         self.inst_id_code_cache.insert(inst_id, inst_id_code);
     }
 
@@ -633,6 +746,10 @@ impl OKXWebSocketClient {
     ///
     /// This is typically called after loading instruments from the HTTP API.
     pub fn cache_inst_id_codes(&self, mappings: impl IntoIterator<Item = (Ustr, u64)>) {
+        let Ok(_checkpoint_write) = self.checkpoint_gate.enter_request() else {
+            log::error!("Socket metadata mutation refused during checkpoint");
+            return;
+        };
         let entries: Vec<_> = mappings.into_iter().collect();
         self.inst_id_code_cache.rcu(|m| {
             for (inst_id, inst_id_code) in &entries {
@@ -651,6 +768,10 @@ impl OKXWebSocketClient {
 
     /// Sets the optional SPOT `tradeQuoteCcy` override for subsequent order placement.
     pub fn set_spot_trade_quote_ccy(&self, ccy: Option<String>) {
+        let Ok(_checkpoint_write) = self.checkpoint_gate.enter_request() else {
+            log::error!("Socket metadata mutation refused during checkpoint");
+            return;
+        };
         *self.spot_trade_quote_ccy.lock() = ccy.map(|value| Ustr::from(value.as_str()));
     }
 
@@ -659,6 +780,10 @@ impl OKXWebSocketClient {
         &self,
         mappings: impl IntoIterator<Item = (Ustr, Vec<Ustr>)>,
     ) {
+        let Ok(_checkpoint_write) = self.checkpoint_gate.enter_request() else {
+            log::error!("Socket metadata mutation refused during checkpoint");
+            return;
+        };
         let entries: Vec<_> = mappings.into_iter().collect();
         self.trade_quote_ccy_lists.rcu(|m| {
             for (inst_id, list) in &entries {
@@ -705,6 +830,10 @@ impl OKXWebSocketClient {
     ///
     /// The VIP level determines which WebSocket channels are available.
     pub fn set_vip_level(&self, vip_level: OKXVipLevel) {
+        let Ok(_checkpoint_write) = self.checkpoint_gate.enter_request() else {
+            log::error!("Socket metadata mutation refused during checkpoint");
+            return;
+        };
         self.vip_level.store(vip_level as u8, Ordering::Relaxed);
     }
 
@@ -720,6 +849,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the connection process fails.
     pub async fn connect(&mut self) -> anyhow::Result<()> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let connect_lock = Arc::clone(&self.connect_lock);
         let _connect_guard = connect_lock.lock().await;
 
@@ -834,11 +967,19 @@ impl OKXWebSocketClient {
 
         let (msg_tx, rx) = tokio::sync::mpsc::unbounded_channel::<OKXWsMessage>();
 
-        self.out_rx = Some(Arc::new(rx));
+        let outbox = crate::checkpoint::RetainedInbox::new(rx);
+        self.out_rx = Some(outbox.clone());
+        self.checkpoint_outbox = Some(outbox);
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
         *self.cmd_tx.write().await = cmd_tx.clone();
 
+        let raw_rx = crate::checkpoint::RetainedInbox::new(raw_rx);
+        let cmd_rx = crate::checkpoint::RetainedInbox::new(cmd_rx);
+        self.checkpoint_raw = Some(raw_rx.clone());
+        self.checkpoint_commands = Some(cmd_rx.clone());
+        let checkpoint_gate = self.checkpoint_gate.clone();
+        let checkpoint_pending = self.checkpoint_pending.clone();
         let signal = self.signal.clone();
         let auth_tracker = self.auth_tracker.clone();
         let subscriptions_state = self.subscriptions_state.clone();
@@ -870,7 +1011,9 @@ impl OKXWebSocketClient {
                     auth_tracker.clone(),
                     subscriptions_state.clone(),
                     clock,
-                );
+                )
+                .with_checkpoint_pending_messages(checkpoint_pending)
+                .with_checkpoint_gate(checkpoint_gate.clone());
 
                 let resubscribe_all = || {
                     let args = subscription_args(
@@ -896,9 +1039,10 @@ impl OKXWebSocketClient {
                             log::debug!("Handler task aborted");
                             break;
                         }
-                        message = handler.next() => message,
+                        message = checkpoint_gate.callback(handler.next()) => message,
                     };
 
+                    let (message, _checkpoint_callback) = message;
                     match message {
                         Some(OKXWsMessage::Reconnected) => {
                             if signal.load(Ordering::Acquire) {
@@ -1082,7 +1226,7 @@ impl OKXWebSocketClient {
             .out_rx
             .take()
             .expect("Data stream receiver already taken or not connected");
-        let mut rx = Arc::try_unwrap(rx).expect("Cannot take ownership - other references exist");
+
         async_stream::stream! {
             while let Some(data) = rx.recv().await {
                 yield data;
@@ -1335,6 +1479,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the unsubscribe request fails to send.
     pub async fn unsubscribe_all(&self) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let all_args = subscription_args(
             &self.subscriptions_inst_type,
             &self.subscriptions_inst_family,
@@ -1376,6 +1524,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_type: OKXInstrumentType,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::Instruments,
             inst_type: Some(instrument_type),
@@ -1402,6 +1554,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let inst_type = okx_instrument_type_from_symbol(instrument_id.symbol.as_str());
         log::debug!("Subscribing to instrument type {inst_type:?} for {instrument_id}");
         self.subscribe_instruments(inst_type).await
@@ -1416,6 +1572,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the subscription request fails.
     pub async fn subscribe_book(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.subscribe_book_with_depth(instrument_id, 0).await
     }
 
@@ -1424,6 +1584,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.subscribe_inst_id(OKXWsChannel::Books, instrument_id.symbol.inner())
             .await
     }
@@ -1434,6 +1598,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the subscription request fails.
     pub async fn subscribe_book_rpi(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.subscribe_inst_id(OKXWsChannel::BooksRpi, instrument_id.symbol.inner())
             .await
     }
@@ -1444,6 +1612,10 @@ impl OKXWebSocketClient {
         instrument_id: InstrumentId,
         channel: OKXBookChannel,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let channel = ws_channel_for_book(channel);
         self.resubscribe_ws_channel(instrument_id, channel).await
     }
@@ -1454,6 +1626,10 @@ impl OKXWebSocketClient {
         instrument_id: InstrumentId,
         channel: OKXWsChannel,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.unsubscribe_inst_id(channel.clone(), instrument_id.symbol.inner())
             .await?;
         self.subscribe_inst_id(channel, instrument_id.symbol.inner())
@@ -1535,6 +1711,10 @@ impl OKXWebSocketClient {
         instrument_id: InstrumentId,
         depth: u16,
     ) -> anyhow::Result<()> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let vip = self.vip_level();
 
         if !matches!(depth, 0 | 50 | 400) {
@@ -1564,6 +1744,10 @@ impl OKXWebSocketClient {
     ///
     /// <https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-best-bid-offer-channel>.
     pub async fn subscribe_quotes(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.subscribe_inst_id(OKXWsChannel::BboTbt, instrument_id.symbol.inner())
             .await
     }
@@ -1586,6 +1770,10 @@ impl OKXWebSocketClient {
         instrument_id: InstrumentId,
         aggregated: bool,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let channel = if aggregated {
             OKXWsChannel::TradesAll
         } else {
@@ -1607,6 +1795,10 @@ impl OKXWebSocketClient {
     ///
     /// <https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-tickers-channel>.
     pub async fn subscribe_ticker(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.subscribe_inst_id(OKXWsChannel::Tickers, instrument_id.symbol.inner())
             .await
     }
@@ -1626,6 +1818,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.subscribe_inst_id(OKXWsChannel::MarkPrice, instrument_id.symbol.inner())
             .await
     }
@@ -1645,6 +1841,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         // Index-tickers channel requires base pair format (e.g., BTC-USDT)
         let symbol = instrument_id.symbol.inner();
         let (base, quote) = parse_base_quote_from_symbol(symbol.as_str())
@@ -1709,6 +1909,10 @@ impl OKXWebSocketClient {
     ///
     /// <https://www.okx.com/docs-v5/en/#public-data-websocket-option-summary-channel>.
     pub async fn subscribe_option_summary(&self, inst_family: Ustr) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::OptionSummary,
             inst_type: None,
@@ -1728,6 +1932,10 @@ impl OKXWebSocketClient {
     ///
     /// <https://www.okx.com/docs-v5/en/#public-data-websocket-event-contract-markets-channel>.
     pub async fn subscribe_event_contract_markets(&self) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::EventContractMarkets,
             inst_type: Some(OKXInstrumentType::Events),
@@ -1747,6 +1955,10 @@ impl OKXWebSocketClient {
     /// Adds an instrument to the option greeks subscription filter, emitting both
     /// Black-Scholes and price-adjusted greeks.
     pub fn add_option_greeks_sub(&self, instrument_id: InstrumentId) {
+        let Ok(_checkpoint_write) = self.checkpoint_gate.enter_request() else {
+            log::error!("Socket metadata mutation refused during checkpoint");
+            return;
+        };
         let both: AHashSet<OKXGreeksType> =
             [OKXGreeksType::Bs, OKXGreeksType::Pa].into_iter().collect();
         self.option_greeks_subs.insert(instrument_id, both);
@@ -1759,6 +1971,10 @@ impl OKXWebSocketClient {
         instrument_id: InstrumentId,
         conventions: AHashSet<OKXGreeksType>,
     ) {
+        let Ok(_checkpoint_write) = self.checkpoint_gate.enter_request() else {
+            log::error!("Socket metadata mutation refused during checkpoint");
+            return;
+        };
         let set = if conventions.is_empty() {
             [OKXGreeksType::Bs, OKXGreeksType::Pa].into_iter().collect()
         } else {
@@ -1769,6 +1985,10 @@ impl OKXWebSocketClient {
 
     /// Removes an instrument from the option greeks subscription filter.
     pub fn remove_option_greeks_sub(&self, instrument_id: &InstrumentId) {
+        let Ok(_checkpoint_write) = self.checkpoint_gate.enter_request() else {
+            log::error!("Socket metadata mutation refused during checkpoint");
+            return;
+        };
         self.option_greeks_subs.remove(instrument_id);
     }
 
@@ -1787,6 +2007,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.subscribe_inst_id(OKXWsChannel::FundingRate, instrument_id.symbol.inner())
             .await
     }
@@ -1803,6 +2027,10 @@ impl OKXWebSocketClient {
     ///
     /// <https://www.okx.com/docs-v5/en/#order-book-trading-market-data-ws-candlesticks-channel>.
     pub async fn subscribe_bars(&self, bar_type: BarType) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         // Use regular trade-price candlesticks which work for all instrument types
         let channel = bar_spec_as_okx_channel(bar_type.spec())
             .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
@@ -1819,6 +2047,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_type: OKXInstrumentType,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::Instruments,
             inst_type: Some(instrument_type),
@@ -1846,6 +2078,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         log::debug!("Instrument unsubscribe is a no-op (shared per-type channel): {instrument_id}");
         Ok(())
     }
@@ -1856,6 +2092,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the subscription request fails.
     pub async fn unsubscribe_book(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.unsubscribe_inst_id(OKXWsChannel::Books, instrument_id.symbol.inner())
             .await
     }
@@ -1869,6 +2109,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.unsubscribe_inst_id(OKXWsChannel::BooksRpi, instrument_id.symbol.inner())
             .await
     }
@@ -1918,6 +2162,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the subscription request fails.
     pub async fn unsubscribe_quotes(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.unsubscribe_inst_id(OKXWsChannel::BboTbt, instrument_id.symbol.inner())
             .await
     }
@@ -1928,6 +2176,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the subscription request fails.
     pub async fn unsubscribe_ticker(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.unsubscribe_inst_id(OKXWsChannel::Tickers, instrument_id.symbol.inner())
             .await
     }
@@ -1941,6 +2193,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.unsubscribe_inst_id(OKXWsChannel::MarkPrice, instrument_id.symbol.inner())
             .await
     }
@@ -1961,6 +2217,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let symbol = instrument_id.symbol.inner();
         let (base, quote) = parse_base_quote_from_symbol(symbol.as_str())
             .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
@@ -2001,6 +2261,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the unsubscription request fails.
     pub async fn unsubscribe_option_summary(&self, inst_family: Ustr) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::OptionSummary,
             inst_type: None,
@@ -2016,6 +2280,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the unsubscription request fails.
     pub async fn unsubscribe_event_contract_markets(&self) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::EventContractMarkets,
             inst_type: Some(OKXInstrumentType::Events),
@@ -2034,6 +2302,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.unsubscribe_inst_id(OKXWsChannel::FundingRate, instrument_id.symbol.inner())
             .await
     }
@@ -2048,6 +2320,10 @@ impl OKXWebSocketClient {
         instrument_id: InstrumentId,
         aggregated: bool,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let channel = if aggregated {
             OKXWsChannel::TradesAll
         } else {
@@ -2063,6 +2339,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the subscription request fails.
     pub async fn unsubscribe_bars(&self, bar_type: BarType) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let channel = bar_spec_as_okx_channel(bar_type.spec())
             .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
         self.unsubscribe_inst_id(channel, bar_type.instrument_id().symbol.inner())
@@ -2078,6 +2358,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_type: OKXInstrumentType,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::Orders,
             inst_type: Some(instrument_type),
@@ -2096,6 +2380,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_type: OKXInstrumentType,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::Orders,
             inst_type: Some(instrument_type),
@@ -2111,6 +2399,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the subscription request fails.
     pub async fn subscribe_spread_orders(&self) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::SprdOrders,
             inst_type: None,
@@ -2126,6 +2418,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the subscription request fails.
     pub async fn unsubscribe_spread_orders(&self) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::SprdOrders,
             inst_type: None,
@@ -2144,6 +2440,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.subscribe_inst_id(OKXWsChannel::SprdBboTbt, instrument_id.symbol.inner())
             .await
     }
@@ -2157,6 +2457,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.subscribe_inst_id(OKXWsChannel::SprdBooks5, instrument_id.symbol.inner())
             .await
     }
@@ -2170,6 +2474,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.subscribe_inst_id(OKXWsChannel::SprdPublicTrades, instrument_id.symbol.inner())
             .await
     }
@@ -2183,6 +2491,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.unsubscribe_inst_id(OKXWsChannel::SprdBboTbt, instrument_id.symbol.inner())
             .await
     }
@@ -2196,6 +2508,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.unsubscribe_inst_id(OKXWsChannel::SprdBooks5, instrument_id.symbol.inner())
             .await
     }
@@ -2209,6 +2525,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_id: InstrumentId,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         self.unsubscribe_inst_id(OKXWsChannel::SprdPublicTrades, instrument_id.symbol.inner())
             .await
     }
@@ -2222,6 +2542,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_type: OKXInstrumentType,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::OrdersAlgo,
             inst_type: Some(instrument_type),
@@ -2240,6 +2564,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_type: OKXInstrumentType,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::OrdersAlgo,
             inst_type: Some(instrument_type),
@@ -2258,6 +2586,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_type: OKXInstrumentType,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::AlgoAdvance,
             inst_type: Some(instrument_type),
@@ -2276,6 +2608,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_type: OKXInstrumentType,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::AlgoAdvance,
             inst_type: Some(instrument_type),
@@ -2291,6 +2627,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the subscription request fails.
     pub async fn subscribe_account(&self) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::Account,
             inst_type: None,
@@ -2306,6 +2646,10 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the subscription request fails.
     pub async fn unsubscribe_account(&self) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::Account,
             inst_type: None,
@@ -2328,6 +2672,10 @@ impl OKXWebSocketClient {
         &self,
         inst_type: OKXInstrumentType,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::Positions,
             inst_type: Some(inst_type),
@@ -2346,6 +2694,10 @@ impl OKXWebSocketClient {
         &self,
         inst_type: OKXInstrumentType,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::Positions,
             inst_type: Some(inst_type),
@@ -2368,6 +2720,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_type: OKXInstrumentType,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::LiquidationWarning,
             inst_type: Some(instrument_type),
@@ -2386,6 +2742,10 @@ impl OKXWebSocketClient {
         &self,
         instrument_type: OKXInstrumentType,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let arg = OKXSubscriptionArg {
             channel: OKXWsChannel::LiquidationWarning,
             inst_type: Some(instrument_type),
@@ -2529,6 +2889,10 @@ impl OKXWebSocketClient {
         rpi_taker_access: Option<bool>,
         rpi_px_round: Option<bool>,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let rpi = rpi.unwrap_or(false);
 
         if !OKX_SUPPORTED_ORDER_TYPES.contains(&order_type) {
@@ -2825,6 +3189,10 @@ impl OKXWebSocketClient {
         rpi_px_round: Option<bool>,
         command_id: nautilus_core::UUID4,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let mut builder = WsAmendOrderParamsBuilder::default();
         let request_id = command_id.to_string().replace('-', "");
         builder.req_id(request_id.clone());
@@ -2934,6 +3302,10 @@ impl OKXWebSocketClient {
         client_order_id: Option<ClientOrderId>,
         venue_order_id: Option<VenueOrderId>,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let mut builder = WsCancelOrderParamsBuilder::default();
 
         let inst_id_code = self
@@ -3006,6 +3378,10 @@ impl OKXWebSocketClient {
     /// # References
     /// <https://www.okx.com/docs-v5/en/#order-book-trading-websocket-mass-cancel-order>
     pub async fn mass_cancel_orders(&self, instrument_id: InstrumentId) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let (inst_type, inst_family) = {
             let instrument = self
                 .instruments_cache
@@ -3100,6 +3476,10 @@ impl OKXWebSocketClient {
             Option<bool>,
         )>,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let client_order_ids: Vec<ClientOrderId> = orders.iter().map(|o| o.3).collect();
         let args: Vec<Value> = {
             let mut args = Vec::with_capacity(orders.len());
@@ -3254,6 +3634,10 @@ impl OKXWebSocketClient {
             Option<bool>,
         )>,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let client_order_ids: Vec<ClientOrderId> = orders.iter().map(|o| o.2).collect();
         let args: Vec<Value> = {
             let mut args = Vec::with_capacity(orders.len());
@@ -3327,6 +3711,10 @@ impl OKXWebSocketClient {
         &self,
         orders: Vec<(InstrumentId, Option<ClientOrderId>, Option<VenueOrderId>)>,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let client_order_ids: Vec<ClientOrderId> = orders
             .iter()
             .filter_map(|(_, cl_ord_id, _)| *cl_ord_id)
@@ -3395,6 +3783,10 @@ impl OKXWebSocketClient {
         callback_spread: Option<String>,
         activation_price: Option<Price>,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         if !is_conditional_order(order_type) {
             return Err(OKXWsError::ClientError(format!(
                 "Order type {order_type:?} is not a conditional order"
@@ -3504,6 +3896,10 @@ impl OKXWebSocketClient {
         client_order_id: Option<ClientOrderId>,
         algo_order_id: Option<String>,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_request = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let mut builder = super::messages::WsCancelAlgoOrderParamsBuilder::default();
 
         let inst_id_code = self

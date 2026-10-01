@@ -69,6 +69,19 @@ pub(crate) enum BookSequenceOutcome {
 }
 
 impl BookSyncTracker {
+    pub(crate) fn verify_empty_checkpoint_profile(&self) -> anyhow::Result<()> {
+        let state = self.state.lock();
+        anyhow::ensure!(
+            state.last_book_ts.is_empty()
+                && state.last_sequences.is_empty()
+                && state.recovering.is_empty()
+                && state.pending_snapshots.is_empty()
+                && state.recovery_attempts.is_empty(),
+            "OKX order-book pipeline checkpoint unsupported"
+        );
+        Ok(())
+    }
+
     pub(crate) fn record_subscription(&self, instrument_id: InstrumentId, now: Instant) {
         let mut state = self.state.lock();
         state.last_book_ts.insert(instrument_id, now);

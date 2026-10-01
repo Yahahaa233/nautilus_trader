@@ -709,6 +709,7 @@ pub struct RunnerRecoveryCodecRegistry {
     required: BTreeSet<RunnerRecoveryChannel>,
     codecs: BTreeMap<RunnerRecoveryChannel, Box<dyn RunnerRecoveryCodec>>,
     sealed: bool,
+    timer_identity_bound: bool,
 }
 
 impl std::fmt::Debug for RunnerRecoveryCodecRegistry {
@@ -732,6 +733,7 @@ impl RunnerRecoveryCodecRegistry {
             required: required.into_iter().collect(),
             codecs: BTreeMap::new(),
             sealed: false,
+            timer_identity_bound: false,
         }
     }
 
@@ -759,6 +761,27 @@ impl RunnerRecoveryCodecRegistry {
             "runner recovery codec for {channel:?} is already registered"
         );
         self.codecs.insert(channel, Box::new(codec));
+        Ok(())
+    }
+
+    /// Explicitly installs the application's native clock/owner/timer resolver.
+    /// Unlike ordinary registration, this acknowledges the callback identity
+    /// contract. The codec must match each actual message binding to a registered
+    /// component clock, preserve cleanup versus dispatch, and restore through
+    /// that same native registration. JSON names alone do not prove the binding.
+    ///
+    /// # Errors
+    /// Refuses other channels, duplicate, missing allow-list or sealed registration.
+    pub fn register_owner_bound_timer_codec<C>(&mut self, codec: C) -> Result<()>
+    where
+        C: RunnerRecoveryCodec + 'static,
+    {
+        ensure!(
+            codec.channel() == RunnerRecoveryChannel::TimeEvent,
+            "owner-bound timer codec must cover actual time messages"
+        );
+        self.register(codec)?;
+        self.timer_identity_bound = true;
         Ok(())
     }
 
@@ -796,9 +819,15 @@ impl RunnerRecoveryCodecRegistry {
         ensure!(self.sealed, "runner recovery codec registry is not sealed");
         let channel = event.channel();
         ensure!(
-            channel != RunnerRecoveryChannel::TimeEvent,
+            channel != RunnerRecoveryChannel::TimeEvent || self.timer_identity_bound,
             "timer callback identity is not recoverably encoded"
         );
+        if let RunnerRecoveryEventRef::TimeEvent(message) = event {
+            let binding = message.checkpoint_callback_binding();
+            ensure!(binding["owner_thread_matches"].as_bool() == Some(true)
+                && matches!(binding["kind"].as_str(), Some("registered_owner_thread" | "registered_cleanup")),
+                "timer message has no actual owner-bound callback identity");
+        }
         let codec = self
             .codecs
             .get(&channel)

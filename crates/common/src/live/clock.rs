@@ -42,6 +42,7 @@ use crate::{
 /// The clock holds thread-local runtime state and must remain on its originating thread.
 #[derive(Debug)]
 pub struct LiveClock {
+    checkpoint_gate: super::checkpoint::CheckpointGate,
     time: &'static AtomicTime,
     timers: BTreeMap<Ustr, LiveTimer>,
     callbacks: CallbackRegistry,
@@ -54,6 +55,7 @@ impl LiveClock {
     #[must_use]
     pub fn new(sender: Option<Arc<dyn TimeEventSender>>) -> Self {
         Self {
+            checkpoint_gate: Default::default(),
             time: get_atomic_clock_realtime(),
             timers: BTreeMap::new(),
             callbacks: CallbackRegistry::new(),
@@ -83,6 +85,45 @@ impl Default for LiveClock {
     }
 }
 
+type TimerInspector = Box<dyn Fn() -> anyhow::Result<serde_json::Value>>;
+
+struct LiveClockCheckpoint {
+    frozen: super::checkpoint::FrozenCallbacks,
+    inventory: serde_json::Value,
+    inspectors: Vec<TimerInspector>,
+}
+impl std::fmt::Debug for LiveClockCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveClockCheckpoint")
+            .field("inventory", &self.inventory)
+            .finish()
+    }
+}
+fn running_timer_inventory(inspectors: &[TimerInspector]) -> anyhow::Result<serde_json::Value> {
+    let timers = inspectors
+        .iter()
+        .map(|inspect| inspect())
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(serde_json::json!({"profile":"live_clock_frozen_registered_schedules.v1","timers":timers}))
+}
+impl crate::clock::TimerCheckpoint for LiveClockCheckpoint {
+    fn inventory(&self) -> &serde_json::Value {
+        &self.inventory
+    }
+    fn verify(&self) -> anyhow::Result<()> {
+        self.frozen.verify()?;
+        anyhow::ensure!(
+            running_timer_inventory(&self.inspectors)? == self.inventory,
+            "registered timer state changed during checkpoint"
+        );
+        self.frozen.verify()
+    }
+    fn finish(self: Box<Self>) -> anyhow::Result<()> {
+        self.verify()?;
+        self.frozen.finish()
+    }
+}
+
 impl Deref for LiveClock {
     type Target = AtomicTime;
 
@@ -92,6 +133,24 @@ impl Deref for LiveClock {
 }
 
 impl Clock for LiveClock {
+    fn freeze_running_timer_checkpoint(
+        &self,
+    ) -> anyhow::Result<Box<dyn crate::clock::TimerCheckpoint>> {
+        let frozen = self.checkpoint_gate.freeze()?;
+        let inspectors = self
+            .timers
+            .values()
+            .map(LiveTimer::checkpoint_inspector)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let inventory = running_timer_inventory(&inspectors)?;
+        frozen.verify()?;
+        Ok(Box::new(LiveClockCheckpoint {
+            frozen,
+            inventory,
+            inspectors,
+        }))
+    }
+
     fn timestamp_ns(&self) -> UnixNanos {
         self.time.get_time_ns()
     }
@@ -181,7 +240,8 @@ impl Clock for LiveClock {
             callback,
             fire_immediately,
             sender,
-        );
+        )
+        .with_checkpoint_gate(self.checkpoint_gate.clone());
 
         timer.start();
 
@@ -240,7 +300,8 @@ impl Clock for LiveClock {
             callback,
             fire_immediately,
             sender,
-        );
+        )
+        .with_checkpoint_gate(self.checkpoint_gate.clone());
         timer.start();
 
         self.clear_expired_timers();

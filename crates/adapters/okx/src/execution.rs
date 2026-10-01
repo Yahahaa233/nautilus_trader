@@ -119,6 +119,9 @@ pub struct OKXExecutionClient {
     ws_business: OKXWebSocketClient,
     trade_mode: OKXTradeMode,
     ws_dispatch_state: Arc<WsDispatchState>,
+    checkpoint_gate: nautilus_common::live::checkpoint::CheckpointGate,
+    private_stream_state: Arc<parking_lot::Mutex<crate::checkpoint::ExecutionStreamState>>,
+    business_stream_state: Arc<parking_lot::Mutex<crate::checkpoint::ExecutionStreamState>>,
     session_tasks: TaskGroup,
     pending_tasks: TaskGroup,
 }
@@ -133,6 +136,7 @@ impl OKXExecutionClient {
         core: ExecutionClientCore,
         config: OKXExecutionClientConfig,
     ) -> anyhow::Result<Self> {
+        let checkpoint_gate = nautilus_common::live::checkpoint::CheckpointGate::default();
         let api_key = config
             .api_key
             .as_ref()
@@ -162,6 +166,7 @@ impl OKXExecutionClient {
             proxy_url.clone(),
         )?;
 
+        let http_client = http_client.with_checkpoint_gate(checkpoint_gate.clone());
         let account_id = core.account_id;
 
         let ws_private = OKXWebSocketClient::with_credentials(
@@ -182,6 +187,7 @@ impl OKXExecutionClient {
             "okx-private-user-streams",
         ));
 
+        let ws_private = ws_private.with_checkpoint_gate(checkpoint_gate.clone());
         let ws_business = OKXWebSocketClient::with_credentials(
             Some(config.ws_business_url()),
             api_key,
@@ -214,6 +220,7 @@ impl OKXExecutionClient {
             None,
         );
 
+        let ws_business = ws_business.with_checkpoint_gate(checkpoint_gate.clone());
         let ws_dispatch_state = Arc::new(WsDispatchState::with_pending_maps(
             ws_private.pending_orders.clone(),
             ws_private.pending_cancels.clone(),
@@ -231,6 +238,9 @@ impl OKXExecutionClient {
             ws_business,
             trade_mode,
             ws_dispatch_state,
+            checkpoint_gate,
+            private_stream_state: Default::default(),
+            business_stream_state: Default::default(),
             session_tasks: TaskGroup::new(),
             pending_tasks: TaskGroup::new(),
         })
@@ -1305,7 +1315,12 @@ impl OKXExecutionClient {
     where
         F: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
+        let Ok(checkpoint_request) = self.checkpoint_gate.enter_request() else {
+            log::error!("Refused {description} during checkpoint");
+            return;
+        };
         let fut = async move {
+            let _checkpoint_request = checkpoint_request;
             if let Err(e) = fut.await {
                 log::warn!("{description} failed: {e:?}");
             }
@@ -1572,45 +1587,46 @@ impl OKXExecutionClient {
                 .context("OKX execution stream task admission is closed")?;
             let cancel = tasks.cancellation_token();
             let clock = self.clock;
+            let checkpoint_gate = self.checkpoint_gate.clone();
+            let stream_state = self.private_stream_state.clone();
 
             spawn_task(&tasks, async move {
-                let mut fee_cache: AHashMap<Ustr, Money> = AHashMap::new();
-                let mut filled_qty_cache: AHashMap<Ustr, Quantity> = AHashMap::new();
-                let mut order_state_cache: AHashMap<ClientOrderId, OrderStateSnapshot> =
-                    AHashMap::new();
-
                 pin_mut!(stream);
 
                 loop {
                     tokio::select! {
                         biased;
                         () = cancel.cancelled() => break,
-                        message = stream.next() => {
+                        (message, _checkpoint_callback) = checkpoint_gate.callback(stream.next()) => {
                             let Some(message) = message else {
                                 break;
                             };
+                            let mut stream_state = stream_state.lock();
+                            let crate::checkpoint::ExecutionStreamState { fee_cache, filled_qty_cache, order_state_cache } = &mut *stream_state;
                             dispatch_ws_message(
                                 message,
                                 &emitter,
                                 &state,
                                 account_id,
                                 &instruments,
-                                &mut fee_cache,
-                                &mut filled_qty_cache,
-                                &mut order_state_cache,
+                                fee_cache,
+                                filled_qty_cache,
+                                order_state_cache,
                                 clock,
                             );
                         }
-                        () = state.wait_for_linked_child_route() => {
+                        ((), _checkpoint_callback) = checkpoint_gate.callback(state.wait_for_linked_child_route()) => {
+                            let mut stream_state = stream_state.lock();
+                            let crate::checkpoint::ExecutionStreamState { fee_cache, filled_qty_cache, order_state_cache } = &mut *stream_state;
                             dispatch_ws_message(
                                 OKXWsMessage::Orders(Vec::new()),
                                 &emitter,
                                 &state,
                                 account_id,
                                 &instruments,
-                                &mut fee_cache,
-                                &mut filled_qty_cache,
-                                &mut order_state_cache,
+                                fee_cache,
+                                filled_qty_cache,
+                                order_state_cache,
                                 clock,
                             );
                         }
@@ -1635,32 +1651,31 @@ impl OKXExecutionClient {
                 .context("OKX execution stream task admission is closed")?;
             let cancel = tasks.cancellation_token();
             let clock = self.clock;
+            let checkpoint_gate = self.checkpoint_gate.clone();
+            let stream_state = self.business_stream_state.clone();
 
             spawn_task(&tasks, async move {
-                let mut fee_cache: AHashMap<Ustr, Money> = AHashMap::new();
-                let mut filled_qty_cache: AHashMap<Ustr, Quantity> = AHashMap::new();
-                let mut order_state_cache: AHashMap<ClientOrderId, OrderStateSnapshot> =
-                    AHashMap::new();
-
                 pin_mut!(stream);
 
                 loop {
                     tokio::select! {
                         biased;
                         () = cancel.cancelled() => break,
-                        message = stream.next() => {
+                        (message, _checkpoint_callback) = checkpoint_gate.callback(stream.next()) => {
                             let Some(message) = message else {
                                 break;
                             };
+                            let mut stream_state = stream_state.lock();
+                            let crate::checkpoint::ExecutionStreamState { fee_cache, filled_qty_cache, order_state_cache } = &mut *stream_state;
                             dispatch_ws_message(
                                 message,
                                 &emitter,
                                 &state,
                                 account_id,
                                 &instruments,
-                                &mut fee_cache,
-                                &mut filled_qty_cache,
-                                &mut order_state_cache,
+                                fee_cache,
+                                filled_qty_cache,
+                                order_state_cache,
                                 clock,
                             );
                         }
@@ -1806,6 +1821,53 @@ fn derive_trade_mode_for_instrument(
 
 #[async_trait(?Send)]
 impl ExecutionClient for OKXExecutionClient {
+    fn freeze_running_checkpoint(
+        &self,
+    ) -> anyhow::Result<Box<dyn nautilus_common::clients::RunningAdapterCheckpoint>> {
+        anyhow::ensure!(
+            self.core.is_connected() && self.core.is_started(),
+            "OKX running checkpoint requires started, connected execution client"
+        );
+        let frozen = self.checkpoint_gate.freeze()?;
+        self.ws_private.stage_checkpoint_raw_input()?;
+        self.ws_business.stage_checkpoint_raw_input()?;
+        let private = self.ws_private.clone();
+        let business = self.ws_business.clone();
+        let http = self.http_client.clone();
+        let state = self.ws_dispatch_state.clone();
+        let private_state = self.private_stream_state.clone();
+        let business_state = self.business_stream_state.clone();
+        let requests = self.pending_tasks.checkpoint_observation();
+        let sessions = self.session_tasks.checkpoint_observation();
+        let account = self.core.account_id;
+        let client = self.core.client_id;
+        Ok(Box::new(crate::checkpoint::OKXCheckpointGuard::new(
+            frozen,
+            move || {
+                let requests = requests.inventory()?;
+                anyhow::ensure!(
+                    requests["owned_tasks"].as_u64() == Some(0),
+                    "OKX execution request tasks remain owned"
+                );
+                let sessions = sessions.inventory()?;
+                anyhow::ensure!(
+                    sessions["owned_tasks"].as_u64() == Some(2),
+                    "OKX execution stream session inventory changed"
+                );
+                Ok(
+                    serde_json::json!({"profile":"okx_connected_execution_quiescent_retained_inputs.v1",
+                        "account_id":account,"client_id":client,"request_tasks":requests,"sessions":sessions,
+                        "private_socket":private.running_checkpoint_inventory()?,
+                        "business_socket":business.running_checkpoint_inventory()?,
+                        "http":http.running_checkpoint_inventory(),"dispatch":state.checkpoint_inventory()?,
+                        "private_stream":&*private_state.lock(),"business_stream":&*business_state.lock(),
+                        "execution_authorized":false,
+                    }),
+                )
+            },
+        )?))
+    }
+
     fn paused_recovery_inventory_profile(&self) -> anyhow::Result<&'static str> {
         self.verify_paused_recovery_inventory()?;
         Ok("okx_fresh_disconnected_v1")

@@ -107,6 +107,7 @@
 // macro expansion; an item-level `allow` cannot reach the expansion
 #![allow(clippy::clone_on_copy)]
 
+mod checkpoint;
 pub mod common;
 pub mod config;
 pub mod data;

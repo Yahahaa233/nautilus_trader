@@ -217,6 +217,39 @@ impl Default for WsDispatchState {
 }
 
 impl WsDispatchState {
+    pub(crate) fn checkpoint_inventory(&self) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            self.pending_orders.is_empty()
+                && self.pending_cancels.is_empty()
+                && self.pending_amends.is_empty(),
+            "OKX execution requests remain pending"
+        );
+        anyhow::ensure!(
+            self.pending_linked_children.lock().is_empty(),
+            "OKX linked child routing is unresolved"
+        );
+        let bindings = self.lifecycle_bindings.lock();
+        Ok(serde_json::json!({
+            "order_identities":self.order_identities.iter().map(|entry| (*entry.key(), *entry.value()))
+                .collect::<std::collections::BTreeMap<_,_>>(),
+            "order_contexts":self.order_contexts.iter().map(|entry| (*entry.key(), *entry.value()))
+                .collect::<std::collections::BTreeMap<_,_>>(),
+            "accepted_venue_order_ids":self.accepted_venue_order_ids.lock().checkpoint_entries(),
+            "triggered_orders":self.triggered_orders.inner.lock().checkpoint_entries(),
+            "filled_orders":self.filled_orders.inner.lock().checkpoint_entries(),
+            "terminal_orders":self.terminal_orders.inner.lock().checkpoint_entries(),
+            "emitted_trades":self.emitted_trades.inner.lock().checkpoint_entries(),
+            "post_only_rejections":self.post_only_rejections.inner.lock().checkpoint_entries(),
+            "client_by_parent":bindings.client_by_parent.iter().map(|(key,value)| (*key,*value))
+                .collect::<std::collections::BTreeMap<_,_>>(),
+            "venue_by_client":bindings.venue_by_client.iter().map(|(key,value)|
+                (*key, serde_json::json!({"parent":value.parent,"child":value.child})))
+                .collect::<std::collections::BTreeMap<_,_>>(),
+            "terminal_client_by_parent":bindings.terminal_client_by_parent.checkpoint_entries(),
+            "pending_linked_children":0,
+        }))
+    }
+
     // Creates a dispatch state sharing the pending operation maps
     // with the WebSocket client that populates them
     pub(crate) fn with_pending_maps(

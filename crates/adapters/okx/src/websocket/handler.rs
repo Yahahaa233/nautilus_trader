@@ -125,23 +125,24 @@ impl Debug for HandlerCommand {
 
 pub(super) struct OKXWsFeedHandler {
     clock: &'static AtomicTime,
+    checkpoint_gate: nautilus_common::live::checkpoint::CheckpointGate,
     signal: Arc<AtomicBool>,
     inner: Option<WebSocketClient>,
-    cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
-    raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+    cmd_rx: crate::checkpoint::RetainedInbox<HandlerCommand>,
+    raw_rx: crate::checkpoint::RetainedInbox<Message>,
     out_tx: tokio::sync::mpsc::UnboundedSender<OKXWsMessage>,
     auth_tracker: AuthTracker,
     subscriptions_state: SubscriptionState,
     retry_manager: RetryManager<OKXWsError>,
-    pending_messages: VecDeque<OKXWsMessage>,
+    pending_messages: Arc<parking_lot::Mutex<VecDeque<OKXWsMessage>>>,
 }
 
 impl OKXWsFeedHandler {
     /// Creates a new [`OKXWsFeedHandler`] instance.
     pub(super) fn new(
         signal: Arc<AtomicBool>,
-        cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
-        raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+        cmd_rx: impl Into<crate::checkpoint::RetainedInbox<HandlerCommand>>,
+        raw_rx: impl Into<crate::checkpoint::RetainedInbox<Message>>,
         out_tx: tokio::sync::mpsc::UnboundedSender<OKXWsMessage>,
         auth_tracker: AuthTracker,
         subscriptions_state: SubscriptionState,
@@ -149,16 +150,33 @@ impl OKXWsFeedHandler {
     ) -> Self {
         Self {
             clock,
+            checkpoint_gate: Default::default(),
             signal,
             inner: None,
-            cmd_rx,
-            raw_rx,
+            cmd_rx: cmd_rx.into(),
+            raw_rx: raw_rx.into(),
             out_tx,
             auth_tracker,
             subscriptions_state,
             retry_manager: create_websocket_retry_manager(),
-            pending_messages: VecDeque::new(),
+            pending_messages: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
         }
+    }
+
+    pub(super) fn with_checkpoint_gate(
+        mut self,
+        gate: nautilus_common::live::checkpoint::CheckpointGate,
+    ) -> Self {
+        self.checkpoint_gate = gate;
+        self
+    }
+
+    pub(super) fn with_checkpoint_pending_messages(
+        mut self,
+        pending: Arc<parking_lot::Mutex<VecDeque<OKXWsMessage>>>,
+    ) -> Self {
+        self.pending_messages = pending;
+        self
     }
 
     pub(super) fn is_stopped(&self) -> bool {
@@ -183,6 +201,10 @@ impl OKXWsFeedHandler {
         payload: SecretString,
         rate_limit_keys: Option<&[Ustr]>,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_transmit = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         if let Some(client) = &self.inner {
             let keys_owned: Option<Vec<Ustr>> = rate_limit_keys.map(<[Ustr]>::to_vec);
             self.retry_manager
@@ -213,6 +235,10 @@ impl OKXWsFeedHandler {
         payload: String,
         rate_limit_keys: Option<&[Ustr]>,
     ) -> Result<(), OKXWsError> {
+        let _checkpoint_transmit = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|error| OKXWsError::ClientError(error.to_string()))?;
         let client = self.inner.as_ref().ok_or(OKXWsError::NoActiveClient)?;
         let connection_epoch = client.connection_epoch();
         client
@@ -235,7 +261,7 @@ impl OKXWsFeedHandler {
     }
 
     pub(super) async fn next(&mut self) -> Option<OKXWsMessage> {
-        if let Some(message) = self.pending_messages.pop_front() {
+        if let Some(message) = self.pending_messages.lock().pop_front() {
             return Some(message);
         }
 
@@ -294,7 +320,7 @@ impl OKXWsFeedHandler {
                                 log::error!("Failed to send message: error={e}");
 
                                 if let Some(request_id) = request_id {
-                                    self.pending_messages.push_back(OKXWsMessage::SendFailed {
+                                    self.pending_messages.lock().push_back(OKXWsMessage::SendFailed {
                                         request_id,
                                         client_order_ids,
                                         op,
@@ -347,7 +373,7 @@ impl OKXWsFeedHandler {
                                 conn_id: Some(conn_id),
                                 timestamp: self.clock.get_time_ns().as_u64(),
                             };
-                            self.pending_messages.push_back(OKXWsMessage::Error(error));
+                            self.pending_messages.lock().push_back(OKXWsMessage::Error(error));
                         }
                         OKXWsFrame::BookData { arg, action, data } => {
                             return Some(OKXWsMessage::BookData { arg, action, data });
