@@ -195,6 +195,7 @@ pub struct RunningCheckpointInventory {
 
 /// Sealed borrowed boundary. Applications cannot construct or retain this value.
 /// Its proof, seven queues, cache and component state share one native freeze.
+#[derive(Debug)]
 pub struct RunningCheckpointBoundary<'a> {
     proof: &'a DispatchCompletionProof,
     pending: &'a RunnerPendingSnapshot,
@@ -441,7 +442,18 @@ impl LiveNode {
                     nautilus_common::msgbus::with_local_only_recovery_inventory(|bus| {
                         nautilus_common::runner::with_empty_sync_command_queues(|| {
                             let pending = receivers.snapshot(&ingress, &guard, &registry)?;
-                            let mut runner_counts = BTreeMap::new();
+                            let mut runner_counts = [
+                                "time_event",
+                                "system_event",
+                                "system_command",
+                                "execution_event",
+                                "execution_command",
+                                "data_event",
+                                "data_command",
+                            ]
+                            .into_iter()
+                            .map(|name| (name.to_owned(), 0))
+                            .collect::<BTreeMap<_, u64>>();
                             for entry in &pending.entries {
                                 let name = serde_json::to_value(entry.channel)?
                                     .as_str()

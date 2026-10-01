@@ -62,10 +62,9 @@ use nautilus_model::{
     instruments::InstrumentAny,
     orders::Order,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance, Money, Quantity},
+    types::{AccountBalance, MarginBalance, Quantity},
 };
 use rust_decimal::Decimal;
-use ustr::Ustr;
 
 use crate::{
     common::{
@@ -102,7 +101,6 @@ use crate::{
             AlgoCancelContext, WsDispatchState, dispatch_ws_message, emit_algo_cancel_rejections,
         },
         messages::OKXWsMessage,
-        parse::OrderStateSnapshot,
     },
 };
 
