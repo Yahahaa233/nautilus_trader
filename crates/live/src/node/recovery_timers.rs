@@ -75,7 +75,9 @@ impl RetainedRecoveryTimerHandoff {
 }
 #[derive(Debug)]
 pub(super) struct RetainedNodeTimers {
-    pub(super) clocks: BTreeMap<String, Option<Box<dyn RestoredTimerCheckpoint>>>,
+    pub(super) clocks: BTreeMap<String, Option<RefCell<Box<dyn RestoredTimerCheckpoint>>>>,
+    #[cfg(feature = "native-tail-replay")]
+    actual_clocks: BTreeMap<String, Rc<RefCell<dyn nautilus_common::clock::Clock>>>,
     source: BTreeMap<String, serde_json::Value>,
     source_pending: Vec<RetainedRecoveryTimerInput>,
     pending: RefCell<VecDeque<TimeEventMessage>>,
@@ -86,7 +88,7 @@ pub(super) struct RetainedNodeTimers {
 impl RetainedNodeTimers {
     pub(super) fn verify(&self) -> Result<()> {
         for clock in self.clocks.values().flatten() {
-            clock.verify()?;
+            clock.try_borrow()?.verify()?;
         }
         Ok(())
     }
@@ -130,15 +132,30 @@ impl RetainedNodeTimers {
                     receipt
                         .as_ref()
                         .context("historical timer producer was already resumed")?
+                        .try_borrow()?
                         .historical_inventory()?,
                 ))
             })
             .collect()
     }
     #[cfg(feature = "native-tail-replay")]
-    pub(super) fn refresh_historical_dispatch(&self) -> Result<()> {
-        for clock in self.clocks.values().flatten() {
-            clock.refresh_after_historical_dispatch()?;
+    pub(super) fn refresh_historical_dispatch(
+        &self,
+        expected: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        ensure!(
+            self.clocks.keys().eq(expected.keys()),
+            "historical native clock owners changed"
+        );
+        for (owner, receipt) in &self.clocks {
+            receipt
+                .as_ref()
+                .context("historical timer owner already resumed")?
+                .try_borrow_mut()?
+                .refresh_from_historical_dispatch(
+                    &*self.actual_clocks[owner].try_borrow()?,
+                    &expected[owner],
+                )?;
         }
         Ok(())
     }
@@ -155,6 +172,7 @@ impl RetainedNodeTimers {
             receipt
                 .as_ref()
                 .context("historical timer producer was already resumed")?
+                .try_borrow()?
                 .apply_historical_inventory(&source[owner])?;
         }
         Ok(())
@@ -204,6 +222,7 @@ impl RetainedNodeTimers {
             let message = self.clocks[owner]
                 .as_ref()
                 .context("historical timer owner resumed")?
+                .try_borrow()?
                 .restore_message(event.clone(), *binding, *cleanup)?;
             pending.push_back(message);
             admitted.insert(event.event_id);
@@ -305,6 +324,7 @@ impl RetainedNodeTimers {
         let message = self.clocks[owner]
             .as_ref()
             .context("historical timer receipt absent")?
+            .try_borrow()?
             .restore_message(event, binding, cleanup)?;
         let original: BTreeMap<String, serde_json::Value> =
             serde_json::from_value(witness.payload["inventory"].clone())?;
@@ -325,7 +345,7 @@ impl RetainedNodeTimers {
                 .get_mut(&format!("component:{id}"))
                 .and_then(Option::take)
             {
-                receipt.resume()?;
+                receipt.into_inner().resume()?;
             }
         }
         Ok(())
@@ -343,7 +363,7 @@ impl RetainedNodeTimers {
             state.phase = "queued";
         }
         for receipt in self.clocks.values_mut().filter_map(Option::take) {
-            receipt.resume()?;
+            receipt.into_inner().resume()?;
         }
         Ok(())
     }
@@ -440,11 +460,11 @@ impl LiveNode {
         }
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_> {
             let mut restored = BTreeMap::new();
-            for (owner, clock) in clocks {
+            for (owner, clock) in &clocks {
                 let receipt = clock
                     .try_borrow_mut()?
-                    .restore_running_timer_checkpoint(&source[&owner])?;
-                restored.insert(owner, Some(receipt));
+                    .restore_running_timer_checkpoint(&source[owner])?;
+                restored.insert(owner.clone(), Some(RefCell::new(receipt)));
             }
             let mut messages = VecDeque::new();
             for input in &pending {
@@ -458,6 +478,7 @@ impl LiveNode {
                     restored[&input.owner]
                         .as_ref()
                         .context("native clock receipt missing")?
+                        .try_borrow()?
                         .restore_message(event, input.source_binding_id, input.cleanup)?,
                 );
             }
@@ -480,6 +501,8 @@ impl LiveNode {
             })));
             let node_timers = RetainedNodeTimers {
                 clocks: restored,
+                #[cfg(feature = "native-tail-replay")]
+                actual_clocks: clocks,
                 source,
                 source_pending: pending,
                 pending: RefCell::new(messages),
@@ -546,6 +569,8 @@ mod tests {
         })));
         let mut timers = RetainedNodeTimers {
             clocks: BTreeMap::new(),
+            #[cfg(feature = "native-tail-replay")]
+            actual_clocks: BTreeMap::new(),
             source: BTreeMap::new(),
             source_pending: Vec::new(),
             pending: RefCell::new(VecDeque::from([message])),

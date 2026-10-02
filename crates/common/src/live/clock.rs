@@ -50,6 +50,7 @@ struct TimerRestoreSpec {
 }
 
 struct LiveRestoredTimers {
+    actual_clock_id: nautilus_core::UUID4,
     clock_id: Option<nautilus_core::UUID4>,
     pause: super::checkpoint::PausedCallbacks,
     source: serde_json::Value,
@@ -197,6 +198,120 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
     }
     fn refresh_after_historical_dispatch(&self) -> anyhow::Result<()> {
         self.pause.verify()?;
+        *self.restored.try_borrow_mut()? =
+            running_timer_inventory(&self.inspectors, self.clock_id)?;
+        Ok(())
+    }
+    fn refresh_from_historical_dispatch(
+        &mut self,
+        clock: &dyn Clock,
+        expected: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.pause.verify()?;
+        anyhow::ensure!(
+            crate::recovery_trace::historical::active(),
+            "timer refresh requires original native dispatch"
+        );
+        let clock = clock
+            .as_any()
+            .downcast_ref::<LiveClock>()
+            .ok_or_else(|| anyhow::anyhow!("historical actual owner is not LiveClock"))?;
+        anyhow::ensure!(
+            clock.native_clock_id == self.actual_clock_id
+                && clock.restored_clock_id == self.clock_id,
+            "historical actual clock owner changed"
+        );
+        let inspectors = clock
+            .timers
+            .values()
+            .map(LiveTimer::checkpoint_inspector)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut actual = running_timer_inventory(&inspectors, self.clock_id)?;
+        let original = expected["timers"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("original timer registration absent"))?;
+        let rows = actual["timers"].as_array_mut().unwrap();
+        anyhow::ensure!(
+            rows.len() == original.len(),
+            "original handler timer registration differs"
+        );
+        let mut tokens = BTreeMap::new();
+        for (row, source) in rows.iter_mut().zip(original) {
+            let name = row["name"].as_str().unwrap().to_owned();
+            anyhow::ensure!(
+                source["name"] == row["name"]
+                    && row["callback_source"].as_str() == Some("registered_clock_default.v1"),
+                "historical timer callback owner/profile changed"
+            );
+            let source_id = source["binding"]["binding_id"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("original timer binding absent"))?;
+            let token = clock.timers[&Ustr::from(&name)].registered_checkpoint_token()?;
+            // Existing native bindings stay bound to the same source ID. A
+            // replacement is allowed only after its actual old token closed.
+            if let Some((old_id, (_, _, _, old_token))) = self
+                .tokens
+                .iter()
+                .find(|(_, (registered, _, _, _))| registered == &name)
+            {
+                if old_token.checkpoint_inventory()["binding_id"] == row["binding"]["binding_id"] {
+                    anyhow::ensure!(
+                        *old_id == source_id,
+                        "original timer binding was reassigned"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        old_token.checkpoint_inventory()["state"]
+                            .as_u64()
+                            .is_some_and(|state| state & (1u64 << 63) != 0),
+                        "original timer was replaced before actual cancellation"
+                    );
+                }
+            }
+            row["binding"]["binding_id"] = source_id.into();
+            // Producer-derived advancement is checked/applied separately from
+            // source receipt admissions; all registration/configuration bytes
+            // must already come from the actual handler's timer.
+            let mut registration = source.clone();
+            registration["next_time_ns"] = row["next_time_ns"].clone();
+            registration["status"] = row["status"].clone();
+            registration["binding"]["state"] = row["binding"]["state"].clone();
+            anyhow::ensure!(
+                registration == *row,
+                "actual historical timer configuration differs"
+            );
+            anyhow::ensure!(
+                tokens
+                    .insert(
+                        source_id,
+                        (
+                            name,
+                            row["interval_ns"].as_u64().unwrap(),
+                            row["next_time_ns"].as_u64().unwrap(),
+                            token
+                        )
+                    )
+                    .is_none(),
+                "duplicate historical timer source binding"
+            );
+        }
+        for (id, (name, _, _, token)) in &self.tokens {
+            if !tokens.contains_key(id) {
+                anyhow::ensure!(
+                    token.checkpoint_inventory()["state"]
+                        .as_u64()
+                        .is_some_and(|state| state & (1u64 << 63) != 0),
+                    "historical timer disappeared without actual cancellation: {name}"
+                );
+            }
+        }
+        self.updaters = clock
+            .timers
+            .iter()
+            .map(|(name, timer)| Ok((name.to_string(), timer.historical_schedule_updater()?)))
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        self.inspectors = inspectors;
+        self.tokens = tokens;
         *self.restored.try_borrow_mut()? =
             running_timer_inventory(&self.inspectors, self.clock_id)?;
         Ok(())
@@ -481,6 +596,7 @@ impl Clock for LiveClock {
         self.restored_clock_id = restored_clock_id;
         let restored = running_timer_inventory(&inspectors, restored_clock_id)?;
         Ok(Box::new(LiveRestoredTimers {
+            actual_clock_id: self.native_clock_id,
             clock_id: restored_clock_id,
             pause,
             source: inventory.clone(),
@@ -606,7 +722,8 @@ impl Clock for LiveClock {
         callback: Option<TimeEventCallback>,
         allow_past: Option<bool>,
     ) -> anyhow::Result<()> {
-        let ts_now = self.get_time_ns();
+        // Timer decisions use the same recorded owner clock read as callbacks.
+        let ts_now = Clock::timestamp_ns(self);
         let (name, alert_time_ns) =
             validate_and_prepare_time_alert(name, alert_time_ns, allow_past, ts_now)?;
 
@@ -662,7 +779,8 @@ impl Clock for LiveClock {
         allow_past: Option<bool>,
         fire_immediately: Option<bool>,
     ) -> anyhow::Result<()> {
-        let ts_now = self.get_time_ns();
+        // Timer decisions use the same recorded owner clock read as callbacks.
+        let ts_now = Clock::timestamp_ns(self);
         let (name, start_time_ns, stop_time_ns, _allow_past, fire_immediately) =
             validate_and_prepare_timer(
                 name,

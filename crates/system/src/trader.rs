@@ -696,7 +696,9 @@ impl Trader {
 
         // Register default time event handler for this strategy
         let actor_id = strategy.actor_id().inner();
-        let callback = TimeEventCallback::from(move |event: TimeEvent| {
+        // The registered owner lives in the current-thread actor registry.
+        // Keep its original callback local and acquire a native binding token.
+        let callback = TimeEventCallback::RustLocal(Rc::new(move |event: TimeEvent| {
             if let Some(mut strategy) = try_get_actor_unchecked::<T>(&actor_id) {
                 log::debug!("{RECV} {event}");
 
@@ -735,7 +737,7 @@ impl Trader {
             } else {
                 log::error!("Strategy {actor_id} not found for time event handling");
             }
-        });
+        }));
         clock.borrow_mut().register_default_handler(callback);
 
         // Transition to Ready state

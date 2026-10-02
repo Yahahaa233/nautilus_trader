@@ -758,7 +758,7 @@ mod tests {
             )))
         }
     }
-    fn actual_node(
+    pub(super) fn actual_node(
         name: &str,
         directory: std::path::PathBuf,
         parent: Option<(
@@ -809,6 +809,12 @@ mod tests {
                 let payload = if let Some(value) = input.downcast_ref::<NativeMutationInput>() {
                     value.canonical_payload()?
                 } else if let Some(DataEvent::Instrument(value)) = input.downcast_ref::<DataEvent>()
+                {
+                    serde_json::to_value(value)?
+                } else if let Some(value) = input.downcast_ref::<DataEvent>() {
+                    super::framework_tests::data_payload(value)?
+                } else if let Some(nautilus_common::messages::ExecutionEvent::Order(value)) =
+                    input.downcast_ref::<nautilus_common::messages::ExecutionEvent>()
                 {
                     serde_json::to_value(value)?
                 } else if let Some(events) =
@@ -1061,3 +1067,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(all(test, not(madsim)))]
+#[path = "native_tail_framework_tests.rs"]
+mod framework_tests;

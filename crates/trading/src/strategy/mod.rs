@@ -71,6 +71,105 @@ pub type BatchModifyOrder = (
     Option<Price>,
 );
 
+// One original framework implementation for normal and reader-bound historical routes.
+// The state comes only from the physical normal handler or its private SDK boundary.
+fn native_order_event_framework<S: Strategy + StrategyNative + ?Sized>(
+    strategy: &mut S,
+    event: &OrderEventAny,
+    state: ComponentState,
+) -> bool {
+    {
+        let core = StrategyNative::strategy_core_mut(strategy);
+        let id = &core.actor.actor_id;
+        let is_warning = matches!(
+            event,
+            OrderEventAny::Denied(_)
+                | OrderEventAny::Rejected(_)
+                | OrderEventAny::CancelRejected(_)
+                | OrderEventAny::ModifyRejected(_)
+        );
+
+        if is_warning {
+            log::warn!("{id} {RECV}{EVT} {event}");
+        } else if core.actor.config.log_events {
+            log::info!("{id} {RECV}{EVT} {event}");
+        }
+    }
+
+    let client_order_id = event.client_order_id();
+    let cached_order_is_closed = {
+        let core = StrategyNative::strategy_core_mut(strategy);
+        core.cache_ref()
+            .order(&client_order_id)
+            .map(|order| order.is_closed())
+    };
+    let is_terminal = match event {
+        OrderEventAny::FillVoided(event) => cached_order_is_closed.unwrap_or(!event.is_reopened),
+        OrderEventAny::Filled(_) => cached_order_is_closed.unwrap_or(true),
+        OrderEventAny::Canceled(_)
+        | OrderEventAny::Rejected(_)
+        | OrderEventAny::Expired(_)
+        | OrderEventAny::Denied(_) => true,
+        _ => false,
+    };
+
+    // GTD timer cleanup runs regardless of state so timers do not leak when
+    // terminal events arrive during the post-stop delay.
+    if is_terminal {
+        strategy.cancel_gtd_expiry(&client_order_id);
+    }
+
+    // Events are logged unconditionally so residual events received after stop
+    // remain observable, but dispatch is gated on the running state.
+    if state != ComponentState::Running {
+        return false;
+    }
+
+    if matches!(event, OrderEventAny::CancelRejected(_)) {
+        let order = StrategyNative::strategy_core_mut(strategy)
+            .cache_ref()
+            .order(&client_order_id)
+            .map(|order| order.clone());
+        if let Some(order) = order
+            && (order.is_open() || order.is_inflight())
+            && !strategy.has_gtd_expiry_timer(&client_order_id)
+            && let Err(e) = strategy.set_gtd_expiry(&order)
+        {
+            log::error!(
+                "Failed to restore GTD expiry for cancel-rejected order {client_order_id}: {e}"
+            );
+        }
+    }
+
+    if matches!(event, OrderEventAny::FillVoided(event) if event.is_reopened) {
+        let order = StrategyNative::strategy_core_mut(strategy)
+            .cache_ref()
+            .order(&client_order_id)
+            .map(|order| order.clone());
+        if let Some(order) = order
+            && order.is_open()
+            && !strategy.has_gtd_expiry_timer(&client_order_id)
+            && let Err(e) = strategy.set_gtd_expiry(&order)
+        {
+            log::error!("Failed to restore GTD expiry for reopened order {client_order_id}: {e}");
+        }
+    }
+
+    let manager_actions = {
+        let core = StrategyNative::strategy_core_mut(strategy);
+        if core.config.manage_contingent_orders {
+            core.order_manager
+                .as_mut()
+                .map_or_else(Vec::new, |manager| manager.handle_event(event))
+        } else {
+            Vec::new()
+        }
+    };
+    strategy.dispatch_manager_actions(manager_actions);
+
+    true
+}
+
 /// Core trait for implementing trading strategies in NautilusTrader.
 ///
 /// Strategies are specialized [`DataActor`]s that combine data ingestion capabilities with
@@ -1363,7 +1462,18 @@ pub trait Strategy: DataActor {
             if nautilus_common::recovery_trace::historical::dispatch_if_active(
                 &component_id,
                 "handle_order_event",
-                |boundary| self.on_native_recovery_input(boundary, &event),
+                |boundary| {
+                    if boundary.original_callback_admitted()?
+                        && native_order_event_framework(
+                            self,
+                            &event,
+                            boundary.original_component_state()?,
+                        )
+                    {
+                        self.on_native_recovery_input(boundary, &event)?;
+                    }
+                    Ok(())
+                },
             ) {
                 return;
             }
@@ -1386,100 +1496,10 @@ pub trait Strategy: DataActor {
         ) {
             return;
         }
-        let state = {
-            let core = StrategyNative::strategy_core_mut(self);
-            let id = &core.actor.actor_id;
-            let is_warning = matches!(
-                &event,
-                OrderEventAny::Denied(_)
-                    | OrderEventAny::Rejected(_)
-                    | OrderEventAny::CancelRejected(_)
-                    | OrderEventAny::ModifyRejected(_)
-            );
-
-            if is_warning {
-                log::warn!("{id} {RECV}{EVT} {event}");
-            } else if core.actor.config.log_events {
-                log::info!("{id} {RECV}{EVT} {event}");
-            }
-
-            core.actor.state()
-        };
-
-        let client_order_id = event.client_order_id();
-        let cached_order_is_closed = {
-            let core = StrategyNative::strategy_core_mut(self);
-            core.cache_ref()
-                .order(&client_order_id)
-                .map(|order| order.is_closed())
-        };
-        let is_terminal = match &event {
-            OrderEventAny::FillVoided(event) => {
-                cached_order_is_closed.unwrap_or(!event.is_reopened)
-            }
-            OrderEventAny::Filled(_) => cached_order_is_closed.unwrap_or(true),
-            OrderEventAny::Canceled(_)
-            | OrderEventAny::Rejected(_)
-            | OrderEventAny::Expired(_)
-            | OrderEventAny::Denied(_) => true,
-            _ => false,
-        };
-
-        // GTD timer cleanup runs regardless of state so timers do not leak when
-        // terminal events arrive during the post-stop delay.
-        if is_terminal {
-            self.cancel_gtd_expiry(&client_order_id);
-        }
-
-        // Events are logged unconditionally so residual events received after stop
-        // remain observable, but dispatch is gated on the running state.
-        if state != ComponentState::Running {
+        let state = StrategyNative::strategy_core(self).actor.state();
+        if !native_order_event_framework(self, &event, state) {
             return;
         }
-
-        if matches!(&event, OrderEventAny::CancelRejected(_)) {
-            let order = StrategyNative::strategy_core_mut(self)
-                .cache_ref()
-                .order(&client_order_id)
-                .map(|order| order.clone());
-            if let Some(order) = order
-                && (order.is_open() || order.is_inflight())
-                && !self.has_gtd_expiry_timer(&client_order_id)
-                && let Err(e) = self.set_gtd_expiry(&order)
-            {
-                log::error!(
-                    "Failed to restore GTD expiry for cancel-rejected order {client_order_id}: {e}"
-                );
-            }
-        }
-
-        if matches!(&event, OrderEventAny::FillVoided(event) if event.is_reopened) {
-            let order = StrategyNative::strategy_core_mut(self)
-                .cache_ref()
-                .order(&client_order_id)
-                .map(|order| order.clone());
-            if let Some(order) = order
-                && order.is_open()
-                && !self.has_gtd_expiry_timer(&client_order_id)
-                && let Err(e) = self.set_gtd_expiry(&order)
-            {
-                log::error!(
-                    "Failed to restore GTD expiry for reopened order {client_order_id}: {e}"
-                );
-            }
-        }
-
-        let manager_actions = {
-            let core = StrategyNative::strategy_core_mut(self);
-            if core.config.manage_contingent_orders {
-                core.order_manager
-                    .as_mut()
-                    .map_or_else(Vec::new, |manager| manager.handle_event(&event))
-            } else {
-                Vec::new()
-            }
-        };
-        self.dispatch_manager_actions(manager_actions);
 
         match &event {
             OrderEventAny::Initialized(e) => self.on_order_initialized(e.clone()),

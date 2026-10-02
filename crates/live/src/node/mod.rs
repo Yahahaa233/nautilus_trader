@@ -437,6 +437,23 @@ impl LiveNode {
                     source_version: "native_actual_registered_engine.v1".into(),
                     payload: serde_json::json!({"trading_state":actual_risk.try_borrow()?.trading_state()}),
                 });
+                let admission = {
+                    let trader = actual_trader.try_borrow()?;
+                    trader.actor_ids().into_iter().map(|id| id.inner())
+                        .chain(trader.strategy_ids().into_iter().map(|id| id.inner()))
+                        .map(|id| (id.to_string(),
+                            serde_json::json!({
+                                "admitted": nautilus_common::actor::recovery_observation::callback_admitted(&id),
+                                "observer": nautilus_common::actor::recovery_observation::is_observer(&id),
+                            })))
+                        .collect::<std::collections::BTreeMap<_,_>>()
+                };
+                found.push(nautilus_common::recovery_trace::NativeReadWitness {
+                    component_id: "native:callback_admission".into(),
+                    profile: "actual_registered_callback_admission.v1".into(),
+                    source_version: "native_actual_registered_admission.v1".into(),
+                    payload: serde_json::json!({"components":admission}),
+                });
                 let timers = recovery_quiescence::with_registered_timer_inventory_mode(
                     &actual_clock, &actual_trader, false, |_, inventory, verify, _| {
                         verify()?; Ok(inventory.clone())
@@ -491,13 +508,12 @@ impl LiveNode {
         #[cfg(feature = "native-tail-replay")]
         if guard.requires_native_effects() {
             if let Some(replay) = &self.historical_replay {
-                let timers = self
-                    .recovery_timers
-                    .as_ref()
-                    .context("historical native owner clocks missing")?;
-                timers.refresh_historical_dispatch()?;
                 let expected = replay.expected_effects()?;
                 let scheduled = serde_json::from_value(expected["registered_timers"].clone())?;
+                self.recovery_timers
+                    .as_ref()
+                    .context("historical native owner clocks missing")?
+                    .refresh_historical_dispatch(&scheduled)?;
                 self.admit_historical_native_timers(
                     &scheduled,
                     expected["timer_capture_ns"]

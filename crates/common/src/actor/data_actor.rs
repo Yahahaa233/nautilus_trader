@@ -237,6 +237,33 @@ pub trait DataActorNative {
     }
 }
 
+fn native_quote_framework(
+    core: &DataActorCore,
+    quote: &QuoteTick,
+    business_admitted: bool,
+) -> anyhow::Result<bool> {
+    core.handle_indicators_for_quote(quote)?;
+    Ok(business_admitted)
+}
+
+fn native_trade_framework(
+    core: &DataActorCore,
+    trade: &TradeTick,
+    business_admitted: bool,
+) -> anyhow::Result<bool> {
+    core.handle_indicators_for_trade(trade)?;
+    Ok(business_admitted)
+}
+
+fn native_bar_framework(
+    core: &DataActorCore,
+    bar: &Bar,
+    business_admitted: bool,
+) -> anyhow::Result<bool> {
+    core.handle_indicators_for_bar(bar)?;
+    Ok(business_admitted)
+}
+
 /// Defines lifecycle callbacks, data handlers, and subscription/request
 /// methods for data actors.
 ///
@@ -264,7 +291,7 @@ pub trait DataActor {
     }
 
     /// Restores one original callback on this actual registered object from a reader proof.
-    /// Normal indicators and lifecycle callbacks do not run in parallel with this hook.
+    /// The SDK applies its original framework prelude once; this hook applies only the original business callback.
     /// The default rejects unsupported history rather than treating an Idle callback as applied.
     /// # Errors
     /// Returns an error for unsupported source/provider/component history.
@@ -1219,7 +1246,19 @@ pub trait DataActor {
             if crate::recovery_trace::historical::dispatch_if_active(
                 &component_id,
                 "handle_quote",
-                |boundary| self.on_native_recovery_input(boundary, quote),
+                |boundary| {
+                    if boundary.original_callback_admitted()?
+                        && native_quote_framework(
+                            self.core(),
+                            quote,
+                            boundary.original_component_state()? == ComponentState::Running
+                                || boundary.original_callback_is_observer()?,
+                        )?
+                    {
+                        self.on_native_recovery_input(boundary, quote)?;
+                    }
+                    Ok(())
+                },
             ) {
                 return;
             }
@@ -1239,14 +1278,16 @@ pub trait DataActor {
         }
         log_received(&quote);
 
-        if let Err(e) = self.core().handle_indicators_for_quote(quote) {
-            log_error(&e);
-            return;
-        }
-
-        if self.not_running() {
-            log_not_running(&quote);
-            return;
+        match native_quote_framework(self.core(), quote, !self.not_running()) {
+            Ok(true) => {}
+            Ok(false) => {
+                log_not_running(&quote);
+                return;
+            }
+            Err(e) => {
+                log_error(&e);
+                return;
+            }
         }
 
         if let Err(e) = self.on_quote(quote) {
@@ -1265,7 +1306,19 @@ pub trait DataActor {
             if crate::recovery_trace::historical::dispatch_if_active(
                 &component_id,
                 "handle_trade",
-                |boundary| self.on_native_recovery_input(boundary, trade),
+                |boundary| {
+                    if boundary.original_callback_admitted()?
+                        && native_trade_framework(
+                            self.core(),
+                            trade,
+                            boundary.original_component_state()? == ComponentState::Running
+                                || boundary.original_callback_is_observer()?,
+                        )?
+                    {
+                        self.on_native_recovery_input(boundary, trade)?;
+                    }
+                    Ok(())
+                },
             ) {
                 return;
             }
@@ -1285,14 +1338,16 @@ pub trait DataActor {
         }
         log_received(&trade);
 
-        if let Err(e) = self.core().handle_indicators_for_trade(trade) {
-            log_error(&e);
-            return;
-        }
-
-        if self.not_running() {
-            log_not_running(&trade);
-            return;
+        match native_trade_framework(self.core(), trade, !self.not_running()) {
+            Ok(true) => {}
+            Ok(false) => {
+                log_not_running(&trade);
+                return;
+            }
+            Err(e) => {
+                log_error(&e);
+                return;
+            }
         }
 
         if let Err(e) = self.on_trade(trade) {
@@ -1311,7 +1366,19 @@ pub trait DataActor {
             if crate::recovery_trace::historical::dispatch_if_active(
                 &component_id,
                 "handle_bar",
-                |boundary| self.on_native_recovery_input(boundary, bar),
+                |boundary| {
+                    if boundary.original_callback_admitted()?
+                        && native_bar_framework(
+                            self.core(),
+                            bar,
+                            boundary.original_component_state()? == ComponentState::Running
+                                || boundary.original_callback_is_observer()?,
+                        )?
+                    {
+                        self.on_native_recovery_input(boundary, bar)?;
+                    }
+                    Ok(())
+                },
             ) {
                 return;
             }
@@ -1331,14 +1398,16 @@ pub trait DataActor {
         }
         log_received(&bar);
 
-        if let Err(e) = self.core().handle_indicators_for_bar(bar) {
-            log_error(&e);
-            return;
-        }
-
-        if self.not_running() {
-            log_not_running(&bar);
-            return;
+        match native_bar_framework(self.core(), bar, !self.not_running()) {
+            Ok(true) => {}
+            Ok(false) => {
+                log_not_running(&bar);
+                return;
+            }
+            Err(e) => {
+                log_error(&e);
+                return;
+            }
         }
 
         if let Err(e) = self.on_bar(bar) {
@@ -3940,7 +4009,9 @@ where
 
         // Register default time event handler for this actor
         let actor_id = self.core().actor_id().inner();
-        let callback = TimeEventCallback::from(move |event: TimeEvent| {
+        // The registered owner lives in the current-thread actor registry.
+        // Keep its original callback local and acquire a native binding token.
+        let callback = TimeEventCallback::RustLocal(Rc::new(move |event: TimeEvent| {
             if !super::recovery_observation::callback_admitted(&actor_id) {
                 return;
             }
@@ -3949,7 +4020,7 @@ where
             } else {
                 log::error!("Actor {actor_id} not found for time event handling");
             }
-        });
+        }));
 
         clock.borrow_mut().register_default_handler(callback);
 

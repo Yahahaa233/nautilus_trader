@@ -109,6 +109,16 @@ pub trait RestoredTimerCheckpoint: Debug {
     fn refresh_after_historical_dispatch(&self) -> anyhow::Result<()> {
         self.verify()
     }
+    /// Refreshes actual timer registrations changed by the original handler.
+    /// This preserves the same owner/producer pause; it cannot install a timer
+    /// from expected JSON or release callback admission.
+    fn refresh_from_historical_dispatch(
+        &mut self,
+        _clock: &dyn Clock,
+        _expected: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("historical actual timer registration refresh unsupported")
+    }
     fn resume(self: Box<Self>) -> anyhow::Result<()>;
 }
 

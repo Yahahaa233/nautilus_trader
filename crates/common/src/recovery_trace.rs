@@ -819,6 +819,48 @@ pub mod historical {
                 _ => &[],
             }
         }
+        /// Actual original component state from this already-consumed SDK route.
+        /// This read cannot change the target's physical lifecycle or callback gate.
+        pub fn original_component_state(&self) -> Result<crate::enums::ComponentState> {
+            use strum::IntoEnumIterator;
+            crate::enums::ComponentState::iter()
+                .find(|state| format!("{state:?}") == self.route.component_state)
+                .context("unsupported original component state")
+        }
+        /// Original native admission, sealed by the SDK producer at Begin. A
+        /// legacy or missing witness is unknown, never a current callback permit.
+        pub fn original_callback_admitted(&self) -> Result<bool> {
+            self.original_admission()?["admitted"]
+                .as_bool()
+                .context("original component admission is unknown")
+        }
+        /// The original observer exception to Component::not_running. It is
+        /// source evidence, never admission for this physical recovery node.
+        pub fn original_callback_is_observer(&self) -> Result<bool> {
+            self.original_admission()?["observer"]
+                .as_bool()
+                .context("original observer registration is unknown")
+        }
+        fn original_admission(&self) -> Result<&serde_json::Value> {
+            let witnesses = self
+                .read_witnesses()
+                .iter()
+                .filter(|witness| witness.component_id == "native:callback_admission")
+                .collect::<Vec<_>>();
+            ensure!(
+                witnesses.len() == 1,
+                "original native callback admission unavailable"
+            );
+            let witness = witnesses[0];
+            ensure!(
+                witness.profile == "actual_registered_callback_admission.v1"
+                    && witness.source_version == "native_actual_registered_admission.v1",
+                "unsupported original callback admission profile"
+            );
+            witness.payload["components"]
+                .get(&self.route.component_id)
+                .context("original component admission is unknown")
+        }
     }
     struct Frame {
         source: Rc<dyn Any>,
