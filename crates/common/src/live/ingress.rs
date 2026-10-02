@@ -9,6 +9,7 @@ struct State {
     frozen: bool,
     snapshot_stopped: bool,
     poisoned: bool,
+    terminal: bool,
 }
 
 /// Clones share one admission boundary. No lock is held while a snapshot runs.
@@ -64,7 +65,7 @@ impl IngressGate {
             .lock()
             .map_err(|_| anyhow::anyhow!("ingress mutex poisoned"))?;
         anyhow::ensure!(
-            !state.poisoned && !state.frozen,
+            !state.poisoned && !state.frozen && !state.terminal,
             "ingress is not open and healthy"
         );
         Ok(())
@@ -137,7 +138,10 @@ impl IngressGate {
             .0
             .lock()
             .map_err(|_| anyhow::anyhow!("ingress mutex poisoned"))?;
-        anyhow::ensure!(!state.poisoned, "ingress invalidated");
+        anyhow::ensure!(
+            !state.poisoned && !state.terminal,
+            "ingress invalidated or terminal"
+        );
         if state.frozen {
             state.poisoned = true;
             anyhow::bail!("ingress already frozen");
@@ -193,6 +197,9 @@ impl<T> IngressSender<T> {
             let Ok(mut state) = self.gate.0.lock() else {
                 return Err(SendError(message));
             };
+            if state.terminal {
+                return Err(SendError(message));
+            }
             if state.frozen || state.poisoned {
                 state.poisoned = true;
                 return Err(SendError(message));
@@ -302,6 +309,26 @@ impl FrozenIngress {
         );
         Ok(())
     }
+    /// Ends a successful terminal capture without reopening any retained sender.
+    /// # Errors
+    /// Refuses rejected sends, changed epochs and in-flight enqueues.
+    pub fn finish_terminal(mut self) -> anyhow::Result<()> {
+        self.verify()?;
+        let mut state = self
+            .gate
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ingress mutex poisoned"))?;
+        anyhow::ensure!(
+            !state.poisoned && state.frozen && state.in_flight == 0 && state.epoch == self.epoch,
+            "terminal ingress boundary changed"
+        );
+        state.terminal = true;
+        state.frozen = false;
+        state.snapshot_stopped = true;
+        self.finished = true;
+        Ok(())
+    }
     /// Revalidates and releases the boundary atomically.
     ///
     /// # Errors
@@ -337,6 +364,20 @@ impl Drop for FrozenIngress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checkpoint_terminal_ingress_retains_prefix_and_rejects_reopening() {
+        let gate = IngressGate::new();
+        let (sender, mut receiver) = gate.channel();
+        sender.send(17).unwrap();
+        let frozen = gate.freeze().unwrap();
+        frozen.finish_terminal().unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), 17);
+        assert!(sender.send(18).is_err());
+        assert!(gate.verify_open().is_err());
+        assert!(gate.freeze().is_err());
+        gate.verify().unwrap();
+    }
+
     #[test]
     fn clone_preserves_gate_without_clone_message_bound() {
         struct Message(u8);

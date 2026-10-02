@@ -34,6 +34,7 @@ struct State {
     paused: bool,
     pause_epoch: u64,
     poisoned: bool,
+    terminal: bool,
     waiters: Vec<Waker>,
 }
 
@@ -56,7 +57,7 @@ impl CheckpointGate {
             state.poisoned = true;
         }
         ensure!(
-            !state.frozen && !state.paused && !state.poisoned,
+            !state.frozen && !state.paused && !state.poisoned && !state.terminal,
             "adapter request admission frozen or failed"
         );
         state.active = state
@@ -77,7 +78,7 @@ impl CheckpointGate {
             .lock()
             .map_err(|_| anyhow::anyhow!("checkpoint gate mutex poisoned"))?;
         ensure!(
-            !state.frozen && !state.poisoned,
+            !state.frozen && !state.poisoned && !state.terminal,
             "adapter checkpoint gate unavailable"
         );
         ensure!(
@@ -108,7 +109,11 @@ impl CheckpointGate {
             .lock()
             .map_err(|_| anyhow::anyhow!("checkpoint gate mutex poisoned"))?;
         ensure!(
-            !state.paused && !state.frozen && !state.poisoned && state.active == 0,
+            !state.paused
+                && !state.frozen
+                && !state.poisoned
+                && !state.terminal
+                && state.active == 0,
             "producer recovery pause unavailable"
         );
         state.pause_epoch = state
@@ -132,7 +137,7 @@ impl CheckpointGate {
             let mut state = self.0.lock().expect("checkpoint gate mutex poisoned");
             // A failed boundary never resumes producer callbacks. Shutdown owns
             // task cancellation; waking here cannot reopen failed admission.
-            if state.frozen || state.paused || state.poisoned {
+            if state.frozen || state.paused || state.poisoned || state.terminal {
                 if !state
                     .waiters
                     .iter()
@@ -262,6 +267,28 @@ impl FrozenCallbacks {
         Ok(())
     }
 
+    /// Ends the same verified freeze with admission permanently closed. This
+    /// healthy terminal cut cannot be reopened by a pause or another checkpoint.
+    /// Producer futures retain all pre-cut input; shutdown owns their join.
+    /// # Errors
+    /// Refuses changed or failed freezes.
+    pub fn finish_terminal(mut self) -> Result<()> {
+        self.verify()?;
+        let mut state = self
+            .gate
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint gate mutex poisoned"))?;
+        ensure!(
+            state.frozen && !state.poisoned && state.epoch == self.epoch && state.active == 0,
+            "terminal adapter boundary changed"
+        );
+        state.terminal = true;
+        state.frozen = false;
+        self.finished = true;
+        Ok(())
+    }
+
     /// # Errors
     /// Refuses a changed/failed boundary instead of resuming its input callbacks.
     pub fn finish(mut self) -> Result<()> {
@@ -313,6 +340,24 @@ mod tests {
         drop(freeze);
         assert!(gate.enter_request().is_err());
         assert!(gate.freeze().is_err());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_terminal_cut_never_reopens_actual_producer_or_request() {
+        let gate = CheckpointGate::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(71).unwrap();
+        let frozen = gate.freeze().unwrap();
+        frozen.finish_terminal().unwrap();
+        assert!(gate.enter_request().is_err());
+        assert!(gate.freeze().is_err());
+        assert!(gate.pause_producers().is_err());
+        let mut future = Box::pin(gate.callback(rx.recv()));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await
+        );
+        drop(future);
+        assert_eq!(rx.len(), 1);
     }
 
     #[tokio::test]

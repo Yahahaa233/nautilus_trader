@@ -124,6 +124,9 @@ pub struct OKXExecutionClient {
     pending_tasks: TaskGroup,
 }
 
+#[path = "execution_recovery.rs"]
+mod checkpoint_recovery;
+
 impl OKXExecutionClient {
     /// Creates a new [`OKXExecutionClient`].
     ///
@@ -1819,6 +1822,10 @@ fn derive_trade_mode_for_instrument(
 
 #[async_trait(?Send)]
 impl ExecutionClient for OKXExecutionClient {
+    fn restore_running_checkpoint(&mut self, inventory: &serde_json::Value) -> anyhow::Result<()> {
+        self.restore_checkpoint_source(inventory)
+    }
+
     fn freeze_running_checkpoint(
         &self,
     ) -> anyhow::Result<Box<dyn nautilus_common::clients::RunningAdapterCheckpoint>> {
@@ -1839,6 +1846,7 @@ impl ExecutionClient for OKXExecutionClient {
         let sessions = self.session_tasks.checkpoint_observation();
         let account = self.core.account_id;
         let client = self.core.client_id;
+        let configuration = self.checkpoint_configuration()?;
         Ok(Box::new(crate::checkpoint::OKXCheckpointGuard::new(
             frozen,
             move || {
@@ -1854,7 +1862,7 @@ impl ExecutionClient for OKXExecutionClient {
                 );
                 Ok(
                     serde_json::json!({"profile":"okx_connected_execution_quiescent_retained_inputs.v1",
-                        "account_id":account,"client_id":client,"request_tasks":requests,"sessions":sessions,
+                        "account_id":account,"client_id":client,"configuration":configuration,"request_tasks":requests,"sessions":sessions,
                         "private_socket":private.running_checkpoint_inventory()?,
                         "business_socket":business.running_checkpoint_inventory()?,
                         "http":http.running_checkpoint_inventory(),"dispatch":state.checkpoint_inventory()?,

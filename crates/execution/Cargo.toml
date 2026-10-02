@@ -60,6 +60,7 @@ rand = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 smallvec = { workspace = true }
 ustr = { workspace = true }
 uuid = { workspace = true }
@@ -76,8 +77,6 @@ criterion = { workspace = true }
 parking_lot = { workspace = true }
 proptest = { workspace = true }
 rstest = { workspace = true }
-serde_json = { workspace = true }
-
 [[bench]]
 name = "matching_core"
 path = "benches/matching_core.rs"

@@ -225,6 +225,13 @@ impl crate::clock::TimerCheckpoint for LiveClockCheckpoint {
         read_time.set(None);
         Ok(())
     }
+    fn finish_terminal(self: Box<Self>) -> anyhow::Result<()> {
+        self.verify()?;
+        let read_time = self.read_time.clone();
+        self.frozen.finish_terminal()?;
+        read_time.set(None);
+        Ok(())
+    }
 }
 
 impl Deref for LiveClock {

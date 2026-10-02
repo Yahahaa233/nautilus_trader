@@ -47,7 +47,7 @@ mod tests {
     use nautilus_core::DurationNanos;
     use nautilus_model::{
         identifiers::TraderId,
-        instruments::{InstrumentAny, stubs::crypto_perpetual_ethusdt},
+        instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
     };
     use rstest::rstest;
 
@@ -84,6 +84,182 @@ mod tests {
             Ok(crate::runner_recovery::RunnerRecoveryEvent::DataEvent(
                 DataEvent::Instrument(serde_json::from_value(envelope.payload.clone())?),
             ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TerminalStore {
+        trace: Rc<std::cell::RefCell<Vec<&'static str>>>,
+        retained: Rc<Cell<bool>>,
+    }
+    impl nautilus_system::event_store::KernelEventStore for TerminalStore {
+        fn restore_parent_cache(&mut self, _: nautilus_core::UUID4, _: &mut Cache) -> Result<()> {
+            Ok(())
+        }
+        fn open(
+            &mut self,
+            _: nautilus_core::UUID4,
+            _: &nautilus_system::event_store::RegisteredComponents,
+            _: Environment,
+        ) -> Result<()> {
+            self.trace.borrow_mut().push("open");
+            Ok(())
+        }
+        fn snapshot_anchorer(&self) -> Option<nautilus_execution::engine::SnapshotAnchorer> {
+            None
+        }
+        fn seal(&mut self, _: nautilus_core::UnixNanos) {
+            assert!(
+                !self.retained.get(),
+                "failed run must never receive normal seal"
+            );
+            self.trace.borrow_mut().push("seal");
+        }
+        fn retain_unsealed(&mut self, reason: &str) -> Result<()> {
+            ensure!(!reason.is_empty(), "failure reason missing");
+            self.retained.set(true);
+            self.trace.borrow_mut().push("retain");
+            Ok(())
+        }
+        fn run_id(&self) -> Option<&str> {
+            Some("terminal-actual-loop")
+        }
+        fn parent_run_id(&self) -> Option<&str> {
+            None
+        }
+        fn is_halted(&self) -> bool {
+            self.retained.get()
+        }
+    }
+
+    #[rstest]
+    #[case(false, false)]
+    #[case(true, false)]
+    #[case(false, true)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn checkpoint_actual_stop_late_input_precedes_final_cut_and_seal_or_retains_failure(
+        #[case] fail_writer: bool,
+        #[case] change_during_write: bool,
+    ) {
+        let trace = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let retained = Rc::new(Cell::new(false));
+        let store = TerminalStore {
+            trace: trace.clone(),
+            retained: retained.clone(),
+        };
+        let mut node =
+            LiveNode::builder(TraderId::from("TERMINAL-CHECKPOINT"), Environment::Sandbox)
+                .unwrap()
+                .with_reconciliation(false)
+                .with_delay_post_stop_secs(0)
+                .with_delay_shutdown_secs(0)
+                .with_event_store(move |_, _| Ok(Box::new(store)))
+                .build()
+                .unwrap();
+        node.set_dispatch_observer(NodeDispatchObserver::new(
+            DispatchObserver::new("terminal-cut".into(), |_| Ok(())).unwrap(),
+            |source, phase, input| {
+                let payload = if let Some(native) =
+                    input.downcast_ref::<super::super::NativeMutationInput>()
+                {
+                    native.canonical_payload()?
+                } else if let Some(DataEvent::Instrument(input)) = input.downcast_ref::<DataEvent>()
+                {
+                    serde_json::to_value(input)?
+                } else {
+                    anyhow::bail!("unexpected terminal actual input")
+                };
+                Ok(DispatchInput {
+                    source,
+                    phase: phase.into(),
+                    payload,
+                    batch_index: None,
+                })
+            },
+        ))
+        .unwrap();
+        let mut registry = RunnerRecoveryCodecRegistry::new([
+            crate::runner_recovery::RunnerRecoveryChannel::DataEvent,
+        ]);
+        registry.register(ActualInstrumentQueueCodec).unwrap();
+        let observed = Rc::new(Cell::new(false));
+        let observed_clone = observed.clone();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let id = instrument.id();
+        let persisted = trace.clone();
+        let handle = node.handle();
+        let mutate = handle.clone();
+        let fences = Rc::new(Cell::new(0));
+        let fenced = fences.clone();
+        node.set_running_checkpoint_handler(
+            Rc::new(registry.seal().unwrap()),
+            RunningCheckpointSchedule::Requested,
+            move |boundary| {
+                ensure!(
+                    boundary.inventory().is_terminal_cut(),
+                    "interval substituted for final cut"
+                );
+                ensure!(
+                    boundary.cache().instrument(&id).is_some(),
+                    "last accepted native instrument missing"
+                );
+                ensure!(
+                    boundary.pending().entries.is_empty(),
+                    "dequeued final input was not processed"
+                );
+                boundary.completion_proof().verify()?;
+                observed_clone.set(true);
+                Ok(())
+            },
+            move |_| {
+                persisted.borrow_mut().push("terminal_checkpoint");
+                if change_during_write {
+                    mutate.stop();
+                }
+                ensure!(!fail_writer, "injected terminal durable writer failure");
+                Ok(())
+            },
+            move |_| fenced.set(fenced.get() + 1),
+        )
+        .unwrap();
+        let driver = async {
+            while !handle.is_running() {
+                tokio::task::yield_now().await;
+            }
+            handle.stop();
+            nautilus_common::live::runner::get_data_event_sender()
+                .send(DataEvent::Instrument(instrument))
+                .unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(node.run_with_mode(NodeRunMode::Hosted), driver)
+        })
+        .await
+        .expect("actual terminal run timed out");
+        assert!(observed.get());
+        let failed = fail_writer || change_during_write;
+        assert_eq!(result.is_err(), failed);
+        assert_eq!(fences.get(), u32::from(failed));
+        assert_eq!(retained.get(), failed);
+        assert_eq!(
+            trace
+                .borrow()
+                .iter()
+                .filter(|value| **value == "seal")
+                .count(),
+            usize::from(!failed)
+        );
+        if !failed {
+            assert_eq!(*trace.borrow(), vec!["open", "terminal_checkpoint", "seal"]);
+            assert!(node.handle.ingress_gate().verify_open().is_err());
+        }
+        if failed {
+            assert!(node.kernel.exec_engine.borrow().submissions_fenced());
+            node.kernel.dispose();
+            assert!(
+                !trace.borrow().contains(&"seal"),
+                "dispose must not promote failure"
+            );
         }
     }
 
@@ -147,7 +323,7 @@ mod tests {
                 );
                 let inventory = serde_json::to_value(boundary.inventory())?;
                 ensure!(
-                    inventory["node_state"] == "running",
+                    inventory["node_state"] == "running" || boundary.inventory().is_terminal_cut(),
                     "not an actual Running boundary"
                 );
                 ensure!(
@@ -199,7 +375,7 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("running boundary timed out: state={:?}, stop={}, metrics={:?}, coverage={:?}, request={}", node.state(), handle.should_stop(), handle.metrics_snapshot(), node.dispatch_observer.as_ref().unwrap().coverage(), handle.checkpoint_requested()));
-        assert_eq!(writes.get(), 1);
+        assert_eq!(writes.get(), if fail_writer { 1 } else { 2 });
         assert_eq!(fences.get(), u32::from(fail_writer));
         assert_eq!(node.state(), NodeState::Stopped);
         assert_eq!(result.is_err(), fail_writer);
@@ -228,11 +404,18 @@ pub struct RunningCheckpointInventory {
     recovery_frontier: Option<crate::runner_recovery::RunnerRecoveryWatermark>,
     empty_bootstrap: Option<super::EmptyBootstrapRecoveryReceipt>,
     retained_recovery_timers: Option<serde_json::Value>,
+    restored_adapters: Option<BTreeMap<String, serde_json::Value>>,
+    data_client_state: BTreeMap<String, serde_json::Value>,
     message_bus_mode: &'static str,
     execution_authorized: bool,
 }
 
 impl RunningCheckpointInventory {
+    /// True only for the final cut which permanently closes actual admission.
+    #[must_use]
+    pub fn is_terminal_cut(&self) -> bool {
+        self.node_state == "shutting_down"
+    }
     #[must_use]
     pub const fn startup_reconciliation(&self) -> Option<&super::StartupReconciliationObservation> {
         self.startup_reconciliation.as_ref()
@@ -264,6 +447,18 @@ impl RunningCheckpointInventory {
     #[must_use]
     pub const fn retained_recovery_timers(&self) -> Option<&serde_json::Value> {
         self.retained_recovery_timers.as_ref()
+    }
+    #[must_use]
+    pub const fn restored_adapters(&self) -> Option<&BTreeMap<String, serde_json::Value>> {
+        self.restored_adapters.as_ref()
+    }
+    #[must_use]
+    pub const fn adapters(&self) -> &BTreeMap<String, serde_json::Value> {
+        &self.adapters
+    }
+    #[must_use]
+    pub const fn data_client_state(&self) -> &BTreeMap<String, serde_json::Value> {
+        &self.data_client_state
     }
 }
 
@@ -344,6 +539,12 @@ impl Debug for RunningCheckpointRegistration {
     }
 }
 
+/// Same-process proof of a persisted final cut. No deserialization or setter.
+#[derive(Debug)]
+pub(super) struct TerminalCheckpointReceipt {
+    pub(super) node_instance: nautilus_core::UUID4,
+    pub(super) root_sequence: u64,
+}
 impl LiveNode {
     /// Registers a node-thread collector and durable writer before running.
     /// The node verifies all guards between collection and persistence and again
@@ -400,15 +601,112 @@ impl LiveNode {
         Ok(())
     }
 
+    /// Runs only on the original runloop after trader stop and residual grace.
+    /// Every actually dequeued input still gets the ordinary begin/complete path.
+    pub(super) fn final_checkpoint_before_stop(
+        &mut self,
+        receivers: RunningReceivers<'_>,
+    ) -> Result<()> {
+        ensure!(
+            self.state() == NodeState::ShuttingDown && self.running_checkpoint.is_some(),
+            "final checkpoint requires shutting-down original run"
+        );
+        let result = (|| -> Result<()> {
+            let mut processed = 0usize;
+            loop {
+                let mut progress = false;
+                macro_rules! take {
+                    ($field:ident, $apply:expr) => {
+                        while let Ok(input) = receivers.$field.try_recv() {
+                            processed += 1;
+                            ensure!(processed <= 100_000, "final drain input bound exceeded");
+                            progress = true;
+                            ($apply)(self, input)?;
+                        }
+                    };
+                }
+                take!(time_evt_rx, |node: &mut Self, input| -> Result<()> {
+                    ensure!(
+                        node.process_time_event(input),
+                        "final native timer dispatch rejected"
+                    );
+                    Ok(())
+                });
+                take!(system_evt_rx, |node: &mut Self, input| -> Result<()> {
+                    node.process_system_event(input);
+                    Ok(())
+                });
+                take!(system_cmd_rx, |node: &mut Self, input| -> Result<()> {
+                    node.process_system_command(input);
+                    Ok(())
+                });
+                take!(exec_evt_rx, |node: &mut Self, input| -> Result<()> {
+                    node.process_exec_event(input);
+                    Ok(())
+                });
+                take!(exec_cmd_rx, |node: &mut Self, input| -> Result<()> {
+                    node.process_exec_command(input);
+                    Ok(())
+                });
+                take!(data_evt_rx, |node: &mut Self, input| -> Result<()> {
+                    node.process_data_event(input);
+                    Ok(())
+                });
+                take!(data_cmd_rx, |node: &mut Self, input| -> Result<()> {
+                    node.process_data_command(input);
+                    Ok(())
+                });
+                if !progress {
+                    break;
+                }
+            }
+            let input = self.native_lifecycle_input("stop.final_admission_cut")?;
+            let guard = self
+                .begin_node_dispatch(crate::dispatch::DispatchSource::Lifecycle, &input)?
+                .context("final cut observer missing")?;
+            guard.complete()?;
+            self.checkpoint_completed_root_mode(receivers, false, true)?;
+            ensure!(
+                self.terminal_checkpoint.is_some(),
+                "final cut was not persisted"
+            );
+            Ok(())
+        })();
+        if let Err(ref error) = result {
+            self.kernel.exec_engine.borrow().fence_submissions();
+            self.handle.ingress_gate().invalidate();
+            if let Some(registration) = &self.running_checkpoint {
+                let reason = format!("final stop checkpoint: {error:#}");
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (registration.fence)(&reason)
+                }));
+            }
+        }
+        result
+    }
+
     pub(super) fn checkpoint_after_completed_root(
+        &mut self,
+        receivers: RunningReceivers<'_>,
+        pending_report_tasks: bool,
+    ) -> Result<()> {
+        self.checkpoint_completed_root_mode(receivers, pending_report_tasks, false)
+    }
+    pub(super) fn checkpoint_completed_root_mode(
         &mut self,
         mut receivers: RunningReceivers<'_>,
         pending_report_tasks: bool,
+        terminal: bool,
     ) -> Result<()> {
         let Some(registration) = self.running_checkpoint.as_ref() else {
             return Ok(());
         };
-        if !matches!(self.state(), NodeState::Running | NodeState::Observing)
+        if terminal {
+            ensure!(
+                self.state() == NodeState::ShuttingDown && self.terminal_checkpoint.is_none(),
+                "terminal capture requires original shutting-down run"
+            );
+        } else if !matches!(self.state(), NodeState::Running | NodeState::Observing)
             || self.handle.should_stop()
         {
             return Ok(());
@@ -422,11 +720,13 @@ impl LiveNode {
             return Ok(());
         };
         if proof.root_sequence() <= registration.last_root {
+            ensure!(!terminal, "terminal cut requires new completed root");
             return Ok(());
         }
         let now = dst::time::Instant::now();
         let request_sequence = self.handle.checkpoint_requested();
-        let due = request_sequence > registration.last_request
+        let due = terminal
+            || request_sequence > registration.last_request
             || match registration.schedule {
                 RunningCheckpointSchedule::Requested => false,
                 RunningCheckpointSchedule::Interval(interval) => {
@@ -491,6 +791,16 @@ impl LiveNode {
                 "execution algorithm private state unsupported"
             );
             let mut adapters = Vec::new();
+            let data_client_state = data
+                .get_clients()
+                .iter()
+                .map(|client| {
+                    Ok((
+                        format!("data:{}", client.client_id),
+                        client.running_checkpoint_state()?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
             for client in data.get_clients() {
                 let client = client.get_client();
                 adapters.push((
@@ -506,9 +816,10 @@ impl LiveNode {
             }
             // Adapter admission is frozen first, so incoming venue messages
             // remain in their owned input queues rather than hitting a closed runner.
-            recovery_quiescence::with_running_registered_timer_inventory(
+            recovery_quiescence::with_registered_timer_inventory_mode(
                 &self.kernel.clock,
                 &self.kernel.trader,
+                terminal,
                 |timers, timer_state, verify_timers, _| {
                     let guard = ingress.freeze()?;
                     let coverage = observer.coverage()?;
@@ -581,8 +892,14 @@ impl LiveNode {
                                 *runner_counts.entry(name).or_insert(0) += 1;
                             }
                             let inventory = RunningCheckpointInventory {
-                                profile: "running_completed_root_local_bus_registered_live_timers.v1",
-                                node_state: if capture_state == NodeState::Observing {
+                                profile: if terminal {
+                                    "terminal_completed_root_closed_admission.v1"
+                                } else {
+                                    "running_completed_root_local_bus_registered_live_timers.v1"
+                                },
+                                node_state: if terminal {
+                                    "shutting_down"
+                                } else if capture_state == NodeState::Observing {
                                     "observing"
                                 } else {
                                     "running"
@@ -611,12 +928,15 @@ impl LiveNode {
                                 recovery_frontier: self.recovery_native_frontier.clone(),
                                 empty_bootstrap: self.recovery_empty_bootstrap.clone(),
                                 retained_recovery_timers: retained_timers.clone(),
+                                restored_adapters: self.recovery_adapter_source.clone(),
+                                data_client_state: data_client_state.clone(),
                                 message_bus_mode: "local_only",
                                 execution_authorized: false,
                             };
                             let verify = || -> Result<()> {
                                 ensure!(
-                                    self.state() == capture_state && !self.handle.should_stop(),
+                                    self.state() == capture_state
+                                        && (terminal || !self.handle.should_stop()),
                                     "node lifecycle changed during checkpoint"
                                 );
                                 ensure!(
@@ -672,7 +992,11 @@ impl LiveNode {
                             verify()?;
                             persist(&boundary, value)?;
                             verify()?;
-                            guard.finish()?;
+                            if terminal {
+                                guard.finish_terminal()?;
+                            } else {
+                                guard.finish()?;
+                            }
                             Ok(())
                         })
                     })
@@ -681,7 +1005,11 @@ impl LiveNode {
             // Reopen adapters only after the runner is ready. No await occurs
             // anywhere in the node-thread collect/persist/revalidation interval.
             for (_, adapter) in adapters {
-                adapter.finish()?;
+                if terminal {
+                    adapter.finish_terminal()?;
+                } else {
+                    adapter.finish()?;
+                }
             }
             Ok(())
         }));
@@ -690,6 +1018,12 @@ impl LiveNode {
                 let registration = self.running_checkpoint.as_mut().unwrap();
                 registration.last_capture = now;
                 registration.last_request = request_sequence;
+                if terminal {
+                    self.terminal_checkpoint = Some(TerminalCheckpointReceipt {
+                        node_instance: self.kernel.instance_id,
+                        root_sequence: proof.root_sequence(),
+                    });
+                }
                 Ok(())
             }
             outcome => {
@@ -703,7 +1037,10 @@ impl LiveNode {
                     Ok(Ok(())) => unreachable!(),
                 };
                 let reason = format!("{error:#}");
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fence(&reason)));
+                if !terminal {
+                    let _ =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fence(&reason)));
+                }
                 self.handle.stop();
                 Err(error)
             }

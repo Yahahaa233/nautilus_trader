@@ -136,7 +136,17 @@ impl Debug for DataClientAdapter {
     }
 }
 
+#[path = "client_checkpoint.rs"]
+mod checkpoint;
+
 impl DataClientAdapter {
+    /// Restores only the underlying adapter's explicitly supported source profile.
+    pub fn restore_running_checkpoint(
+        &mut self,
+        inventory: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.client.restore_running_checkpoint(inventory)
+    }
     /// Creates a new [`DataClientAdapter`] with the given client and clock.
     #[must_use]
     pub fn new(

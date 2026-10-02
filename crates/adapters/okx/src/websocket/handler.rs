@@ -135,6 +135,7 @@ pub(super) struct OKXWsFeedHandler {
     subscriptions_state: SubscriptionState,
     retry_manager: RetryManager<OKXWsError>,
     pending_messages: Arc<parking_lot::Mutex<VecDeque<OKXWsMessage>>>,
+    recovery_raw: Option<Arc<crate::checkpoint::RecoveryRawPrefix>>,
 }
 
 impl OKXWsFeedHandler {
@@ -151,6 +152,7 @@ impl OKXWsFeedHandler {
         Self {
             clock,
             checkpoint_gate: Default::default(),
+            recovery_raw: None,
             signal,
             inner: None,
             cmd_rx: cmd_rx.into(),
@@ -168,6 +170,14 @@ impl OKXWsFeedHandler {
         gate: nautilus_common::live::checkpoint::CheckpointGate,
     ) -> Self {
         self.checkpoint_gate = gate;
+        self
+    }
+
+    pub(super) fn with_recovery_raw_input(
+        mut self,
+        recovery: Option<Arc<crate::checkpoint::RecoveryRawPrefix>>,
+    ) -> Self {
+        self.recovery_raw = recovery;
         self
     }
 
@@ -340,9 +350,23 @@ impl OKXWsFeedHandler {
 
                 msg = self.raw_rx.recv() => {
                     let event = match msg {
-                        Some(msg) => match Self::parse_raw_message(msg) {
+                        Some(msg) => {
+                            let msg = if let Some(recovery) = &self.recovery_raw {
+                                match recovery.retain_current(msg) {
+                                    Ok(Some(msg)) => msg,
+                                    Ok(None) => continue,
+                                    Err(error) => {
+                                        log::error!("Fresh socket recovery input failed: {error:#}");
+                                        self.signal.store(true, Ordering::Release);
+                                        self.auth_tracker.fail("socket recovery input failed");
+                                        return None;
+                                    }
+                                }
+                            } else { msg };
+                            match Self::parse_raw_message(msg) {
                             Some(event) => event,
                             None => continue,
+                            }
                         },
                         None => {
                             log::debug!("WebSocket stream closed");

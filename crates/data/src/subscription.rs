@@ -130,6 +130,37 @@ impl<K, T> SubscriptionRegistry<K, T>
 where
     K: Eq + Hash,
 {
+    pub(crate) fn restore_entries(
+        &mut self,
+        entries: Vec<(K, T, AHashSet<UUID4>, usize)>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.entries.is_empty(),
+            "subscription restoration requires empty registry"
+        );
+        let mut restored = AHashMap::new();
+        for (key, command, acquisitions, owners) in entries {
+            anyhow::ensure!(
+                owners > 0 && owners <= acquisitions.len() && acquisitions.len() <= 1_000_000,
+                "source subscription ownership invalid"
+            );
+            anyhow::ensure!(
+                restored
+                    .insert(
+                        key,
+                        ActiveSubscription {
+                            command,
+                            acquisitions,
+                            owners
+                        }
+                    )
+                    .is_none(),
+                "duplicate source native subscription"
+            );
+        }
+        self.entries = restored;
+        Ok(())
+    }
     pub(crate) fn contains(&self, key: &K) -> bool {
         self.entries.contains_key(key)
     }

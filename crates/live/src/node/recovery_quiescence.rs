@@ -17,6 +17,20 @@ pub(super) fn with_running_registered_timer_inventory<T>(
         &dyn Fn(&dyn Fn() -> Result<()>) -> Result<()>,
     ) -> Result<T>,
 ) -> Result<T> {
+    with_registered_timer_inventory_mode(kernel_clock, trader, false, capture)
+}
+
+pub(super) fn with_registered_timer_inventory_mode<T>(
+    kernel_clock: &Rc<RefCell<dyn Clock>>,
+    trader: &Rc<RefCell<Trader>>,
+    terminal: bool,
+    capture: impl FnOnce(
+        &std::collections::BTreeMap<String, u64>,
+        &std::collections::BTreeMap<String, serde_json::Value>,
+        &dyn Fn() -> Result<()>,
+        &dyn Fn(&dyn Fn() -> Result<()>) -> Result<()>,
+    ) -> Result<T>,
+) -> Result<T> {
     let trader = trader
         .try_borrow()
         .context("trader busy during running timer capture")?;
@@ -97,7 +111,11 @@ pub(super) fn with_running_registered_timer_inventory<T>(
     let result = capture(&counts, &inventories, &verify, &with_actual_clock_reads)?;
     verify()?;
     for guard in guards {
-        guard.finish()?;
+        if terminal {
+            guard.finish_terminal()?;
+        } else {
+            guard.finish()?;
+        }
     }
     Ok(result)
 }

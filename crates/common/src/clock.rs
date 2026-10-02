@@ -54,6 +54,10 @@ pub trait TimerCheckpoint: Debug {
     /// # Errors
     /// Reopens production only on the same verified boundary.
     fn finish(self: Box<Self>) -> anyhow::Result<()>;
+    /// Permanently closes production on the same verified schedule inventory.
+    fn finish_terminal(self: Box<Self>) -> anyhow::Result<()> {
+        anyhow::bail!("timer terminal checkpoint unsupported")
+    }
     /// Temporarily exposes actual time for independent freshness checks while
     /// producer admission stays frozen. It never changes the underlying clock.
     fn pause_read_view(&self) -> anyhow::Result<()> {
@@ -75,6 +79,9 @@ impl TimerCheckpoint for EmptyTimerCheckpoint {
         Ok(())
     }
     fn finish(self: Box<Self>) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn finish_terminal(self: Box<Self>) -> anyhow::Result<()> {
         Ok(())
     }
 }

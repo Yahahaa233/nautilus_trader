@@ -2368,6 +2368,38 @@ impl Default for OKXHttpClient {
 }
 
 impl OKXHttpClient {
+    pub(crate) fn restore_running_checkpoint(
+        &self,
+        source: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Snapshot {
+            instruments: AHashMap<Ustr, InstrumentAny>,
+            trade_quote_ccy_lists: AHashMap<Ustr, Vec<Ustr>>,
+            spot_trade_quote_ccy: Option<Ustr>,
+            cache_initialized: bool,
+            environment: OKXEnvironment,
+        }
+        let source: Snapshot = serde_json::from_value(source.clone())?;
+        anyhow::ensure!(
+            source.environment == self.inner.environment
+                && self.instruments_cache.load().is_empty()
+                && !self.cache_initialized.load(Ordering::Acquire),
+            "HTTP source environment or fresh cache differs"
+        );
+        self.instruments_cache
+            .rcu(|m| *m = source.instruments.clone());
+        self.trade_quote_ccy_lists
+            .rcu(|m| *m = source.trade_quote_ccy_lists.clone());
+        *self
+            .spot_trade_quote_ccy
+            .lock()
+            .expect("quote currency mutex poisoned") = source.spot_trade_quote_ccy;
+        self.cache_initialized
+            .store(source.cache_initialized, Ordering::Release);
+        Ok(())
+    }
     pub(crate) fn running_checkpoint_inventory(&self) -> serde_json::Value {
         serde_json::json!({"instruments":&**self.instruments_cache.load(),
             "trade_quote_ccy_lists":&**self.trade_quote_ccy_lists.load(),

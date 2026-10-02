@@ -38,6 +38,12 @@ pub trait RunningAdapterCheckpoint: Debug {
     /// # Errors
     /// Refuses an invalid freeze; dropping unfinished guards fails closed.
     fn finish(self: Box<Self>) -> anyhow::Result<()>;
+    /// Permanently closes callback/request admission after a durable terminal cut.
+    /// # Errors
+    /// Unknown adapters must explicitly implement their actual terminal gate.
+    fn finish_terminal(self: Box<Self>) -> anyhow::Result<()> {
+        anyhow::bail!("adapter terminal checkpoint admission unsupported")
+    }
 }
 
 pub use data::DataClient;

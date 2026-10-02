@@ -138,6 +138,9 @@ pub static OKX_WS_ALGO_CANCEL_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
     Quota::per_second(NonZeroU32::new(1).expect("non-zero")).expect("valid constant")
 });
 
+#[path = "recovery.rs"]
+mod recovery;
+
 /// Maximum subscription args per subscribe/unsubscribe websocket message.
 const OKX_WS_SUBSCRIPTION_ARGS_MAX_PER_MESSAGE: usize = 256;
 
@@ -278,6 +281,7 @@ pub struct OKXWebSocketClient {
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
     out_rx: Option<crate::checkpoint::RetainedInbox<OKXWsMessage>>,
     checkpoint_gate: nautilus_common::live::checkpoint::CheckpointGate,
+    checkpoint_recovery: Option<recovery::SocketRecoveryPlan>,
     checkpoint_raw:
         Option<crate::checkpoint::RetainedInbox<tokio_tungstenite::tungstenite::Message>>,
     checkpoint_commands: Option<crate::checkpoint::RetainedInbox<HandlerCommand>>,
@@ -432,6 +436,7 @@ impl OKXWebSocketClient {
             },
             out_rx: None,
             checkpoint_gate: Default::default(),
+            checkpoint_recovery: None,
             checkpoint_raw: None,
             checkpoint_commands: None,
             checkpoint_outbox: None,
@@ -505,6 +510,9 @@ impl OKXWebSocketClient {
                 && self.subscriptions_state.pending_unsubscribe().is_empty(),
             "OKX socket subscription acknowledgement is pending"
         );
+        if let Some(recovery) = &self.checkpoint_recovery {
+            recovery.raw.verify_released()?;
+        }
         let active = self.is_active();
         anyhow::ensure!(
             !active || self.handler_tasks.len() == 1,
@@ -534,7 +542,11 @@ impl OKXWebSocketClient {
             .map(crate::checkpoint::RetainedInbox::raw_prefix)
             .transpose()?;
         Ok(
-            serde_json::json!({"profile":"okx_live_socket_retained_raw_prefix.v1",
+            serde_json::json!({"profile":"okx_live_socket_retained_raw_prefix.v2",
+                "endpoint":self.url,"requires_authentication":self.credential.is_some(),
+                "subscription_references":self.subscriptions_state.all_topics().into_iter().map(|topic| {
+                    let count=self.subscriptions_state.get_reference_count(&topic); (topic,count)
+                }).collect::<std::collections::BTreeMap<_,_>>(),
                 "active":active,"authenticated":self.auth_tracker.is_authenticated(),
                 "tasks":self.handler_tasks.checkpoint_observation().inventory()?,
                 "request_id_counter":self.request_id_counter.load(Ordering::Acquire),
@@ -862,6 +874,7 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the connection process fails.
     pub async fn connect(&mut self) -> anyhow::Result<()> {
+        self.verify_checkpoint_metadata()?;
         let _checkpoint_request = self
             .checkpoint_gate
             .enter_request()
@@ -993,6 +1006,10 @@ impl OKXWebSocketClient {
         self.checkpoint_commands = Some(cmd_rx.clone());
         let checkpoint_gate = self.checkpoint_gate.clone();
         let checkpoint_pending = self.checkpoint_pending.clone();
+        let recovery_raw = self
+            .checkpoint_recovery
+            .as_ref()
+            .map(|plan| plan.raw.clone());
         let signal = self.signal.clone();
         let auth_tracker = self.auth_tracker.clone();
         let subscriptions_state = self.subscriptions_state.clone();
@@ -1025,6 +1042,7 @@ impl OKXWebSocketClient {
                     subscriptions_state.clone(),
                     clock,
                 )
+                .with_recovery_raw_input(recovery_raw)
                 .with_checkpoint_pending_messages(checkpoint_pending)
                 .with_checkpoint_gate(checkpoint_gate.clone());
 
@@ -1188,6 +1206,7 @@ impl OKXWebSocketClient {
             }
         }
 
+        self.finish_checkpoint_recovery_handshake().await?;
         rollback.disarm();
         Ok(())
     }

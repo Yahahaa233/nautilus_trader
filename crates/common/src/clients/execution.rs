@@ -51,6 +51,14 @@ pub const DEFAULT_POSITION_RECONCILIATION_TOLERANCE: Decimal =
 /// allows implementations to hold non-Send state for any Python interop.
 #[async_trait(?Send)]
 pub trait ExecutionClient {
+    /// Restores source replay/dedup state before a fresh connection. It confers
+    /// no account attestation or execution authorization.
+    ///
+    /// # Errors
+    /// Unknown adapters or unsupported source profiles refuse.
+    fn restore_running_checkpoint(&mut self, _inventory: &serde_json::Value) -> anyhow::Result<()> {
+        anyhow::bail!("running execution adapter restoration is unsupported")
+    }
     /// Freezes actual requests, callbacks and outboxes for a restricted checkpoint.
     ///
     /// # Errors

@@ -78,6 +78,7 @@ pub struct RecoveryReleaseBoundary<'a> {
     components: &'a nautilus_system::trader::CollectedComponentState,
     node_instance_id: nautilus_core::UUID4,
     recovery_frontier: &'a Option<crate::runner_recovery::RunnerRecoveryWatermark>,
+    empty_bootstrap: &'a Option<super::EmptyBootstrapRecoveryReceipt>,
 }
 impl RecoveryReleaseBoundary<'_> {
     #[must_use]
@@ -101,6 +102,10 @@ impl RecoveryReleaseBoundary<'_> {
     #[must_use]
     pub fn recovery_frontier(&self) -> Option<&crate::runner_recovery::RunnerRecoveryWatermark> {
         self.recovery_frontier.as_ref()
+    }
+    #[must_use]
+    pub const fn empty_bootstrap(&self) -> Option<&super::EmptyBootstrapRecoveryReceipt> {
+        self.empty_bootstrap.as_ref()
     }
 }
 
@@ -275,6 +280,19 @@ impl LiveNode {
             !self.kernel.exec_engine.try_borrow()?.submissions_fenced(),
             "permanent native failure fence cannot be released by observation"
         );
+        if self.recovery_native_frontier.is_some() {
+            let clients = self.kernel.data_engine.try_borrow()?.get_clients().len()
+                + self
+                    .kernel
+                    .exec_engine
+                    .try_borrow()?
+                    .get_all_clients()
+                    .len();
+            ensure!(
+                clients == 0 || self.recovery_adapter_source.is_some(),
+                "restored actual clients require source adapter and native subscription inventory"
+            );
+        }
         ensure!(
             self.kernel
                 .trader
@@ -561,6 +579,7 @@ impl LiveNode {
                     components: &components,
                     node_instance_id: self.kernel.instance_id,
                     recovery_frontier: &self.recovery_native_frontier,
+                    empty_bootstrap: &self.recovery_empty_bootstrap,
                 };
                 generation.verify()?;
                 // The callback sees actual actor Clock now, even if an earlier

@@ -73,6 +73,13 @@ impl Debug for ExecutionClientAdapter {
 }
 
 impl ExecutionClientAdapter {
+    /// Restores replay state without granting execution authorization.
+    pub fn restore_running_checkpoint(
+        &mut self,
+        inventory: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        self.client.restore_running_checkpoint(inventory)
+    }
     /// Creates a new [`ExecutionClientAdapter`] with the given client.
     #[must_use]
     pub fn new(client: Box<dyn ExecutionClient>) -> Self {

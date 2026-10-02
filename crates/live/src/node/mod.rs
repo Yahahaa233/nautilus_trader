@@ -171,6 +171,8 @@ pub use recovery_observation::{
 #[cfg(feature = "dispatch-observer")]
 pub use recovery_timers::{RetainedRecoveryTimerHandoff, RetainedRecoveryTimerInput};
 #[cfg(feature = "dispatch-observer")]
+mod recovery_adapters;
+#[cfg(feature = "dispatch-observer")]
 mod running_checkpoint;
 #[cfg(feature = "dispatch-observer")]
 pub use running_checkpoint::{
@@ -235,9 +237,13 @@ pub struct LiveNode {
     #[cfg(feature = "dispatch-observer")]
     running_checkpoint: Option<running_checkpoint::RunningCheckpointRegistration>,
     #[cfg(feature = "dispatch-observer")]
+    terminal_checkpoint: Option<running_checkpoint::TerminalCheckpointReceipt>,
+    #[cfg(feature = "dispatch-observer")]
     recovery_observation: Option<recovery_observation::RecoveryObservationRegistration>,
     #[cfg(feature = "dispatch-observer")]
     recovery_timers: Option<recovery_timers::RetainedNodeTimers>,
+    #[cfg(feature = "dispatch-observer")]
+    recovery_adapter_source: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     runner: Option<AsyncRunner>,
     config: LiveNodeConfig,
     handle: LiveNodeHandle,
@@ -552,24 +558,6 @@ impl LiveNode {
         self.contain_event_store_failure && self.event_store_halted()
     }
 
-    #[cfg(feature = "dispatch-observer")]
-    fn record_discarded_dispatch(
-        &self,
-        source: crate::dispatch::DispatchSource,
-        input: &dyn std::any::Any,
-    ) -> bool {
-        let Some(observer) = &self.dispatch_observer else {
-            return true;
-        };
-        let phase = format!("{:?}", self.state());
-        if let Err(error) = observer.record_discarded(source, &phase, input) {
-            log::error!("Discarded dispatch recording failed: {error:#}");
-            self.handle.stop();
-            return false;
-        }
-        true
-    }
-
     #[allow(clippy::unused_unit)]
     fn process_external_message(&self, message: &BusMessage) {
         let guard = begin_node_dispatch!(self, ExternalMessage, message, ());
@@ -676,9 +664,13 @@ impl LiveNode {
             #[cfg(feature = "dispatch-observer")]
             running_checkpoint: None,
             #[cfg(feature = "dispatch-observer")]
+            terminal_checkpoint: None,
+            #[cfg(feature = "dispatch-observer")]
             recovery_observation: None,
             #[cfg(feature = "dispatch-observer")]
             recovery_timers: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_adapter_source: None,
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
@@ -773,9 +765,13 @@ impl LiveNode {
             #[cfg(feature = "dispatch-observer")]
             running_checkpoint: None,
             #[cfg(feature = "dispatch-observer")]
+            terminal_checkpoint: None,
+            #[cfg(feature = "dispatch-observer")]
             recovery_observation: None,
             #[cfg(feature = "dispatch-observer")]
             recovery_timers: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_adapter_source: None,
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
@@ -2858,18 +2854,66 @@ impl LiveNode {
         drop(external_msgbus_rx.take());
         let _ = self.kernel.cache().borrow().check_residuals();
 
-        let stop_result = self.finalize_stop().await;
-
-        // Handle events that arrived during finalize_stop
-        self.drain_channels(
-            &mut time_evt_rx,
-            &mut system_evt_rx,
-            &mut system_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-        );
+        #[cfg(feature = "dispatch-observer")]
+        if checkpoint_error.is_none() && self.running_checkpoint.is_some() {
+            let terminal_result =
+                self.final_checkpoint_before_stop(crate::runner::RunningReceivers {
+                    time_evt_rx: &mut time_evt_rx,
+                    system_evt_rx: &mut system_evt_rx,
+                    system_cmd_rx: &mut system_cmd_rx,
+                    exec_evt_rx: &mut exec_evt_rx,
+                    exec_cmd_rx: &mut exec_cmd_rx,
+                    data_evt_rx: &mut data_evt_rx,
+                    data_cmd_rx: &mut data_cmd_rx,
+                });
+            if let Err(error) = terminal_result {
+                checkpoint_error = Some(error);
+            }
+        }
+        #[cfg(feature = "dispatch-observer")]
+        let may_seal = checkpoint_error.is_none();
+        #[cfg(feature = "dispatch-observer")]
+        if let Some(error) = &checkpoint_error {
+            if let Err(retain_error) = self.kernel.prohibit_event_store_seal(&format!("{error:#}"))
+            {
+                log::error!("Failed to establish event-store Drop retention: {retain_error:#}");
+            }
+        }
+        #[cfg(not(feature = "dispatch-observer"))]
+        let may_seal = true;
+        let stop_result = self.disconnect_stop().await;
+        #[cfg(feature = "dispatch-observer")]
+        let terminal_cut = self.terminal_checkpoint.is_some();
+        #[cfg(not(feature = "dispatch-observer"))]
+        let terminal_cut = false;
+        // No-checkpoint clients stay open until their transports have joined.
+        // Their last emitted reports must be processed before seal as well.
+        if !terminal_cut {
+            self.drain_channels(
+                &mut time_evt_rx,
+                &mut system_evt_rx,
+                &mut system_cmd_rx,
+                &mut exec_evt_rx,
+                &mut exec_cmd_rx,
+                &mut data_evt_rx,
+                &mut data_cmd_rx,
+            );
+        }
+        let stop_result = match stop_result {
+            Ok(()) if may_seal => self.finish_stop_seal().await,
+            Ok(()) => {
+                self.kernel.finish_stop_without_seal().await?;
+                Err(anyhow::anyhow!(
+                    "failed final checkpoint: run remains unsealed"
+                ))
+            }
+            Err(error) => {
+                let _ = self.kernel.prohibit_event_store_seal(&format!("{error:#}"));
+                let _ = self.kernel.finish_stop_without_seal().await;
+                Err(error)
+            }
+        };
+        self.handle.set_stopped();
 
         log::info!("Event loop stopped");
 
@@ -3407,13 +3451,45 @@ impl LiveNode {
     }
 
     async fn finalize_stop(&mut self) -> anyhow::Result<()> {
+        self.disconnect_stop().await?;
+        self.drain_runner_pending();
+        #[cfg(feature = "dispatch-observer")]
+        if self.running_checkpoint.is_some() && self.terminal_checkpoint.is_none() {
+            let _ = self
+                .kernel
+                .prohibit_event_store_seal("shutdown without persisted terminal boundary");
+            self.kernel.finish_stop_without_seal().await?;
+            self.handle.set_stopped();
+            anyhow::bail!("shutdown has no persisted terminal boundary; run remains unsealed");
+        }
+        self.finish_stop_seal().await?;
+        self.handle.set_stopped();
+        Ok(())
+    }
+    async fn disconnect_stop(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "dispatch-observer")]
+        let terminal = self.terminal_checkpoint.is_some();
+        #[cfg(not(feature = "dispatch-observer"))]
+        let terminal = false;
         let input = self.native_lifecycle_input("stop.disconnect_finalize")?;
-        let guard = begin_node_dispatch!(
-            self,
-            Lifecycle,
-            &input,
-            Err(anyhow::anyhow!("stop lifecycle dispatch begin failed"))
-        );
+        #[cfg(feature = "dispatch-observer")]
+        let guard = if terminal {
+            None
+        } else {
+            match self.begin_node_dispatch(crate::dispatch::DispatchSource::Lifecycle, &input) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    log::error!("Shutdown observer failed; preserving unsealed run: {error:#}");
+                    let _ = self.kernel.prohibit_event_store_seal(&format!("{error:#}"));
+                    None
+                }
+            }
+        };
+        #[cfg(not(feature = "dispatch-observer"))]
+        let guard = {
+            let _ = (input, terminal);
+            None::<()>
+        };
         self.close_external_ingress();
 
         let timeout = self.config.timeout_disconnection;
@@ -3432,9 +3508,6 @@ impl LiveNode {
         }
 
         let readiness_result = self.await_engines_disconnected(deadline).await;
-        let kernel_result = self.kernel.finalize_stop().await;
-
-        self.handle.set_stopped();
 
         let mut errors = Vec::new();
         if let Err(e) = disconnect_result {
@@ -3443,10 +3516,6 @@ impl LiveNode {
 
         if let Err(e) = readiness_result {
             errors.push(format!("failed while awaiting engine disconnection: {e}"));
-        }
-
-        if let Err(e) = kernel_result {
-            errors.push(format!("failed while finalizing kernel shutdown: {e}"));
         }
 
         if self.event_store_halted() {
@@ -3459,6 +3528,32 @@ impl LiveNode {
         } else {
             anyhow::bail!("{}", errors.join("; "))
         }
+    }
+
+    async fn finish_stop_seal(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "dispatch-observer")]
+        if let Some(receipt) = &self.terminal_checkpoint {
+            let proof = self
+                .dispatch_observer
+                .as_ref()
+                .context("terminal observer missing")?
+                .completed_root_boundary_proof()?
+                .context("terminal completed root missing")?;
+            anyhow::ensure!(
+                receipt.node_instance == self.kernel.instance_id
+                    && receipt.root_sequence == proof.root_sequence(),
+                "terminal frontier changed before seal"
+            );
+            proof.verify()?;
+        }
+        anyhow::ensure!(
+            !self.event_store_halted(),
+            "event store halted before Stop seal"
+        );
+        self.kernel
+            .finalize_stop()
+            .await
+            .map_err(|error| anyhow::anyhow!("failed while finalizing kernel shutdown: {error:#}"))
     }
 
     #[allow(clippy::unused_unit)]
@@ -3476,9 +3571,6 @@ impl LiveNode {
         data_evt_rx: &mut SnapshotReceiver<DataEvent>,
         data_cmd_rx: &mut SnapshotReceiver<DataCommand>,
     ) {
-        if !self.note_dispatch_gap("final_drain_discarded_system_inputs") {
-            return;
-        }
         let mut drained = 0;
 
         while let Ok(handler) = time_evt_rx.try_recv() {
@@ -3487,25 +3579,11 @@ impl LiveNode {
         }
 
         while let Ok(event) = system_evt_rx.try_recv() {
-            // Keep the value consumed when observer instrumentation is disabled.
-            let _ = &event;
-            #[cfg(feature = "dispatch-observer")]
-            if !self.record_discarded_dispatch(crate::dispatch::DispatchSource::SystemEvent, &event)
-            {
-                return;
-            }
+            self.process_system_events(vec![event]);
             drained += 1;
         }
-
         while let Ok(command) = system_cmd_rx.try_recv() {
-            // Keep the value consumed when observer instrumentation is disabled.
-            let _ = &command;
-            #[cfg(feature = "dispatch-observer")]
-            if !self
-                .record_discarded_dispatch(crate::dispatch::DispatchSource::SystemCommand, &command)
-            {
-                return;
-            }
+            self.process_system_commands(vec![command]);
             drained += 1;
         }
 

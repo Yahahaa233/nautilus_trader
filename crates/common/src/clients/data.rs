@@ -47,6 +47,14 @@ use crate::messages::defi::{
 /// allows implementations to hold non-Send state for any Python interop.
 #[async_trait(?Send)]
 pub trait DataClient {
+    /// Restores a validated native source inventory into a fresh adapter before
+    /// connect. Historical data does not establish a fresh authenticated session.
+    ///
+    /// # Errors
+    /// Unknown adapters or unsupported source profiles refuse.
+    fn restore_running_checkpoint(&mut self, _inventory: &serde_json::Value) -> anyhow::Result<()> {
+        anyhow::bail!("running data adapter restoration is unsupported")
+    }
     /// Freezes actual running adapter work for a restricted checkpoint.
     ///
     /// # Errors

@@ -105,6 +105,13 @@ pub trait KernelEventStore: Debug {
     /// Idempotent: a closed or absent session is a no-op. Halted sessions defer the seal to
     /// the next-boot recovery sweep.
     fn seal(&mut self, ts_init: UnixNanos);
+    /// Preserves failed final-boundary evidence without writing a normal seal,
+    /// including during implementation Drop. This never deletes or retries input.
+    /// # Errors
+    /// Unknown implementations refuse the contract rather than imply success.
+    fn retain_unsealed(&mut self, _reason: &str) -> anyhow::Result<()> {
+        anyhow::bail!("event-store unsealed failure retention unsupported")
+    }
 
     /// Returns the run id of the currently open run, when capture is active.
     fn run_id(&self) -> Option<&str>;

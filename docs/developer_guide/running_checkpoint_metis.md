@@ -120,3 +120,59 @@ Tracked diff and both new module hashes were unchanged during the wrapper.
 Observed peak tree RSS was 2580528 KiB with two jobs. Active OKX restoration,
 remaining native state/replay integration, the final Stop drain/checkpoint/seal
 and consumer pin/migration are not certified by this scoped batch.
+
+
+The adapter/terminal-Stop batch ran 83 tests: 83 passed, 6344 outside the scoped
+filter skipped, final wrapper exit 0. This includes actual HTTP metadata and
+public/business WebSocket sessions: old retained economic frames remain ahead
+of new-session economic arrivals, while only current-session control ACKs can
+confirm fresh subscriptions. Old login/ACK frames, configuration drift,
+duplicate source bindings and repeated restore are refused. Native acquisition
+and owner counts are restored into the actual DataClientAdapter registry.
+The private execution dispatch deduplication/lifecycle state is restored and
+verified in SDK tests; independent fresh UID/account facts remain mandatory.
+The loopback data tests do not establish a live/private-account venue acceptance.
+
+The compiled installation entry is:
+`LiveNode::restore_registered_adapter_checkpoint(&adapters,
+&data_client_state, &watermark) -> Result<()>`. It requires Idle, the same already
+installed native recovery frontier, restored cache/components, actual registered
+client identities and fresh supported adapters. It runs a typed native lifecycle
+root and installs real adapter/facade state once. No JSON inventory is execution
+authority. `RunningCheckpointInventory::adapters()` and `data_client_state()`
+expose those source maps. `RecoveryReleaseBoundary::empty_bootstrap()` now exposes
+the actual sealed native receipt, not a reconstructed readiness value.
+
+A configured original run performs its final seven-channel drain and a new
+completed native lifecycle root, then uses the same collect/persist/verify
+handler regardless of interval/request cadence. `inventory.is_terminal_cut()`
+identifies `terminal_completed_root_closed_admission.v1`; actual pre-cut raw or
+native pending inputs remain serialized, so the terminal pending count is not
+assumed zero. The successful freeze permanently closes actual adapter,
+registered timer and runner admission without reopening callback producers.
+Inputs arriving after that cut cannot become old-run business callbacks. Owned
+transports are disconnected/joined before the kernel seal. Tests assert a real
+late native input is in the final cache before checkpoint/normal seal, and an
+actual active OKX terminal cut retains its raw prefix and joins both session
+tasks without publishing that retained input after the cut.
+
+A writer error or mutation during final persistence invokes the private failure
+fence, prohibits finalize/dispose normal seal and retains an unsealed run. The
+actual event-store adapter must implement
+`KernelEventStore::retain_unsealed(&mut self, reason: &str) -> Result<()>` to latch
+its real writer/session failure and suppress any implementation Drop seal. The
+default refuses this contract. `NautilusKernel::prohibit_event_store_seal` latches
+native failure; successful disconnect is never a substitute for final evidence.
+Unknown adapters or timer implementations refuse terminal gate closure.
+
+Authoritative record:
+`/Volumes/My PSSD/CQS/trading-checkpoint-validation/adapter-stop-6/`.
+Log SHA256: `6c8762f7ae3b96418968bdd2fd32bc2e8762b670840ddb44df1cef6f9dc10d2d`.
+Tracked pre/post diff SHA256:
+`8cd5eda8963c26ff2e7dfa651438f586984fe9972ba2745329334dceac02e3df`;
+all five untracked module hashes also remained unchanged. Peak tree RSS was
+2676800 KiB with two jobs. Failed earlier compile and context-regression records
+are retained. These tests certify the specified independent fork slices, not
+consumer governance, original Demo, a private venue account or complete S3.
+Historical coverage/replay, native manager/data-pipeline state, the exact
+consumer caller and final approved source migration still require actual closure.

@@ -114,6 +114,81 @@ fn venue() -> Venue {
 // --------------------------------------------------------------------------------------------
 
 #[rstest]
+fn test_checkpoint_subscription_restore_preserves_actual_acquisitions_and_owners(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let make = || {
+        DataClientAdapter::new(
+            client_id,
+            Some(venue),
+            false,
+            false,
+            Box::new(MockDataClient::new(
+                clock.clone(),
+                cache.clone(),
+                client_id,
+                Some(venue),
+            )),
+        )
+    };
+    let mut source = make();
+    let data_type = DataType::new("NativeSubscriptionCheckpoint", None, None);
+    let subscribe = |id| {
+        SubscribeCommand::Data(SubscribeCustomData::new(
+            Some(client_id),
+            Some(venue),
+            data_type.clone(),
+            id,
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+    };
+    let first = subscribe(UUID4::new());
+    let second = subscribe(UUID4::new());
+    source.execute_subscribe(first.clone());
+    source.execute_subscribe(second.clone());
+    let snapshot = source.running_checkpoint_state().unwrap();
+    assert_eq!(snapshot["active"][0]["owners"], 2);
+    let mut restored = make();
+    restored
+        .restore_running_checkpoint_state(&snapshot)
+        .unwrap();
+    restored.execute_subscribe(first.clone());
+    assert_eq!(
+        restored.running_checkpoint_state().unwrap(),
+        snapshot,
+        "source acquisition replay added a phantom owner"
+    );
+    let inverse = first.into_unsubscribe(UUID4::new(), UnixNanos::default(), None);
+    restored.execute_unsubscribe(&inverse);
+    assert_eq!(
+        restored.running_checkpoint_state().unwrap()["active"][0]["owners"],
+        1
+    );
+    restored.execute_unsubscribe(&inverse);
+    assert!(
+        restored.running_checkpoint_state().unwrap()["active"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let mut forged = snapshot;
+    forged["active"][0]["owners"] = serde_json::json!(3);
+    let mut rejected = make();
+    assert!(rejected.restore_running_checkpoint_state(&forged).is_err());
+    assert!(
+        rejected.running_checkpoint_state().unwrap()["active"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[rstest]
 fn test_custom_data_subscription(
     clock: Rc<RefCell<TestClock>>,
     cache: Rc<RefCell<Cache>>,

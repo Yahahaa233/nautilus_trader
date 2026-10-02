@@ -125,6 +125,7 @@ pub struct NautilusKernel {
     shutdown_requested: Rc<Cell<bool>>,
     event_store: Option<Box<dyn KernelEventStore>>,
     event_store_replay: bool,
+    event_store_seal_blocked: bool,
     state_save_armed: bool,
     start_attempted: bool,
     #[cfg(feature = "streaming")]
@@ -435,6 +436,7 @@ impl NautilusKernel {
             ts_shutdown: None,
             shutdown_requested,
             event_store_replay: false,
+            event_store_seal_blocked: false,
             state_save_armed: false,
             start_attempted: false,
             #[cfg(feature = "streaming")]
@@ -965,15 +967,14 @@ impl NautilusKernel {
         reason = "keeps the public async kernel API shape stable"
     )]
     pub async fn finalize_stop(&mut self) -> anyhow::Result<()> {
-        disarm_shutdown_on_error();
-
-        // Execution and data clients are stopped by their engines via `stop_engines` below
-
-        let save_result = self.save_trader_state();
-        self.portfolio.borrow_mut().finalize_equity_curve();
-        self.stop_engines();
-        self.cancel_timers();
-
+        anyhow::ensure!(
+            !self.event_store_seal_blocked,
+            "event store seal prohibited after failed final boundary"
+        );
+        if let Err(error) = self.finish_stop_without_seal().await {
+            let _ = self.prohibit_event_store_seal(&format!("{error:#}"));
+            return Err(error);
+        }
         let ts_shutdown = self.clock.borrow().timestamp_ns();
 
         if let Some(event_store) = self.event_store.as_deref_mut() {
@@ -982,6 +983,30 @@ impl NautilusKernel {
         }
         self.ts_shutdown = Some(ts_shutdown);
         log::info!("Stopped");
+        self.flush_streaming()
+    }
+
+    /// Latches failure before teardown. Disposal can never promote this run to
+    /// a normal seal; the actual implementation must also suppress its Drop seal.
+    pub fn prohibit_event_store_seal(&mut self, reason: &str) -> anyhow::Result<()> {
+        self.event_store_seal_blocked = true;
+        self.exec_engine.borrow_mut().set_snapshot_anchorer(None);
+        if let Some(store) = self.event_store.as_deref_mut() {
+            store.retain_unsealed(reason)?;
+        }
+        Ok(())
+    }
+
+    /// Stops owned engines/timers and saves state while retaining an unsealed
+    /// event store when the final boundary failed. Disconnect alone is not seal.
+    #[allow(unknown_lints)]
+    #[expect(clippy::unused_async, reason = "public async shutdown API")]
+    pub async fn finish_stop_without_seal(&mut self) -> anyhow::Result<()> {
+        disarm_shutdown_on_error();
+        let save_result = self.save_trader_state();
+        self.portfolio.borrow_mut().finalize_equity_curve();
+        self.stop_engines();
+        self.cancel_timers();
         save_result?;
         self.flush_streaming()
     }
@@ -1088,7 +1113,9 @@ impl NautilusKernel {
         // run for non-streaming backtests. finalize_stop (live) consumes the session
         // first; this call is then a no-op. Callers that skip dispose entirely fall
         // back to the event-store implementation's Drop.
-        if let Some(event_store) = self.event_store.as_deref_mut() {
+        if !self.event_store_seal_blocked
+            && let Some(event_store) = self.event_store.as_deref_mut()
+        {
             self.exec_engine.borrow_mut().set_snapshot_anchorer(None);
             let ts_dispose = self.clock.borrow().timestamp_ns();
             event_store.seal(ts_dispose);

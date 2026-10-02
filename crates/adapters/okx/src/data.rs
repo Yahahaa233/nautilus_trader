@@ -134,6 +134,9 @@ pub struct OKXDataClient {
     clock: &'static AtomicTime,
 }
 
+#[path = "data_recovery.rs"]
+mod checkpoint_recovery;
+
 impl OKXDataClient {
     /// Creates a new [`OKXDataClient`] instance.
     ///
@@ -1713,7 +1716,7 @@ async fn fetch_configured_instruments(
 ///
 /// Comparison runs on the serialized form so every venue field, including
 /// the free-form `info` metadata, participates without listing each field.
-fn instrument_definitions_match(a: &InstrumentAny, b: &InstrumentAny) -> bool {
+pub(crate) fn instrument_definitions_match(a: &InstrumentAny, b: &InstrumentAny) -> bool {
     fn normalized(instrument: &InstrumentAny) -> Option<serde_json::Value> {
         let mut value = serde_json::to_value(instrument).ok()?;
 
@@ -1818,6 +1821,10 @@ async fn reconcile_instruments(
 
 #[async_trait::async_trait(?Send)]
 impl DataClient for OKXDataClient {
+    fn restore_running_checkpoint(&mut self, inventory: &serde_json::Value) -> anyhow::Result<()> {
+        self.restore_checkpoint_source(inventory)
+    }
+
     fn freeze_running_checkpoint(
         &self,
     ) -> anyhow::Result<Box<dyn nautilus_common::clients::RunningAdapterCheckpoint>> {
@@ -1855,6 +1862,7 @@ impl DataClient for OKXDataClient {
             )
             + usize::from(self.config.update_instruments_interval_mins > 0);
         let client_id = self.client_id;
+        let configuration = self.checkpoint_configuration()?;
         Ok(Box::new(crate::checkpoint::OKXCheckpointGuard::new(
             frozen,
             move || {
@@ -1874,7 +1882,7 @@ impl DataClient for OKXDataClient {
                 );
                 Ok(
                     serde_json::json!({"profile":"okx_connected_data_quiescent_retained_inputs_no_books.v1",
-                        "client_id":client_id,"tasks":tasks,"public_socket":public.running_checkpoint_inventory()?,
+                        "client_id":client_id,"configuration":configuration,"tasks":tasks,"public_socket":public.running_checkpoint_inventory()?,
                         "business_socket":business.as_ref().map(OKXWebSocketClient::running_checkpoint_inventory).transpose()?,
                         "http":http.running_checkpoint_inventory(),"instruments":&**instruments.load(),
                         "instrument_write_sequence":update.write_seq.load(Ordering::SeqCst),
@@ -5315,8 +5323,15 @@ mod tests {
             .expect("refresh task joins after cancel");
     }
 
+    #[rstest]
+    #[case(false, false)]
+    #[case(true, false)]
+    #[case(false, true)]
     #[tokio::test]
-    async fn active_okx_data_checkpoint_keeps_real_socket_arrivals_after_the_cut() {
+    async fn active_okx_data_checkpoint_keeps_real_socket_arrivals_after_the_cut(
+        #[case] restore: bool,
+        #[case] terminal: bool,
+    ) {
         use futures_util::SinkExt;
         use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -5333,11 +5348,19 @@ mod tests {
         let websocket_addr = listener.local_addr().unwrap();
         let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let mut frame_receiver = Some(frames_rx);
+        let mut current_quote = test_payload("ws_bbo_tbt.json");
+        current_quote["data"][0]["asks"][0][0] = json!("8478.98");
+        current_quote["data"][0]["bids"][0][0] = json!("8478.97");
+        current_quote["data"][0]["ts"] = json!("1597026383087");
         let server = tokio::spawn(async move {
+            let mut connection_index = 0usize;
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut websocket = accept_async(socket).await.unwrap();
                 let frames = frame_receiver.take();
+                let index = connection_index;
+                connection_index += 1;
+                let current_quote = current_quote.clone();
                 tokio::spawn(async move {
                     let mut frames = frames;
                     loop {
@@ -5362,6 +5385,9 @@ mod tests {
                                         if let Some(op) = value["op"].as_str() {
                                             if op == "subscribe" || op == "unsubscribe" {
                                                 for arg in value["args"].as_array().unwrap() {
+                                                    if restore && index >= 2 && op == "subscribe" && arg["channel"] == "bbo-tbt" {
+                                                        websocket.send(Message::Text(current_quote.to_string().into())).await.unwrap();
+                                                    }
                                                     websocket.send(Message::Text(json!({
                                                         "event":op,"arg":arg,"connId":"local-checkpoint"
                                                     }).to_string().into())).await.unwrap();
@@ -5390,7 +5416,7 @@ mod tests {
             update_instruments_interval_mins: 0,
             ..OKXDataClientConfig::default()
         };
-        let mut client = OKXDataClient::new(*OKX_CLIENT_ID, config).unwrap();
+        let mut client = OKXDataClient::new(*OKX_CLIENT_ID, config.clone()).unwrap();
         client.connect().await.unwrap();
         client
             .ws_public
@@ -5418,6 +5444,92 @@ mod tests {
         )
         .await;
         while receiver.try_recv().is_ok() {}
+        if restore || terminal {
+            let paused = client.checkpoint_gate.pause_producers().unwrap();
+            let first = test_payload("ws_bbo_tbt.json");
+            let mut second = first.clone();
+            second["data"][0]["asks"][0][0] = json!("8477.98");
+            second["data"][0]["bids"][0][0] = json!("8477.97");
+            second["data"][0]["ts"] = json!("1597026383086");
+            frames_tx.send(first.to_string()).unwrap();
+            frames_tx.send(second.to_string()).unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let guard = client.freeze_running_checkpoint().unwrap();
+            let source = guard.inventory().clone();
+            assert_eq!(
+                source["public_socket"]["raw_input"]["fifo"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            if terminal {
+                guard.finish_terminal().unwrap();
+                paused.finish().unwrap();
+                assert!(client.checkpoint_gate.enter_request().is_err());
+                assert!(client.checkpoint_gate.pause_producers().is_err());
+                assert!(client.freeze_running_checkpoint().is_err());
+                client.disconnect().await.unwrap();
+                assert!(client.tasks.is_empty());
+                assert!(!client.ws_public.as_ref().unwrap().has_task());
+                assert!(!client.ws_business.as_ref().unwrap().has_task());
+                assert!(
+                    !receiver.try_recv().is_ok(),
+                    "terminal producer emitted retained input after final cut"
+                );
+                assert_eq!(
+                    source["public_socket"]["raw_input"]["fifo"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    2,
+                    "actual pre-cut raw FIFO must remain available for recovery"
+                );
+                server.abort();
+                return;
+            }
+            guard.finish().unwrap();
+            paused.finish().unwrap();
+            client.disconnect().await.unwrap();
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            replace_data_event_sender(sender);
+            let mut restored = OKXDataClient::new(*OKX_CLIENT_ID, config.clone()).unwrap();
+            let mut wrong = source.clone();
+            wrong["configuration"]["environment"] = json!("Demo");
+            assert!(restored.restore_running_checkpoint(&wrong).is_err());
+            let mut historical_login = source.clone();
+            historical_login["public_socket"]["raw_input"]["fifo"] = json!([{"kind":"text","body":"{\"event\":\"login\",\"code\":\"0\",\"connId\":\"old\"}"}]);
+            let mut rejected = OKXDataClient::new(*OKX_CLIENT_ID, config.clone()).unwrap();
+            assert!(
+                rejected
+                    .restore_running_checkpoint(&historical_login)
+                    .is_err()
+            );
+            restored.restore_running_checkpoint(&source).unwrap();
+            assert!(restored.restore_running_checkpoint(&source).is_err());
+            restored.connect().await.unwrap();
+            let quotes = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut quotes = Vec::new();
+                while quotes.len() < 3 {
+                    if let Some(DataEvent::Data(Data::Quote(q))) = receiver.recv().await {
+                        quotes.push(q);
+                    }
+                }
+                quotes
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                quotes
+                    .iter()
+                    .map(|q| q.bid_price.to_string())
+                    .collect::<Vec<_>>(),
+                vec!["8476.97", "8477.97", "8478.97"]
+            );
+            restored.disconnect().await.unwrap();
+            server.abort();
+            return;
+        }
         let guard = client.freeze_running_checkpoint().unwrap();
         assert_eq!(guard.inventory()["public_socket"]["active"], true);
         assert_eq!(guard.inventory()["business_socket"]["active"], true);

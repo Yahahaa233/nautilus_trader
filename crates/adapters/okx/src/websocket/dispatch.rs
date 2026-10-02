@@ -84,7 +84,7 @@ const DEDUP_CAPACITY: usize = 10_000;
 #[path = "amendment_tests.rs"]
 mod amendment_tests;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct OrderVenueBinding {
     parent: VenueOrderId,
     child: Option<VenueOrderId>,
@@ -217,6 +217,109 @@ impl Default for WsDispatchState {
 }
 
 impl WsDispatchState {
+    pub(crate) fn restore_checkpoint(&self, source: &serde_json::Value) -> anyhow::Result<()> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Snapshot {
+            order_identities: AHashMap<ClientOrderId, OrderIdentity>,
+            order_contexts: AHashMap<ClientOrderId, OrderContext>,
+            accepted_venue_order_ids: Vec<(ClientOrderId, VenueOrderId)>,
+            triggered_orders: Vec<ClientOrderId>,
+            filled_orders: Vec<ClientOrderId>,
+            terminal_orders: Vec<ClientOrderId>,
+            emitted_trades: Vec<TradeId>,
+            post_only_rejections: Vec<Ustr>,
+            client_by_parent: AHashMap<VenueOrderId, ClientOrderId>,
+            venue_by_client: AHashMap<ClientOrderId, OrderVenueBinding>,
+            terminal_client_by_parent: Vec<(VenueOrderId, ClientOrderId)>,
+            pending_linked_children: u64,
+        }
+        fn distinct<K: Eq + Hash>(values: impl IntoIterator<Item = K>) -> anyhow::Result<()> {
+            let mut keys = std::collections::HashSet::new();
+            for key in values {
+                anyhow::ensure!(
+                    keys.insert(key) && keys.len() <= DEDUP_CAPACITY,
+                    "duplicate or oversized source FIFO"
+                );
+            }
+            Ok(())
+        }
+        let source: Snapshot = serde_json::from_value(source.clone())?;
+        anyhow::ensure!(
+            self.checkpoint_inventory()? == Self::default().checkpoint_inventory()?
+                && source.pending_linked_children == 0,
+            "execution dispatch recovery requires fresh resolved source"
+        );
+        for (key, identity) in &source.order_identities {
+            anyhow::ensure!(
+                *key == identity.client_order_id,
+                "source order identity key differs"
+            );
+        }
+        for (key, context) in &source.order_contexts {
+            anyhow::ensure!(
+                *key == context.identity.client_order_id
+                    && source
+                        .order_identities
+                        .get(key)
+                        .is_none_or(|identity| *identity == context.identity),
+                "source order context differs"
+            );
+        }
+        for (client, binding) in &source.venue_by_client {
+            anyhow::ensure!(
+                source.client_by_parent.get(&binding.parent) == Some(client),
+                "source lifecycle parent binding differs"
+            );
+        }
+        for (parent, client) in &source.client_by_parent {
+            anyhow::ensure!(
+                source
+                    .venue_by_client
+                    .get(client)
+                    .is_some_and(|binding| binding.parent == *parent),
+                "source lifecycle client binding differs"
+            );
+        }
+        distinct(source.accepted_venue_order_ids.iter().map(|(key, _)| *key))?;
+        distinct(source.terminal_client_by_parent.iter().map(|(key, _)| *key))?;
+        distinct(source.triggered_orders.iter())?;
+        distinct(source.filled_orders.iter())?;
+        distinct(source.terminal_orders.iter())?;
+        distinct(source.emitted_trades.iter())?;
+        distinct(source.post_only_rejections.iter())?;
+        for (key, value) in source.order_identities {
+            self.order_identities.insert(key, value);
+        }
+        for (key, value) in source.order_contexts {
+            self.order_contexts.insert(key, value);
+        }
+        for (key, value) in source.accepted_venue_order_ids {
+            self.accepted_venue_order_ids.lock().insert(key, value);
+        }
+        for key in source.triggered_orders {
+            self.triggered_orders.insert(key);
+        }
+        for key in source.filled_orders {
+            self.filled_orders.insert(key);
+        }
+        for key in source.terminal_orders {
+            self.terminal_orders.insert(key);
+        }
+        for key in source.emitted_trades {
+            self.emitted_trades.insert(key);
+        }
+        for key in source.post_only_rejections {
+            self.post_only_rejections.insert(key);
+        }
+        let mut bindings = self.lifecycle_bindings.lock();
+        bindings.client_by_parent = source.client_by_parent;
+        bindings.venue_by_client = source.venue_by_client;
+        for (key, value) in source.terminal_client_by_parent {
+            bindings.terminal_client_by_parent.insert(key, value);
+        }
+        Ok(())
+    }
     pub(crate) fn checkpoint_inventory(&self) -> anyhow::Result<serde_json::Value> {
         anyhow::ensure!(
             self.pending_orders.is_empty()
@@ -2629,6 +2732,36 @@ mod tests {
 
     use super::*;
     use crate::websocket::{error::OKXWsError, messages::OKXWsFrame};
+
+    #[test]
+    fn checkpoint_restore_retains_fifo_dedup_and_rejects_duplicate_sources() {
+        let source = WsDispatchState::default();
+        let client = ClientOrderId::from("RESTORE-ORDER");
+        source.insert_accepted(client, VenueOrderId::from("RESTORE-VENUE"));
+        source.insert_triggered(client);
+        source.insert_terminal(client);
+        source.emitted_trades.insert(TradeId::from("RESTORE-TRADE"));
+        let inventory = source.checkpoint_inventory().unwrap();
+        let restored = WsDispatchState::default();
+        restored.restore_checkpoint(&inventory).unwrap();
+        assert_eq!(restored.checkpoint_inventory().unwrap(), inventory);
+        assert!(restored.contains_terminal(&client));
+        assert!(
+            !restored
+                .emitted_trades
+                .insert(TradeId::from("RESTORE-TRADE")),
+            "restoration re-emitted an already observed trade"
+        );
+        assert!(restored.restore_checkpoint(&inventory).is_err());
+        let mut forged = inventory;
+        forged["terminal_orders"] = serde_json::json!(["RESTORE-ORDER", "RESTORE-ORDER"]);
+        let rejected = WsDispatchState::default();
+        assert!(rejected.restore_checkpoint(&forged).is_err());
+        assert_eq!(
+            rejected.checkpoint_inventory().unwrap(),
+            WsDispatchState::default().checkpoint_inventory().unwrap()
+        );
+    }
 
     fn load_algo_order_messages(fixture: &str) -> Vec<OKXAlgoOrderMsg> {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
