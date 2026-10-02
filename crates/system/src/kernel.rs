@@ -2211,7 +2211,6 @@ mod lifecycle_tests {
         kernel.start();
         kernel.start_trader().unwrap();
         kernel.stop_trader();
-        let expected_shutdown = kernel.clock.borrow().timestamp_ns();
         let error = finalize(&mut kernel).unwrap_err();
         kernel.dispose();
 
@@ -2220,7 +2219,14 @@ mod lifecycle_tests {
             "Failed to save component state: actor FAIL-SAVE-ACTOR callback: test actor on_save \
              failure; strategy FAIL-SAVE-STRATEGY-001 callback: test strategy on_save failure"
         );
-        assert_eq!(kernel.ts_shutdown, Some(expected_shutdown));
+        assert_eq!(kernel.ts_shutdown, None);
+        assert!(kernel.event_store_seal_blocked.get());
+        assert!(
+            finalize(&mut kernel)
+                .unwrap_err()
+                .to_string()
+                .contains("event store seal prohibited")
+        );
         assert_eq!(
             control.events(),
             vec![
@@ -2235,7 +2241,6 @@ mod lifecycle_tests {
                 "strategy.on_stop",
                 "actor.on_save",
                 "strategy.on_save",
-                "event_store.seal",
                 "database.close",
             ]
         );
