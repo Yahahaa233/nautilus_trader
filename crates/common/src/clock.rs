@@ -43,6 +43,76 @@ use crate::timer::{
     create_valid_interval,
 };
 
+/// Owner-thread callback produced for one Portfolio equity-curve account.
+/// This binding is transient and cannot be deserialized from a checkpoint.
+#[derive(Debug)]
+pub struct PortfolioEquityCurveTimerCallback {
+    pub(crate) name: Ustr,
+    pub(crate) profile: serde_json::Value,
+    pub(crate) callback: TimeEventCallback,
+}
+
+impl PortfolioEquityCurveTimerCallback {
+    pub const SOURCE: &'static str = "registered_portfolio_equity_curve.v1";
+
+    /// Binds the actual callback factory to the exact account and configuration.
+    /// # Errors
+    /// Refuses any closure outside the original private Portfolio factory or a
+    /// configuration which cannot be encoded. A caller label cannot bind an
+    /// arbitrary callback to this supported producer profile.
+    pub fn new<F: Fn(TimeEvent) + 'static>(
+        account: nautilus_model::identifiers::AccountId,
+        configuration: &impl serde::Serialize,
+        callback: std::rc::Rc<F>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            std::any::type_name::<F>() == Self::FACTORY_TYPE,
+            "Portfolio callback is not the original private native factory"
+        );
+        Self::from_original_factory(
+            account,
+            configuration,
+            TimeEventCallback::RustLocal(callback),
+        )
+    }
+
+    const FACTORY_TYPE: &'static str =
+        "nautilus_portfolio::portfolio::equity_curve_callback::{{closure}}";
+
+    fn from_original_factory(
+        account: nautilus_model::identifiers::AccountId,
+        configuration: &impl serde::Serialize,
+        callback: TimeEventCallback,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            callback.is_local(),
+            "portfolio callback must own the node thread"
+        );
+        Ok(Self {
+            name: format!("portfolio_equity_curve.{account}").as_str().into(),
+            profile: serde_json::json!({"factory":"portfolio_equity_curve_callback.v1", "rust_factory_type": Self::FACTORY_TYPE,
+                "account_id":account,"configuration":serde_json::to_value(configuration)?}),
+            callback,
+        })
+    }
+
+    // Tests here verify registry/FIFO mechanics with local counters. Production
+    // can only obtain this binding from the private original Portfolio factory.
+    #[cfg(test)]
+    pub(crate) fn with_counter_for_test(
+        account: nautilus_model::identifiers::AccountId,
+        configuration: &impl serde::Serialize,
+        callback: TimeEventCallback,
+    ) -> anyhow::Result<Self> {
+        Self::from_original_factory(account, configuration, callback)
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> &serde_json::Value {
+        &self.profile
+    }
+}
+
 /// Provides time access, timer scheduling, and callback registration.
 ///
 /// An active timer is one that has not expired.
@@ -123,6 +193,15 @@ pub trait RestoredTimerCheckpoint: Debug {
 }
 
 pub trait Clock: Debug + Any {
+    /// Registers only the actual Portfolio equity-curve factory callback. A
+    /// false result preserves ordinary explicit-callback scheduling for clocks
+    /// without this recovery profile; it provides no restoration evidence.
+    fn register_portfolio_equity_curve_callback(
+        &mut self,
+        _binding: PortfolioEquityCurveTimerCallback,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
     /// Rebuilds validated source schedules with this actual registered clock's
     /// default owner callback. Producers remain paused until the opaque receipt
     /// is consumed. Unknown/named callback contracts fail closed.

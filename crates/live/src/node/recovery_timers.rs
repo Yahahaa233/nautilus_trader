@@ -459,6 +459,10 @@ impl LiveNode {
             );
         }
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_> {
+            self.kernel
+                .portfolio
+                .try_borrow_mut()?
+                .prepare_equity_curve_timer_recovery(&source["kernel"])?;
             let mut restored = BTreeMap::new();
             for (owner, clock) in &clocks {
                 let receipt = clock

@@ -342,6 +342,28 @@ fn cache(orders: &[OrderAny]) -> Cache {
 #[case(true)]
 #[tokio::test(flavor = "current_thread")]
 async fn actual_registered_native_tail_uuid_commands_and_changed_input(#[case] changed: bool) {
+    command_run_case(changed, 0, false).await;
+}
+
+#[rstest]
+#[case(false, false)]
+#[case(false, true)]
+#[case(true, false)]
+#[case(true, true)]
+#[tokio::test(flavor = "current_thread")]
+async fn actual_registered_native_trace_startup_queues_and_buffered_receipts(
+    #[case] buffered: bool,
+    #[case] changed: bool,
+) {
+    command_run_case(changed, if buffered { 2 } else { 1 }, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_registered_native_trace_portfolio_source_cut_rejects_changed_series() {
+    command_run_case(false, 1, true).await;
+}
+
+async fn command_run_case(changed: bool, startup: u8, changed_portfolio: bool) {
     let directory = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap())
         .join(format!("uuid-command-tail-{}", UUID4::new()));
     std::fs::create_dir_all(&directory).unwrap();
@@ -350,6 +372,9 @@ async fn actual_registered_native_tail_uuid_commands_and_changed_input(#[case] c
     let mut source = actual_node("uuid-command-source", directory.join("source"), None);
     source.add_strategy(CommandStrategy::new()).unwrap();
     *source.kernel.cache.borrow_mut() = cache(&seeds);
+    if startup > 0 {
+        queue_original_startup_batch(&mut source, now);
+    }
     let instance = source.kernel.instance_id();
     let trace = source
         .prepare_owned_native_trace(
@@ -364,6 +389,43 @@ async fn actual_registered_native_tail_uuid_commands_and_changed_input(#[case] c
             |_| Ok(()),
         )
         .unwrap();
+    if startup == 2 {
+        // An actual connect future is driven on the owner thread. A scheduler
+        // yield keeps it pending so real messages exercise the buffering path.
+        // Processing is delayed until the connection future releases its borrow.
+        let mut runner = source.runner.take().unwrap();
+        let mut receivers = crate::node::RunnerReceivers::from(runner.startup_channels_mut());
+        let mut pending = crate::node::startup::StartupPending::default();
+        let input = source
+            .native_lifecycle_input("startup.connect_reconcile_start")
+            .unwrap();
+        let guard = source
+            .begin_node_dispatch(crate::dispatch::DispatchSource::Lifecycle, &input)
+            .unwrap()
+            .unwrap();
+        let deadline = nautilus_common::live::dst::time::Instant::now() + Duration::from_secs(1);
+        crate::node::startup::buffer_startup_events(
+            async {
+                source.connect_data_phase(deadline).await?;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                Ok::<(), anyhow::Error>(())
+            },
+            &mut pending,
+            &mut receivers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending.retained_counts_for_test(), (2, 2, 4));
+        source
+            .flush_startup_data(&mut pending, &mut receivers)
+            .unwrap();
+        source
+            .flush_startup_events(&mut pending, &mut receivers)
+            .unwrap();
+        source.process_startup_system(&mut pending).unwrap();
+        source.finish_node_dispatch(guard).unwrap();
+        source.runner = Some(runner);
+    }
     let cuts = Rc::new(RefCell::new(Vec::new()));
     let ready = Rc::new(tokio::sync::Notify::new());
     let progressed = Rc::new(tokio::sync::Notify::new());
@@ -430,6 +492,24 @@ async fn actual_registered_native_tail_uuid_commands_and_changed_input(#[case] c
         .unwrap();
     let identity = trace.source().unwrap();
     let first = cuts.borrow()[0].clone();
+    if startup > 0 {
+        let timer = first.0.registered_timers["kernel"]["timers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "portfolio_equity_curve.BINANCE-001")
+            .expect("actual AccountState must retain its default Portfolio timer");
+        assert_eq!(
+            timer["callback_source"],
+            nautilus_common::clock::PortfolioEquityCurveTimerCallback::SOURCE
+        );
+        assert_eq!(timer["callback_profile"]["account_id"], "BINANCE-001");
+        assert_eq!(
+            timer["callback_profile"]["configuration"]["equity_curve"],
+            true
+        );
+        assert_eq!(timer["interval_ns"], 86_400_000_000_000u64);
+    }
     source.dispose();
     drop(source);
     let reader = EventStoreReader::new(
@@ -441,6 +521,9 @@ async fn actual_registered_native_tail_uuid_commands_and_changed_input(#[case] c
         .unwrap(),
     );
     let end = reader.high_watermark().unwrap();
+    if startup > 0 {
+        assert_original_startup_receipts(&reader, first.0.prefix.sequence);
+    }
     let verified = reader.verify_native_tail(&identity, &first.0, end).unwrap();
     let mut draws = BTreeSet::new();
     let mut emitted = BTreeSet::new();
@@ -533,7 +616,9 @@ async fn actual_registered_native_tail_uuid_commands_and_changed_input(#[case] c
         )),
     );
     target.add_strategy(CommandStrategy::new()).unwrap();
-    target.restore_native_cache(cache(&seeds)).unwrap();
+    target
+        .restore_native_cache(cache_from_actual_cut(&first.0.native_effects))
+        .unwrap();
     target.restore_component_state(&first.2).unwrap();
     target
         .kernel
@@ -560,6 +645,16 @@ async fn actual_registered_native_tail_uuid_commands_and_changed_input(#[case] c
             &watermark,
         )
         .unwrap();
+    let mut portfolio_cut = first.0.native_effects["portfolio"].clone();
+    if changed_portfolio {
+        let before = portfolio_cut["portfolio_snapshots"][0][1][0]["ts_event"]
+            .as_u64()
+            .unwrap();
+        portfolio_cut["portfolio_snapshots"][0][1][0]["ts_event"] = (before + 1).into();
+    }
+    target
+        .restore_registered_portfolio_checkpoint(&portfolio_cut, &watermark)
+        .unwrap();
     target
         .restore_registered_timer_checkpoint(
             first.0.registered_timers.clone(),
@@ -567,6 +662,43 @@ async fn actual_registered_native_tail_uuid_commands_and_changed_input(#[case] c
             &watermark,
         )
         .unwrap();
+    assert_eq!(
+        target
+            .kernel
+            .portfolio
+            .borrow()
+            .running_checkpoint_state()
+            .unwrap(),
+        portfolio_cut,
+        "original Portfolio cut history was lost"
+    );
+    if startup > 0 {
+        assert!(
+            !first.0.native_effects["portfolio"]["portfolio_snapshots"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "actual startup account must carry its original equity series"
+        );
+    }
+    if startup > 0 {
+        let original = first.0.registered_timers["kernel"]["timers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "portfolio_equity_curve.BINANCE-001")
+            .unwrap();
+        assert_eq!(
+            target
+                .kernel
+                .clock
+                .borrow()
+                .next_time_ns("portfolio_equity_curve.BINANCE-001")
+                .unwrap()
+                .as_u64(),
+            original["next_time_ns"].as_u64().unwrap()
+        );
+    }
     let result = target.replay_native_tail(
         &verified,
         &watermark,
@@ -600,7 +732,7 @@ async fn actual_registered_native_tail_uuid_commands_and_changed_input(#[case] c
         },
         |_, _| anyhow::bail!("source left no retained input"),
     );
-    if changed {
+    if changed || changed_portfolio {
         assert!(result.is_err());
         assert!(target.kernel.exec_engine.borrow().submissions_fenced());
         assert!(target.event_store_halted());
@@ -623,5 +755,320 @@ async fn actual_registered_native_tail_uuid_commands_and_changed_input(#[case] c
     drop(target);
     drop(reader);
     drop(trace);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+// All messages are admitted before trace installation, like restored strategy
+// warmup. Receipt identity belongs to the physical channels, never a test DTO.
+fn queue_original_startup_batch(node: &mut LiveNode, now: UnixNanos) {
+    use nautilus_common::messages::data::{SubscribeCommand, subscribe::SubscribeInstruments};
+    use nautilus_model::{
+        events::{AccountState, OrderAcceptedBatch, OrderSubmittedBatch},
+        identifiers::Venue,
+    };
+    let runner = node.runner.as_ref().unwrap();
+    let data = runner.data_event_sender_clone();
+    let commands = runner.data_command_sender_clone();
+    let execution = runner.execution_event_sender_clone();
+    for _ in 0..2 {
+        data.send(DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
+            crypto_perpetual_ethusdt(),
+        )))
+        .unwrap();
+        commands
+            .send(nautilus_common::messages::data::DataCommand::Subscribe(
+                SubscribeCommand::Instruments(SubscribeInstruments::new(
+                    None,
+                    Venue::from("BINANCE"),
+                    UUID4::new(),
+                    now,
+                    None,
+                    None,
+                )),
+            ))
+            .unwrap();
+    }
+    let mut submitted = Vec::new();
+    let mut accepted = Vec::new();
+    for id in ["STARTUP-BATCH-A", "STARTUP-BATCH-B"] {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id("NATIVE-TAIL-001".into())
+            .strategy_id(STRATEGY.into())
+            .instrument_id(instrument_id())
+            .client_order_id(id.into())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("1000.00"))
+            .build();
+        let account = AccountId::from("BINANCE-001");
+        submitted.push(OrderSubmitted::new(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            account,
+            UUID4::new(),
+            now,
+            now,
+        ));
+        accepted.push(OrderAccepted::new(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            VenueOrderId::from(id),
+            account,
+            UUID4::new(),
+            now,
+            now,
+            false,
+        ));
+        node.kernel
+            .cache
+            .borrow_mut()
+            .add_order(order, None, None, false)
+            .unwrap();
+    }
+    execution
+        .send(ExecutionEvent::OrderSubmittedBatch(
+            OrderSubmittedBatch::new(submitted),
+        ))
+        .unwrap();
+    execution
+        .send(ExecutionEvent::Account(AccountState::new(
+            AccountId::from("BINANCE-001"),
+            AccountType::Margin,
+            vec![],
+            vec![],
+            true,
+            UUID4::new(),
+            now,
+            now,
+            None,
+        )))
+        .unwrap();
+    execution
+        .send(ExecutionEvent::OrderAcceptedBatch(OrderAcceptedBatch::new(
+            accepted,
+        )))
+        .unwrap();
+    execution
+        .send(ExecutionEvent::Account(AccountState::new(
+            AccountId::from("BINANCE-001"),
+            AccountType::Margin,
+            vec![],
+            vec![],
+            true,
+            UUID4::new(),
+            now,
+            now,
+            None,
+        )))
+        .unwrap();
+}
+fn cache_from_actual_cut(effects: &serde_json::Value) -> Cache {
+    use nautilus_model::accounts::AccountAny;
+    let mut cache = Cache::default();
+    for instrument in effects["market_cache"].as_array().unwrap() {
+        cache
+            .add_instrument(serde_json::from_value(instrument["instrument"].clone()).unwrap())
+            .unwrap();
+    }
+    for account in serde_json::from_value::<Vec<AccountAny>>(effects["accounts"].clone()).unwrap() {
+        cache.add_account(account).unwrap();
+    }
+    for order in serde_json::from_value::<Vec<OrderAny>>(effects["orders"].clone()).unwrap() {
+        cache.add_order(order, None, None, false).unwrap();
+    }
+    cache
+}
+fn assert_original_startup_receipts(reader: &EventStoreReader<RedbBackend>, prefix: u64) {
+    use std::collections::BTreeMap;
+    let mut ordinals = BTreeMap::<String, Vec<u64>>::new();
+    let mut inputs = Vec::new();
+    for seq in 1..=prefix {
+        let entry = reader.scan_seq(seq).unwrap().unwrap();
+        if entry.payload_type.as_str()
+            != nautilus_event_store::native_trace::NATIVE_TRACE_PAYLOAD_TYPE
+        {
+            continue;
+        }
+        let record: NativeTraceRecord = rmp_serde::from_slice(&entry.payload).unwrap();
+        if let NativeTraceRecord::Begin {
+            input_source,
+            receipt,
+            payload,
+            stack_parent,
+            ..
+        } = record
+        {
+            if let Some(receipt) = receipt.ingress {
+                assert!(
+                    stack_parent.is_some(),
+                    "startup queue member lost its lifecycle parent"
+                );
+                assert_eq!(receipt.input_source, input_source);
+                ordinals
+                    .entry(receipt.channel_id.to_string())
+                    .or_default()
+                    .push(receipt.channel_ordinal);
+                inputs.push((input_source, payload));
+            }
+        }
+    }
+    assert_eq!(
+        inputs.len(),
+        8,
+        "startup messages were dropped or batches split"
+    );
+    for fifo in ordinals.values() {
+        assert!(
+            fifo.iter().copied().eq(1..=fifo.len() as u64),
+            "startup FIFO receipt changed: {fifo:?}"
+        );
+    }
+    let execution = inputs
+        .into_iter()
+        .filter(|(source, _)| *source == NativeInputSource::ExecutionEvent)
+        .map(|(_, payload)| payload)
+        .collect::<Vec<_>>();
+    assert_eq!(execution.len(), 4);
+    assert_eq!(execution[0]["SubmittedBatch"].as_array().unwrap().len(), 2);
+    assert!(execution[1].get("Account").is_some());
+    assert_eq!(execution[2]["AcceptedBatch"].as_array().unwrap().len(), 2);
+    assert!(execution[3].get("Account").is_some());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_native_trace_startup_codec_failure_fences_and_retains_without_clock_panic() {
+    use crate::dispatch::{DispatchInput, DispatchObserver};
+    use nautilus_common::messages::data::{SubscribeCommand, subscribe::SubscribeInstruments};
+    use nautilus_model::identifiers::Venue;
+    let directory = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap())
+        .join(format!("startup-receipt-failure-{}", UUID4::new()));
+    let mut source = actual_node("startup-receipt-failure", directory.clone(), None);
+    source.dispatch_observer = None;
+    let commands_seen = Rc::new(std::cell::Cell::new(0));
+    let seen = commands_seen.clone();
+    source
+        .set_dispatch_observer(crate::node::NodeDispatchObserver::new(
+            DispatchObserver::new("actual-startup-failure".into(), |_| Ok(())).unwrap(),
+            move |source, phase, input| {
+                let payload = if let Some(input) =
+                    input.downcast_ref::<crate::node::NativeMutationInput>()
+                {
+                    input.canonical_payload()?
+                } else if let Some(DataEvent::Instrument(instrument)) =
+                    input.downcast_ref::<DataEvent>()
+                {
+                    serde_json::to_value(instrument)?
+                } else if let Some(nautilus_common::messages::data::DataCommand::Subscribe(
+                    command,
+                )) = input.downcast_ref::<nautilus_common::messages::data::DataCommand>()
+                {
+                    let next = seen.get() + 1;
+                    seen.set(next);
+                    ensure!(next == 1, "changed actual startup command source codec");
+                    serde_json::json!({"Subscribe":command})
+                } else {
+                    anyhow::bail!("unknown actual startup input")
+                };
+                Ok(DispatchInput {
+                    source,
+                    phase: phase.into(),
+                    payload,
+                    batch_index: None,
+                })
+            },
+        ))
+        .unwrap();
+    let runner = source.runner.as_ref().unwrap();
+    runner
+        .data_event_sender_clone()
+        .send(DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
+            crypto_perpetual_ethusdt(),
+        )))
+        .unwrap();
+    for _ in 0..2 {
+        runner
+            .data_command_sender_clone()
+            .send(nautilus_common::messages::data::DataCommand::Subscribe(
+                SubscribeCommand::Instruments(SubscribeInstruments::new(
+                    None,
+                    Venue::from("BINANCE"),
+                    UUID4::new(),
+                    UnixNanos::default(),
+                    None,
+                    None,
+                )),
+            ))
+            .unwrap();
+    }
+    let trace = source
+        .prepare_owned_native_trace(
+            "actual-startup-failure-business-run".into(),
+            nautilus_event_store::native_trace::native_inventory_digest(
+                &serde_json::to_value(&source.config).unwrap(),
+            )
+            .unwrap(),
+            "actual_startup_failure.v1".into(),
+            "actual_no_registered_components.v1".into(),
+            |_, _, _| Ok(Vec::new()),
+            |_| Ok(()),
+        )
+        .unwrap();
+    let identity = trace.source().unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        source.run_with_mode(NodeRunMode::Hosted),
+    )
+    .await
+    .expect("failed startup did not terminate");
+    assert!(result.is_err(), "failed startup must not return success");
+    assert_eq!(commands_seen.get(), 2);
+    assert!(source.kernel.exec_engine.borrow().submissions_fenced());
+    assert!(source.event_store_halted());
+    assert!(
+        nautilus_common::recovery_trace::scope::current_cause().is_none(),
+        "abandoned capture frame retained"
+    );
+    // The original source failure remains permanent; cleanup reads real Clock
+    // outside the released capture branch and cannot create a new source Begin.
+    assert!(
+        nautilus_common::recovery_trace::scope::take_ingress(NativeInputSource::DataCommand)
+            .is_err()
+    );
+    let _ = source.kernel.clock.borrow().timestamp_ns();
+    assert!(
+        source
+            .begin_node_dispatch(
+                crate::dispatch::DispatchSource::Lifecycle,
+                &source
+                    .native_lifecycle_input("stop.disconnect_finalize")
+                    .unwrap()
+            )
+            .is_err()
+    );
+    source.dispose();
+    drop(source);
+    drop(trace);
+    let manifest = RedbBackend::list_runs(&directory, &identity.node_instance.to_string())
+        .unwrap()
+        .into_iter()
+        .find(|manifest| manifest.run_id == identity.journal_run)
+        .unwrap();
+    assert_eq!(
+        manifest.status,
+        nautilus_event_store::manifest::RunStatus::Running
+    );
+    assert!(manifest.end_ts_init.is_none());
+    assert!(
+        RedbBackend::open_sealed(
+            directory.clone(),
+            &identity.node_instance.to_string(),
+            &identity.journal_run
+        )
+        .is_err()
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }

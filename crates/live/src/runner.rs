@@ -189,6 +189,8 @@ impl TradingCommandSender for AsyncTradingCommandSender {
 
 #[path = "runner_snapshot.rs"]
 mod snapshot;
+#[cfg(feature = "node")]
+pub(crate) use snapshot::Retained;
 pub use snapshot::SnapshotReceiver;
 
 pub trait Runner {
@@ -747,6 +749,12 @@ impl AsyncRunner {
         self.channels
     }
 
+    #[cfg(feature = "node")]
+    pub(crate) fn startup_channels_mut(&mut self) -> &mut AsyncRunnerChannels {
+        self.ingress.invalidate_if_frozen();
+        &mut self.channels
+    }
+
     /// Flushes all pending data events and commands from the channels.
     ///
     /// Loops until both data channels are empty, processing each item
@@ -787,7 +795,7 @@ impl AsyncRunner {
         }
     }
 
-    #[cfg(feature = "node")]
+    #[cfg(all(test, feature = "node"))]
     pub(crate) fn drain_pending_system_events(&mut self) -> Vec<SystemEvent> {
         self.ingress.invalidate_if_frozen();
         let mut events = Vec::new();
@@ -799,7 +807,7 @@ impl AsyncRunner {
         events
     }
 
-    #[cfg(feature = "node")]
+    #[cfg(all(test, feature = "node"))]
     pub(crate) fn drain_pending_system_commands(&mut self) -> Vec<SystemCommand> {
         self.ingress.invalidate_if_frozen();
         let mut commands = Vec::new();

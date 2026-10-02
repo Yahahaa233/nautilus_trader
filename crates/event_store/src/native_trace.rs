@@ -311,6 +311,25 @@ impl NativeTraceRecorder {
         })
     }
 
+    /// Samples the actual processing clock for a completed-effects snapshot.
+    /// The original input receipt is retained separately and is never rewritten.
+    /// # Errors
+    /// Refuses a failed source or an invalid monotonic origin.
+    pub fn effects_capture_instant(&self) -> Result<(dst::time::Instant, u64)> {
+        let state = self
+            .0
+            .try_borrow()
+            .context("native effects clock reentered")?;
+        state.check()?;
+        let at = dst::time::Instant::now();
+        let elapsed = u64::try_from(
+            at.checked_duration_since(state.process_start)
+                .context("native effects clock moved backwards")?
+                .as_nanos(),
+        )?;
+        Ok((at, elapsed))
+    }
+
     /// Appends the host checkpoint as explicit metadata at the same frozen native cut.
     /// The host must place its complete immutable artifact bindings in this record;
     /// subsequent readers do not classify arbitrary unjoined rows as checkpoints.
@@ -758,6 +777,71 @@ impl NativeHistoricalRootReplay {
                 _ => None,
             })
             .context("historical native source Complete missing")
+    }
+    /// Maps the exact original effects-snapshot instant into the installed
+    /// source timeline. A parent's Begin predates its queued child updates.
+    /// # Errors
+    /// Refuses a substituted/out-of-receipt snapshot or missing target timeline.
+    pub fn effects_capture_instant(&self) -> Result<(dst::time::Instant, Option<u64>)> {
+        let expected = self.expected_effects()?;
+        let Some(value) = expected.get("manager_effects_capture_process_elapsed_ns") else {
+            // Older source profiles sampled effects at their original Begin.
+            return Ok((
+                nautilus_common::recovery_trace::scope::effective_activity_instant(),
+                None,
+            ));
+        };
+        let elapsed = value
+            .as_u64()
+            .context("original effects processing sample invalid")?;
+        let state = self
+            .0
+            .try_borrow()
+            .context("historical effects clock reentered")?;
+        let input = state
+            .stack
+            .last()
+            .context("historical effects input absent")?;
+        let start = state
+            .root
+            .inputs
+            .iter()
+            .find_map(|record| match record {
+                NativeTraceRecord::Begin {
+                    input_sequence,
+                    receipt,
+                    ..
+                } if input_sequence == input => Some(receipt.process_elapsed_ns),
+                _ => None,
+            })
+            .context("original effects Begin absent")?;
+        let end = state
+            .root
+            .inputs
+            .iter()
+            .find_map(|record| match record {
+                NativeTraceRecord::Complete {
+                    input_sequence,
+                    receipt,
+                    ..
+                } if input_sequence == input => Some(receipt.process_elapsed_ns),
+                _ => None,
+            })
+            .context("original effects Complete absent")?;
+        ensure!(
+            start <= elapsed && elapsed <= end,
+            "original effects processing sample outside input receipts"
+        );
+        let (cut_at, cut_elapsed) = state
+            .timeline
+            .context("historical effects timeline absent")?;
+        let delta = elapsed
+            .checked_sub(cut_elapsed)
+            .context("original effects precede source cut")?;
+        let at = cut_at
+            .checked_add(std::time::Duration::from_nanos(delta))
+            .context("original effects exceed monotonic range")?;
+        Ok((at, Some(elapsed)))
     }
     /// Enters only the next exact original source input, including actual nested children.
     /// # Errors
@@ -1381,6 +1465,7 @@ impl<B: EventStore> EventStoreReader<B> {
                         receipt,
                         output_count,
                         queued_outputs,
+                        native_effects,
                         ..
                     } => {
                         for output in queued_outputs {
@@ -1404,6 +1489,18 @@ impl<B: EventStore> EventStoreReader<B> {
                             );
                         }
                         let input = stack.pop().context("native Complete without Begin")?;
+                        if let Some(value) =
+                            native_effects.get("manager_effects_capture_process_elapsed_ns")
+                        {
+                            let sample = value
+                                .as_u64()
+                                .context("native effects processing sample invalid")?;
+                            ensure!(
+                                input.begin_receipt.process_elapsed_ns <= sample
+                                    && sample <= receipt.process_elapsed_ns,
+                                "native effects processing sample outside input receipts"
+                            );
+                        }
                         ensure!(
                             source == expected
                                 && input.input == *input_sequence
@@ -1712,6 +1809,94 @@ mod tests {
             ),
             (2, 3, Some(2), 1)
         );
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn native_trace_effects_capture_sample_preserves_nested_time_and_rejects_changed_boundary(
+        #[case] changed: bool,
+    ) {
+        let (trace, writer, backend, source, _) = actual_journal();
+        let cut = cut(&trace);
+        trace
+            .persist_checkpoint(&cut, serde_json::Value::Null)
+            .unwrap();
+        let root_payload = serde_json::json!({"actual_parent":true});
+        let child_payload = serde_json::json!({"actual_child":true});
+        let root = trace
+            .begin_native(
+                2,
+                2,
+                None,
+                NativeInputSource::Maintenance,
+                "running",
+                root_payload.clone(),
+                vec![],
+            )
+            .unwrap();
+        let child = trace
+            .begin_native(
+                2,
+                3,
+                Some(2),
+                NativeInputSource::QueryResult,
+                "running",
+                child_payload.clone(),
+                vec![],
+            )
+            .unwrap();
+        let (_, child_sample) = trace.effects_capture_instant().unwrap();
+        let child_effects =
+            serde_json::json!({"manager_effects_capture_process_elapsed_ns":child_sample});
+        child.complete(child_effects.clone()).unwrap();
+        let (_, parent_sample) = trace.effects_capture_instant().unwrap();
+        assert!(child_sample <= parent_sample);
+        let parent_effects = serde_json::json!({"manager_effects_capture_process_elapsed_ns":if changed { 0 } else { parent_sample }});
+        root.complete(parent_effects.clone()).unwrap();
+        writer.flush().unwrap();
+        let reader = EventStoreReader::new(backend);
+        let verified = reader.verify_native_tail(&source, &cut, writer.high_watermark());
+        if changed {
+            assert!(
+                verified
+                    .unwrap_err()
+                    .to_string()
+                    .contains("outside input receipts")
+            );
+        } else {
+            let verified = verified.unwrap();
+            let replay = NativeHistoricalRootReplay::with_timeline(
+                &verified.roots()[0],
+                dst::time::Instant::now(),
+                cut.captured_process_elapsed_ns,
+            );
+            let root = replay
+                .begin(NativeInputSource::Maintenance, &root_payload)
+                .unwrap();
+            let child = replay
+                .begin(NativeInputSource::QueryResult, &child_payload)
+                .unwrap();
+            let (child_at, elapsed) = replay.effects_capture_instant().unwrap();
+            assert_eq!(elapsed, Some(child_sample));
+            child.complete(child_effects).unwrap();
+            let (parent_at, elapsed) = replay.effects_capture_instant().unwrap();
+            assert_eq!(elapsed, Some(parent_sample));
+            assert!(child_at <= parent_at);
+            root.complete(parent_effects).unwrap();
+            replay.finish().unwrap();
+        }
+        drop(trace);
+        Arc::try_unwrap(writer)
+            .unwrap()
+            .close(EntryDraft::without_indices(
+                Headers::empty(),
+                "run.lifecycle.RunEnded".into(),
+                Ustr::from("RunEnded"),
+                Bytes::new(),
+                UnixNanos::from(4),
+            ))
+            .unwrap();
     }
 
     #[rstest]

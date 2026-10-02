@@ -418,6 +418,7 @@ pub struct RunningCheckpointInventory {
     restored_adapters: Option<BTreeMap<String, serde_json::Value>>,
     data_client_state: BTreeMap<String, serde_json::Value>,
     data_engine: serde_json::Value,
+    portfolio: serde_json::Value,
     message_bus_mode: &'static str,
     execution_authorized: bool,
 }
@@ -430,6 +431,10 @@ impl RunningCheckpointInventory {
     #[must_use]
     pub const fn data_engine(&self) -> &serde_json::Value {
         &self.data_engine
+    }
+    #[must_use]
+    pub const fn portfolio(&self) -> &serde_json::Value {
+        &self.portfolio
     }
     /// True only for the final cut which permanently closes actual admission.
     #[must_use]
@@ -843,6 +848,11 @@ impl LiveNode {
                 "execution algorithm private state unsupported"
             );
             let data_engine_state = data.running_checkpoint_state()?;
+            let portfolio_state = self
+                .kernel
+                .portfolio
+                .try_borrow()?
+                .running_checkpoint_state()?;
             let mut adapters = Vec::new();
             let data_client_state = data
                 .get_clients()
@@ -984,6 +994,7 @@ impl LiveNode {
                                 restored_adapters: self.recovery_adapter_source.clone(),
                                 data_client_state: data_client_state.clone(),
                                 data_engine: data_engine_state.clone(),
+                                portfolio: portfolio_state.clone(),
                                 message_bus_mode: "local_only",
                                 execution_authorized: false,
                             };
@@ -1019,6 +1030,14 @@ impl LiveNode {
                                     "actual native DataEngine internal inventory changed"
                                 );
                                 ensure!(
+                                    self.kernel
+                                        .portfolio
+                                        .try_borrow()?
+                                        .running_checkpoint_state()?
+                                        == portfolio_state,
+                                    "actual native Portfolio history changed during checkpoint"
+                                );
+                                ensure!(
                                     self.exec_manager.checkpoint_inventory(now)? == manager,
                                     "reconciliation state changed during checkpoint"
                                 );
@@ -1052,6 +1071,10 @@ impl LiveNode {
                                 cut.registered_timers = inventory.timers.clone();
                                 cut.native_effects["registered_timers"] = serde_json::to_value(&inventory.timers)?;
                                 cut.native_effects["execution_manager"] = self.exec_manager.trace_effects_inventory(now)?;
+                                cut.native_effects["portfolio"] = portfolio_state.clone();
+                                if cut.native_effects.get("manager_effects_capture_process_elapsed_ns").is_some() {
+                                    cut.native_effects["manager_effects_capture_process_elapsed_ns"] = cut.captured_process_elapsed_ns.into();
+                                }
                                 cut.native_effects["timer_capture_ns"] = inventory.captured_at_ns.into();
                                 ensure!(cut.pending_inputs.iter().map(|input| &input.receipt).eq(cut.pending.iter()),
                                     "actual staged source payload/receipt inventory differs");

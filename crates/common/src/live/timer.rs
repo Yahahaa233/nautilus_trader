@@ -86,6 +86,7 @@ const TASK_EXHAUSTED: u8 = 3;
 pub struct LiveTimer {
     checkpoint_gate: super::checkpoint::CheckpointGate,
     callback_source: &'static str,
+    callback_profile: Option<serde_json::Value>,
     /// The name of the timer.
     pub name: Ustr,
     /// The interval between timer events in nanoseconds.
@@ -108,6 +109,11 @@ pub struct LiveTimer {
 impl LiveTimer {
     pub(crate) fn with_callback_source(mut self, source: &'static str) -> Self {
         self.callback_source = source;
+        self
+    }
+
+    pub(crate) fn with_callback_profile(mut self, profile: Option<serde_json::Value>) -> Self {
+        self.callback_profile = profile;
         self
     }
     pub(crate) fn registered_checkpoint_token(&self) -> anyhow::Result<TimeEventCallbackToken> {
@@ -139,6 +145,7 @@ impl LiveTimer {
         let stop = self.stop_time_ns;
         let fire_immediately = self.fire_immediately;
         let callback_source = self.callback_source;
+        let callback_profile = self.callback_profile.clone();
         let token = match &self.callback {
             OwnerCallback::Registered { token, .. } => Some(token.clone()),
             OwnerCallback::Direct(_) => None,
@@ -157,16 +164,18 @@ impl LiveTimer {
                 next == state.next_time_ns.load(atomic::Ordering::SeqCst),
                 "timer published schedules disagree"
             );
-            Ok(
-                serde_json::json!({"name":name,"interval_ns":interval,"start_time_ns":start,
-                    "stop_time_ns":stop,"next_time_ns":next,"fire_immediately":fire_immediately,
-                    "status":if status == TASK_ACTIVE {"active"} else {"exhausted"},
-                    "callback_kind":if token.is_some() {"registered_owner_thread"} else {"thread_safe_callback"},
-                    "callback_source":callback_source,
-                    "binding":token.as_ref().map(TimeEventCallbackToken::checkpoint_inventory),
-                    "execution_authorized":false,
-                }),
-            )
+            let mut inventory = serde_json::json!({"name":name,"interval_ns":interval,"start_time_ns":start,
+                "stop_time_ns":stop,"next_time_ns":next,"fire_immediately":fire_immediately,
+                "status":if status == TASK_ACTIVE {"active"} else {"exhausted"},
+                "callback_kind":if token.is_some() {"registered_owner_thread"} else {"thread_safe_callback"},
+                "callback_source":callback_source,
+                "binding":token.as_ref().map(TimeEventCallbackToken::checkpoint_inventory),
+                "execution_authorized":false,
+            });
+            if let Some(profile) = &callback_profile {
+                inventory["callback_profile"] = profile.clone();
+            }
+            Ok(inventory)
         }))
     }
 
@@ -262,6 +271,7 @@ impl LiveTimer {
         Self {
             checkpoint_gate: Default::default(),
             callback_source: "named_or_explicit_unsupported",
+            callback_profile: None,
             name,
             interval_ns,
             start_time_ns,

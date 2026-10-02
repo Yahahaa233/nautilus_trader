@@ -2701,9 +2701,18 @@ pub(crate) mod serial_tests {
         mass_status.add_order_reports(vec![report]);
         *source_state.mass_status.lock() = Some(mass_status);
 
+        // Every registered execution source must provide its own actual mass
+        // status, including a source with an explicitly empty order inventory.
+        *venue_state.mass_status.lock() = Some(ExecutionMassStatus::new(
+            venue_client_id,
+            AccountId::from("VENUE-001"),
+            instrument_id.venue,
+            UnixNanos::default(),
+            None,
+        ));
         let venue_factory = StartupMassStatusExecutionClientFactory::new(
             venue_state.clone(),
-            StartupMassStatusBehavior::Unavailable,
+            StartupMassStatusBehavior::Available,
         )
         .with_identity(
             venue_client_id,
@@ -2950,7 +2959,8 @@ pub(crate) mod serial_tests {
         assert!(
             error
                 .to_string()
-                .contains("disappeared during startup reconciliation"),
+                .contains("Startup reconciliation unresolved for SOURCE-CLIENT")
+                && error.to_string().contains("execution_client_unavailable"),
             "unexpected error: {error:#}"
         );
         assert_eq!(node.state(), NodeState::Stopped);

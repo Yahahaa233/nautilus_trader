@@ -39,8 +39,8 @@
 //!
 //! 1. Connect data clients (instruments arrive as buffered `DataEvent`s).
 //! 2. Flush all pending data events and commands into the cache via
-//!    `flush_pending_data`, which loops `try_recv` on the channel receivers
-//!    until no items remain.
+//!    the original Node dispatch handlers, retaining each dequeue receipt
+//!    and whole batch until its engine borrow is available.
 //! 3. Connect execution clients (`load_instruments_from_cache` now finds
 //!    populated instruments).
 //! 4. Drain remaining events, then run reconciliation.
@@ -152,7 +152,9 @@ mod metrics;
 mod mutation;
 mod queue;
 mod reconciliation;
+mod startup;
 pub use mutation::NativeMutationInput;
+use startup::{StartupPending, buffer_startup_events};
 #[cfg(feature = "dispatch-observer")]
 mod recovery;
 #[cfg(feature = "dispatch-observer")]
@@ -249,6 +251,8 @@ pub struct LiveNode {
     recovery_adapter_source: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     #[cfg(feature = "dispatch-observer")]
     recovery_engine_source: Option<serde_json::Value>,
+    #[cfg(feature = "dispatch-observer")]
+    recovery_portfolio_source: Option<serde_json::Value>,
     #[cfg(feature = "native-tail-replay")]
     historical_replay: Option<nautilus_event_store::native_trace::NativeHistoricalRootReplay>,
     #[cfg(feature = "native-tail-replay")]
@@ -541,6 +545,19 @@ impl LiveNode {
                 } else {
                     nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64
                 };
+                let (manager_at, manager_capture_elapsed) =
+                    if let Some(replay) = &self.historical_replay {
+                        replay.effects_capture_instant()?
+                    } else if let Some(trace) = self
+                        .dispatch_observer
+                        .as_ref()
+                        .and_then(NodeDispatchObserver::native_trace)
+                    {
+                        let (at, elapsed) = trace.effects_capture_instant()?;
+                        (at, Some(elapsed))
+                    } else {
+                        (dst::time::Instant::now(), None)
+                    };
                 let cache = self.kernel.cache.try_borrow()?;
                 let mut orders = cache
                     .orders(None, None, None, None, None)
@@ -598,19 +615,25 @@ impl LiveNode {
                     .data_engine
                     .try_borrow()?
                     .running_checkpoint_state()?;
-                let manager = self.exec_manager.trace_effects_inventory(
-                    nautilus_common::recovery_trace::scope::effective_activity_instant(),
-                )?;
+                let manager = self.exec_manager.trace_effects_inventory(manager_at)?;
+                let portfolio = self
+                    .kernel
+                    .portfolio
+                    .try_borrow()?
+                    .running_checkpoint_state()?;
                 verify()?;
-                Ok(
-                    serde_json::json!({"schema":"NautilusNativeTraceEffects.v1","timer_capture_ns":timer_capture_ns,
+                let mut effects = serde_json::json!({"schema":"NautilusNativeTraceEffects.v1","timer_capture_ns":timer_capture_ns,
                     "orders":orders, "positions":positions, "accounts":accounts,"market_cache":market,
-                    "components":components, "data_engine":data, "execution_manager":manager,
+                    "components":components, "data_engine":data, "execution_manager":manager, "portfolio":portfolio,
                     "registered_timers":if self.historical_replay.is_some() {
                         self.recovery_timers.as_ref().context("historical owner timer installation missing")?.historical_inventory()?
                     } else { timers.clone() }, "report_contexts": &*self.native_report_contexts.try_borrow()?,
-                    "risk_state":nautilus_common::recovery_trace::native_risk_state(self.kernel.risk_engine.try_borrow()?.trading_state())}),
-                )
+                    "risk_state":nautilus_common::recovery_trace::native_risk_state(self.kernel.risk_engine.try_borrow()?.trading_state())});
+                if let Some(elapsed) = manager_capture_elapsed {
+                    effects["manager_effects_capture_process_elapsed_ns"] =
+                        serde_json::Value::from(elapsed);
+                }
+                Ok(effects)
             },
         )
     }
@@ -1044,6 +1067,8 @@ impl LiveNode {
             recovery_adapter_source: None,
             #[cfg(feature = "dispatch-observer")]
             recovery_engine_source: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_portfolio_source: None,
             #[cfg(feature = "native-tail-replay")]
             historical_replay: None,
             #[cfg(feature = "native-tail-replay")]
@@ -1157,6 +1182,8 @@ impl LiveNode {
             recovery_adapter_source: None,
             #[cfg(feature = "dispatch-observer")]
             recovery_engine_source: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_portfolio_source: None,
             #[cfg(feature = "native-tail-replay")]
             historical_replay: None,
             #[cfg(feature = "native-tail-replay")]
@@ -1623,16 +1650,14 @@ impl LiveNode {
                 .await;
         }
 
-        let (startup_system_events, startup_system_commands) =
-            if let Some(runner) = self.runner.as_mut() {
-                runner.flush_pending_data();
-                (
-                    runner.drain_pending_system_events(),
-                    runner.drain_pending_system_commands(),
-                )
-            } else {
-                (Vec::new(), Vec::new())
-            };
+        let mut pending = StartupPending::default();
+        if let Err(error) = self.flush_installed_startup(&mut pending, true) {
+            #[cfg(feature = "dispatch-observer")]
+            drop(startup_guard);
+            return self
+                .abort_startup_with_error("Startup data dispatch failed", error)
+                .await;
+        }
 
         if let Err(e) = self.connect_exec_clients(connection_deadline).await {
             return self
@@ -1645,7 +1670,20 @@ impl LiveNode {
             return Ok(());
         }
 
-        match self.await_engines_connected(connection_deadline).await {
+        let connection_status = match self
+            .await_startup_engines_connected(&mut pending, None, connection_deadline)
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                #[cfg(feature = "dispatch-observer")]
+                drop(startup_guard);
+                return self
+                    .abort_startup_with_error("Startup dispatch failed", error)
+                    .await;
+            }
+        };
+        match connection_status {
             EngineConnectionStatus::Connected => {}
             EngineConnectionStatus::TimedOut => {
                 return self
@@ -1691,14 +1729,20 @@ impl LiveNode {
             return self.abort_after_trader_start_failure(e).await;
         }
 
-        self.process_system_events(startup_system_events);
-        self.process_system_commands(startup_system_commands);
+        if let Err(error) = self.process_startup_system(&mut pending) {
+            #[cfg(feature = "dispatch-observer")]
+            drop(startup_guard);
+            return self
+                .abort_startup_with_error("Startup system dispatch failed", error)
+                .await;
+        }
 
         if !self.finish_startup_trader(None).await? {
             return Ok(());
         }
 
         complete_node_dispatch!(self, startup_guard);
+        self.check_startup_dispatch()?;
         Ok(())
     }
 
@@ -1949,6 +1993,7 @@ impl LiveNode {
     /// Awaits engine clients to connect with timeout.
     ///
     /// Returns the final connection wait status.
+    #[cfg(test)]
     async fn await_engines_connected(
         &self,
         deadline: dst::time::Instant,
@@ -2428,99 +2473,64 @@ impl LiveNode {
         };
 
         let stop_handle = self.handle.clone();
-        let mut pending = PendingEvents::default();
-        let mut startup_system_events = Vec::new();
-        let mut startup_system_commands = Vec::new();
+        let mut pending = StartupPending::default();
         let connection_deadline = dst::time::Instant::now() + self.config.timeout_connection;
+        let mut startup_receivers = RunnerReceivers {
+            time_evt: &mut time_evt_rx,
+            system_evt: &mut system_evt_rx,
+            system_cmd: &mut system_cmd_rx,
+            exec_evt: &mut exec_evt_rx,
+            exec_cmd: &mut exec_cmd_rx,
+            data_evt: &mut data_evt_rx,
+            data_cmd: &mut data_cmd_rx,
+        };
 
-        // Startup phase 1: Connect data clients and drain instrument events into cache.
-        // This ensures the cache is populated before execution clients connect.
-        let data_connect_result = drive_with_event_buffering(
+        // The connect future owns an engine borrow. Dequeues retain their original
+        // receipts until that borrow ends, then actual Node handlers run.
+        let data_connect_result = buffer_startup_events(
             self.connect_data_phase(connection_deadline),
             &mut pending,
-            &mut time_evt_rx,
-            &mut system_evt_rx,
-            &mut system_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
+            &mut startup_receivers,
         )
         .await;
-
-        if let Err(e) = data_connect_result {
-            flush_all_pending(
-                &mut pending,
-                &mut time_evt_rx,
-                &mut system_evt_rx,
-                &mut system_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-            );
-            let result = self
-                .abort_startup_with_error("Data client connection timed out", e)
+        if let Err(error) = data_connect_result {
+            #[cfg(feature = "dispatch-observer")]
+            drop(startup_guard);
+            return self
+                .abort_startup_with_error("Data client connection timed out", error)
                 .await;
-            self.drain_channels(
-                &mut time_evt_rx,
-                &mut system_evt_rx,
-                &mut system_cmd_rx,
-                &mut exec_evt_rx,
-                &mut exec_cmd_rx,
-                &mut data_evt_rx,
-                &mut data_cmd_rx,
-            );
-            log::info!("Event loop stopped");
-            return result;
+        }
+        if let Err(error) = self.flush_startup_data(&mut pending, &mut startup_receivers) {
+            #[cfg(feature = "dispatch-observer")]
+            drop(startup_guard);
+            return self
+                .abort_startup_with_error("Startup data dispatch failed", error)
+                .await;
         }
 
-        // Flush any data events still queued in the channel receivers that the
-        // select loop did not capture before the connect future resolved, then
-        // drain everything into cache.
-        flush_pending_data(&mut pending, &mut data_evt_rx, &mut data_cmd_rx);
-        startup_system_events.extend(pending.take_system_events());
-        startup_system_commands.extend(pending.take_system_commands());
-        debug_assert!(
-            pending.data_evts.is_empty() && pending.data_cmds.is_empty(),
-            "data must be drained into cache before exec clients connect",
-        );
-
-        // Startup phase 2: Connect execution clients (instruments now in cache)
-        let engine_connection_result = drive_with_event_buffering(
-            self.connect_exec_phase(connection_deadline),
+        let exec_connect_result = buffer_startup_events(
+            self.connect_exec_clients(connection_deadline),
             &mut pending,
-            &mut time_evt_rx,
-            &mut system_evt_rx,
-            &mut system_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
+            &mut startup_receivers,
         )
         .await;
-
-        // Flush channel receivers and drain all remaining pending events
-        flush_all_pending(
-            &mut pending,
-            &mut time_evt_rx,
-            &mut system_evt_rx,
-            &mut system_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
-        );
-        startup_system_events.extend(pending.take_system_events());
-        startup_system_commands.extend(pending.take_system_commands());
-        debug_assert!(
-            pending.is_empty(),
-            "all startup events must be processed before reconciliation",
-        );
+        let engine_connection_result = match exec_connect_result {
+            Ok(()) => {
+                self.await_startup_engines_connected(
+                    &mut pending,
+                    Some(&mut startup_receivers),
+                    connection_deadline,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
 
         let engine_connection_status = match engine_connection_result {
             Ok(status) => status,
             Err(e) => {
+                #[cfg(feature = "dispatch-observer")]
+                drop(startup_guard);
                 let result = self
                     .abort_startup_with_error("Execution client connection timed out", e)
                     .await;
@@ -2623,8 +2633,13 @@ impl LiveNode {
                     .abort_startup_with_error("Recovery input observation failed", error)
                     .await;
             }
-            self.process_system_events(startup_system_events);
-            self.process_system_commands(startup_system_commands);
+            if let Err(error) = self.process_startup_system(&mut pending) {
+                #[cfg(feature = "dispatch-observer")]
+                drop(startup_guard);
+                return self
+                    .abort_startup_with_error("Startup system dispatch failed", error)
+                    .await;
+            }
         } else {
             if let Err(e) = self.kernel.start_trader() {
                 let result = self.abort_after_trader_start_failure(e).await;
@@ -2657,8 +2672,13 @@ impl LiveNode {
                 return result;
             }
 
-            self.process_system_events(startup_system_events);
-            self.process_system_commands(startup_system_commands);
+            if let Err(error) = self.process_startup_system(&mut pending) {
+                #[cfg(feature = "dispatch-observer")]
+                drop(startup_guard);
+                return self
+                    .abort_startup_with_error("Startup system dispatch failed", error)
+                    .await;
+            }
 
             let finish_result = {
                 let mut receivers = RunnerReceivers {
@@ -3557,18 +3577,6 @@ impl LiveNode {
         dst::time::timeout(remaining, self.kernel.connect_exec_clients())
             .await
             .map_err(|_| anyhow::anyhow!("exec-connect timeout"))
-    }
-
-    /// Connects execution clients and checks all engines are connected.
-    ///
-    /// Returns the final connection wait status.
-    /// Must be called after data clients are connected and instrument events drained.
-    async fn connect_exec_phase(
-        &mut self,
-        deadline: dst::time::Instant,
-    ) -> anyhow::Result<EngineConnectionStatus> {
-        self.connect_exec_clients(deadline).await?;
-        Ok(self.await_engines_connected(deadline).await)
     }
 
     fn startup_abort_reason(&self) -> Option<&'static str> {
@@ -4570,6 +4578,7 @@ struct RunnerReceivers<'a> {
 /// This closes the gap where `drive_with_event_buffering` exits as soon as its
 /// driven future resolves (biased select), leaving items in the channel receivers
 /// that were not captured into `pending`.
+#[cfg(test)]
 fn flush_pending_data(
     pending: &mut PendingEvents,
     data_evt_rx: &mut SnapshotReceiver<DataEvent>,
@@ -4603,6 +4612,7 @@ fn flush_pending_data(
     clippy::too_many_arguments,
     reason = "all runner receivers are drained together"
 )]
+#[cfg(test)]
 fn flush_all_pending(
     pending: &mut PendingEvents,
     time_evt_rx: &mut SnapshotReceiver<TimeEventMessage>,
@@ -4670,87 +4680,7 @@ fn flush_all_pending(
     pending.drain();
 }
 
-/// Drives a future to completion while buffering channel events.
-///
-/// Time events are handled immediately. Account events are forwarded directly.
-/// All other events are buffered in `pending` for later processing.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "startup buffering owns one future plus the pending state and all runner receivers"
-)]
-async fn drive_with_event_buffering<F: std::future::Future>(
-    future: F,
-    pending: &mut PendingEvents,
-    time_evt_rx: &mut SnapshotReceiver<TimeEventMessage>,
-    system_evt_rx: &mut SnapshotReceiver<SystemEvent>,
-    system_cmd_rx: &mut SnapshotReceiver<SystemCommand>,
-    exec_evt_rx: &mut SnapshotReceiver<ExecutionEvent>,
-    exec_cmd_rx: &mut SnapshotReceiver<TradingCommandMessage>,
-    data_evt_rx: &mut SnapshotReceiver<DataEvent>,
-    data_cmd_rx: &mut SnapshotReceiver<DataCommand>,
-) -> F::Output {
-    tokio::pin!(future);
-
-    loop {
-        tokio::select! {
-            biased;
-
-            result = &mut future => {
-                break result;
-            }
-            Some(handler) = time_evt_rx.recv() => {
-                let _ = AsyncRunner::handle_time_event(handler);
-            }
-            Some(event) = system_evt_rx.recv() => {
-                pending.system_events.push(event);
-            }
-            Some(command) = system_cmd_rx.recv() => {
-                pending.system_commands.push(command);
-            }
-            Some(evt) = exec_evt_rx.recv() => {
-                // Account events are safe to process immediately. Report and
-                // Order events need ExecEngine borrow_mut which may conflict
-                // with the borrow held by the driven future.
-                match evt {
-                    ExecutionEvent::Account(_) => {
-                        AsyncRunner::handle_exec_event(evt);
-                    }
-                    ExecutionEvent::Report(report) => {
-                        pending.exec_reports.push(report);
-                    }
-                    ExecutionEvent::Order(order_evt) => {
-                        pending.order_evts.push(order_evt);
-                    }
-                    ExecutionEvent::OrderSubmittedBatch(batch) => {
-                        for submitted in batch {
-                            pending.order_evts.push(OrderEventAny::Submitted(submitted));
-                        }
-                    }
-                    ExecutionEvent::OrderAcceptedBatch(batch) => {
-                        for accepted in batch {
-                            pending.order_evts.push(OrderEventAny::Accepted(accepted));
-                        }
-                    }
-                    ExecutionEvent::OrderCanceledBatch(batch) => {
-                        for canceled in batch {
-                            pending.order_evts.push(OrderEventAny::Canceled(canceled));
-                        }
-                    }
-                }
-            }
-            Some(cmd) = exec_cmd_rx.recv() => {
-                pending.exec_cmds.push(cmd);
-            }
-            Some(evt) = data_evt_rx.recv() => {
-                pending.data_evts.push(evt);
-            }
-            Some(cmd) = data_cmd_rx.recv() => {
-                pending.data_cmds.push(cmd);
-            }
-        }
-    }
-}
-
+#[cfg(test)]
 #[derive(Default)]
 struct PendingEvents {
     system_events: Vec<SystemEvent>,
@@ -4762,6 +4692,7 @@ struct PendingEvents {
     exec_cmds: Vec<TradingCommandMessage>,
 }
 
+#[cfg(test)]
 impl PendingEvents {
     fn is_empty(&self) -> bool {
         self.system_events.is_empty()

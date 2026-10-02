@@ -581,6 +581,9 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(#[cas
         )
         .unwrap();
     target
+        .restore_registered_portfolio_checkpoint(&first.0.native_effects["portfolio"], &watermark)
+        .unwrap();
+    target
         .restore_registered_timer_checkpoint(
             first.0.registered_timers.clone(),
             Vec::new(),

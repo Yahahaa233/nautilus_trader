@@ -10,9 +10,17 @@ use std::{
 use tokio::sync::mpsc::{UnboundedReceiver, error::TryRecvError};
 
 #[derive(Debug)]
-struct Retained<T> {
+pub(crate) struct Retained<T> {
     message: T,
     receipt: Option<NativeIngressReceipt>,
+}
+impl<T> Retained<T> {
+    /// Publishes the original dequeue evidence only when its message is processed.
+    /// Buffering owns both members and cannot overwrite an active dispatch receipt.
+    pub(crate) fn activate(self) -> T {
+        scope::received_ingress(self.receipt);
+        self.message
+    }
 }
 
 #[derive(Debug)]
@@ -123,12 +131,17 @@ impl<T> SnapshotReceiver<T> {
     /// # Errors
     /// Returns the underlying empty/disconnected error when no prefix remains.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        let entry = match self.prefix.pop_front() {
+        self.try_recv_retained().map(Retained::activate)
+    }
+    pub(crate) fn try_recv_retained(&mut self) -> Result<Retained<T>, TryRecvError> {
+        match self.prefix.pop_front() {
             Some(message) => Ok(message),
             None => self.receiver.try_recv(),
-        }?;
-        scope::received_ingress(entry.receipt);
-        Ok(entry.message)
+        }
+    }
+    #[cfg(feature = "node")]
+    pub(crate) async fn recv_retained(&mut self) -> Option<Retained<T>> {
+        std::future::poll_fn(|context| self.poll_recv_retained(context)).await
     }
     /// Waits for the oldest message, consuming retained messages first.
     pub async fn recv(&mut self) -> Option<T> {
@@ -136,16 +149,14 @@ impl<T> SnapshotReceiver<T> {
     }
     /// Polls for the oldest retained or channel-resident message.
     pub fn poll_recv(&mut self, context: &mut Context<'_>) -> Poll<Option<T>> {
-        let message = match self.prefix.pop_front() {
+        self.poll_recv_retained(context)
+            .map(|entry| entry.map(Retained::activate))
+    }
+    fn poll_recv_retained(&mut self, context: &mut Context<'_>) -> Poll<Option<Retained<T>>> {
+        match self.prefix.pop_front() {
             Some(message) => Poll::Ready(Some(message)),
             None => self.receiver.poll_recv(context),
-        };
-        message.map(|message| {
-            message.map(|entry| {
-                scope::received_ingress(entry.receipt);
-                entry.message
-            })
-        })
+        }
     }
     pub(super) fn stage(&mut self) -> anyhow::Result<()> {
         // Reserve before consuming: an allocation failure cannot drop a moved message.

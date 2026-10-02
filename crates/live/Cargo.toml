@@ -135,6 +135,7 @@ bytes = { workspace = true }
 criterion = { workspace = true }
 madsim = { workspace = true }
 proptest = { workspace = true }
+rmp-serde = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

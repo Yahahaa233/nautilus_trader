@@ -177,6 +177,12 @@ impl LiveNode {
             trace.initial_cut_sealed(),
             "native initial cut was not sealed by the actual source barrier"
         );
+        ensure!(
+            trace.cut().native_effects.get("portfolio").is_some()
+                && self.recovery_portfolio_source.as_ref()
+                    == trace.cut().native_effects.get("portfolio"),
+            "native source Portfolio cut was not completely installed"
+        );
         let final_cut = trace.final_cut()?;
         self.historical_timer_admissions = original_timer_admissions(trace)?;
         ensure!(
@@ -497,6 +503,7 @@ impl LiveNode {
             "components",
             "data_engine",
             "report_contexts",
+            "portfolio",
         ] {
             ensure!(
                 expected.get(name).is_some() && actual[name] == expected[name],
@@ -813,10 +820,20 @@ mod tests {
                     serde_json::to_value(value)?
                 } else if let Some(value) = input.downcast_ref::<DataEvent>() {
                     super::framework_tests::data_payload(value)?
-                } else if let Some(nautilus_common::messages::ExecutionEvent::Order(value)) =
-                    input.downcast_ref::<nautilus_common::messages::ExecutionEvent>()
-                {
-                    serde_json::to_value(value)?
+                } else if let Some(value) = input.downcast_ref::<nautilus_common::messages::data::DataCommand>() {
+                    match value {
+                        nautilus_common::messages::data::DataCommand::Subscribe(value) => serde_json::json!({"Subscribe":value}),
+                        _ => anyhow::bail!("unknown actual test data command"),
+                    }
+                } else if let Some(value) = input.downcast_ref::<nautilus_common::messages::ExecutionEvent>() {
+                    use nautilus_common::messages::ExecutionEvent;
+                    match value {
+                        ExecutionEvent::Order(value) => serde_json::to_value(value)?,
+                        ExecutionEvent::Account(value) => serde_json::json!({"Account":value}),
+                        ExecutionEvent::OrderSubmittedBatch(value) => serde_json::json!({"SubmittedBatch":value.events}),
+                        ExecutionEvent::OrderAcceptedBatch(value) => serde_json::json!({"AcceptedBatch":value.events}),
+                        _ => anyhow::bail!("unknown actual test execution event"),
+                    }
                 } else if let Some(command) = input.downcast_ref::<nautilus_common::runner::TradingCommandMessage>() {
                     serde_json::json!({"endpoint":command.endpoint().to_string(),"command":command.command()})
                 } else if let Some(events) =
@@ -1013,6 +1030,12 @@ mod tests {
                 &first.1["execution_manager"],
                 &first.1["data_engine"],
                 first.0.captured_at_ns,
+                &watermark,
+            )
+            .unwrap();
+        target
+            .restore_registered_portfolio_checkpoint(
+                &first.0.native_effects["portfolio"],
                 &watermark,
             )
             .unwrap();

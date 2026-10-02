@@ -17,6 +17,7 @@
 
 use std::{collections::BTreeMap, ops::Deref, sync::Arc};
 
+use anyhow::Context;
 use nautilus_core::{
     AtomicTime, DurationNanos, UnixNanos, correctness::check_predicate_true,
     time::get_atomic_clock_realtime,
@@ -26,8 +27,8 @@ use ustr::Ustr;
 use super::timer::LiveTimer;
 use crate::{
     clock::{
-        CallbackRegistry, Clock, replace_existing_timer, validate_and_prepare_time_alert,
-        validate_and_prepare_timer,
+        CallbackRegistry, Clock, PortfolioEquityCurveTimerCallback, replace_existing_timer,
+        validate_and_prepare_time_alert, validate_and_prepare_timer,
     },
     runner::{TimeEventSender, purge_closed_time_event_callbacks, try_get_time_event_sender},
     timer::{TimeEventCallback, create_valid_interval},
@@ -45,6 +46,8 @@ struct TimerRestoreSpec {
     status: String,
     callback_kind: String,
     callback_source: String,
+    #[serde(default)]
+    callback_profile: Option<serde_json::Value>,
     binding: serde_json::Value,
     execution_authorized: bool,
 }
@@ -238,9 +241,17 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
         let mut tokens = BTreeMap::new();
         for (row, source) in rows.iter_mut().zip(original) {
             let name = row["name"].as_str().unwrap().to_owned();
+            clock.resolve_recovery_callback(
+                &name.as_str().into(),
+                row["callback_source"]
+                    .as_str()
+                    .context("actual timer callback source missing")?,
+                row.get("callback_profile"),
+            )?;
             anyhow::ensure!(
                 source["name"] == row["name"]
-                    && row["callback_source"].as_str() == Some("registered_clock_default.v1"),
+                    && row["callback_source"] == source["callback_source"]
+                    && row.get("callback_profile") == source.get("callback_profile"),
                 "historical timer callback owner/profile changed"
             );
             let source_id = source["binding"]["binding_id"]
@@ -338,6 +349,7 @@ pub struct LiveClock {
     time: &'static AtomicTime,
     timers: BTreeMap<Ustr, LiveTimer>,
     callbacks: CallbackRegistry,
+    portfolio_callback_profiles: BTreeMap<Ustr, serde_json::Value>,
     sender: Option<Arc<dyn TimeEventSender>>,
     sender_deferred: bool,
 }
@@ -354,6 +366,7 @@ impl LiveClock {
             time: get_atomic_clock_realtime(),
             timers: BTreeMap::new(),
             callbacks: CallbackRegistry::new(),
+            portfolio_callback_profiles: BTreeMap::new(),
             sender,
             sender_deferred: false,
         }
@@ -366,6 +379,50 @@ impl LiveClock {
 
     fn replace_existing_timer_if_needed(&mut self, name: &Ustr) {
         replace_existing_timer(&mut self.timers, name);
+    }
+
+    fn resolve_recovery_callback(
+        &self,
+        name: &Ustr,
+        source: &str,
+        profile: Option<&serde_json::Value>,
+    ) -> anyhow::Result<(TimeEventCallback, &'static str)> {
+        let (callback, source) = match source {
+            "registered_clock_default.v1" => {
+                anyhow::ensure!(
+                    profile.is_none(),
+                    "default callback cannot inherit a named factory"
+                );
+                (
+                    self.callbacks
+                        .default_handler()
+                        .context("actual registered owner default timer callback missing")?,
+                    "registered_clock_default.v1",
+                )
+            }
+            PortfolioEquityCurveTimerCallback::SOURCE => {
+                let registered = self
+                    .portfolio_callback_profiles
+                    .get(name)
+                    .context("actual Portfolio callback factory/account absent")?;
+                anyhow::ensure!(
+                    Some(registered) == profile,
+                    "Portfolio callback factory/account/configuration changed"
+                );
+                (
+                    self.callbacks
+                        .get_callback(name)
+                        .context("actual Portfolio callback absent")?,
+                    PortfolioEquityCurveTimerCallback::SOURCE,
+                )
+            }
+            _ => anyhow::bail!("source timer callback/owner restoration contract unsupported"),
+        };
+        anyhow::ensure!(
+            callback.is_local(),
+            "timer restore requires actual owner-thread callback"
+        );
+        Ok((callback, source))
     }
 }
 
@@ -468,6 +525,26 @@ impl Deref for LiveClock {
 }
 
 impl Clock for LiveClock {
+    fn register_portfolio_equity_curve_callback(
+        &mut self,
+        binding: PortfolioEquityCurveTimerCallback,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            binding.callback.is_local(),
+            "Portfolio callback is not owner-thread local"
+        );
+        if let Some(previous) = self.portfolio_callback_profiles.get(&binding.name) {
+            anyhow::ensure!(
+                previous == &binding.profile,
+                "Portfolio callback registration source changed"
+            );
+        }
+        self.callbacks
+            .register_callback(binding.name, binding.callback);
+        self.portfolio_callback_profiles
+            .insert(binding.name, binding.profile);
+        Ok(true)
+    }
     fn restore_running_timer_checkpoint(
         &mut self,
         inventory: &serde_json::Value,
@@ -503,10 +580,14 @@ impl Clock for LiveClock {
             );
             anyhow::ensure!(
                 spec.callback_kind == "registered_owner_thread"
-                    && spec.callback_source == "registered_clock_default.v1"
                     && matches!(spec.status.as_str(), "active" | "exhausted"),
                 "source timer callback/owner restoration contract unsupported"
             );
+            self.resolve_recovery_callback(
+                &spec.name.as_str().into(),
+                &spec.callback_source,
+                spec.callback_profile.as_ref(),
+            )?;
             let id = spec
                 .binding
                 .get("binding_id")
@@ -531,18 +612,6 @@ impl Clock for LiveClock {
                 );
             }
         }
-        let callback = if specs.is_empty() {
-            None
-        } else {
-            let callback = self.callbacks.default_handler().ok_or_else(|| {
-                anyhow::anyhow!("actual registered owner default timer callback missing")
-            })?;
-            anyhow::ensure!(
-                callback.is_local(),
-                "timer restore requires actual owner-thread default callback"
-            );
-            Some(callback)
-        };
         let restored_clock_id = inventory
             .get("native_clock_id")
             .cloned()
@@ -556,16 +625,22 @@ impl Clock for LiveClock {
         let pause = self.checkpoint_gate.pause_producers()?;
         let mut tokens = BTreeMap::new();
         for spec in specs {
+            let (callback, callback_source) = self.resolve_recovery_callback(
+                &spec.name.as_str().into(),
+                &spec.callback_source,
+                spec.callback_profile.as_ref(),
+            )?;
             let mut timer = LiveTimer::new(
                 Ustr::from(spec.name.as_str()),
                 std::num::NonZeroU64::new(spec.interval_ns).unwrap(),
                 spec.start_time_ns,
                 spec.stop_time_ns,
-                callback.as_ref().unwrap().clone(),
+                callback,
                 spec.fire_immediately,
                 sender.clone(),
             )
-            .with_callback_source("registered_clock_default.v1")
+            .with_callback_source(callback_source)
+            .with_callback_profile(spec.callback_profile)
             .with_checkpoint_gate(self.checkpoint_gate.clone());
             timer.start_restored(
                 UnixNanos::from(spec.next_time_ns),
@@ -713,6 +788,7 @@ impl Clock for LiveClock {
 
     fn cancel_callbacks(&mut self) {
         self.callbacks.clear();
+        self.portfolio_callback_profiles.clear();
     }
 
     fn set_time_alert_ns(
@@ -734,7 +810,15 @@ impl Clock for LiveClock {
 
         self.replace_existing_timer_if_needed(&name);
 
-        let callback_source = self.callbacks.callback_source(&name, callback.is_some());
+        if callback.is_some() {
+            self.portfolio_callback_profiles.remove(&name);
+        }
+        let callback_profile = self.portfolio_callback_profiles.get(&name).cloned();
+        let callback_source = if callback_profile.is_some() {
+            PortfolioEquityCurveTimerCallback::SOURCE
+        } else {
+            self.callbacks.callback_source(&name, callback.is_some())
+        };
         let callback = if let Some(callback) = callback {
             self.callbacks.register_callback(name, callback.clone());
             callback
@@ -759,7 +843,8 @@ impl Clock for LiveClock {
             sender,
         )
         .with_checkpoint_gate(self.checkpoint_gate.clone())
-        .with_callback_source(callback_source);
+        .with_callback_source(callback_source)
+        .with_callback_profile(callback_profile);
 
         timer.start();
 
@@ -799,7 +884,15 @@ impl Clock for LiveClock {
 
         self.replace_existing_timer_if_needed(&name);
 
-        let callback_source = self.callbacks.callback_source(&name, callback.is_some());
+        if callback.is_some() {
+            self.portfolio_callback_profiles.remove(&name);
+        }
+        let callback_profile = self.portfolio_callback_profiles.get(&name).cloned();
+        let callback_source = if callback_profile.is_some() {
+            PortfolioEquityCurveTimerCallback::SOURCE
+        } else {
+            self.callbacks.callback_source(&name, callback.is_some())
+        };
         let callback = if let Some(callback) = callback {
             self.callbacks.register_callback(name, callback.clone());
             callback
@@ -822,7 +915,8 @@ impl Clock for LiveClock {
             sender,
         )
         .with_checkpoint_gate(self.checkpoint_gate.clone())
-        .with_callback_source(callback_source);
+        .with_callback_source(callback_source)
+        .with_callback_profile(callback_profile);
         timer.start();
 
         self.clear_expired_timers();
@@ -1078,17 +1172,38 @@ mod tests {
     }
 
     #[rstest]
-    #[case(false)]
-    #[case(true)]
+    #[case(false, false)]
+    #[case(true, false)]
+    #[case(false, true)]
+    #[case(true, true)]
     fn actual_checkpoint_timer_restore_preserves_overdue_frontier_and_owner_callback_fifo(
         #[case] advance_history: bool,
+        #[case] portfolio_named: bool,
     ) {
         let (source_tx, source_rx) = mpsc::channel();
         let mut source = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(source_tx))));
-        source.register_default_handler(TimeEventCallback::RustLocal(std::rc::Rc::new(|_| {})));
+        let account = nautilus_model::identifiers::AccountId::from("SOURCE-001");
+        let configuration = serde_json::json!({"equity_curve":true,"bar_updates":true});
+        let source_callback = TimeEventCallback::RustLocal(std::rc::Rc::new(|_| {}));
+        let name = if portfolio_named {
+            source
+                .register_portfolio_equity_curve_callback(
+                    PortfolioEquityCurveTimerCallback::with_counter_for_test(
+                        account,
+                        &configuration,
+                        source_callback,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            "portfolio_equity_curve.SOURCE-001"
+        } else {
+            source.register_default_handler(source_callback);
+            "same-name"
+        };
         source
             .set_timer_ns(
-                "same-name",
+                name,
                 DurationNanos::from_millis(100),
                 None,
                 None,
@@ -1113,9 +1228,22 @@ mod tests {
         let called = count.clone();
         let mut restored =
             LiveClock::new(Some(Arc::new(CheckpointQueuedSender(restored_tx.clone()))));
-        restored.register_default_handler(TimeEventCallback::RustLocal(std::rc::Rc::new(
-            move |_| called.set(called.get() + 1),
-        )));
+        let target_callback =
+            TimeEventCallback::RustLocal(std::rc::Rc::new(move |_| called.set(called.get() + 1)));
+        if portfolio_named {
+            restored
+                .register_portfolio_equity_curve_callback(
+                    PortfolioEquityCurveTimerCallback::with_counter_for_test(
+                        account,
+                        &configuration,
+                        target_callback,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        } else {
+            restored.register_default_handler(target_callback);
+        }
         let receipt = restored
             .restore_running_timer_checkpoint(&inventory)
             .unwrap();
@@ -1126,7 +1254,7 @@ mod tests {
             "restored producer must remain paused"
         );
         assert_eq!(
-            restored.next_time_ns("same-name").unwrap().as_u64(),
+            restored.next_time_ns(name).unwrap().as_u64(),
             nominal_next,
             "recovery must not clamp an overdue source frontier to now"
         );
@@ -1170,6 +1298,94 @@ mod tests {
         assert_eq!(count.get(), 2);
         restored.cancel_timers();
         drop(source_message);
+    }
+
+    #[rstest]
+    fn checkpoint_portfolio_equity_curve_rejects_unregistered_native_callback_factory() {
+        let result = PortfolioEquityCurveTimerCallback::new(
+            nautilus_model::identifiers::AccountId::from("SOURCE-001"),
+            &serde_json::json!({"equity_curve":true}),
+            std::rc::Rc::new(|_: crate::timer::TimeEvent| {}),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("original private native factory")
+        );
+    }
+
+    #[rstest]
+    #[case("account")]
+    #[case("configuration")]
+    #[case("factory")]
+    #[case("legacy_unknown")]
+    fn checkpoint_portfolio_equity_curve_timer_rejects_changed_or_unknown_factory(
+        #[case] changed: &str,
+    ) {
+        let account = nautilus_model::identifiers::AccountId::from("SOURCE-001");
+        let configuration = serde_json::json!({"equity_curve":true});
+        let (sender, _) = mpsc::channel();
+        let mut source = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(sender))));
+        source
+            .register_portfolio_equity_curve_callback(
+                PortfolioEquityCurveTimerCallback::with_counter_for_test(
+                    account,
+                    &configuration,
+                    TimeEventCallback::RustLocal(std::rc::Rc::new(|_| {})),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        source
+            .set_timer_ns(
+                "portfolio_equity_curve.SOURCE-001",
+                DurationNanos::from_secs(60),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let frozen = source.freeze_running_timer_checkpoint().unwrap();
+        let mut inventory = frozen.inventory().clone();
+        frozen.finish().unwrap();
+        source.cancel_timers();
+        let (sender, _) = mpsc::channel();
+        let mut target = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(sender))));
+        target
+            .register_portfolio_equity_curve_callback(
+                PortfolioEquityCurveTimerCallback::with_counter_for_test(
+                    account,
+                    &configuration,
+                    TimeEventCallback::RustLocal(std::rc::Rc::new(|_| {})),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let row = &mut inventory["timers"][0];
+        match changed {
+            "account" => row["callback_profile"]["account_id"] = "OTHER-001".into(),
+            "configuration" => {
+                row["callback_profile"]["configuration"]["equity_curve"] = false.into()
+            }
+            "factory" => row["callback_profile"]["factory"] = "unregistered_factory".into(),
+            "legacy_unknown" => {
+                row["callback_source"] = "named_or_explicit_unsupported".into();
+                row.as_object_mut().unwrap().remove("callback_profile");
+            }
+            _ => unreachable!(),
+        }
+        let error = target
+            .restore_running_timer_checkpoint(&inventory)
+            .unwrap_err();
+        assert!(error.to_string().contains(if changed == "legacy_unknown" {
+            "restoration contract unsupported"
+        } else {
+            "factory/account/configuration changed"
+        }));
+        assert_eq!(target.timer_count(), 0);
     }
 
     #[rstest]

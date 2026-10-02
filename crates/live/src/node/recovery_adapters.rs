@@ -19,6 +19,53 @@ use anyhow::{Result, ensure};
 use nautilus_common::live::dst;
 use std::collections::{BTreeMap, BTreeSet};
 impl LiveNode {
+    /// Installs complete native Portfolio history at the same already-installed
+    /// cache/component/frontier cut, before rebinding original owner timers.
+    /// JSON contains history; the private installed frontier is the authority.
+    /// # Errors
+    /// Rejects repeat/out-of-order installation or missing/changed original
+    /// Portfolio schema, config, account roster, calculation caches or series.
+    pub fn restore_registered_portfolio_checkpoint(
+        &mut self,
+        portfolio: &serde_json::Value,
+        watermark: &crate::runner_recovery::RunnerRecoveryWatermark,
+    ) -> Result<()> {
+        ensure!(
+            self.state() == NodeState::Idle
+                && !self.handle.should_stop()
+                && self.recovery_requires_release
+                && self.recovery_cache_installed
+                && self.recovery_restored_components.is_some()
+                && self.recovery_native_frontier.as_ref() == Some(watermark)
+                && self.recovery_portfolio_source.is_none()
+                && self.recovery_timers.is_none(),
+            "Portfolio restore requires the same installed source cut before timers"
+        );
+        let input = self.native_mutation_input(
+            "recovery.portfolio_state_install",
+            &serde_json::json!({"watermark":watermark,"portfolio":portfolio}),
+        )?;
+        let guard = self.begin_node_dispatch(crate::dispatch::DispatchSource::Lifecycle, &input)?;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+            self.kernel
+                .portfolio
+                .try_borrow_mut()?
+                .restore_running_checkpoint_state(portfolio)?;
+            self.recovery_portfolio_source = Some(portfolio.clone());
+            Ok(())
+        }))
+        .map_err(|_| anyhow::anyhow!("native Portfolio restoration panicked"))
+        .and_then(|result| result);
+        if let Err(error) = &result {
+            self.fail_recovery_observation(&format!("native Portfolio restore failed: {error:#}"));
+        }
+        result?;
+        if let Some(guard) = guard {
+            self.finish_node_dispatch(guard)?;
+        }
+        Ok(())
+    }
+
     /// Installs complete supported native engine state at the source checkpoint
     /// frontier before replaying later inputs. Actual offline elapsed time ages
     /// native recency; it cannot refresh approval/account facts or replay queues.

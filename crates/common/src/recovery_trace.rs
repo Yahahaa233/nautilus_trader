@@ -471,17 +471,17 @@ pub mod scope {
                     | NativeInputSource::DataEvent
                     | NativeInputSource::DataCommand
             );
-            if runner_source && state.frames.is_empty() {
-                let receipt = state
-                    .received
-                    .take()
-                    .context("native runner input missing receipt")?;
+            if runner_source && let Some(receipt) = state.received.take() {
                 ensure!(
                     receipt.input_source == source,
                     "native receipt channel mismatch"
                 );
                 Ok(Some(receipt))
             } else {
+                ensure!(
+                    !runner_source || !state.frames.is_empty(),
+                    "native runner input missing receipt"
+                );
                 ensure!(
                     state.received.is_none(),
                     "runner receipt replaced by inline producer"
@@ -670,6 +670,17 @@ pub mod scope {
                 let _ = CURRENT.try_with(|state| {
                     if let Ok(mut state) = state.try_borrow_mut() {
                         state.failed = true;
+                        // Failed capture still releases only this guard's owned
+                        // branch. Keeping a dead frame would make ordinary cleanup
+                        // Clock reads attempt to append to an abandoned input.
+                        // The permanent source-failure latch is never cleared.
+                        if let Some(index) = state
+                            .frames
+                            .iter()
+                            .position(|frame| frame.epoch == self.epoch)
+                        {
+                            state.frames.truncate(index);
+                        }
                     }
                 });
             }

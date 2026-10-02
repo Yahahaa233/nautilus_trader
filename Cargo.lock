@@ -6438,6 +6438,7 @@ dependencies = [
  "proptest",
  "pyo3",
  "pyo3-stub-gen",
+ "rmp-serde",
  "rstest",
  "rust_decimal",
  "rust_decimal_macros",
@@ -6724,6 +6725,7 @@ dependencies = [
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

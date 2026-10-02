@@ -32,7 +32,7 @@ use nautilus_analysis::{
 };
 use nautilus_common::{
     cache::{AccountLookupError, AccountRef, Cache},
-    clock::Clock,
+    clock::{Clock, PortfolioEquityCurveTimerCallback},
     enums::LogColor,
     msgbus::{self, MessagingSwitchboard, TypedHandler, TypedIntoHandler},
     timer::{TimeEvent, TimeEventCallback},
@@ -53,6 +53,9 @@ use rust_decimal::Decimal;
 
 use crate::{config::PortfolioConfig, manager::AccountsManager};
 
+#[path = "recovery_checkpoint.rs"]
+mod recovery_checkpoint;
+
 // Sized for post-run backtest analysis (e.g. ~11 days at 1s cadence, or years
 // at per-minute cadence), long-lived live deployments should consume snapshots
 // via the message bus instead of relying on this buffer.
@@ -61,6 +64,8 @@ const SNAPSHOT_BUFFER_CAP: usize = 1_000_000;
 struct PortfolioState {
     accounts: AccountsManager,
     analyzer: PortfolioAnalyzer,
+    // Private original factories distinguish same-name custom registrations.
+    native_statistic_factories: AHashMap<String, Statistic>,
     unrealized_pnls: IndexMap<InstrumentId, Money>,
     realized_pnls: IndexMap<InstrumentId, Money>,
     recorded_closed_position_cycles: AHashSet<(PositionId, UnixNanos)>,
@@ -118,9 +123,12 @@ impl PortfolioState {
             .map(DurationNanos::from_millis)
             .unwrap_or_default();
 
+        let analyzer = PortfolioAnalyzer::default();
+        let native_statistic_factories = analyzer.statistics.clone();
         Self {
             accounts: AccountsManager::new(clock, cache),
-            analyzer: PortfolioAnalyzer::default(),
+            analyzer,
+            native_statistic_factories,
             unrealized_pnls: IndexMap::new(),
             realized_pnls: IndexMap::new(),
             recorded_closed_position_cycles: AHashSet::new(),
@@ -414,6 +422,65 @@ impl Portfolio {
     #[must_use]
     pub fn clock(&self) -> &Rc<RefCell<dyn Clock>> {
         &self.clock
+    }
+
+    /// Rebinds only this Portfolio's original account/configuration callback
+    /// factory before native schedules are installed. No timer is armed here.
+    /// # Errors
+    /// Rejects absent cache accounts, changed factories/configuration or a
+    /// finalized target Portfolio. Original next-due/FIFO belong to the Clock.
+    pub fn prepare_equity_curve_timer_recovery(
+        &mut self,
+        inventory: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let rows = inventory["timers"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Portfolio source timer inventory missing"))?;
+        for row in rows {
+            if row["callback_source"].as_str() != Some(PortfolioEquityCurveTimerCallback::SOURCE) {
+                continue;
+            }
+            let account_id: AccountId =
+                serde_json::from_value(row["callback_profile"]["account_id"].clone())?;
+            anyhow::ensure!(
+                self.config.equity_curve && !self.inner.borrow().equity_curve_finalized,
+                "Portfolio equity curve factory is disabled or finalized"
+            );
+            anyhow::ensure!(
+                self.cache.borrow().account(&account_id).is_some(),
+                "Portfolio timer account is absent from the installed native cache"
+            );
+            let binding = PortfolioEquityCurveTimerCallback::new(
+                account_id,
+                &self.config,
+                equity_curve_callback(
+                    &self.clock,
+                    &self.cache,
+                    &self.inner,
+                    self.config,
+                    account_id,
+                ),
+            )?;
+            anyhow::ensure!(
+                row["name"].as_str() == Some(equity_curve_timer_name(account_id).as_str())
+                    && binding.profile() == &row["callback_profile"],
+                "Portfolio timer factory/account/configuration changed"
+            );
+            anyhow::ensure!(
+                self.clock
+                    .borrow_mut()
+                    .register_portfolio_equity_curve_callback(binding)?,
+                "Portfolio native callback owner restoration unsupported"
+            );
+            anyhow::ensure!(
+                self.inner
+                    .borrow()
+                    .equity_curve_accounts
+                    .contains(&account_id),
+                "Portfolio original account history must be installed before timers"
+            );
+        }
+        Ok(())
     }
 
     /// Returns `true` if the portfolio has been initialized.
@@ -4108,11 +4175,46 @@ fn arm_equity_curve_timer(
         return;
     };
     let timer_name = equity_curve_timer_name(account_id);
+    let callback = equity_curve_callback(clock, cache, inner, config, account_id);
+    let registered = PortfolioEquityCurveTimerCallback::new(account_id, &config, callback.clone())
+        .and_then(|binding| {
+            clock
+                .borrow_mut()
+                .register_portfolio_equity_curve_callback(binding)
+        });
+    let callback = match registered {
+        Ok(true) => None,
+        Ok(false) => Some(TimeEventCallback::RustLocal(callback)),
+        Err(error) => {
+            log::error!("Failed to bind portfolio equity curve callback for {account_id}: {error}");
+            return;
+        }
+    };
+    if let Err(e) = clock.borrow_mut().set_timer_ns(
+        &timer_name,
+        day,
+        Some(next_day),
+        None,
+        callback,
+        Some(false),
+        Some(true),
+    ) {
+        log::error!("Failed to arm portfolio equity curve timer for {account_id}: {e}");
+    }
+}
+
+fn equity_curve_callback(
+    clock: &Rc<RefCell<dyn Clock>>,
+    cache: &Rc<RefCell<Cache>>,
+    inner: &Rc<RefCell<PortfolioState>>,
+    config: PortfolioConfig,
+    account_id: AccountId,
+) -> Rc<impl Fn(TimeEvent) + 'static> {
     let cache_weak = Rc::downgrade(cache);
     let clock_weak = Rc::downgrade(clock);
     let inner_weak = Rc::downgrade(inner);
 
-    let callback: Rc<dyn Fn(TimeEvent)> = Rc::new(move |event| {
+    Rc::new(move |event: TimeEvent| {
         let Some(cache) = cache_weak.upgrade() else {
             return;
         };
@@ -4123,19 +4225,7 @@ fn arm_equity_curve_timer(
             return;
         };
         emit_snapshot(&cache, &clock, &inner, config, account_id, event.ts_event);
-    });
-
-    if let Err(e) = clock.borrow_mut().set_timer_ns(
-        &timer_name,
-        day,
-        Some(next_day),
-        None,
-        Some(TimeEventCallback::from(callback)),
-        Some(false),
-        Some(true),
-    ) {
-        log::error!("Failed to arm portfolio equity curve timer for {account_id}: {e}");
-    }
+    })
 }
 
 fn snapshot_timer_name(account_id: AccountId) -> String {
@@ -4280,7 +4370,7 @@ fn push_bounded(
 
 #[cfg(test)]
 mod tests {
-    use nautilus_core::{UUID4, UnixNanos};
+    use nautilus_core::UnixNanos;
     use nautilus_model::{enums::AccountType, identifiers::AccountId};
     use rstest::rstest;
 
