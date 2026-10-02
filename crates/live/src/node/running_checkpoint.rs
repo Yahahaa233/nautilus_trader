@@ -58,6 +58,481 @@ mod tests {
     };
 
     #[derive(Debug)]
+    struct PendingQuotesActor {
+        core: nautilus_common::actor::DataActorCore,
+        request: Rc<Cell<Option<nautilus_core::UUID4>>>,
+        responses: Rc<Cell<usize>>,
+        delay_response: bool,
+    }
+    impl nautilus_common::actor::DataActor for PendingQuotesActor {
+        fn on_start(&mut self) -> Result<()> {
+            let request = self.request_quotes(
+                crypto_perpetual_ethusdt().id(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            self.request.set(Some(request));
+            Ok(())
+        }
+        fn on_historical_quotes(&mut self, _: &[nautilus_model::data::QuoteTick]) -> Result<()> {
+            if self.delay_response {
+                // Real callback processing crosses the configured deadline while
+                // the select-loop cannot poll its ready expiration arm.
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            self.responses.set(self.responses.get() + 1);
+            Ok(())
+        }
+    }
+    nautilus_common::nautilus_actor!(PendingQuotesActor);
+
+    #[derive(Debug)]
+    struct CheckpointHeartbeatActor {
+        core: nautilus_common::actor::DataActorCore,
+        heartbeats: Rc<Cell<usize>>,
+    }
+    impl nautilus_common::actor::DataActor for CheckpointHeartbeatActor {
+        fn on_start(&mut self) -> Result<()> {
+            self.clock().set_timer(
+                "CHECKPOINT-FAIRNESS-HEARTBEAT",
+                Duration::from_millis(10),
+                None,
+                None,
+                None,
+                Some(false),
+                Some(false),
+            )?;
+            // The actual LiveClock producer runs on its real background runtime.
+            // Keep original startup dispatch active while it queues a backlog;
+            // no test-created callback/message replaces this registered owner.
+            std::thread::sleep(Duration::from_millis(60));
+            Ok(())
+        }
+        fn on_time_event(&mut self, event: &nautilus_common::timer::TimeEvent) -> Result<()> {
+            ensure!(
+                event.name.as_str() == "CHECKPOINT-FAIRNESS-HEARTBEAT",
+                "wrong timer owner"
+            );
+            self.heartbeats.set(self.heartbeats.get() + 1);
+            Ok(())
+        }
+    }
+    nautilus_common::nautilus_actor!(CheckpointHeartbeatActor);
+
+    #[derive(Debug)]
+    struct ActualHeartbeatQueueCodec;
+    impl crate::runner_recovery::RunnerRecoveryCodec for ActualHeartbeatQueueCodec {
+        fn channel(&self) -> crate::runner_recovery::RunnerRecoveryChannel {
+            crate::runner_recovery::RunnerRecoveryChannel::TimeEvent
+        }
+        fn codec_id(&self) -> &str {
+            "actual-registered-heartbeat-capture.v1"
+        }
+        fn encode(
+            &self,
+            event: crate::runner_recovery::RunnerRecoveryEventRef<'_>,
+        ) -> Result<serde_json::Value> {
+            let crate::runner_recovery::RunnerRecoveryEventRef::TimeEvent(message) = event else {
+                anyhow::bail!("expected actual timer message");
+            };
+            let event = message.event();
+            Ok(
+                serde_json::json!({"name":event.name.to_string(),"event_id":event.event_id,
+                "ts_event":event.ts_event,"ts_init":event.ts_init,
+                "callback":message.checkpoint_callback_binding()}),
+            )
+        }
+        fn decode(
+            &self,
+            _: &crate::runner_recovery::RunnerRecoveryEnvelope,
+        ) -> Result<crate::runner_recovery::RunnerRecoveryEvent> {
+            anyhow::bail!("actual fairness source registry is capture-only")
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn checkpoint_slow_persistence_bounds_maintenance_and_registered_heartbeat_priority() {
+        use nautilus_common::actor::{DataActorConfig, DataActorCore};
+
+        let trace = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let retained = Rc::new(Cell::new(false));
+        let heartbeats = Rc::new(Cell::new(0));
+        let mut node =
+            LiveNode::builder(TraderId::from("CHECKPOINT-FAIRNESS"), Environment::Sandbox)
+                .unwrap()
+                .with_reconciliation(false)
+                .with_delay_post_stop_secs(0)
+                .with_delay_shutdown_secs(1)
+                .with_event_store({
+                    let trace = trace.clone();
+                    let retained = retained.clone();
+                    move |_, _| Ok(Box::new(TerminalStore { trace, retained }))
+                })
+                .build()
+                .unwrap();
+        node.add_actor(CheckpointHeartbeatActor {
+            core: DataActorCore::new(DataActorConfig {
+                actor_id: Some("CHECKPOINT-HEARTBEAT-ACTOR".into()),
+                ..Default::default()
+            }),
+            heartbeats: heartbeats.clone(),
+        })
+        .unwrap();
+        let selected = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let selected_input = selected.clone();
+        let maintenance_roots = Rc::new(Cell::new(0));
+        let maintenance = maintenance_roots.clone();
+        let handle = node.handle();
+        let stop = handle.clone();
+        let selected_roots = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let actual_roots = selected_roots.clone();
+        let root_handle = handle.clone();
+        node.set_dispatch_observer(NodeDispatchObserver::new(
+            DispatchObserver::new("slow-checkpoint-heartbeat".into(), move |record| {
+                if let crate::dispatch::DispatchRecord::Begin {
+                    root_sequence,
+                    parent_input_sequence: None,
+                    input,
+                    ..
+                } = record
+                    && !root_handle.should_stop()
+                    && matches!(
+                        input.source,
+                        crate::dispatch::DispatchSource::Maintenance
+                            | crate::dispatch::DispatchSource::Time
+                    )
+                {
+                    actual_roots.borrow_mut().push(*root_sequence);
+                }
+                Ok(())
+            })
+            .unwrap(),
+            move |source, phase, input| {
+                let payload = if let Some(native) =
+                    input.downcast_ref::<super::super::NativeMutationInput>()
+                {
+                    if source == crate::dispatch::DispatchSource::Maintenance {
+                        selected_input.borrow_mut().push("maintenance");
+                        maintenance.set(maintenance.get() + 1);
+                        // Bound the actual loop even if the old scheduling bug
+                        // regresses; stop does not modify a frozen checkpoint.
+                        if maintenance.get() == 5 {
+                            stop.stop();
+                        }
+                    }
+                    native.canonical_payload()?
+                } else if let Some(message) =
+                    input.downcast_ref::<nautilus_common::runner::TimeEventMessage>()
+                {
+                    selected_input.borrow_mut().push("heartbeat");
+                    let event = message.event();
+                    serde_json::json!({"name":event.name.to_string(),"event_id":event.event_id,
+                        "ts_event":event.ts_event,"ts_init":event.ts_init,
+                        "callback":message.checkpoint_callback_binding()})
+                } else {
+                    anyhow::bail!("unsupported actual fairness input");
+                };
+                Ok(DispatchInput {
+                    source,
+                    phase: phase.into(),
+                    payload,
+                    batch_index: None,
+                })
+            },
+        ))
+        .unwrap();
+        let mut registry = RunnerRecoveryCodecRegistry::new([
+            crate::runner_recovery::RunnerRecoveryChannel::TimeEvent,
+        ]);
+        registry
+            .register_owner_bound_timer_codec(ActualHeartbeatQueueCodec)
+            .unwrap();
+        let captures = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let persisted = captures.clone();
+        let retained_fence = retained.clone();
+        node.set_running_checkpoint_handler(
+            Rc::new(registry.seal().unwrap()),
+            RunningCheckpointSchedule::EveryCompletedRoot,
+            |boundary| {
+                boundary.verify()?;
+                Ok((
+                    boundary.completion_proof().root_sequence(),
+                    boundary.inventory().is_terminal_cut(),
+                ))
+            },
+            move |capture| {
+                // Every selected root still gets its original synchronous
+                // persistence. Its cost makes maintenance continuously ready.
+                std::thread::sleep(Duration::from_millis(130));
+                persisted.borrow_mut().push(capture);
+                Ok(())
+            },
+            move |_| retained_fence.set(true),
+        )
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            node.run_with_mode(NodeRunMode::Hosted),
+        )
+        .await
+        .expect("actual heartbeat fairness bounded run")
+        .unwrap();
+        let selected = selected.borrow();
+        let maintenance_indices = selected
+            .iter()
+            .enumerate()
+            .filter_map(|(index, kind)| (*kind == "maintenance").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(maintenance_indices.len(), 5, "{selected:?}");
+        assert!(
+            maintenance_indices
+                .windows(2)
+                .all(|indices| selected[indices[0] + 1..indices[1]].contains(&"heartbeat")),
+            "ready heartbeat starved by continuously due maintenance: {selected:?}"
+        );
+        assert!(
+            heartbeats.get() >= 4,
+            "original actor heartbeat callback did not run"
+        );
+        let captures = captures.borrow();
+        for root in selected_roots.borrow().iter() {
+            assert!(
+                captures
+                    .iter()
+                    .any(|(captured, terminal)| captured == root && !terminal),
+                "selected original root {root} lost its synchronous checkpoint: {captures:?}"
+            );
+        }
+        assert!(
+            captures.windows(2).all(|cuts| cuts[0].0 < cuts[1].0),
+            "cut roots did not advance"
+        );
+        assert!(captures.last().is_some_and(|(_, terminal)| *terminal));
+        assert!(!retained.get());
+        assert!(trace.borrow().contains(&"seal"));
+        assert!(!node.kernel.exec_engine.borrow().submissions_fenced());
+    }
+
+    #[rstest]
+    #[case::actual_response(false, false, false, false)]
+    #[case::deadline_without_another_input(true, false, false, false)]
+    #[case::terminal_pending(false, true, false, false)]
+    #[case::changed_ingress_at_persistence(false, false, true, false)]
+    #[case::late_response_must_not_clear_expired_budget(false, false, false, true)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn checkpoint_pending_request_defers_real_cut_then_captures_or_retains_failure(
+        #[case] never_respond: bool,
+        #[case] stop_pending: bool,
+        #[case] change_during_write: bool,
+        #[case] late_response: bool,
+    ) {
+        use nautilus_common::{
+            actor::{DataActorConfig, DataActorCore},
+            messages::{
+                DataResponse,
+                data::{DataCommand, QuotesResponse, RequestCommand},
+            },
+            msgbus,
+        };
+        let trace = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let retained = Rc::new(Cell::new(false));
+        let request = Rc::new(Cell::new(None));
+        let responses = Rc::new(Cell::new(0));
+        let mut node =
+            LiveNode::builder(TraderId::from("PENDING-CHECKPOINT"), Environment::Sandbox)
+                .unwrap()
+                .with_reconciliation(false)
+                .with_delay_post_stop_secs(0)
+                .with_delay_shutdown_secs(0)
+                .with_event_store({
+                    let trace = trace.clone();
+                    let retained = retained.clone();
+                    move |_, _| Ok(Box::new(TerminalStore { trace, retained }))
+                })
+                .build()
+                .unwrap();
+        let encoded_request = Rc::new(Cell::new(None));
+        let recorded = encoded_request.clone();
+        node.set_dispatch_observer(NodeDispatchObserver::new(
+            DispatchObserver::new("pending-request-cut".into(), |_| Ok(())).unwrap(),
+            move |source, phase, input| {
+                let payload = if let Some(native) =
+                    input.downcast_ref::<super::super::NativeMutationInput>()
+                {
+                    native.canonical_payload()?
+                } else if let Some(DataCommand::Request(RequestCommand::Quotes(value))) =
+                    input.downcast_ref::<DataCommand>()
+                {
+                    recorded.set(Some(value.request_id));
+                    serde_json::to_value(value)?
+                } else if let Some(DataEvent::Instrument(value)) = input.downcast_ref::<DataEvent>()
+                {
+                    serde_json::to_value(value)?
+                } else if let Some(DataEvent::Response(DataResponse::Quotes(value))) =
+                    input.downcast_ref::<DataEvent>()
+                {
+                    serde_json::to_value(value)?
+                } else {
+                    anyhow::bail!("unsupported actual request test input");
+                };
+                Ok(DispatchInput {
+                    source,
+                    phase: phase.into(),
+                    payload,
+                    batch_index: None,
+                })
+            },
+        ))
+        .unwrap();
+        node.add_actor(PendingQuotesActor {
+            core: DataActorCore::new(DataActorConfig {
+                actor_id: Some("PENDING-QUOTES-ACTOR".into()),
+                ..Default::default()
+            }),
+            request: request.clone(),
+            responses: responses.clone(),
+            delay_response: late_response,
+        })
+        .unwrap();
+        let mut registry = RunnerRecoveryCodecRegistry::new([
+            crate::runner_recovery::RunnerRecoveryChannel::DataEvent,
+        ]);
+        registry.register(ActualInstrumentQueueCodec).unwrap();
+        let writes = Rc::new(Cell::new(0));
+        let written = writes.clone();
+        let ready_responses = responses.clone();
+        let retained_fence = retained.clone();
+        let handle = node.handle();
+        node.set_running_checkpoint_handler(
+            Rc::new(registry.seal().unwrap()),
+            RunningCheckpointSchedule::Requested,
+            move |boundary| {
+                ensure!(
+                    ready_responses.get() == 1,
+                    "original registered actor response was not processed"
+                );
+                boundary.verify()?;
+                Ok(boundary.inventory().is_terminal_cut())
+            },
+            move |terminal| {
+                written.set(written.get() + 1);
+                if change_during_write && !terminal {
+                    ensure!(
+                        nautilus_common::live::runner::get_data_event_sender()
+                            .send(DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
+                                crypto_perpetual_ethusdt()
+                            )))
+                            .is_err(),
+                        "changed actual input was admitted during checkpoint"
+                    );
+                }
+                Ok(())
+            },
+            move |_| retained_fence.set(true),
+        )
+        .unwrap();
+        assert!(
+            node.set_running_checkpoint_pending_response_timeout(Duration::ZERO)
+                .is_err()
+        );
+        node.set_running_checkpoint_pending_response_timeout(if never_respond || late_response {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(2)
+        })
+        .unwrap();
+        assert!(
+            node.set_running_checkpoint_pending_response_timeout(Duration::from_secs(2))
+                .is_err()
+        );
+        let drive = async {
+            while !handle.is_running() {
+                tokio::task::yield_now().await;
+            }
+            let correlation = request.get().expect("actual actor request missing");
+            assert_eq!(encoded_request.get(), Some(correlation));
+            assert_eq!(
+                msgbus::local_only_recovery_readiness().unwrap(),
+                msgbus::LocalRecoveryReadiness::PendingResponses { count: 1 }
+            );
+            handle.request_running_checkpoint();
+            nautilus_common::live::runner::get_data_event_sender()
+                .send(DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
+                    crypto_perpetual_ethusdt(),
+                )))
+                .unwrap();
+            // Let the real completed Instrument root attempt the requested cut.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(writes.get(), 0);
+            assert!(!retained.get());
+            assert_eq!(responses.get(), 0);
+            assert!(
+                msgbus::get_message_bus()
+                    .borrow()
+                    .get_response_handler(&correlation)
+                    .is_some()
+            );
+            if stop_pending {
+                handle.stop();
+            } else if !never_respond {
+                nautilus_common::live::runner::get_data_event_sender()
+                    .send(DataEvent::Response(DataResponse::Quotes(QuotesResponse {
+                        correlation_id: correlation,
+                        client_id: "SIM".into(),
+                        instrument_id: crypto_perpetual_ethusdt().id(),
+                        data: vec![],
+                        start: None,
+                        end: None,
+                        ts_init: 0.into(),
+                        params: None,
+                    })))
+                    .unwrap();
+                while writes.get() == 0 && !handle.should_stop() {
+                    tokio::task::yield_now().await;
+                }
+                if !change_during_write && !late_response {
+                    handle.stop();
+                }
+            }
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(node.run_with_mode(NodeRunMode::Hosted), drive)
+        })
+        .await
+        .expect("actual request checkpoint bounded run");
+        let failed = never_respond || stop_pending || change_during_write || late_response;
+        assert_eq!(result.is_err(), failed, "{result:?}");
+        assert_eq!(retained.get(), failed);
+        assert_eq!(
+            responses.get(),
+            usize::from(!never_respond && !stop_pending)
+        );
+        if failed {
+            assert!(node.kernel.exec_engine.borrow().submissions_fenced());
+            node.kernel.dispose();
+            assert!(!trace.borrow().contains(&"seal"));
+        } else {
+            assert_eq!(writes.get(), 2);
+            assert!(trace.borrow().contains(&"seal"));
+        }
+        if never_respond || late_response {
+            assert!(
+                format!("{:#}", result.as_ref().unwrap_err())
+                    .contains("checkpoint pending responses deadline expired")
+            );
+        }
+        if stop_pending {
+            assert!(
+                format!("{:#}", result.as_ref().unwrap_err())
+                    .contains("terminal checkpoint message bus responses remain pending")
+            );
+        }
+    }
+
+    #[derive(Debug)]
     struct ActualInstrumentQueueCodec;
     impl crate::runner_recovery::RunnerRecoveryCodec for ActualInstrumentQueueCodec {
         fn channel(&self) -> crate::runner_recovery::RunnerRecoveryChannel {
@@ -576,6 +1051,19 @@ pub(super) type Collect = dyn Fn(&RunningCheckpointBoundary<'_>) -> Result<Box<d
 pub(super) type Persist = dyn Fn(&RunningCheckpointBoundary<'_>, Box<dyn Any>) -> Result<()>;
 pub(super) type Fence = dyn Fn(&str);
 
+#[derive(Debug)]
+pub(super) struct PendingResponseCapture {
+    first_root: u64,
+    request_sequence: u64,
+    count: usize,
+    deadline: dst::time::Instant,
+}
+
+enum CaptureDisposition {
+    Persisted,
+    PendingResponses(usize),
+}
+
 pub(super) struct RunningCheckpointRegistration {
     pub(super) registry: Rc<RunnerRecoveryCodecRegistry>,
     pub(super) schedule: RunningCheckpointSchedule,
@@ -585,6 +1073,8 @@ pub(super) struct RunningCheckpointRegistration {
     pub(super) last_root: u64,
     pub(super) last_request: u64,
     pub(super) last_capture: dst::time::Instant,
+    pub(super) pending_response_timeout: Option<Duration>,
+    pub(super) pending_responses: Option<PendingResponseCapture>,
 }
 
 impl Debug for RunningCheckpointRegistration {
@@ -654,7 +1144,74 @@ impl LiveNode {
             last_root: 0,
             last_request: 0,
             last_capture: dst::time::Instant::now(),
+            pending_response_timeout: None,
+            pending_responses: None,
         });
+        Ok(())
+    }
+
+    /// Explicitly bounds deferral of due nonterminal cuts with local responses pending.
+    /// The original request/cadence stays due; only a later completed root may capture.
+    /// Without this opt-in, the original fail-closed behavior is retained.
+    ///
+    /// # Errors
+    /// Requires an idle registered collector and an explicit positive representable timeout.
+    pub fn set_running_checkpoint_pending_response_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<()> {
+        ensure!(
+            self.state() == NodeState::Idle && !self.handle.should_stop(),
+            "checkpoint timeout requires idle node"
+        );
+        ensure!(
+            !timeout.is_zero() && dst::time::Instant::now().checked_add(timeout).is_some(),
+            "checkpoint pending timeout must be explicit and positive"
+        );
+        let registration = self
+            .running_checkpoint
+            .as_mut()
+            .context("checkpoint handler missing")?;
+        ensure!(
+            registration.pending_response_timeout.is_none(),
+            "checkpoint pending timeout already configured"
+        );
+        registration.pending_response_timeout = Some(timeout);
+        Ok(())
+    }
+
+    pub(super) fn running_checkpoint_pending_response_deadline(
+        &self,
+    ) -> Option<dst::time::Instant> {
+        self.running_checkpoint
+            .as_ref()?
+            .pending_responses
+            .as_ref()
+            .map(|pending| pending.deadline)
+    }
+
+    fn verify_running_checkpoint_pending_response_deadline(&self) -> Result<()> {
+        let Some(registration) = &self.running_checkpoint else {
+            return Ok(());
+        };
+        let Some(pending) = &registration.pending_responses else {
+            return Ok(());
+        };
+        if dst::time::Instant::now() < pending.deadline {
+            return Ok(());
+        }
+        let reason = format!(
+            "checkpoint pending responses deadline expired: count={}, first_root={}, request_sequence={}",
+            pending.count, pending.first_root, pending.request_sequence
+        );
+        anyhow::bail!(reason)
+    }
+
+    pub(super) fn expire_running_checkpoint_pending_responses(&self) -> Result<()> {
+        if let Err(error) = self.verify_running_checkpoint_pending_response_deadline() {
+            self.fail_native_dispatch(&format!("{error:#}"));
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -758,6 +1315,7 @@ impl LiveNode {
         let Some(registration) = self.running_checkpoint.as_ref() else {
             return Ok(());
         };
+        self.expire_running_checkpoint_pending_responses()?;
         if terminal {
             ensure!(
                 self.state() == NodeState::ShuttingDown && self.terminal_checkpoint.is_none(),
@@ -806,7 +1364,7 @@ impl LiveNode {
         );
         let ingress = self.handle.ingress_gate();
         let capture_state = self.state();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+        let capture = || -> Result<CaptureDisposition> {
             ensure!(
                 !pending_report_tasks,
                 "venue reconciliation HTTP is in flight"
@@ -853,6 +1411,26 @@ impl LiveNode {
                 .portfolio
                 .try_borrow()?
                 .running_checkpoint_state()?;
+            // No adapter/runner/timer freeze has begun. Pending correlations are
+            // a typed local-bus observation, never an error-text retry heuristic.
+            proof.verify()?;
+            if let nautilus_common::msgbus::LocalRecoveryReadiness::PendingResponses { count } =
+                nautilus_common::msgbus::local_only_recovery_readiness()?
+            {
+                ensure!(
+                    !terminal,
+                    "terminal checkpoint message bus responses remain pending"
+                );
+                ensure!(
+                    self.running_checkpoint
+                        .as_ref()
+                        .unwrap()
+                        .pending_response_timeout
+                        .is_some(),
+                    "message bus responses remain pending without explicit checkpoint timeout"
+                );
+                return Ok(CaptureDisposition::PendingResponses(count));
+            }
             let mut adapters = Vec::new();
             let data_client_state = data
                 .get_clients()
@@ -999,6 +1577,7 @@ impl LiveNode {
                                 execution_authorized: false,
                             };
                             let verify = || -> Result<()> {
+                                self.verify_running_checkpoint_pending_response_deadline()?;
                                 ensure!(
                                     self.state() == capture_state
                                         && (terminal || !self.handle.should_stop()),
@@ -1115,13 +1694,37 @@ impl LiveNode {
                     adapter.finish()?;
                 }
             }
-            Ok(())
-        }));
+            Ok(CaptureDisposition::Persisted)
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(capture));
         match outcome {
-            Ok(Ok(())) => {
+            Ok(Ok(CaptureDisposition::PendingResponses(count))) => {
+                let registration = self.running_checkpoint.as_mut().unwrap();
+                if let Some(pending) = &mut registration.pending_responses {
+                    pending.count = count;
+                } else {
+                    let timeout = registration
+                        .pending_response_timeout
+                        .context("checkpoint timeout missing")?;
+                    registration.pending_responses = Some(PendingResponseCapture {
+                        first_root: proof.root_sequence(),
+                        request_sequence,
+                        count,
+                        deadline: now
+                            .checked_add(timeout)
+                            .context("checkpoint timeout overflow")?,
+                    });
+                }
+                // Do not update last_capture/last_request, persist an old cut,
+                // discard correlations, or reuse this completed root.
+                Ok(())
+            }
+            Ok(Ok(CaptureDisposition::Persisted)) => {
+                self.expire_running_checkpoint_pending_responses()?;
                 let registration = self.running_checkpoint.as_mut().unwrap();
                 registration.last_capture = now;
                 registration.last_request = request_sequence;
+                registration.pending_responses = None;
                 if terminal {
                     self.terminal_checkpoint = Some(TerminalCheckpointReceipt {
                         node_instance: self.kernel.instance_id,
@@ -1138,7 +1741,7 @@ impl LiveNode {
                 let error = match outcome {
                     Ok(Err(error)) => error,
                     Err(_) => anyhow::anyhow!("running checkpoint callback panicked"),
-                    Ok(Ok(())) => unreachable!(),
+                    Ok(Ok(_)) => unreachable!(),
                 };
                 let reason = format!("{error:#}");
                 if !terminal {

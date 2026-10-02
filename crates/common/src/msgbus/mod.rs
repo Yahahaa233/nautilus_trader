@@ -361,6 +361,42 @@ fn reject_recovery_dispatch() {
     }
 }
 
+/// Read-only capturability of the actual local bus. This is not a capture guard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalRecoveryReadiness {
+    /// The local bus has no outstanding response handlers.
+    Ready,
+    /// Actual response handlers remain registered; none are consumed here.
+    PendingResponses { count: usize },
+}
+
+/// Observes pending responses without removing handlers or accepting a checkpoint.
+///
+/// # Errors
+/// Missing/busy buses, external I/O, active dispatch and nested capture still refuse.
+pub fn local_only_recovery_readiness() -> anyhow::Result<LocalRecoveryReadiness> {
+    MESSAGE_BUS.with(|slot| {
+        let slot = slot.try_borrow()?;
+        let bus = slot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("message bus missing"))?;
+        let bus = bus.try_borrow()?;
+        bus.verify_local_only_recovery_source()?;
+        anyhow::ensure!(
+            BUS_DISPATCH_DEPTH.get() == 0,
+            "message bus dispatch remains active"
+        );
+        anyhow::ensure!(!RECOVERY_CAPTURE_ACTIVE.get(), "nested message bus capture");
+        Ok(if bus.correlation_index.is_empty() {
+            LocalRecoveryReadiness::Ready
+        } else {
+            LocalRecoveryReadiness::PendingResponses {
+                count: bus.correlation_index.len(),
+            }
+        })
+    })
+}
+
 /// Captures only a local bus with no external backing or outstanding responses.
 /// Retains immutable bus and TLS-slot borrows, rejecting registry mutation and replacement.
 /// Every dispatch attempt invalidates the guard even when its panic is caught.
@@ -399,6 +435,97 @@ pub fn with_local_only_recovery_inventory<T>(
 #[cfg(test)]
 mod recovery_inventory_tests {
     use super::*;
+    #[test]
+    fn local_recovery_readiness_preserves_actual_correlations_until_response() {
+        std::thread::spawn(|| {
+            use crate::messages::data::{DataResponse, QuotesResponse};
+            let bus = Rc::new(RefCell::new(MessageBus::default()));
+            set_message_bus(bus.clone());
+            let calls = Rc::new(Cell::new(0));
+            let correlation = UUID4::new();
+            let called = calls.clone();
+            register_response_handler(
+                &correlation,
+                ShareableMessageHandler::from_typed(move |_: &QuotesResponse| {
+                    called.set(called.get() + 1)
+                }),
+            );
+            assert_eq!(
+                local_only_recovery_readiness().unwrap(),
+                LocalRecoveryReadiness::PendingResponses { count: 1 }
+            );
+            assert_eq!(
+                local_only_recovery_readiness().unwrap(),
+                LocalRecoveryReadiness::PendingResponses { count: 1 }
+            );
+            assert_eq!(calls.get(), 0);
+            assert!(bus.borrow().get_response_handler(&correlation).is_some());
+            assert!(with_local_only_recovery_inventory(|_| Ok(())).is_err());
+            send_response(
+                &correlation,
+                &DataResponse::Quotes(QuotesResponse {
+                    correlation_id: correlation,
+                    client_id: "SIM".into(),
+                    instrument_id: "TEST.SIM".into(),
+                    data: vec![],
+                    start: None,
+                    end: None,
+                    ts_init: 0.into(),
+                    params: None,
+                }),
+            );
+            assert_eq!(calls.get(), 1);
+            assert!(bus.borrow().get_response_handler(&correlation).is_none());
+            assert_eq!(
+                local_only_recovery_readiness().unwrap(),
+                LocalRecoveryReadiness::Ready
+            );
+            with_local_only_recovery_inventory(|guard| guard.verify()).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn local_recovery_readiness_does_not_reclassify_external_busy_or_active_sources() {
+        std::thread::spawn(|| {
+            let bus = Rc::new(RefCell::new(MessageBus::default()));
+            set_message_bus(bus.clone());
+            bus.borrow_mut()
+                .register_response_handler(&UUID4::new(), stubs::get_stub_shareable_handler(None))
+                .unwrap();
+            bus.borrow_mut().has_backing = true;
+            assert!(local_only_recovery_readiness().is_err());
+            bus.borrow_mut().has_backing = false;
+            {
+                let _borrow = bus.borrow_mut();
+                assert!(local_only_recovery_readiness().is_err());
+            }
+            #[derive(Debug)]
+            struct ReadinessHandler(Rc<Cell<bool>>);
+            impl Handler<dyn Any> for ReadinessHandler {
+                fn id(&self) -> ustr::Ustr {
+                    "readiness-handler".into()
+                }
+                fn handle(&self, _: &dyn Any) {
+                    self.0.set(local_only_recovery_readiness().is_err());
+                }
+            }
+            let active_refused = Rc::new(Cell::new(false));
+            register_any(
+                "readiness-handler".into(),
+                typed_handler::shareable_handler(Rc::new(ReadinessHandler(active_refused.clone()))),
+            );
+            send_any("readiness-handler".into(), &());
+            assert!(active_refused.get());
+            assert_eq!(
+                local_only_recovery_readiness().unwrap(),
+                LocalRecoveryReadiness::PendingResponses { count: 1 }
+            );
+        })
+        .join()
+        .unwrap();
+    }
     #[test]
     fn local_only_inventory_rejects_reentry_from_actual_handler() {
         #[derive(Debug)]

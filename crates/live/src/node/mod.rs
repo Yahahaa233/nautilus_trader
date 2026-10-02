@@ -80,6 +80,9 @@
 //! `inflight_check_interval_ms` and `own_books_audit_interval_secs` smaller)
 //! become eligible on the next maintenance tick. Event processing and runtime
 //! scheduling can delay dispatch further; the timer does not guarantee a maximum delay.
+//! When maintenance and runner inputs are both ready, one maintenance root
+//! alternates with one actual runner input. This bounds priority in both
+//! directions even when synchronous checkpoint persistence exceeds 100ms.
 
 use std::{any::Any, fmt::Debug, time::Duration};
 
@@ -2868,6 +2871,7 @@ impl LiveNode {
             .as_ref()
             .map(|config| QueueMonitor::new(config, metrics.snapshot()));
         let mut dispatches_since_yield = 0usize;
+        let mut last_dispatch_was_maintenance = false;
         #[cfg(feature = "dispatch-observer")]
         let mut checkpoint_error = None;
 
@@ -2875,9 +2879,38 @@ impl LiveNode {
             let shutdown_deadline = self.shutdown_deadline;
             let is_shutting_down = self.state() == NodeState::ShuttingDown;
             let is_running = matches!(self.state(), NodeState::Running | NodeState::Observing);
+            #[cfg(feature = "dispatch-observer")]
+            let checkpoint_pending_deadline = self.running_checkpoint_pending_response_deadline();
+            #[cfg(not(feature = "dispatch-observer"))]
+            let checkpoint_pending_deadline: Option<dst::time::Instant> = None;
+            // A slow synchronous checkpoint can leave every next maintenance
+            // tick ready. Preserve its priority, but never select it twice in
+            // succession while an actual runner input is already queued.
+            // Reading queue length neither dequeues nor changes FIFO/receipts.
+            let runner_input_ready = !time_evt_rx.is_empty()
+                || !system_evt_rx.is_empty()
+                || !system_cmd_rx.is_empty()
+                || !exec_evt_rx.is_empty()
+                || !exec_cmd_rx.is_empty()
+                || !data_evt_rx.is_empty()
+                || !data_cmd_rx.is_empty();
+            let maintenance_can_dispatch = !last_dispatch_was_maintenance || !runner_input_ready;
 
             tokio::select! {
                 biased;
+
+                () = async {
+                    match checkpoint_pending_deadline {
+                        Some(deadline) => dst::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if is_running && checkpoint_pending_deadline.is_some() => {
+                    #[cfg(feature = "dispatch-observer")]
+                    if let Err(error) = self.expire_running_checkpoint_pending_responses() {
+                        checkpoint_error = Some(error);
+                        break;
+                    }
+                }
 
                 // Signal branches first so they are always checked
                 result = &mut ctrl_c, if is_running => {
@@ -2975,9 +3008,10 @@ impl LiveNode {
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
 
-                // Maintenance dispatcher (before event processing to avoid
-                // starvation). See module docs for design rationale.
-                _ = maintenance_timer.tick(), if is_running => {
+                // Bound both directions: maintenance keeps priority after each
+                // runner input, then yields one turn to any already queued input.
+                _ = maintenance_timer.tick(), if is_running && maintenance_can_dispatch => {
+                    last_dispatch_was_maintenance = true;
                     let maintenance_now = dst::time::Instant::now();
                     let maintenance_input = self.native_mutation_input("maintenance.tick", &serde_json::json!({
                         "reconciliation_due":recon_enabled && maintenance_now >= recon_next,
@@ -3073,6 +3107,7 @@ impl LiveNode {
                 // submit, etc.) is not delayed behind a market data backlog
                 // when the biased select polls receivers each iteration.
                 Some(handler) = time_evt_rx.recv() => {
+                    last_dispatch_was_maintenance = false;
                     let dispatch_start = dst::time::Instant::now();
                     let dispatched = self.process_time_event(handler);
 
@@ -3091,6 +3126,7 @@ impl LiveNode {
                     }
                 }
                 Some(event) = system_evt_rx.recv() => {
+                    last_dispatch_was_maintenance = false;
                     if is_shutting_down {
                         log::debug!("Residual system event: {event}");
                         residual_events += 1;
@@ -3098,6 +3134,7 @@ impl LiveNode {
                     self.process_system_event(event);
                 }
                 Some(command) = system_cmd_rx.recv() => {
+                    last_dispatch_was_maintenance = false;
                     if is_shutting_down {
                         log::debug!("Residual system command: {command}");
                         residual_events += 1;
@@ -3105,6 +3142,7 @@ impl LiveNode {
                     self.process_system_command(command);
                 }
                 Some(evt) = exec_evt_rx.recv() => {
+                    last_dispatch_was_maintenance = false;
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -3121,6 +3159,7 @@ impl LiveNode {
                     );
                 }
                 Some(cmd) = exec_cmd_rx.recv() => {
+                    last_dispatch_was_maintenance = false;
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -3164,6 +3203,7 @@ impl LiveNode {
                     );
                 }
                 Some(evt) = data_evt_rx.recv() => {
+                    last_dispatch_was_maintenance = false;
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -3179,6 +3219,7 @@ impl LiveNode {
                     );
                 }
                 Some(cmd) = data_cmd_rx.recv() => {
+                    last_dispatch_was_maintenance = false;
                     let dispatch_start = dst::time::Instant::now();
 
                     if is_shutting_down {
@@ -3195,6 +3236,8 @@ impl LiveNode {
                 }
             }
 
+            #[cfg(feature = "dispatch-observer")]
+            let checkpoint_started = dst::time::Instant::now();
             #[cfg(feature = "dispatch-observer")]
             if let Err(error) = self.observation_after_completed_root(
                 crate::runner::RunningReceivers {
@@ -3214,8 +3257,22 @@ impl LiveNode {
                 break;
             }
 
+            #[cfg(feature = "dispatch-observer")]
+            let checkpoint_occupied_tick =
+                checkpoint_started.elapsed() >= Duration::from_millis(100);
+            #[cfg(not(feature = "dispatch-observer"))]
+            let checkpoint_occupied_tick = false;
+
             dispatches_since_yield += 1;
-            if dispatches_since_yield >= DISPATCHES_PER_YIELD {
+            if checkpoint_occupied_tick {
+                dispatches_since_yield = 0;
+                // All capture guards are released before this await. A merely
+                // ready task/yield_now does not guarantee a current-thread
+                // runtime polls its timer driver. Await one timer quantum after
+                // a synchronous capture consumed an entire maintenance tick;
+                // heartbeat, stop and existing deadline timers must progress.
+                dst::time::sleep(Duration::from_millis(1)).await;
+            } else if dispatches_since_yield >= DISPATCHES_PER_YIELD {
                 dispatches_since_yield = 0;
                 tokio::task::yield_now().await;
             }

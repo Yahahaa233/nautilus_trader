@@ -367,6 +367,10 @@ impl LiveNode {
             );
             let collect_ids = ids.clone();
             registration.suspended_checkpoint = self.running_checkpoint.take();
+            let pending_response_timeout = registration
+                .suspended_checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.pending_response_timeout);
             self.running_checkpoint = Some(RunningCheckpointRegistration {
                 registry: registration.registry.clone(),
                 schedule: registration.schedule,
@@ -406,6 +410,8 @@ impl LiveNode {
                 last_root: 0,
                 last_request: 0,
                 last_capture: dst::time::Instant::now(),
+                pending_response_timeout,
+                pending_responses: None,
             });
             Ok(())
         }))
