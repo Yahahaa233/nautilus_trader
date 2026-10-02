@@ -257,6 +257,8 @@ pub struct LiveNode {
     #[cfg(feature = "dispatch-observer")]
     recovery_portfolio_source: Option<serde_json::Value>,
     #[cfg(feature = "native-tail-replay")]
+    recovery_market_source: Option<native_tail::InstalledNativeMarketCut>,
+    #[cfg(feature = "native-tail-replay")]
     historical_replay: Option<nautilus_event_store::native_trace::NativeHistoricalRootReplay>,
     #[cfg(feature = "native-tail-replay")]
     historical_timer_admissions: Vec<(String, u64, bool, nautilus_common::timer::TimeEvent, u64)>,
@@ -576,42 +578,8 @@ impl LiveNode {
                 orders.sort_by_key(|order| order.client_order_id());
                 positions.sort_by_key(|position| position.id);
                 accounts.sort_by_key(|account| account.id());
-                let mut instrument_ids = cache
-                    .instrument_ids(None)
-                    .into_iter()
-                    .copied()
-                    .collect::<Vec<_>>();
-                instrument_ids.sort();
-                let mut market = Vec::new();
-                for id in &instrument_ids {
-                    let mut bar_types = cache
-                        .bar_types(
-                            Some(id),
-                            None,
-                            nautilus_model::enums::AggregationSource::External,
-                        )
-                        .into_iter()
-                        .copied()
-                        .collect::<Vec<_>>();
-                    bar_types.extend(
-                        cache
-                            .bar_types(
-                                Some(id),
-                                None,
-                                nautilus_model::enums::AggregationSource::Internal,
-                            )
-                            .into_iter()
-                            .copied(),
-                    );
-                    bar_types.sort_by_key(ToString::to_string);
-                    let bars = bar_types
-                        .iter()
-                        .map(|kind| serde_json::json!({"type":kind,"bars":cache.bars(kind)}))
-                        .collect::<Vec<_>>();
-                    market.push(serde_json::json!({"instrument":cache.instrument(id),"quotes":cache.quotes(id),
-                        "trades":cache.trades(id),"marks":cache.mark_prices(id),"index_prices":cache.index_prices(id),
-                        "funding":cache.funding_rates(id),"bars":bars}));
-                }
+                let market = cache.native_market_checkpoint()?;
+                let market_config = cache.native_market_checkpoint_config();
                 let components = Trader::collect_native_recovery_state(&self.kernel.trader)?;
                 let data = self
                     .kernel
@@ -626,7 +594,7 @@ impl LiveNode {
                     .running_checkpoint_state()?;
                 verify()?;
                 let mut effects = serde_json::json!({"schema":"NautilusNativeTraceEffects.v1","timer_capture_ns":timer_capture_ns,
-                    "orders":orders, "positions":positions, "accounts":accounts,"market_cache":market,
+                    "orders":orders, "positions":positions, "accounts":accounts,"market_cache":market,"market_cache_config":market_config,
                     "components":components, "data_engine":data, "execution_manager":manager, "portfolio":portfolio,
                     "registered_timers":if self.historical_replay.is_some() {
                         self.recovery_timers.as_ref().context("historical owner timer installation missing")?.historical_inventory()?
@@ -1073,6 +1041,8 @@ impl LiveNode {
             #[cfg(feature = "dispatch-observer")]
             recovery_portfolio_source: None,
             #[cfg(feature = "native-tail-replay")]
+            recovery_market_source: None,
+            #[cfg(feature = "native-tail-replay")]
             historical_replay: None,
             #[cfg(feature = "native-tail-replay")]
             historical_timer_admissions: Vec::new(),
@@ -1187,6 +1157,8 @@ impl LiveNode {
             recovery_engine_source: None,
             #[cfg(feature = "dispatch-observer")]
             recovery_portfolio_source: None,
+            #[cfg(feature = "native-tail-replay")]
+            recovery_market_source: None,
             #[cfg(feature = "native-tail-replay")]
             historical_replay: None,
             #[cfg(feature = "native-tail-replay")]

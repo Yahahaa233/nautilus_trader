@@ -367,6 +367,13 @@ fn flush(
     halt: &HaltSink,
     high_watermark: &AtomicU64,
 ) -> bool {
+    // An empty flush must not acknowledge an unexpected storage generation. The
+    // owned backend performs only its compact generation/identity check here;
+    // unknown backends retain their original full-prefix fallback on request.
+    if let Err(error) = backend.verified_append_only_entry_hashes() {
+        halt.fire(HaltReason::from_backend_error(&error));
+        return false;
+    }
     if batch.is_empty() {
         return true;
     }

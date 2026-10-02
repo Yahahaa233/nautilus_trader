@@ -19,11 +19,15 @@
 //! [`Durability::Immediate`] so a crashed writer never leaves the in-flight tail visible
 //! after reopen, and the high-watermark only advances after a durable acknowledgement.
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::{
+    cell::Cell,
     fmt::Debug,
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
 use nautilus_core::UnixNanos;
@@ -39,6 +43,7 @@ use crate::{
     entry::EventStoreEntry,
     error::EventStoreError,
     format,
+    hash::EntryHash,
     manifest::{RunManifest, RunStatus},
     snapshot::{SnapshotAnchor, validate_new_anchor},
 };
@@ -73,6 +78,95 @@ struct RunState {
     high_watermark: u64,
     max_ts_init: UnixNanos,
     file_path: PathBuf,
+    append_only_prefix: Option<VerifiedAppendOnlyPrefix>,
+    prefix_failed: Cell<bool>,
+    #[cfg(test)]
+    verified_suffix_reads: u64,
+}
+
+/// Available only for a fresh run owned by this database handle. Existing files
+/// never inherit these process-local verified hashes from an earlier writer.
+#[derive(Debug)]
+struct VerifiedAppendOnlyPrefix {
+    run_id: String,
+    hashes: Vec<EntryHash>,
+    generation: FileGeneration,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileGeneration {
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    ctime: (i64, i64),
+}
+
+impl FileGeneration {
+    fn read(path: &Path) -> Result<Self, EventStoreError> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|e| EventStoreError::Backend(format!("native prefix file metadata: {e}")))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(EventStoreError::Backend(
+                "native prefix file identity changed".into(),
+            ));
+        }
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified().map_err(|e| {
+                EventStoreError::Backend(format!("native prefix modification time: {e}"))
+            })?,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+impl RunState {
+    fn check_prefix_owner(&self) -> Result<(), EventStoreError> {
+        if self.prefix_failed.get() {
+            return Err(EventStoreError::Backend(
+                "native prefix verification previously failed".into(),
+            ));
+        }
+        let result = (|| {
+            if let Some(prefix) = &self.append_only_prefix {
+                if prefix.run_id != self.manifest.run_id
+                    || u64::try_from(prefix.hashes.len()).ok() != Some(self.high_watermark)
+                    || prefix.generation != FileGeneration::read(&self.file_path)?
+                {
+                    return Err(EventStoreError::Backend(
+                        "native prefix owner or generation changed".into(),
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.prefix_failed.set(true);
+        }
+        result
+    }
+
+    fn refresh_prefix_generation(&mut self) -> Result<(), EventStoreError> {
+        if let Some(prefix) = &mut self.append_only_prefix {
+            match FileGeneration::read(&self.file_path) {
+                Ok(generation) => prefix.generation = generation,
+                Err(error) => {
+                    self.prefix_failed.set(true);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 enum RunDatabase {
@@ -236,6 +330,10 @@ impl RedbBackend {
                 high_watermark,
                 max_ts_init,
                 file_path: path,
+                append_only_prefix: None,
+                prefix_failed: Cell::new(false),
+                #[cfg(test)]
+                verified_suffix_reads: 0,
             }),
         })
     }
@@ -515,6 +613,10 @@ impl EventStore for RedbBackend {
                 high_watermark,
                 max_ts_init,
                 file_path: path,
+                append_only_prefix: None,
+                prefix_failed: Cell::new(false),
+                #[cfg(test)]
+                verified_suffix_reads: 0,
             });
             return Err(EventStoreError::CrashedPredecessor);
         }
@@ -524,12 +626,27 @@ impl EventStore for RedbBackend {
         manifest.high_watermark = 0;
         Self::initialize_fresh(&db, &manifest)?;
 
+        // File identity/generation is part of this optimization's ownership proof.
+        // Platforms without the native inode contract retain complete scans.
+        #[cfg(unix)]
+        let append_only_prefix = Some(VerifiedAppendOnlyPrefix {
+            run_id: manifest.run_id.clone(),
+            hashes: Vec::new(),
+            generation: FileGeneration::read(&path)?,
+        });
+        #[cfg(not(unix))]
+        let append_only_prefix = None;
+
         self.state = Some(RunState {
             db: RunDatabase::ReadWrite(db),
             manifest,
             high_watermark: 0,
             max_ts_init: UnixNanos::default(),
             file_path: path,
+            append_only_prefix,
+            prefix_failed: Cell::new(false),
+            #[cfg(test)]
+            verified_suffix_reads: 0,
         });
         Ok(())
     }
@@ -541,11 +658,30 @@ impl EventStore for RedbBackend {
             return Err(EventStoreError::Closed);
         }
 
+        state.check_prefix_owner()?;
+
         if entries.is_empty() {
             return Ok(state.high_watermark);
         }
 
-        for (expected, append) in (state.high_watermark + 1..).zip(entries.iter()) {
+        let entry_count = u64::try_from(entries.len())
+            .map_err(|_| EventStoreError::Backend("native prefix batch count overflow".into()))?;
+        let first = state
+            .high_watermark
+            .checked_add(1)
+            .ok_or_else(|| EventStoreError::Backend("native prefix sequence exhausted".into()))?;
+        state
+            .high_watermark
+            .checked_add(entry_count)
+            .ok_or_else(|| {
+                EventStoreError::Backend("native prefix batch sequence exhausted".into())
+            })?;
+        for (offset, append) in entries.iter().enumerate() {
+            let offset = u64::try_from(offset)
+                .map_err(|_| EventStoreError::Backend("native prefix offset overflow".into()))?;
+            let expected = first.checked_add(offset).ok_or_else(|| {
+                EventStoreError::Backend("native prefix sequence offset exhausted".into())
+            })?;
             if append.entry.seq != expected {
                 // Atomically rejected: surface the durable high-watermark, not the within-batch
                 // validation cursor, so callers that resync from this value never skip entries
@@ -555,6 +691,13 @@ impl EventStore for RedbBackend {
                     seq: append.entry.seq,
                 });
             }
+        }
+
+        if let Some(prefix) = &mut state.append_only_prefix {
+            prefix.hashes.try_reserve(entries.len()).map_err(|e| {
+                state.prefix_failed.set(true);
+                EventStoreError::Backend(format!("native prefix capacity unavailable: {e}"))
+            })?;
         }
 
         let encoded: Vec<Vec<u8>> = entries
@@ -607,6 +750,71 @@ impl EventStore for RedbBackend {
         state.high_watermark = new_hwm;
         state.max_ts_init = max_ts;
         state.manifest.high_watermark = new_hwm;
+
+        if state.append_only_prefix.is_some() {
+            // No acknowledgment or cached hash is issued from the pre-commit draft.
+            // Read the exact committed suffix once in one database transaction.
+            let result = (|| {
+                let txn = state.db.begin_read()?;
+                let table = txn.open_table(ENTRIES_TABLE).map_err(map_table_err)?;
+                let mut hashes = Vec::new();
+                hashes.try_reserve(entries.len()).map_err(|e| {
+                    EventStoreError::Backend(format!("native suffix capacity unavailable: {e}"))
+                })?;
+                for (append, expected_bytes) in entries.iter().zip(&encoded) {
+                    let value = table
+                        .get(append.entry.seq)
+                        .map_err(map_storage_err)?
+                        .ok_or_else(|| {
+                            EventStoreError::Backend("native committed suffix absent".into())
+                        })?;
+                    let bytes = value.value();
+                    if bytes != expected_bytes.as_slice() {
+                        return Err(EventStoreError::Backend(
+                            "native committed suffix bytes changed".into(),
+                        ));
+                    }
+                    let actual =
+                        codec::decode_from_slice::<EventStoreEntry>(bytes).map_err(|e| {
+                            EventStoreError::Corrupted(format!("native committed suffix: {e}"))
+                        })?;
+                    check_embedded_seq(append.entry.seq, &actual)?;
+                    if actual.recompute_hash() != actual.entry_hash {
+                        return Err(EventStoreError::HashMismatch { seq: actual.seq });
+                    }
+                    hashes.push(actual.entry_hash);
+                }
+                Ok(hashes)
+            })();
+            match result {
+                Ok(hashes) => {
+                    #[cfg(test)]
+                    {
+                        state.verified_suffix_reads = state
+                            .verified_suffix_reads
+                            .checked_add(entry_count)
+                            .ok_or_else(|| {
+                                EventStoreError::Backend(
+                                    "native suffix read counter exhausted".into(),
+                                )
+                            })?;
+                    }
+                    if let Some(prefix) = &mut state.append_only_prefix {
+                        prefix.hashes.extend(hashes);
+                    } else {
+                        state.prefix_failed.set(true);
+                        return Err(EventStoreError::Backend(
+                            "native prefix owner disappeared".into(),
+                        ));
+                    }
+                    state.refresh_prefix_generation()?;
+                }
+                Err(error) => {
+                    state.prefix_failed.set(true);
+                    return Err(error);
+                }
+            }
+        }
 
         Ok(new_hwm)
     }
@@ -710,6 +918,41 @@ impl EventStore for RedbBackend {
         Ok(Some(entry))
     }
 
+    fn verified_append_only_entry_hashes(&self) -> Result<Option<&[EntryHash]>, EventStoreError> {
+        let state = self.state()?;
+        state.check_prefix_owner()?;
+        let Some(prefix) = &state.append_only_prefix else {
+            return Ok(None);
+        };
+        let result = (|| {
+            let manifest = Self::read_manifest(state.db.readable())?
+                .ok_or_else(|| EventStoreError::Backend("native prefix manifest absent".into()))?;
+            if manifest.run_id != prefix.run_id || manifest.status != state.manifest.status {
+                return Err(EventStoreError::Backend(
+                    "native prefix durable run changed".into(),
+                ));
+            }
+            let txn = state.db.begin_read()?;
+            let table = txn.open_table(ENTRIES_TABLE).map_err(map_table_err)?;
+            let actual_hwm = table
+                .last()
+                .map_err(map_storage_err)?
+                .map_or(0, |(key, _)| key.value());
+            if actual_hwm != state.high_watermark {
+                return Err(EventStoreError::Backend(
+                    "native prefix durable watermark changed".into(),
+                ));
+            }
+            // The expected generation is checked again after the actual backend reads.
+            state.check_prefix_owner()?;
+            Ok(Some(prefix.hashes.as_slice()))
+        })();
+        if result.is_err() {
+            state.prefix_failed.set(true);
+        }
+        result
+    }
+
     fn lookup(&self, kind: IndexKind, key: &str) -> Result<Option<u64>, EventStoreError> {
         let state = self.state()?;
         let txn = state.db.begin_read()?;
@@ -747,6 +990,8 @@ impl EventStore for RedbBackend {
             return Err(EventStoreError::Closed);
         }
 
+        state.check_prefix_owner()?;
+
         let latest = Self::read_snapshot_anchor(state.db.readable())?;
         validate_new_anchor(&anchor, state.high_watermark, latest.as_ref())?;
 
@@ -763,6 +1008,7 @@ impl EventStore for RedbBackend {
                 .map_err(map_storage_err)?;
         }
         txn.commit().map_err(map_commit_err)?;
+        state.refresh_prefix_generation()?;
         Ok(())
     }
 
@@ -772,6 +1018,7 @@ impl EventStore for RedbBackend {
 
     fn seal(&mut self, status: RunStatus) -> Result<(), EventStoreError> {
         let state = self.state_mut()?;
+        state.check_prefix_owner()?;
 
         // Running is not a terminal state; accepting it would leave `is_sealed()` returning
         // false while the seal call returned Ok, so subsequent appends would not see Closed.
@@ -795,6 +1042,9 @@ impl EventStore for RedbBackend {
 
         Self::write_manifest(state.db.read_write()?, &updated)?;
         state.manifest = updated;
+        // Sealed readers independently scan every original payload; no live cache
+        // is exported or reused as a reader-issued proof.
+        state.append_only_prefix = None;
         Ok(())
     }
 
@@ -937,6 +1187,331 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[cfg(unix)]
+    fn prefix_manifest(run_id: &str) -> RunManifest {
+        RunManifest {
+            run_id: run_id.into(),
+            parent_run_id: None,
+            instance_id: "prefix-owner".into(),
+            binary_hash: "native-binary".into(),
+            schema_version: 1,
+            crate_versions: "native-source".into(),
+            feature_flags: Vec::new(),
+            adapter_versions: Default::default(),
+            config_hash: "frozen-config".into(),
+            registered_components: Default::default(),
+            seed: None,
+            start_ts_init: UnixNanos::from(0),
+            end_ts_init: None,
+            high_watermark: 0,
+            status: RunStatus::Running,
+        }
+    }
+
+    #[cfg(unix)]
+    fn prefix_entry(seq: u64) -> AppendEntry {
+        let headers = crate::headers::Headers::empty();
+        let topic: crate::entry::Topic = "events.native.prefix".into();
+        let payload_type = ustr::Ustr::from("NativePrefixOriginal.v1");
+        let payload =
+            bytes::Bytes::from(vec![u8::try_from(seq).expect("small fixture"); 128 * 1024]);
+        let ts = UnixNanos::from(seq);
+        let hash = crate::hash::compute_entry_hash(
+            seq,
+            ts,
+            ts,
+            topic.as_ref(),
+            payload_type.as_str(),
+            &payload,
+            &headers,
+        );
+        AppendEntry::without_indices(EventStoreEntry::new(
+            hash,
+            seq,
+            headers,
+            topic,
+            payload_type,
+            payload,
+            ts,
+            ts,
+        ))
+    }
+
+    #[cfg(unix)]
+    fn original_full_prefix(backend: &dyn EventStore) -> crate::writer::DurableJournalPrefix {
+        let run_id = backend.manifest().expect("manifest").run_id;
+        let sequence = backend.high_watermark().expect("high watermark");
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"nautilus-native-journal-prefix/v1");
+        digest.update(&(run_id.len() as u64).to_be_bytes());
+        digest.update(run_id.as_bytes());
+        digest.update(&sequence.to_be_bytes());
+        for seq in 1..=sequence {
+            let row = backend
+                .scan_seq(seq)
+                .expect("full original read")
+                .expect("row");
+            assert_eq!(row.recompute_hash(), row.entry_hash);
+            digest.update(row.entry_hash.as_bytes());
+        }
+        crate::writer::DurableJournalPrefix {
+            run_id,
+            sequence,
+            entry_hash_digest: digest.finalize().to_hex().to_string(),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_prefix_real_redb_reads_only_committed_suffix_and_preserves_v1_digest() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut backend = RedbBackend::new(tmp.path());
+        backend
+            .open_run(prefix_manifest("multi-batch"))
+            .expect("open");
+        assert_eq!(
+            crate::writer::read_durable_prefix(&backend).expect("empty prefix"),
+            original_full_prefix(&backend)
+        );
+        for batch in [
+            vec![prefix_entry(1), prefix_entry(2)],
+            vec![prefix_entry(3)],
+            vec![prefix_entry(4), prefix_entry(5)],
+        ] {
+            backend.append_batch(&batch).expect("actual durable commit");
+            let watermark = backend.high_watermark().expect("hwm");
+            for _ in 0..4 {
+                assert_eq!(
+                    crate::writer::read_durable_prefix(&backend).expect("same cut prefix"),
+                    original_full_prefix(&backend)
+                );
+            }
+            assert_eq!(
+                backend.state().expect("state").verified_suffix_reads,
+                watermark,
+                "prefix requests must not reread old payloads"
+            );
+            backend
+                .record_snapshot_anchor(SnapshotAnchor::new(watermark, "real-cut", "cut-hash"))
+                .expect("anchor");
+            assert_eq!(
+                crate::writer::read_durable_prefix(&backend).expect("anchor generation"),
+                original_full_prefix(&backend)
+            );
+        }
+        let expected = original_full_prefix(&backend);
+        backend.seal(RunStatus::Ended).expect("seal");
+        assert!(
+            backend
+                .verified_append_only_entry_hashes()
+                .expect("sealed fallback")
+                .is_none()
+        );
+        drop(backend);
+        let reader = RedbBackend::open_sealed(tmp.path(), "prefix-owner", "multi-batch")
+            .expect("sealed original");
+        assert!(
+            reader
+                .verified_append_only_entry_hashes()
+                .expect("reopened fallback")
+                .is_none()
+        );
+        assert_eq!(
+            crate::writer::read_durable_prefix(&reader).expect("all original rows verified again"),
+            expected
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_prefix_existing_redb_never_inherits_process_cache() {
+        let tmp = TempDir::new().expect("tempdir");
+        let expected = {
+            let mut original = RedbBackend::new(tmp.path());
+            original.open_run(prefix_manifest("crashed")).expect("open");
+            original
+                .append_batch(&[prefix_entry(1), prefix_entry(2)])
+                .expect("commit");
+            original_full_prefix(&original)
+        };
+        let mut reopened = RedbBackend::new(tmp.path());
+        assert!(matches!(
+            reopened.open_run(prefix_manifest("crashed")),
+            Err(EventStoreError::CrashedPredecessor)
+        ));
+        assert!(
+            reopened
+                .verified_append_only_entry_hashes()
+                .expect("existing fallback")
+                .is_none()
+        );
+        assert_eq!(
+            crate::writer::read_durable_prefix(&reopened).expect("full existing rows"),
+            expected
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_prefix_old_payload_change_cannot_be_hidden_by_legal_commit_anchor_or_seal() {
+        for action in ["append", "anchor", "seal", "prefix"] {
+            let tmp = TempDir::new().expect("tempdir");
+            let mut backend = RedbBackend::new(tmp.path());
+            backend.open_run(prefix_manifest(action)).expect("open");
+            backend
+                .append_batch(&[prefix_entry(1)])
+                .expect("original commit");
+            let mut tampered = prefix_entry(1).entry;
+            tampered.payload = bytes::Bytes::from_static(b"changed old payload");
+            let bytes = codec::encode_to_vec(&tampered).expect("encode changed actual row");
+            // Deliberately bypass the sole legal append path using the owned test
+            // database handle. Its unexpected generation must be refused before
+            // any later legal commit could refresh the expected generation.
+            {
+                let state = backend.state().expect("state");
+                let txn =
+                    begin_immediate_write(state.db.read_write().expect("owned db")).expect("write");
+                {
+                    let mut table = txn.open_table(ENTRIES_TABLE).expect("table");
+                    table
+                        .insert(1, bytes.as_slice())
+                        .expect("old payload change");
+                }
+                txn.commit().expect("actual unexpected commit");
+            }
+            let result = match action {
+                "append" => backend.append_batch(&[prefix_entry(2)]).map(|_| ()),
+                "anchor" => backend.record_snapshot_anchor(SnapshotAnchor::new(1, "cut", "hash")),
+                "seal" => backend.seal(RunStatus::Ended),
+                _ => crate::writer::read_durable_prefix(&backend).map(|_| ()),
+            };
+            assert!(result.is_err(), "{action} must reject changed old storage");
+            assert!(backend.state().expect("state").prefix_failed.get());
+            assert!(
+                backend.append_batch(&[prefix_entry(2)]).is_err(),
+                "failure must remain latched"
+            );
+            assert_eq!(backend.high_watermark().expect("hwm"), 1);
+            assert_eq!(
+                backend.manifest().expect("manifest").status,
+                RunStatus::Running
+            );
+            assert!(matches!(
+                backend.scan_seq(1),
+                Err(EventStoreError::HashMismatch { seq: 1 })
+            ));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_prefix_bad_committed_suffix_never_mints_ack_or_advances_verified_hashes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut backend = RedbBackend::new(tmp.path());
+        backend
+            .open_run(prefix_manifest("bad-suffix"))
+            .expect("open");
+        backend
+            .append_batch(&[prefix_entry(1)])
+            .expect("first commit");
+        let mut invalid = prefix_entry(2);
+        invalid.entry.payload = bytes::Bytes::from_static(b"bad committed checksum");
+        assert!(matches!(
+            backend.append_batch(&[invalid]),
+            Err(EventStoreError::HashMismatch { seq: 2 })
+        ));
+        assert_eq!(
+            backend
+                .high_watermark()
+                .expect("committed but not acknowledged"),
+            2
+        );
+        assert_eq!(
+            backend
+                .state()
+                .expect("state")
+                .append_only_prefix
+                .as_ref()
+                .expect("cache")
+                .hashes
+                .len(),
+            1
+        );
+        assert!(crate::writer::read_durable_prefix(&backend).is_err());
+        assert!(backend.append_batch(&[prefix_entry(3)]).is_err());
+        assert!(backend.seal(RunStatus::Ended).is_err());
+        assert_eq!(
+            backend.manifest().expect("retained").status,
+            RunStatus::Running
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_prefix_unknown_backend_keeps_full_original_payload_verification() {
+        let mut backend = crate::backend::MemoryBackend::new();
+        backend.open_run(prefix_manifest("unknown")).expect("open");
+        backend.append_batch(&[prefix_entry(1)]).expect("commit");
+        assert!(
+            backend
+                .verified_append_only_entry_hashes()
+                .expect("no opt in")
+                .is_none()
+        );
+        assert_eq!(
+            crate::writer::read_durable_prefix(&backend).expect("full original prefix"),
+            original_full_prefix(&backend)
+        );
+        let mut invalid = prefix_entry(2);
+        invalid.entry.payload = bytes::Bytes::from_static(b"invalid unknown source");
+        backend
+            .append_batch(&[invalid])
+            .expect("unknown backend retains its original append contract");
+        assert!(
+            crate::writer::read_durable_prefix(&backend).is_err(),
+            "default backend cannot bypass payload verification"
+        );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(madsim)))]
+    fn native_prefix_failed_durable_suffix_fences_actual_writer_and_retains_unsealed_redb() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut backend = RedbBackend::new(tmp.path());
+        backend
+            .open_run(prefix_manifest("failed-writer"))
+            .expect("open");
+        let path = backend.current_path().expect("path").to_path_buf();
+        let mut invalid = prefix_entry(1);
+        invalid.entry.payload = bytes::Bytes::from_static(b"changed before durable suffix read");
+        assert!(backend.append_batch(&[invalid]).is_err());
+        let halt = crate::kernel::HaltSignal::new();
+        let writer = crate::writer::EventStoreWriter::spawn(
+            Box::new(backend),
+            nautilus_core::time::get_atomic_clock_realtime(),
+            halt.callback(),
+            crate::writer::WriterConfig::default(),
+        )
+        .expect("actual owner writer");
+        assert_eq!(
+            crate::writer::WriterConfig::default().halt_threshold,
+            std::time::Duration::from_millis(250)
+        );
+        assert!(
+            writer.flush().is_err(),
+            "an empty flush must not acknowledge failed integrity"
+        );
+        assert!(halt.is_halted());
+        assert!(writer.durable_prefix().is_err());
+        drop(writer);
+        assert_eq!(
+            RedbBackend::read_run_manifest(&path)
+                .expect("original manifest")
+                .status,
+            RunStatus::Running
+        );
+    }
 
     fn raw_run_path(base: &Path, run_id: &str) -> PathBuf {
         let dir = base.join("trader-001");

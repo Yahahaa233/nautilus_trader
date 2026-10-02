@@ -863,14 +863,19 @@ fn cross_backend_seal_persists_to_disk() {
 fn scan_recomputes_hash_and_quarantines_on_mismatch() {
     // Trust the writer: the entry's `entry_hash` field is what gets stored. By
     // tampering with the payload before append, the stored hash no longer matches the
-    // recomputed hash, and scan must surface HashMismatch rather than the corrupted
-    // row.
+    // recomputed hash. The owned append-only backend now refuses its durable ACK;
+    // independent scan must still surface HashMismatch for the committed forensic row.
     let (_tmp, mut backend) = open_backend();
     let mut tampered = build_entry(1, Headers::empty(), 10);
     tampered.payload = Bytes::from_static(b"\xFF\xFF");
-    backend
-        .append_batch(&[AppendEntry::without_indices(tampered)])
-        .expect("append");
+    let append_result = backend.append_batch(&[AppendEntry::without_indices(tampered)]);
+    #[cfg(unix)]
+    assert!(matches!(
+        append_result,
+        Err(EventStoreError::HashMismatch { seq: 1 })
+    ));
+    #[cfg(not(unix))]
+    append_result.expect("append");
 
     assert!(matches!(
         backend.scan_seq(1),

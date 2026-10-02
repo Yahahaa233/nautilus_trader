@@ -29,6 +29,7 @@ pub use redb::RedbBackend;
 use crate::{
     entry::EventStoreEntry,
     error::EventStoreError,
+    hash::EntryHash,
     manifest::{RunManifest, RunStatus},
     snapshot::SnapshotAnchor,
 };
@@ -184,6 +185,17 @@ pub trait EventStore: Send {
     ///
     /// See [`EventStore::scan_range`].
     fn scan_seq(&self, seq: u64) -> Result<Option<EventStoreEntry>, EventStoreError>;
+
+    /// Returns hashes verified from the actual durable rows of an exclusively owned,
+    /// append-only run. Only a backend which enforces that ownership and detects any
+    /// unexpected storage generation change may opt in. Existing or read-only runs
+    /// and unknown backends keep the complete row verification path.
+    ///
+    /// # Errors
+    /// Refuses a failed commit/read, changed owner, run, watermark or storage generation.
+    fn verified_append_only_entry_hashes(&self) -> Result<Option<&[EntryHash]>, EventStoreError> {
+        Ok(None)
+    }
 
     /// Looks up the first `seq` recorded under the given index key.
     ///

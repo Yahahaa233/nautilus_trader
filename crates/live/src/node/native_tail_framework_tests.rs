@@ -31,8 +31,11 @@ use nautilus_common::{
     cache::Cache,
     component::Component,
     enums::ComponentState,
-    messages::{DataEvent, ExecutionEvent},
-    msgbus::{self, TypedHandler, switchboard},
+    messages::{
+        DataEvent, ExecutionEvent,
+        data::{BarsResponse, DataResponse, QuotesResponse},
+    },
+    msgbus::{self, ShareableMessageHandler, TypedHandler, switchboard},
     recovery_trace::{
         NativeComponentLifecycle,
         historical::{HistoricalInputBoundary, HistoricalReplayPreparation},
@@ -44,7 +47,7 @@ use nautilus_model::{
     data::{Bar, BarType, Data, QuoteTick, TradeTick},
     enums::{OrderType, TimeInForce},
     events::{OrderDenied, OrderEventAny},
-    identifiers::{ClientOrderId, InstrumentId, StrategyId, TraderId},
+    identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
     orders::{Order, OrderAny, OrderTestBuilder},
     types::{Price, Quantity},
@@ -388,10 +391,15 @@ fn install(node: &mut LiveNode, order: &OrderAny, source: bool) {
 }
 
 #[rstest]
-#[case(false)]
-#[case(true)]
+#[case(false, false)]
+#[case(true, false)]
+#[case(false, true)]
+#[case(true, true)]
 #[tokio::test(flavor = "current_thread")]
-async fn actual_registered_native_tail_framework_effects_and_changed_input(#[case] changed: bool) {
+async fn actual_registered_native_tail_framework_effects_and_changed_input(
+    #[case] changed: bool,
+    #[case] historical_responses: bool,
+) {
     let directory = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap())
         .join(format!("framework-tail-{}", UUID4::new()));
     std::fs::create_dir_all(&directory).unwrap();
@@ -408,6 +416,96 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(#[cas
         .build();
     let mut source = actual_node("framework-source", directory.join("source"), None);
     install(&mut source, &order, true);
+    if historical_responses {
+        // Actual response processing, not a cache DTO: production warmup fills
+        // the shared DataEngine cache before the first completed-root cut.
+        let received = Rc::new(Cell::new(0));
+        for bars in [true, false] {
+            let correlation_id = UUID4::new();
+            let count = received.clone();
+            let handler = if bars {
+                ShareableMessageHandler::from_typed(move |_: &BarsResponse| {
+                    count.set(count.get() + 1)
+                })
+            } else {
+                ShareableMessageHandler::from_typed(move |_: &QuotesResponse| {
+                    count.set(count.get() + 1)
+                })
+            };
+            msgbus::get_message_bus()
+                .borrow_mut()
+                .register_response_handler(&correlation_id, handler)
+                .unwrap();
+            let time = UnixNanos::from(now.as_u64() - 1_000_000);
+            let response = if bars {
+                let mut first = Bar::default();
+                first.bar_type = bar_type();
+                first.open = Price::from("1000.00");
+                first.high = first.open;
+                first.low = first.open;
+                first.close = first.open;
+                first.volume = Quantity::from(1);
+                first.ts_event = time;
+                first.ts_init = time;
+                let mut second = first;
+                second.close = Price::from("1001.00");
+                second.open = second.close;
+                second.high = second.close;
+                second.low = second.close;
+                DataResponse::Bars(BarsResponse::new(
+                    correlation_id,
+                    ClientId::from("BINANCE"),
+                    bar_type(),
+                    vec![first, second],
+                    None,
+                    None,
+                    now,
+                    None,
+                ))
+            } else {
+                let mut first = nautilus_model::data::stubs::quote_ethusdt_binance();
+                first.bid_price = Price::from("1000.00");
+                first.ask_price = Price::from("1001.00");
+                first.ts_event = time;
+                first.ts_init = time;
+                let mut second = first;
+                second.bid_price = Price::from("1002.00");
+                second.ask_price = Price::from("1003.00");
+                DataResponse::Quotes(QuotesResponse::new(
+                    correlation_id,
+                    ClientId::from("BINANCE"),
+                    instrument_id(),
+                    vec![first, second],
+                    None,
+                    None,
+                    now,
+                    None,
+                ))
+            };
+            source.kernel.data_engine.borrow_mut().response(response);
+        }
+        assert_eq!(received.get(), 2);
+        assert_eq!(
+            source
+                .kernel
+                .cache
+                .borrow()
+                .bars(&bar_type())
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            source
+                .kernel
+                .cache
+                .borrow()
+                .quotes(&instrument_id())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
     let instance = source.kernel.instance_id();
     let trace = source
         .prepare_owned_native_trace(
@@ -514,6 +612,22 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(#[cas
     drop(actual);
     let identity = trace.source().unwrap();
     let first = cuts.borrow()[0].clone();
+    if historical_responses {
+        assert_eq!(
+            first.0.native_effects["market_cache"][0]["quotes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            first.0.native_effects["market_cache"][0]["bars"][0]["bars"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
     source.dispose();
     drop(source);
     let reader = EventStoreReader::new(
@@ -572,6 +686,30 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(#[cas
     target
         .replay_recovery_events(&watermark, &[], &registry(), |_, _| Ok(()))
         .unwrap();
+    let mut wrong_cut = watermark.clone();
+    wrong_cut.checkpoint_sequence += 1;
+    assert!(
+        target
+            .restore_native_market_checkpoint(&verified, &wrong_cut)
+            .is_err()
+    );
+    target
+        .restore_native_market_checkpoint(&verified, &watermark)
+        .unwrap();
+    assert_eq!(
+        target
+            .kernel
+            .cache
+            .borrow()
+            .native_market_checkpoint()
+            .unwrap(),
+        first.0.native_effects["market_cache"]
+    );
+    assert!(
+        target
+            .restore_native_market_checkpoint(&verified, &watermark)
+            .is_err()
+    );
     target
         .restore_registered_engine_checkpoint(
             &first.1["execution_manager"],
@@ -624,6 +762,15 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(#[cas
         assert!(target.event_store_halted());
     } else {
         result.unwrap();
+        assert_eq!(
+            target
+                .kernel
+                .cache
+                .borrow()
+                .native_market_checkpoint()
+                .unwrap(),
+            verified.final_cut().unwrap().native_effects["market_cache"]
+        );
         let actual = get_actor_unchecked::<FrameworkStrategy>(&StrategyId::from(STRATEGY).inner());
         assert_eq!(actual.indicator.counts.get(), [3, 4, 5]);
         assert_eq!(actual.callbacks, [3, 4, 5]);

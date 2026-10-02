@@ -96,6 +96,13 @@ struct HistoricalReports {
     position: Option<PositionReportTask>,
 }
 
+#[derive(Debug)]
+pub(super) struct InstalledNativeMarketCut {
+    watermark: RunnerRecoveryWatermark,
+    source: NativeTraceSource,
+    prefix: nautilus_event_store::writer::DurableJournalPrefix,
+}
+
 impl LiveNode {
     /// Replays source roots through this node's actual registered objects and native handlers.
     /// The strict decoder is checked by the same source encoder before each dispatch.
@@ -129,6 +136,76 @@ impl LiveNode {
         outcome
     }
 
+    /// Installs the original market deques from a reader-issued source trace.
+    /// This is historical cache state, not market freshness or execution authority.
+    /// Install it once after cache/components/frontier and before engines/timers.
+    /// # Errors
+    /// Refuses an unsealed/changed source cut, unknown original cache capacity,
+    /// changed instruments/configuration, populated target histories or repeat use.
+    pub fn restore_native_market_checkpoint(
+        &mut self,
+        trace: &VerifiedNativeTrace,
+        watermark: &RunnerRecoveryWatermark,
+    ) -> Result<()> {
+        ensure!(
+            self.state() == NodeState::Idle
+                && self.recovery_requires_release
+                && !self.handle.should_stop()
+                && !self.dispatch_failure.get()
+                && self.historical_replay.is_none()
+                && self.recovery_cache_installed
+                && self.recovery_restored_components.is_some()
+                && self.recovery_native_frontier.as_ref() == Some(watermark)
+                && self.recovery_market_source.is_none()
+                && self.recovery_engine_source.is_none()
+                && self.recovery_timers.is_none(),
+            "market restore requires the same idle source cut before engines/timers"
+        );
+        ensure!(
+            trace.initial_cut_sealed()
+                && trace.cut().last_input_sequence == watermark.dispatch_watermark,
+            "market source is not the verified installed checkpoint cut"
+        );
+        let config = trace
+            .cut()
+            .native_effects
+            .get("market_cache_config")
+            .context("original market cache configuration/capacity absent")?;
+        let market = trace
+            .cut()
+            .native_effects
+            .get("market_cache")
+            .context("original market cache histories absent")?;
+        let input = self.native_mutation_input(
+            "recovery.market_cache_install",
+            &serde_json::json!({"watermark":watermark,"source":trace.source(),
+                "source_prefix":trace.cut().prefix,"market_cache_config":config,"market_cache":market}),
+        )?;
+        let guard = self.begin_node_dispatch(crate::dispatch::DispatchSource::Lifecycle, &input)?;
+        let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+            self.kernel
+                .cache
+                .try_borrow_mut()?
+                .restore_native_market_checkpoint(config, market)?;
+            self.recovery_market_source = Some(InstalledNativeMarketCut {
+                watermark: watermark.clone(),
+                source: trace.source().clone(),
+                prefix: trace.cut().prefix.clone(),
+            });
+            Ok(())
+        }))
+        .map_err(|_| anyhow::anyhow!("native market restoration panicked"))
+        .and_then(|result| result);
+        if let Err(error) = &outcome {
+            self.fail_native_dispatch(&format!("native market restoration failed: {error:#}"));
+        }
+        outcome?;
+        if let Some(guard) = guard {
+            self.finish_node_dispatch(guard)?;
+        }
+        Ok(())
+    }
+
     fn replay_native_tail_inner(
         &mut self,
         trace: &VerifiedNativeTrace,
@@ -139,6 +216,14 @@ impl LiveNode {
             &NativePendingInput,
         ) -> Result<RunnerRecoveryEvent>,
     ) -> Result<NativeTailReplayReceipt> {
+        if let Some(installed) = &self.recovery_market_source {
+            ensure!(
+                installed.watermark == *cut
+                    && installed.source == *trace.source()
+                    && installed.prefix == trace.cut().prefix,
+                "native market installation belongs to a different verified source cut"
+            );
+        }
         ensure!(
             self.state() == NodeState::Idle
                 && self.recovery_requires_release
@@ -500,6 +585,7 @@ impl LiveNode {
             "positions",
             "accounts",
             "market_cache",
+            "market_cache_config",
             "components",
             "data_engine",
             "report_contexts",

@@ -138,6 +138,21 @@ pub(crate) fn read_durable_prefix(
     digest.update(&(manifest.run_id.len() as u64).to_be_bytes());
     digest.update(manifest.run_id.as_bytes());
     digest.update(&sequence.to_be_bytes());
+    if let Some(hashes) = backend.verified_append_only_entry_hashes()? {
+        if u64::try_from(hashes.len()).ok() != Some(sequence) {
+            return Err(crate::error::EventStoreError::Backend(
+                "native append-only prefix watermark mismatch".into(),
+            ));
+        }
+        for hash in hashes {
+            digest.update(hash.as_bytes());
+        }
+        return Ok(DurableJournalPrefix {
+            run_id: manifest.run_id,
+            sequence,
+            entry_hash_digest: digest.finalize().to_hex().to_string(),
+        });
+    }
     for seq in 1..=sequence {
         let entry = backend.scan_seq(seq)?.ok_or_else(|| {
             crate::error::EventStoreError::Backend("native prefix row absent".into())
@@ -698,6 +713,7 @@ mod imp {
             if inner.closed {
                 return Err(EventStoreError::Closed);
             }
+            inner.backend.verified_append_only_entry_hashes()?;
             Ok(self.high_watermark.load(Ordering::Acquire))
         }
 

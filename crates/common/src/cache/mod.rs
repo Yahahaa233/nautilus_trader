@@ -26,6 +26,7 @@ pub mod refs;
 mod bounded;
 mod error;
 mod index;
+mod market_checkpoint;
 mod position;
 
 #[cfg(test)]
