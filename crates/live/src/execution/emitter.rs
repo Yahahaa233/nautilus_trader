@@ -37,7 +37,7 @@ use nautilus_common::{
     live::ingress::IngressSender,
     messages::{ExecutionEvent, ExecutionReport},
 };
-use nautilus_core::{Params, UUID4, UnixNanos, time::AtomicTime};
+use nautilus_core::{Params, UnixNanos, time::AtomicTime};
 use nautilus_model::{
     enums::{AccountType, LiquiditySide},
     events::{
@@ -362,7 +362,7 @@ impl ExecutionEventEmitter {
             client_order_id,
             self.factory.account_id(),
             reason.into(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_event,
             self.ts_init(),
             false,
@@ -387,7 +387,7 @@ impl ExecutionEventEmitter {
             instrument_id,
             client_order_id,
             reason.into(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_event,
             self.ts_init(),
             false,
@@ -413,7 +413,7 @@ impl ExecutionEventEmitter {
             instrument_id,
             client_order_id,
             reason.into(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_event,
             self.ts_init(),
             false,

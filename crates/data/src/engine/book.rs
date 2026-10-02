@@ -316,7 +316,7 @@ impl BookSnapshotter {
 #[cfg(test)]
 mod tests {
     use nautilus_common::msgbus::TypedHandler;
-    use nautilus_core::{UUID4, UnixNanos};
+    use nautilus_core::UnixNanos;
     use nautilus_model::{
         data::BookOrder,
         enums::{BookType, OrderSide},
@@ -351,7 +351,7 @@ mod tests {
         );
         let event = TimeEvent::new(
             Ustr::from("TEST"),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::default(),
             UnixNanos::default(),
         );
@@ -398,7 +398,7 @@ mod tests {
         let snapshotter = BookSnapshotter::new(interval_ms, snapshot_infos, cache);
         let event = TimeEvent::new(
             Ustr::from("TEST"),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::default(),
             UnixNanos::default(),
         );
@@ -446,7 +446,7 @@ mod tests {
         let snapshotter = BookSnapshotter::new(interval_ms, snapshot_infos, cache);
         let event = TimeEvent::new(
             Ustr::from("TEST"),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::default(),
             UnixNanos::default(),
         );

@@ -98,6 +98,7 @@ fn entry_round_trip_populated_headers() {
     // still validate; catches regressions in `wire::nanos_as_u64` and in
     // `Option<UUID4>` serde coupling under non-self-describing formats.
     let headers = Headers {
+        native_origin: None,
         correlation_id: Some(UUID4::new()),
         causation_id: Some(UUID4::new()),
     };

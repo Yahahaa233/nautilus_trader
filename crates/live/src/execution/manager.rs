@@ -186,8 +186,24 @@ impl ExecutionManager {
         &self,
         at: dst::time::Instant,
     ) -> anyhow::Result<serde_json::Value> {
+        self.state_inventory(at, false)
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn trace_effects_inventory(
+        &self,
+        at: dst::time::Instant,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.state_inventory(at, true)
+    }
+
+    fn state_inventory(
+        &self,
+        at: dst::time::Instant,
+        preserve_pending: bool,
+    ) -> anyhow::Result<serde_json::Value> {
         anyhow::ensure!(
-            self.order_query_pending.is_empty(),
+            preserve_pending || self.order_query_pending.is_empty(),
             "execution manager has pending venue queries"
         );
         let age = |instant: dst::time::Instant| -> anyhow::Result<u64> {
@@ -219,14 +235,14 @@ impl ExecutionManager {
             })
             .collect::<Vec<_>>();
         Ok(serde_json::json!({
-            "schema":"NautilusExecutionManagerCheckpoint.v2",
+            "schema": if preserve_pending {"NautilusExecutionManagerTrace.v1"} else {"NautilusExecutionManagerCheckpoint.v2"},
             "configuration":self.config,
             "captured_at_ns":self.timestamp_ns().as_u64(),
             "monotonic_offsets":"age_ns_at_common_boundary",
             "order_activity":self.order_activity.checkpoint_entries(at)?,
             "order_inflight_checks":inflight,
             "order_query_recency":self.order_query_recency.checkpoint_entries(at)?,
-            "order_query_pending":[],
+            "order_query_pending":self.order_query_pending,
             "order_recon_retries":self.order_recon_retries.iter().collect::<Vec<_>>(),
             "order_coverage_unresolved":self.order_coverage_unresolved,
             "order_coverage_warnings":self.order_coverage_warnings,
@@ -242,10 +258,11 @@ impl ExecutionManager {
 
     /// Installs actual checkpoint state before recovery-tail event dispatch.
     /// Source monotonic ages include real elapsed wall time, never restart at now.
-    pub(crate) fn restore_checkpoint_inventory(
+    pub(crate) fn restore_checkpoint_inventory_at(
         &mut self,
         source: &serde_json::Value,
         downtime_ns: u64,
+        at: dst::time::Instant,
     ) -> anyhow::Result<()> {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -297,7 +314,6 @@ impl ExecutionManager {
                 && snapshot.order_query_pending.is_empty(),
             "native manager source configuration/profile or query ownership differs"
         );
-        let at = dst::time::Instant::now();
         let fresh = self.checkpoint_inventory(at)?;
         for (key, value) in fresh.as_object().expect("native manager is an object") {
             if matches!(
@@ -469,7 +485,7 @@ impl ExecutionManager {
         self.order_inflight_checks.insert(
             client_order_id,
             InflightCheck {
-                submitted_at: dst::time::Instant::now(),
+                submitted_at: nautilus_common::recovery_trace::scope::effective_activity_instant(),
                 retry_count: 0,
                 last_query_at: None,
             },
@@ -1843,7 +1859,7 @@ impl ExecutionManager {
     /// (rejection or cancellation) based on the order's status.
     pub fn check_inflight_orders(&mut self) -> InflightCheckResult {
         let mut result = InflightCheckResult::default();
-        let now = dst::time::Instant::now();
+        let now = nautilus_common::recovery_trace::scope::effective_activity_instant();
         let threshold = Duration::from_millis(self.config().inflight_threshold_ms);
 
         let mut to_check = Vec::new();
@@ -1908,7 +1924,7 @@ impl ExecutionManager {
                                     order.strategy_id(),
                                     order.instrument_id(),
                                     order.client_order_id(),
-                                    UUID4::new(),
+                                    nautilus_common::recovery_trace::native_event_uuid(),
                                     ts_now,
                                     ts_now,
                                     true, // reconciliation
@@ -1937,7 +1953,7 @@ impl ExecutionManager {
                         order.instrument_id(),
                         order.client_order_id(),
                         order.venue_order_id(),
-                        UUID4::new(),
+                        nautilus_common::recovery_trace::native_event_uuid(),
                         ts_now,
                         None,
                         None, // correlation_id
@@ -1995,7 +2011,10 @@ impl ExecutionManager {
     ) -> Vec<OrderEventAny> {
         log::debug!("Checking order consistency between cached-state and venues");
 
-        let check = self.prepare_open_order_report_check(UUID4::new(), clients);
+        let check = self.prepare_open_order_report_check(
+            nautilus_common::recovery_trace::native_event_uuid(),
+            clients,
+        );
         let mut all_reports = Vec::new();
         let mut queried_clients = IndexSet::new();
         let mut failed_clients = IndexSet::new();
@@ -2157,7 +2176,7 @@ impl ExecutionManager {
         &mut self,
         client_ids: Option<&IndexSet<ClientId>>,
     ) -> Vec<TradingCommand> {
-        let now = dst::time::Instant::now();
+        let now = nautilus_common::recovery_trace::scope::effective_activity_instant();
         let query_delay = Duration::from_millis(u64::from(self.config.single_order_query_delay_ms));
         let query_limit = self.config.max_single_order_queries_per_cycle as usize;
 
@@ -2220,7 +2239,7 @@ impl ExecutionManager {
                 order.instrument_id(),
                 client_order_id,
                 order.venue_order_id(),
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 ts_now,
                 None,
                 None,
@@ -2482,7 +2501,7 @@ impl ExecutionManager {
             planned_queries += required_queries;
             self.order_query_recency.mark(client_order_id);
             self.order_query_pending.insert(client_order_id);
-            let command_id = UUID4::new();
+            let command_id = nautilus_common::recovery_trace::native_event_uuid();
             let ts_now = self.clock.borrow().timestamp_ns();
 
             let command = GenerateOrderStatusReport::new(
@@ -2584,7 +2603,10 @@ impl ExecutionManager {
         &mut self,
         clients: &[&dyn ExecutionClient],
     ) -> Vec<OrderEventAny> {
-        let check = self.prepare_position_report_check(UUID4::new(), clients);
+        let check = self.prepare_position_report_check(
+            nautilus_common::recovery_trace::native_event_uuid(),
+            clients,
+        );
         let mut reports = Vec::new();
         let mut queried_clients = IndexSet::new();
         let mut failed_clients = IndexSet::new();
@@ -2779,7 +2801,7 @@ impl ExecutionManager {
 
             for client_id in responsible_clients.iter() {
                 let mut command = GenerateFillReports::new(
-                    UUID4::new(),
+                    nautilus_common::recovery_trace::native_event_uuid(),
                     query_end,
                     Some(key.0),
                     None,
@@ -3460,7 +3482,7 @@ impl ExecutionManager {
                     order.strategy_id(),
                     order.instrument_id(),
                     client_order_id,
-                    UUID4::new(),
+                    nautilus_common::recovery_trace::native_event_uuid(),
                     ts_now,
                     ts_now,
                     true,
@@ -3485,7 +3507,8 @@ impl ExecutionManager {
                 self.order_recon_retries.shift_remove(&client_order_id);
                 if let Some(check) = self.order_inflight_checks.get_mut(&client_order_id) {
                     check.retry_count = 0;
-                    check.last_query_at = Some(dst::time::Instant::now());
+                    check.last_query_at =
+                        Some(nautilus_common::recovery_trace::scope::effective_activity_instant());
                 }
 
                 self.order_query_recency.mark(client_order_id);
@@ -4631,7 +4654,7 @@ impl ExecutionManager {
             report.reduce_only,
             false, // quote_quantity
             true,  // reconciliation
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_now,
             ts_now,
             report.price,
@@ -5917,7 +5940,7 @@ mod tests {
 
         let check = OpenOrderReportCheck {
             command: GenerateOrderStatusReports::new(
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 UnixNanos::from(1),
                 true,
                 None,
@@ -5990,7 +6013,7 @@ mod tests {
 
         let check = OpenOrderReportCheck {
             command: GenerateOrderStatusReports::new(
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 UnixNanos::from(1),
                 false,
                 None,
@@ -6061,7 +6084,7 @@ mod tests {
 
         let make_check = |start| OpenOrderReportCheck {
             command: GenerateOrderStatusReports::new(
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 UnixNanos::from(1),
                 false,
                 None,
@@ -6142,7 +6165,7 @@ mod tests {
 
         let check = OpenOrderReportCheck {
             command: GenerateOrderStatusReports::new(
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 UnixNanos::from(1),
                 false,
                 None,
@@ -6220,7 +6243,7 @@ mod tests {
 
         let check = OpenOrderReportCheck {
             command: GenerateOrderStatusReports::new(
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 UnixNanos::from(1),
                 false,
                 None,
@@ -6751,7 +6774,7 @@ mod tests {
             .advance_time(UnixNanos::default().saturating_add(lookback * 2), true);
 
         let ts_now = clock.borrow().timestamp_ns();
-        let command_id = UUID4::new();
+        let command_id = nautilus_common::recovery_trace::native_event_uuid();
         let check = manager.prepare_open_order_report_check(command_id, &[]);
 
         assert_eq!(check.command.command_id, command_id);
@@ -6809,7 +6832,7 @@ mod tests {
         );
 
         let ts_now = clock.borrow().timestamp_ns();
-        let command_id = UUID4::new();
+        let command_id = nautilus_common::recovery_trace::native_event_uuid();
         let check = manager.prepare_position_report_check(command_id, &[]);
         let key = (
             included_position.instrument_id,
@@ -6861,7 +6884,10 @@ mod tests {
             "2000.00",
         );
         let client = PositionCoverageStubClient;
-        let check = manager.prepare_position_report_check(UUID4::new(), &[&client]);
+        let check = manager.prepare_position_report_check(
+            nautilus_common::recovery_trace::native_event_uuid(),
+            &[&client],
+        );
         let queried_clients = IndexSet::from([client.client_id()]);
 
         let events = manager.reconcile_position_reports(
@@ -6901,7 +6927,10 @@ mod tests {
         );
         let key = (position.instrument_id, position.account_id);
         let client_id = ClientId::from("BYBIT");
-        let mut check = manager.prepare_position_report_check(UUID4::new(), &[]);
+        let mut check = manager.prepare_position_report_check(
+            nautilus_common::recovery_trace::native_event_uuid(),
+            &[],
+        );
         check.client_coverage.insert(
             key,
             ReportClientCoverage::Resolved(IndexSet::from([client_id])),
@@ -6962,7 +6991,10 @@ mod tests {
             .add_instrument(instrument.clone())
             .unwrap();
         let account_id = position.account_id;
-        let check = manager.prepare_position_report_check(UUID4::new(), &[]);
+        let check = manager.prepare_position_report_check(
+            nautilus_common::recovery_trace::native_event_uuid(),
+            &[],
+        );
 
         let report = PositionStatusReport::new(
             account_id,
@@ -7038,7 +7070,10 @@ mod tests {
         cache.borrow_mut().add_instrument(instrument).unwrap();
         let account_id = position.account_id;
         manager.record_position_activity(instrument_id, account_id);
-        let check = manager.prepare_position_report_check(UUID4::new(), &[]);
+        let check = manager.prepare_position_report_check(
+            nautilus_common::recovery_trace::native_event_uuid(),
+            &[],
+        );
 
         let report = PositionStatusReport::new(
             account_id,
@@ -7317,7 +7352,10 @@ mod tests {
                 .advance_time(UnixNanos::default().saturating_add(lookback * 2), true);
             let client = PositionCoverageStubClient;
             let clients: [&dyn ExecutionClient; 1] = [&client];
-            let mut check = manager.prepare_position_report_check(UUID4::new(), &clients);
+            let mut check = manager.prepare_position_report_check(
+                nautilus_common::recovery_trace::native_event_uuid(),
+                &clients,
+            );
             let query_end = clock.borrow().timestamp_ns();
 
             let report = PositionStatusReport::new(
@@ -7387,7 +7425,10 @@ mod tests {
                 .unwrap();
             let client = PositionCoverageStubClient;
             let clients: [&dyn ExecutionClient; 1] = [&client];
-            let mut check = manager.prepare_position_report_check(UUID4::new(), &clients);
+            let mut check = manager.prepare_position_report_check(
+                nautilus_common::recovery_trace::native_event_uuid(),
+                &clients,
+            );
             let position = insert_open_position(
                 &cache,
                 &instrument,
@@ -7464,7 +7505,10 @@ mod tests {
             let client = LiveExecutionClient::new(Box::new(PositionCoverageStubClient));
             let client: &dyn ExecutionClient = &client;
 
-            let check = manager.prepare_position_report_check(UUID4::new(), &[client]);
+            let check = manager.prepare_position_report_check(
+                nautilus_common::recovery_trace::native_event_uuid(),
+                &[client],
+            );
             let client_id = ClientId::from("BYBIT");
 
             assert_eq!(

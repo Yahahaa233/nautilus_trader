@@ -35,7 +35,6 @@ use nautilus_common::{
         },
     },
 };
-use nautilus_core::UUID4;
 use nautilus_model::{
     identifiers::{ClientId, ClientOrderId},
     reports::{FillReport, PositionStatusReport},
@@ -57,6 +56,119 @@ use crate::{
 const POSITION_FILLS_PER_CYCLE: usize = 64;
 
 impl LiveNode {
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn retain_native_report_context<T: serde::Serialize>(
+        &self,
+        kind: &str,
+        context: &T,
+    ) -> anyhow::Result<()> {
+        self.native_report_contexts
+            .try_borrow_mut()?
+            .insert(kind.into(), serde_json::to_value(context)?);
+        Ok(())
+    }
+    #[cfg(feature = "native-tail-replay")]
+    fn consume_native_report_context(&self, kind: &str) -> anyhow::Result<serde_json::Value> {
+        self.native_report_contexts
+            .try_borrow_mut()?
+            .remove(kind)
+            .ok_or_else(|| {
+                anyhow::anyhow!("native query completion has no original prepared owner: {kind}")
+            })
+    }
+
+    /// The same prepared result handler is used by the live collector and proof-bound history.
+    pub(super) fn apply_open_order_report_outcome(
+        &mut self,
+        result: ReportTaskOutcome<OpenOrderReportResult>,
+    ) -> anyhow::Result<Option<TargetedOrderReportTask>> {
+        #[cfg(feature = "native-tail-replay")]
+        let prepared = self.consume_native_report_context("open_order")?;
+        match result {
+            ReportTaskOutcome::Completed(result) => {
+                #[cfg(feature = "native-tail-replay")]
+                anyhow::ensure!(
+                    prepared == serde_json::to_value(&result.check)?,
+                    "open-order result preparation differs"
+                );
+                let clients = self
+                    .exec_clients
+                    .iter()
+                    .map(|client| client as &dyn ExecutionClient)
+                    .collect::<Vec<_>>();
+                let reconciliation = self.exec_manager.reconcile_open_order_reports(
+                    &result.check,
+                    result.reports,
+                    &result.queried_clients,
+                    &result.failed_clients,
+                    &clients,
+                );
+                self.process_reconciliation_events(&reconciliation.events);
+                Ok((!reconciliation.targeted_queries.is_empty()).then(|| {
+                    self.start_targeted_order_report_check(reconciliation.targeted_queries)
+                }))
+            }
+            ReportTaskOutcome::TimedOut => {
+                self.cleanup_cancelled_report_tasks(&[]);
+                Ok(None)
+            }
+        }
+    }
+    pub(super) fn apply_targeted_report_outcome(
+        &mut self,
+        result: ReportTaskOutcome<Vec<TargetedOrderReportResult>>,
+        planned: &[ClientOrderId],
+    ) -> anyhow::Result<()> {
+        #[cfg(feature = "native-tail-replay")]
+        let _prepared = self.consume_native_report_context("targeted_order")?;
+        match result {
+            ReportTaskOutcome::Completed(result) => {
+                let clients = self
+                    .exec_clients
+                    .iter()
+                    .map(|client| client as &dyn ExecutionClient)
+                    .collect::<Vec<_>>();
+                let events = self
+                    .exec_manager
+                    .reconcile_targeted_order_reports(result, &clients);
+                self.process_reconciliation_events(&events);
+            }
+            ReportTaskOutcome::TimedOut => self.cleanup_cancelled_report_tasks(planned),
+        }
+        Ok(())
+    }
+    pub(super) fn apply_position_report_outcome(
+        &mut self,
+        result: ReportTaskOutcome<PositionReportTaskResult>,
+    ) -> anyhow::Result<Option<PositionReportTask>> {
+        #[cfg(feature = "native-tail-replay")]
+        let prepared = self.consume_native_report_context("position")?;
+        match result {
+            ReportTaskOutcome::Completed(PositionReportTaskResult::Positions(result)) => {
+                #[cfg(feature = "native-tail-replay")]
+                anyhow::ensure!(
+                    prepared == serde_json::to_value(&result.check)?,
+                    "position result preparation differs"
+                );
+                Ok(self.handle_position_report_result(result))
+            }
+            ReportTaskOutcome::Completed(PositionReportTaskResult::Fills(result)) => {
+                #[cfg(feature = "native-tail-replay")]
+                anyhow::ensure!(
+                    prepared.as_array().and_then(|v| v.first())
+                        == Some(&serde_json::to_value(&result.position_result)?),
+                    "fill result original preparation differs"
+                );
+                self.handle_position_fill_report_result(result);
+                Ok(None)
+            }
+            ReportTaskOutcome::TimedOut => {
+                self.cleanup_cancelled_report_tasks(&[]);
+                Ok(None)
+            }
+        }
+    }
+
     /// Runs due checks while serializing order and position reconciliation.
     pub(super) fn run_reconciliation_checks(
         &mut self,
@@ -125,7 +237,7 @@ impl LiveNode {
         }
     }
 
-    fn start_open_order_report_check(&mut self) -> Option<OpenOrderReportTask> {
+    pub(super) fn start_open_order_report_check(&mut self) -> Option<OpenOrderReportTask> {
         if self.exec_clients.is_empty() {
             log::debug!("No execution clients to check orders consistency");
             return None;
@@ -136,9 +248,13 @@ impl LiveNode {
             .iter()
             .map(|client| client as &dyn ExecutionClient)
             .collect::<Vec<_>>();
-        let check = self
-            .exec_manager
-            .prepare_open_order_report_check(UUID4::new(), &client_refs);
+        let check = self.exec_manager.prepare_open_order_report_check(
+            nautilus_common::recovery_trace::native_event_uuid(),
+            &client_refs,
+        );
+        #[cfg(feature = "native-tail-replay")]
+        self.retain_native_report_context("open_order", &check)
+            .expect("native open-order context capture failed");
         let command = check.command.clone();
         let clients = self.exec_clients.clone();
         let deadline = dst::time::Instant::now() + self.config.timeout_reconciliation;
@@ -166,6 +282,9 @@ impl LiveNode {
         &self,
         queries: Vec<TargetedOrderQuery>,
     ) -> TargetedOrderReportTask {
+        #[cfg(feature = "native-tail-replay")]
+        self.retain_native_report_context("targeted_order", &queries)
+            .expect("native targeted query context capture failed");
         let clients = self.exec_clients.clone();
         let query_delay = Duration::from_millis(u64::from(
             self.config.exec_engine.single_order_query_delay_ms,
@@ -197,7 +316,7 @@ impl LiveNode {
         }
     }
 
-    fn start_position_report_check(&self) -> Option<PositionReportTask> {
+    pub(super) fn start_position_report_check(&self) -> Option<PositionReportTask> {
         if self.exec_clients.is_empty() {
             log::debug!("No execution clients to check positions consistency");
             return None;
@@ -208,9 +327,13 @@ impl LiveNode {
             .iter()
             .map(|client| client as &dyn ExecutionClient)
             .collect::<Vec<_>>();
-        let check = self
-            .exec_manager
-            .prepare_position_report_check(UUID4::new(), &client_refs);
+        let check = self.exec_manager.prepare_position_report_check(
+            nautilus_common::recovery_trace::native_event_uuid(),
+            &client_refs,
+        );
+        #[cfg(feature = "native-tail-replay")]
+        self.retain_native_report_context("position", &check)
+            .expect("native position context capture failed");
         let command = check.command.clone();
         let clients = self.exec_clients.clone();
         let deadline = dst::time::Instant::now() + self.config.timeout_reconciliation;
@@ -240,6 +363,9 @@ impl LiveNode {
         position_result: PositionReportResult,
         queries: Vec<PositionFillReportQuery>,
     ) -> PositionReportTask {
+        #[cfg(feature = "native-tail-replay")]
+        self.retain_native_report_context("position", &(&position_result, &queries))
+            .expect("native position-fill context capture failed");
         let clients = self.exec_clients.clone();
         let deadline = dst::time::Instant::now() + self.config.timeout_reconciliation;
 
@@ -472,6 +598,8 @@ impl LiveNode {
         drop(open_order_report_task.take());
         drop(targeted_order_report_task.take());
         drop(position_report_task.take());
+        #[cfg(feature = "native-tail-replay")]
+        self.native_report_contexts.borrow_mut().clear();
         self.cleanup_cancelled_report_tasks(&planned_client_order_ids);
     }
 }
@@ -717,6 +845,7 @@ pub(super) struct ReconciliationCheckState<'a> {
 
 /// Report completion or expiry of its collection deadline.
 #[derive(serde::Serialize)]
+#[cfg_attr(feature = "native-tail-replay", derive(serde::Deserialize))]
 pub(super) enum ReportTaskOutcome<T> {
     Completed(T),
     TimedOut,
@@ -732,6 +861,7 @@ pub(super) struct OpenOrderReportTask {
 
 /// Bulk order reports, client outcomes, and their preparation snapshot.
 #[derive(serde::Serialize)]
+#[cfg_attr(feature = "native-tail-replay", derive(serde::Deserialize))]
 pub(super) struct OpenOrderReportResult {
     pub(super) check: OpenOrderReportCheck,
     pub(super) reports: Vec<SourcedOrderStatusReport>,
@@ -764,6 +894,7 @@ pub(super) struct PositionReportTask {
 
 /// Position reports, client outcomes, and their preparation snapshot.
 #[derive(serde::Serialize)]
+#[cfg_attr(feature = "native-tail-replay", derive(serde::Deserialize))]
 pub(super) struct PositionReportResult {
     pub(super) check: PositionReportCheck,
     pub(super) reports: Vec<PositionStatusReport>,
@@ -786,6 +917,7 @@ impl PositionReportResult {
 
 /// Completed position reports or subsequent authoritative fill reports.
 #[derive(serde::Serialize)]
+#[cfg_attr(feature = "native-tail-replay", derive(serde::Deserialize))]
 pub(super) enum PositionReportTaskResult {
     Positions(PositionReportResult),
     Fills(PositionFillReportResult),
@@ -793,9 +925,14 @@ pub(super) enum PositionReportTaskResult {
 
 /// Authoritative fills and the position snapshot that prompted their queries.
 #[derive(serde::Serialize)]
+#[cfg_attr(feature = "native-tail-replay", derive(serde::Deserialize))]
 pub(super) struct PositionFillReportResult {
     pub(super) position_result: PositionReportResult,
     #[serde(serialize_with = "crate::execution::serialize_ordered_pairs")]
+    #[cfg_attr(
+        feature = "native-tail-replay",
+        serde(deserialize_with = "crate::execution::deserialize_ordered_pairs")
+    )]
     pub(super) reports: IndexMap<InstrumentAccountKey, Vec<FillReport>>,
     pub(super) successful_keys: IndexSet<InstrumentAccountKey>,
 }

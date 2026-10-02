@@ -43,7 +43,6 @@ use std::{
     time::Duration,
 };
 
-#[cfg(feature = "streaming")]
 use anyhow::Context;
 #[cfg(feature = "streaming")]
 use jiff::tz::TimeZone;
@@ -66,7 +65,7 @@ use nautilus_common::{
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_data::engine::DataEngine;
 use nautilus_execution::{
-    engine::ExecutionEngine,
+    engine::{ExecutionEngine, ExecutionFailureFence},
     order_emulator::{adapter::OrderEmulatorAdapter, emulator::OrderEmulator},
 };
 use nautilus_model::identifiers::{ClientId, TraderId};
@@ -125,13 +124,26 @@ pub struct NautilusKernel {
     shutdown_requested: Rc<Cell<bool>>,
     event_store: Option<Box<dyn KernelEventStore>>,
     event_store_replay: bool,
-    event_store_seal_blocked: bool,
+    event_store_seal_blocked: Cell<bool>,
+    execution_failure_fence: ExecutionFailureFence,
+    paused_journal_start: Option<PausedJournalStart>,
+    paused_journal_start_used: bool,
     state_save_armed: bool,
     start_attempted: bool,
     #[cfg(feature = "streaming")]
     streaming_writer: Option<Rc<RefCell<FeatherWriter>>>,
     #[cfg(feature = "streaming")]
     streaming_subscriptions: Option<FeatherWriterSubscriptions>,
+}
+
+/// Only the actual paused-open entrypoint can issue this one-start continuation.
+/// It reuses Journal ownership; it proves no business readiness or permission.
+#[derive(Debug)]
+struct PausedJournalStart {
+    owner_address: usize,
+    run_id: String,
+    components: RegisteredComponents,
+    environment: Environment,
 }
 
 impl Debug for NautilusKernel {
@@ -416,6 +428,7 @@ impl NautilusKernel {
             None => (None, None),
         };
 
+        let execution_failure_fence = exec_engine.borrow().failure_fence();
         Ok(Self {
             name,
             instance_id,
@@ -436,7 +449,10 @@ impl NautilusKernel {
             ts_shutdown: None,
             shutdown_requested,
             event_store_replay: false,
-            event_store_seal_blocked: false,
+            event_store_seal_blocked: Cell::new(false),
+            execution_failure_fence,
+            paused_journal_start: None,
+            paused_journal_start_used: false,
             state_save_armed: false,
             start_attempted: false,
             #[cfg(feature = "streaming")]
@@ -733,20 +749,35 @@ impl NautilusKernel {
                     store.run_id().is_some() && !store.is_halted(),
                     "paused recovery event store did not open a healthy run"
                 );
-                Ok(store.snapshot_anchorer())
+                Ok((
+                    store.snapshot_anchorer(),
+                    PausedJournalStart {
+                        owner_address: std::ptr::from_ref(store) as *const () as usize,
+                        run_id: store
+                            .run_id()
+                            .context("paused Journal run unavailable")?
+                            .to_owned(),
+                        components: components.clone(),
+                        environment,
+                    },
+                ))
             }));
         match outcome {
-            Ok(Ok(anchorer)) => {
+            Ok(Ok((anchorer, continuation))) => {
                 execution.set_snapshot_anchorer(anchorer);
+                self.paused_journal_start = Some(continuation);
                 Ok(())
             }
             Ok(Err(error)) => {
                 self.shutdown_requested.set(true);
-                store.seal(self.clock.borrow().timestamp_ns());
+                self.event_store_seal_blocked.set(true);
+                let _ = store.retain_unsealed(&format!("paused Journal startup failed: {error:#}"));
                 Err(error)
             }
             Err(panic) => {
                 self.shutdown_requested.set(true);
+                self.event_store_seal_blocked.set(true);
+                let _ = store.retain_unsealed("paused Journal startup panicked");
                 // A panic may leave the store inconsistent; disposal owns its cleanup.
                 std::panic::resume_unwind(panic)
             }
@@ -755,6 +786,13 @@ impl NautilusKernel {
 
     /// Starts the Nautilus system kernel synchronously (for backtest use).
     pub fn start(&mut self) {
+        if self.paused_journal_start_used {
+            self.shutdown_requested.set(true);
+            let _ = self
+                .prohibit_event_store_seal("paused Journal continuation consumed more than once");
+            log::error!("Paused Journal continuation consumed more than once");
+            return;
+        }
         self.start_attempted = true;
         arm_shutdown_on_error(self.config.shutdown_on_error());
         log::info!("Starting");
@@ -773,7 +811,51 @@ impl NautilusKernel {
                 return;
             }
 
-            if self.config.load_state()
+            let continuation = self.paused_journal_start.take();
+            if let Some(continuation) = &continuation {
+                self.paused_journal_start_used = true;
+                let valid = !self.config.load_state()
+                    && !event_store_replay_configured
+                    && !event_store.is_halted()
+                    && continuation.owner_address
+                        == std::ptr::from_ref(event_store) as *const () as usize
+                    && event_store.run_id() == Some(continuation.run_id.as_str())
+                    && continuation.components == components
+                    && continuation.environment == environment;
+                if !valid {
+                    self.event_store_seal_blocked.set(true);
+                    self.shutdown_requested.set(true);
+                    let _ =
+                        event_store.retain_unsealed("paused Journal startup continuation changed");
+                    log::error!("Paused Journal startup continuation changed");
+                    return;
+                }
+                if let Err(error) = event_store.continue_paused_start(
+                    self.instance_id,
+                    &continuation.run_id,
+                    &components,
+                    environment,
+                ) {
+                    self.event_store_seal_blocked.set(true);
+                    self.shutdown_requested.set(true);
+                    let _ = event_store
+                        .retain_unsealed(&format!("paused Journal permit rejected: {error:#}"));
+                    log::error!("Paused Journal permit rejected: {error:#}");
+                    return;
+                }
+                if event_store.run_id() != Some(continuation.run_id.as_str())
+                    || event_store.is_halted()
+                {
+                    self.event_store_seal_blocked.set(true);
+                    self.shutdown_requested.set(true);
+                    let _ = event_store
+                        .retain_unsealed("paused Journal writer changed during continuation");
+                    return;
+                }
+            }
+
+            if continuation.is_none()
+                && self.config.load_state()
                 && let Err(e) =
                     event_store.restore_parent_cache(self.instance_id, &mut self.cache.borrow_mut())
             {
@@ -781,7 +863,12 @@ impl NautilusKernel {
                 return;
             }
 
-            if let Err(e) = event_store.open(self.instance_id, &components, environment) {
+            if continuation.is_none()
+                && let Err(e) = event_store.open(self.instance_id, &components, environment)
+            {
+                self.event_store_seal_blocked.set(true);
+                self.shutdown_requested.set(true);
+                let _ = event_store.retain_unsealed(&format!("Journal startup failed: {e:#}"));
                 log::error!("Failed to open event-store run: {e}");
                 return;
             }
@@ -968,7 +1055,7 @@ impl NautilusKernel {
     )]
     pub async fn finalize_stop(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !self.event_store_seal_blocked,
+            !self.event_store_seal_blocked.get(),
             "event store seal prohibited after failed final boundary"
         );
         if let Err(error) = self.finish_stop_without_seal().await {
@@ -986,10 +1073,32 @@ impl NautilusKernel {
         self.flush_streaming()
     }
 
+    /// Synchronous containment safe during callbacks holding engine borrows.
+    /// This latches the actual permanent engine fence and forbids kernel sealing
+    /// before any user callback runs. The current owned Journal must latch its
+    /// existing halt signal; implementations cannot substitute a new writer.
+    ///
+    /// # Errors
+    /// Unknown Journal callback retention is refused; the kernel seal prohibition
+    /// and permanent execution fence remain set even when retention fails.
+    pub fn contain_native_failure(&self, reason: &str) -> anyhow::Result<()> {
+        self.execution_failure_fence.latch();
+        self.event_store_seal_blocked.set(true);
+        self.shutdown_requested.set(true);
+        if let Some(store) = self.event_store.as_deref() {
+            let retention = store
+                .failure_retention()
+                .context("owned Journal callback failure retention unsupported")?;
+            retention.retain(reason)?;
+            anyhow::ensure!(store.is_halted(), "owned Journal failure was not latched");
+        }
+        Ok(())
+    }
+
     /// Latches failure before teardown. Disposal can never promote this run to
     /// a normal seal; the actual implementation must also suppress its Drop seal.
     pub fn prohibit_event_store_seal(&mut self, reason: &str) -> anyhow::Result<()> {
-        self.event_store_seal_blocked = true;
+        self.event_store_seal_blocked.set(true);
         self.exec_engine.borrow_mut().set_snapshot_anchorer(None);
         if let Some(store) = self.event_store.as_deref_mut() {
             store.retain_unsealed(reason)?;
@@ -1113,7 +1222,7 @@ impl NautilusKernel {
         // run for non-streaming backtests. finalize_stop (live) consumes the session
         // first; this call is then a no-op. Callers that skip dispose entirely fall
         // back to the event-store implementation's Drop.
-        if !self.event_store_seal_blocked
+        if !self.event_store_seal_blocked.get()
             && let Some(event_store) = self.event_store.as_deref_mut()
         {
             self.exec_engine.borrow_mut().set_snapshot_anchorer(None);
@@ -1645,6 +1754,7 @@ mod lifecycle_tests {
     #[derive(Debug)]
     struct PausedRecoveryStore {
         opened: bool,
+        halted: Rc<Cell<bool>>,
         fail: bool,
         calls: Rc<RefCell<Vec<String>>>,
         manifest: Rc<RefCell<Option<(UUID4, RegisteredComponents, Environment)>>>,
@@ -1669,6 +1779,28 @@ mod lifecycle_tests {
         fn snapshot_anchorer(&self) -> Option<SnapshotAnchorer> {
             None
         }
+        fn continue_paused_start(
+            &mut self,
+            id: UUID4,
+            run: &str,
+            components: &RegisteredComponents,
+            environment: Environment,
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                self.opened
+                    && !self.halted.get()
+                    && run == "paused-child"
+                    && self.manifest.borrow().as_ref()
+                        == Some(&(id, components.clone(), environment)),
+                "actual child owner manifest changed"
+            );
+            anyhow::ensure!(
+                !self.calls.borrow().iter().any(|call| call == "continue"),
+                "actual child continuation already consumed"
+            );
+            self.calls.borrow_mut().push("continue".into());
+            Ok(())
+        }
         fn seal(&mut self, _: UnixNanos) {
             self.calls.borrow_mut().push("seal".into());
             self.opened = false;
@@ -1680,7 +1812,23 @@ mod lifecycle_tests {
             Some("verified-parent")
         }
         fn is_halted(&self) -> bool {
-            false
+            self.halted.get()
+        }
+        fn failure_retention(&self) -> Option<crate::event_store::EventStoreFailureRetention> {
+            let halted = self.halted.clone();
+            let calls = self.calls.clone();
+            Some(crate::event_store::EventStoreFailureRetention::new(
+                move |_| {
+                    halted.set(true);
+                    calls.borrow_mut().push("callback_retention".into());
+                    Ok(())
+                },
+            ))
+        }
+        fn retain_unsealed(&mut self, _: &str) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push("retain_unsealed".into());
+            self.halted.set(true);
+            Ok(())
         }
     }
 
@@ -1691,6 +1839,7 @@ mod lifecycle_tests {
             let manifest = Rc::new(RefCell::new(None));
             let store = PausedRecoveryStore {
                 opened: false,
+                halted: Rc::new(Cell::new(false)),
                 fail,
                 calls: calls.clone(),
                 manifest: manifest.clone(),
@@ -1736,7 +1885,7 @@ mod lifecycle_tests {
             assert_eq!(
                 *calls.borrow(),
                 if fail {
-                    vec!["open", "seal"]
+                    vec!["open", "retain_unsealed"]
                 } else {
                     vec!["open"]
                 }
@@ -1744,6 +1893,103 @@ mod lifecycle_tests {
             assert_eq!(kernel.is_shutdown_requested(), fail);
             kernel.dispose();
         }
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn paused_journal_native_start_continuation_is_owned_and_single_use(
+        #[case] change_registration: bool,
+    ) {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let manifest = Rc::new(RefCell::new(None));
+        let store = PausedRecoveryStore {
+            opened: false,
+            halted: Rc::new(Cell::new(false)),
+            fail: false,
+            calls: calls.clone(),
+            manifest,
+        };
+        let mut kernel = NautilusKernelBuilder::default()
+            .with_load_state(false)
+            .with_event_store(move |_, _| Ok(Box::new(store)))
+            .build()
+            .unwrap();
+        kernel
+            .risk_engine
+            .borrow_mut()
+            .set_trading_state(nautilus_model::enums::TradingState::Halted);
+        kernel.open_event_store_for_paused_recovery().unwrap();
+        if change_registration {
+            let (_, control) = TestCacheDatabaseControl::create();
+            kernel
+                .trader
+                .borrow_mut()
+                .add_actor(StateActor::new(
+                    ActorId::from("CHANGED-AFTER-OPEN"),
+                    control,
+                    IndexMap::new(),
+                ))
+                .unwrap();
+        }
+        kernel.start();
+        assert_eq!(
+            calls
+                .borrow()
+                .iter()
+                .filter(|call| call.as_str() == "open")
+                .count(),
+            1
+        );
+        assert_eq!(kernel.ts_started.is_some(), !change_registration);
+        assert_eq!(kernel.is_shutdown_requested(), change_registration);
+        assert!(!kernel.is_event_store_replay());
+        if change_registration {
+            assert_eq!(&*calls.borrow(), &["open", "retain_unsealed"]);
+            assert!(finalize(&mut kernel).is_err());
+        } else {
+            assert_eq!(
+                kernel.event_store().and_then(|store| store.run_id()),
+                Some("paused-child")
+            );
+            kernel.start();
+            assert!(kernel.is_shutdown_requested());
+            assert_eq!(&*calls.borrow(), &["open", "continue", "retain_unsealed"]);
+            assert!(finalize(&mut kernel).is_err());
+        }
+        kernel.dispose();
+        assert!(!calls.borrow().iter().any(|call| call == "seal"));
+    }
+
+    #[rstest]
+    fn native_failure_containment_during_mutably_borrowed_engine_cannot_seal() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let store = PausedRecoveryStore {
+            opened: false,
+            halted: Rc::new(Cell::new(false)),
+            fail: false,
+            calls: calls.clone(),
+            manifest: Rc::new(RefCell::new(None)),
+        };
+        let mut kernel = NautilusKernelBuilder::default()
+            .with_event_store(move |_, _| Ok(Box::new(store)))
+            .build()
+            .unwrap();
+        kernel
+            .risk_engine
+            .borrow_mut()
+            .set_trading_state(nautilus_model::enums::TradingState::Halted);
+        kernel.open_event_store_for_paused_recovery().unwrap();
+        let engine = kernel.exec_engine.borrow_mut();
+        kernel
+            .contain_native_failure("actual callback writer generation changed")
+            .unwrap();
+        assert!(engine.submissions_fenced());
+        assert!(kernel.event_store().unwrap().is_halted());
+        drop(engine);
+        assert!(finalize(&mut kernel).is_err());
+        kernel.dispose();
+        assert_eq!(&*calls.borrow(), &["open", "callback_retention"]);
     }
 
     #[derive(Debug, PartialEq)]

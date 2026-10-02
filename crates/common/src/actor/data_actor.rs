@@ -244,6 +244,39 @@ pub trait DataActorNative {
 /// [`DataActorNative`] and [`Component`] bounds. The actor ID and clock facades
 /// use [`DataActorBinding`] to access component state.
 pub trait DataActor {
+    /// Installs only this original object's local historical pubsub routes. This
+    /// must not call ordinary on_start, reset private history, or contact a venue.
+    /// Custom TypedHandler closures must use historical admission on this same owner.
+    #[cfg(feature = "live")]
+    fn prepare_native_recovery(
+        &mut self,
+        _boundary: &crate::recovery_trace::historical::HistoricalReplayPreparation<'_>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("registered component has no historical local-binding profile")
+    }
+
+    /// Versioned business state compared during source capture and original-object
+    /// replay. Physical recovery permission/lifecycle is not a business snapshot.
+    /// Implementations must expose actual private state; unknown fields cannot be stripped.
+    #[cfg(feature = "live")]
+    fn on_native_recovery_state(&self) -> anyhow::Result<IndexMap<String, Vec<u8>>> {
+        anyhow::bail!("registered component has no native historical business-state profile")
+    }
+
+    /// Restores one original callback on this actual registered object from a reader proof.
+    /// Normal indicators and lifecycle callbacks do not run in parallel with this hook.
+    /// The default rejects unsupported history rather than treating an Idle callback as applied.
+    /// # Errors
+    /// Returns an error for unsupported source/provider/component history.
+    #[cfg(feature = "live")]
+    fn on_native_recovery_input(
+        &mut self,
+        _boundary: &crate::recovery_trace::historical::HistoricalInputBoundary<'_>,
+        _input: &dyn Any,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("registered component has no native historical callback profile")
+    }
+
     /// Returns the actor ID.
     ///
     /// # Panics
@@ -838,6 +871,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_time_event",
+                |boundary| self.on_native_recovery_input(boundary, event),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_time_event".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&event);
 
         if self.not_running() {
@@ -855,6 +909,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_data",
+                |boundary| self.on_native_recovery_input(boundary, data),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_data".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&data);
 
         if self.not_running() {
@@ -872,6 +947,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_signal",
+                |boundary| self.on_native_recovery_input(boundary, signal),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_signal".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&signal);
 
         if self.not_running() {
@@ -889,6 +985,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_queue_state",
+                |boundary| self.on_native_recovery_input(boundary, event),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_queue_state".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&event);
 
         if self.not_running() {
@@ -906,6 +1023,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_socket_state",
+                |boundary| self.on_native_recovery_input(boundary, event),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_socket_state".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&event);
 
         if self.not_running() {
@@ -923,6 +1061,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_instrument",
+                |boundary| self.on_native_recovery_input(boundary, instrument),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_instrument".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&instrument);
 
         if self.not_running() {
@@ -940,6 +1099,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_book_deltas",
+                |boundary| self.on_native_recovery_input(boundary, deltas),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_book_deltas".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&deltas);
 
         if self.not_running() {
@@ -957,6 +1137,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_book_depth",
+                |boundary| self.on_native_recovery_input(boundary, depth),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_book_depth".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&depth);
 
         if self.not_running() {
@@ -974,6 +1175,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_book",
+                |boundary| self.on_native_recovery_input(boundary, book),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_book".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&book);
 
         if self.not_running() {
@@ -991,6 +1213,27 @@ pub trait DataActor {
     where
         Self: DataActorNative + Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.core().actor_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_quote",
+                |boundary| self.on_native_recovery_input(boundary, quote),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_quote".into(),
+                    component_state: format!("{:?}", self.core().state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         if !super::recovery_observation::callback_admitted(&self.core().actor_id().inner()) {
             return;
         }
@@ -1016,6 +1259,27 @@ pub trait DataActor {
     where
         Self: DataActorNative + Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.core().actor_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_trade",
+                |boundary| self.on_native_recovery_input(boundary, trade),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_trade".into(),
+                    component_state: format!("{:?}", self.core().state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         if !super::recovery_observation::callback_admitted(&self.core().actor_id().inner()) {
             return;
         }
@@ -1041,6 +1305,27 @@ pub trait DataActor {
     where
         Self: DataActorNative + Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.core().actor_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_bar",
+                |boundary| self.on_native_recovery_input(boundary, bar),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_bar".into(),
+                    component_state: format!("{:?}", self.core().state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         if !super::recovery_observation::callback_admitted(&self.core().actor_id().inner()) {
             return;
         }
@@ -1066,6 +1351,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_mark_price",
+                |boundary| self.on_native_recovery_input(boundary, mark_price),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_mark_price".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&mark_price);
 
         if self.not_running() {
@@ -1083,6 +1389,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_index_price",
+                |boundary| self.on_native_recovery_input(boundary, index_price),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_index_price".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&index_price);
 
         if self.not_running() {
@@ -1100,6 +1427,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_funding_rate",
+                |boundary| self.on_native_recovery_input(boundary, funding_rate),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_funding_rate".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&funding_rate);
 
         if self.not_running() {
@@ -1117,6 +1465,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_option_greeks",
+                |boundary| self.on_native_recovery_input(boundary, greeks),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_option_greeks".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&greeks);
 
         if self.not_running() {
@@ -1134,6 +1503,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_option_chain",
+                |boundary| self.on_native_recovery_input(boundary, slice),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_option_chain".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&slice);
 
         if self.not_running() {
@@ -1151,6 +1541,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_instrument_status",
+                |boundary| self.on_native_recovery_input(boundary, status),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_instrument_status".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&status);
 
         if self.not_running() {
@@ -1168,6 +1579,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_instrument_close",
+                |boundary| self.on_native_recovery_input(boundary, close),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_instrument_close".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&close);
 
         if self.not_running() {
@@ -1186,6 +1618,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_block",
+                |boundary| self.on_native_recovery_input(boundary, block),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_block".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&block);
 
         if self.not_running() {
@@ -1204,6 +1657,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_pool",
+                |boundary| self.on_native_recovery_input(boundary, pool),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_pool".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&pool);
 
         if self.not_running() {
@@ -1222,6 +1696,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_pool_swap",
+                |boundary| self.on_native_recovery_input(boundary, swap),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_pool_swap".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&swap);
 
         if self.not_running() {
@@ -1240,6 +1735,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_pool_liquidity_update",
+                |boundary| self.on_native_recovery_input(boundary, update),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_pool_liquidity_update".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&update);
 
         if self.not_running() {
@@ -1258,6 +1774,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_pool_fee_collect",
+                |boundary| self.on_native_recovery_input(boundary, collect),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_pool_fee_collect".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&collect);
 
         if self.not_running() {
@@ -1276,6 +1813,27 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_pool_flash",
+                |boundary| self.on_native_recovery_input(boundary, flash),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_pool_flash".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&flash);
 
         if self.not_running() {
@@ -1298,7 +1856,31 @@ pub trait DataActor {
     }
 
     /// Handles a data response.
-    fn handle_data_response(&mut self, resp: &CustomDataResponse) {
+    fn handle_data_response(&mut self, resp: &CustomDataResponse)
+    where
+        Self: Component,
+    {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_data_response",
+                |boundary| self.on_native_recovery_input(boundary, resp),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_data_response".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         if let Some(data) = resp.data.as_ref().downcast_ref::<Vec<CustomData>>() {
             log_received_bulk("CustomDataResponse", &resp.correlation_id, data.len());
             log::trace!("{RECV} {resp:?}");
@@ -1312,7 +1894,31 @@ pub trait DataActor {
     }
 
     /// Handles an instrument response.
-    fn handle_instrument_response(&mut self, resp: &InstrumentResponse) {
+    fn handle_instrument_response(&mut self, resp: &InstrumentResponse)
+    where
+        Self: Component,
+    {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_instrument_response",
+                |boundary| self.on_native_recovery_input(boundary, resp),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_instrument_response".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&resp);
 
         if let Err(e) = self.on_instrument(&resp.data) {
@@ -1321,7 +1927,31 @@ pub trait DataActor {
     }
 
     /// Handles an instruments response.
-    fn handle_instruments_response(&mut self, resp: &InstrumentsResponse) {
+    fn handle_instruments_response(&mut self, resp: &InstrumentsResponse)
+    where
+        Self: Component,
+    {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_instruments_response",
+                |boundary| self.on_native_recovery_input(boundary, resp),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_instruments_response".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received_bulk("InstrumentsResponse", &resp.correlation_id, resp.data.len());
         log::trace!("{RECV} {resp:?}");
 
@@ -1333,7 +1963,31 @@ pub trait DataActor {
     }
 
     /// Handles a book response.
-    fn handle_book_response(&mut self, resp: &BookResponse) {
+    fn handle_book_response(&mut self, resp: &BookResponse)
+    where
+        Self: Component,
+    {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_book_response",
+                |boundary| self.on_native_recovery_input(boundary, resp),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_book_response".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received(&resp);
 
         if let Err(e) = self.on_book(&resp.data) {
@@ -1342,7 +1996,31 @@ pub trait DataActor {
     }
 
     /// Handles a book deltas response.
-    fn handle_book_deltas_response(&mut self, resp: &BookDeltasResponse) {
+    fn handle_book_deltas_response(&mut self, resp: &BookDeltasResponse)
+    where
+        Self: Component,
+    {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_book_deltas_response",
+                |boundary| self.on_native_recovery_input(boundary, resp),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_book_deltas_response".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received_bulk("BookDeltasResponse", &resp.correlation_id, resp.data.len());
         log::trace!("{RECV} {resp:?}");
 
@@ -1352,7 +2030,31 @@ pub trait DataActor {
     }
 
     /// Handles a book depth response.
-    fn handle_book_depth_response(&mut self, resp: &BookDepthResponse) {
+    fn handle_book_depth_response(&mut self, resp: &BookDepthResponse)
+    where
+        Self: Component,
+    {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_book_depth_response",
+                |boundary| self.on_native_recovery_input(boundary, resp),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_book_depth_response".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received_bulk("BookDepthResponse", &resp.correlation_id, resp.data.len());
         log::trace!("{RECV} {resp:?}");
 
@@ -1366,6 +2068,27 @@ pub trait DataActor {
     where
         Self: DataActorNative,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.core().actor_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_quotes_response",
+                |boundary| self.on_native_recovery_input(boundary, resp),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_quotes_response".into(),
+                    component_state: format!("{:?}", self.core().state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received_bulk("QuotesResponse", &resp.correlation_id, resp.data.len());
         log::trace!("{RECV} {resp:?}");
 
@@ -1384,6 +2107,27 @@ pub trait DataActor {
     where
         Self: DataActorNative,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.core().actor_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_trades_response",
+                |boundary| self.on_native_recovery_input(boundary, resp),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_trades_response".into(),
+                    component_state: format!("{:?}", self.core().state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received_bulk("TradesResponse", &resp.correlation_id, resp.data.len());
         log::trace!("{RECV} {resp:?}");
 
@@ -1402,6 +2146,27 @@ pub trait DataActor {
     where
         Self: DataActorNative,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.core().actor_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_bars_response",
+                |boundary| self.on_native_recovery_input(boundary, resp),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_bars_response".into(),
+                    component_state: format!("{:?}", self.core().state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received_bulk("BarsResponse", &resp.correlation_id, resp.data.len());
         log::trace!("{RECV} {resp:?}");
 
@@ -1416,7 +2181,31 @@ pub trait DataActor {
     }
 
     /// Handles a funding rates response.
-    fn handle_funding_rates_response(&mut self, resp: &FundingRatesResponse) {
+    fn handle_funding_rates_response(&mut self, resp: &FundingRatesResponse)
+    where
+        Self: Component,
+    {
+        #[cfg(feature = "live")]
+        {
+            let component_id = self.component_id().to_string();
+            if crate::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_funding_rates_response",
+                |boundary| self.on_native_recovery_input(boundary, resp),
+            ) {
+                return;
+            }
+            if let Err(error) = crate::recovery_trace::scope::note_callback(
+                crate::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_funding_rates_response".into(),
+                    component_state: format!("{:?}", self.state()),
+                },
+            ) {
+                log_error(&error);
+                return;
+            }
+        }
         log_received_bulk(
             "FundingRatesResponse",
             &resp.correlation_id,

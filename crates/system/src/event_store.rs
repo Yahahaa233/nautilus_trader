@@ -40,6 +40,32 @@ pub type EventStoreFactory = Box<
         + 'static,
 >;
 
+/// Synchronous, borrow-independent retention on one actual owned Journal.
+/// It must latch the writer's existing failure state and prohibit Drop sealing.
+/// No deserialization, source replacement or recovery permission is available.
+#[derive(Clone)]
+pub struct EventStoreFailureRetention(Rc<dyn Fn(&str) -> anyhow::Result<()>>);
+
+impl Debug for EventStoreFailureRetention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventStoreFailureRetention")
+            .finish_non_exhaustive()
+    }
+}
+
+impl EventStoreFailureRetention {
+    /// Implementations bind their current session's actual halt signal here.
+    pub fn new(retain: impl Fn(&str) -> anyhow::Result<()> + 'static) -> Self {
+        Self(Rc::new(retain))
+    }
+
+    /// # Errors
+    /// Returns an error if the original Journal cannot establish failure retention.
+    pub fn retain(&self, reason: &str) -> anyhow::Result<()> {
+        (self.0)(reason)
+    }
+}
+
 /// The component manifest captured into the event-store `RunStarted` entry.
 ///
 /// Replay binds actors, strategies, algorithms, subscriptions, and command endpoints from
@@ -94,10 +120,32 @@ pub trait KernelEventStore: Debug {
         environment: Environment,
     ) -> anyhow::Result<()>;
 
-    /// Returns a snapshot anchorer for the currently open run, when capture is active.
+    /// Consumes the implementation's private paused-child startup permit on its same
+    /// owned writer. It must not open a run, reload cache/business state or mint a permit.
+    /// The kernel has checked its own non-serializable owner continuation first.
     ///
-    /// The execution engine installs the returned callback so position snapshots commit a
-    /// matching anchor entry against the durable high-watermark.
+    /// # Errors
+    /// Unknown implementations refuse; consumers must verify and consume their actual
+    /// source/target/process/child/parent/frontier/components/environment permit once.
+    fn continue_paused_start(
+        &mut self,
+        _instance_id: UUID4,
+        _child_run_id: &str,
+        _components: &RegisteredComponents,
+        _environment: Environment,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("owned paused Journal startup continuation unsupported")
+    }
+
+    /// Issues a trace handle from this exact owned open Journal. A native node
+    /// downcasts it to its concrete reader/recorder type; no JSON grants authority.
+    #[cfg(feature = "live")]
+    fn native_trace_handle(&self, _source: nautilus_common::recovery_trace::NativeTraceSource)
+        -> anyhow::Result<std::rc::Rc<dyn std::any::Any>> {
+        anyhow::bail!("owned Journal native causal trace unsupported")
+    }
+
+    /// Returns the current run's actual durable snapshot anchorer.
     fn snapshot_anchorer(&self) -> Option<SnapshotAnchorer>;
 
     /// Seals the open run by writing the terminal entry and updating the manifest.
@@ -111,6 +159,12 @@ pub trait KernelEventStore: Debug {
     /// Unknown implementations refuse the contract rather than imply success.
     fn retain_unsealed(&mut self, _reason: &str) -> anyhow::Result<()> {
         anyhow::bail!("event-store unsealed failure retention unsupported")
+    }
+
+    /// Returns a latch on the current actual writer that is safe during callbacks
+    /// holding unrelated RefCell borrows. Unknown stores remain unsupported.
+    fn failure_retention(&self) -> Option<EventStoreFailureRetention> {
+        None
     }
 
     /// Returns the run id of the currently open run, when capture is active.

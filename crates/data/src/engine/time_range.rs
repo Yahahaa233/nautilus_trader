@@ -482,7 +482,7 @@ fn time_range_child_request(
 ) -> RequestCommand {
     let start = Some(start_ns.to_datetime_utc());
     let end = Some(end_ns.to_datetime_utc());
-    let request_id = UUID4::new();
+    let request_id = nautilus_common::recovery_trace::native_event_uuid();
 
     match parent {
         RequestCommand::Quotes(cmd) => RequestCommand::Quotes(RequestQuotes {
@@ -779,7 +779,7 @@ fn parse_time_range_duration(value: &Value) -> anyhow::Result<Option<DurationNan
 #[cfg(test)]
 mod tests {
     use nautilus_common::messages::data::{RequestCommand, RequestInstrument};
-    use nautilus_core::{Params, UUID4, UnixNanos};
+    use nautilus_core::{Params, UnixNanos};
     use nautilus_model::identifiers::{ClientId, InstrumentId};
     use rstest::rstest;
     use serde_json::json;
@@ -819,7 +819,7 @@ mod tests {
                 None,
                 None,
                 None,
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 UnixNanos::default(),
                 None,
             )),
@@ -836,8 +836,12 @@ mod tests {
             last_response: None,
         };
 
-        let result =
-            empty_time_range_parent_response(UUID4::new(), &state, UnixNanos::from(2u64), None);
+        let result = empty_time_range_parent_response(
+            nautilus_common::recovery_trace::native_event_uuid(),
+            &state,
+            UnixNanos::from(2u64),
+            None,
+        );
 
         assert!(result.is_none());
     }

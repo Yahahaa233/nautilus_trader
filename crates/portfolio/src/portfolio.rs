@@ -1037,7 +1037,7 @@ impl Portfolio {
             stale_instruments,
             stale_currencies,
             unpriced_instruments,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_now,
             ts_now,
         ))
@@ -4301,7 +4301,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::from(seq),
             UnixNanos::from(seq),
         )

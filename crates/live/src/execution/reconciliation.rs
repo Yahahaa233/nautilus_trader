@@ -67,6 +67,7 @@ pub(super) type FillKey = (AccountId, InstrumentId, TradeId);
 
 /// Execution clients responsible for reporting one cached entity.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "native-tail-replay", derive(serde::Deserialize))]
 pub enum ReportClientCoverage {
     /// Every identified client provides the required report coverage.
     Resolved(IndexSet<ClientId>),
@@ -115,7 +116,7 @@ pub(crate) struct OpenOrderReconciliationResult {
 }
 
 /// Order snapshot and client coverage for a targeted status query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct TargetedOrderQuery {
     pub(super) client_order_id: ClientOrderId,
     pub(super) responsible_clients: IndexSet<ClientId>,
@@ -133,6 +134,7 @@ impl TargetedOrderQuery {
 
 /// Targeted status query result with fills and coverage completeness.
 #[derive(Debug, serde::Serialize)]
+#[cfg_attr(feature = "native-tail-replay", derive(serde::Deserialize))]
 pub(crate) struct TargetedOrderReportResult {
     pub(super) client_order_id: ClientOrderId,
     pub(super) client_id: Option<ClientId>,
@@ -143,6 +145,7 @@ pub(crate) struct TargetedOrderReportResult {
 
 /// Order status report paired with its source execution client.
 #[derive(Debug, serde::Serialize)]
+#[cfg_attr(feature = "native-tail-replay", derive(serde::Deserialize))]
 pub(crate) struct SourcedOrderStatusReport {
     pub client_id: ClientId,
     pub report: OrderStatusReport,
@@ -150,6 +153,7 @@ pub(crate) struct SourcedOrderStatusReport {
 
 /// Snapshot and command for one continuous open-order reconciliation check.
 #[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(feature = "native-tail-replay", derive(serde::Deserialize))]
 pub(crate) struct OpenOrderReportCheck {
     pub command: GenerateOrderStatusReports,
     pub filtered_orders: Vec<OrderAny>,
@@ -158,19 +162,28 @@ pub(crate) struct OpenOrderReportCheck {
 
 /// Prepare-time state and command for one continuous position reconciliation check.
 #[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(feature = "native-tail-replay", derive(serde::Deserialize))]
 pub struct PositionReportCheck {
     /// The bulk position query.
     pub command: GeneratePositionStatusReports,
     /// Responsible clients by instrument and account.
     #[serde(serialize_with = "serialize_ordered_pairs")]
+    #[cfg_attr(
+        feature = "native-tail-replay",
+        serde(deserialize_with = "deserialize_ordered_pairs")
+    )]
     pub client_coverage: IndexMap<InstrumentAccountKey, ReportClientCoverage>,
     /// Activity revisions captured before the query.
     #[serde(serialize_with = "serialize_ordered_pairs")]
+    #[cfg_attr(
+        feature = "native-tail-replay",
+        serde(deserialize_with = "deserialize_ordered_pairs")
+    )]
     pub activity_revisions: IndexMap<InstrumentAccountKey, u64>,
 }
 
 /// Fill report request for one instrument, account, and execution client.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct PositionFillReportQuery {
     /// The instrument and account to reconcile.
     pub key: InstrumentAccountKey,
@@ -345,7 +358,7 @@ pub(crate) async fn request_targeted_order_reports(
                 Ok(Some(candidate)) if targeted_report_matches(&query, &candidate) => {
                     if terminal_report_has_missing_fills(&candidate, query.filled_qty) {
                         let mut command = GenerateFillReports::new(
-                            UUID4::new(),
+                            nautilus_common::recovery_trace::native_event_uuid(),
                             query.command.ts_init,
                             Some(candidate.instrument_id),
                             Some(candidate.venue_order_id),
@@ -1450,4 +1463,25 @@ pub(crate) fn serialize_ordered_pairs<
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serde::Serialize::serialize(&values.iter().collect::<Vec<_>>(), serializer)
+}
+
+#[cfg(feature = "native-tail-replay")]
+pub(crate) fn deserialize_ordered_pairs<'de, K, V, D>(
+    deserializer: D,
+) -> Result<IndexMap<K, V>, D::Error>
+where
+    K: serde::Deserialize<'de> + Eq + std::hash::Hash,
+    V: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    let pairs = <Vec<(K, V)> as serde::Deserialize>::deserialize(deserializer)?;
+    if pairs.len() > 1_000_000 {
+        return Err(serde::de::Error::custom("oversized ordered native source"));
+    }
+    let length = pairs.len();
+    let map = pairs.into_iter().collect::<IndexMap<_, _>>();
+    if map.len() != length {
+        return Err(serde::de::Error::custom("duplicate native source identity"));
+    }
+    Ok(map)
 }

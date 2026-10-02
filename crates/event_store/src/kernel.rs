@@ -515,6 +515,8 @@ pub struct EventStoreLifecycle {
     recovered: Vec<RecoveredRun>,
     parent_run_id: Option<String>,
     session: Option<EventStoreSession>,
+    opened_environment: Option<Environment>,
+    paused_start_consumed: bool,
     halt: HaltSignal,
     // Held so `Drop` can stamp the seal even when the kernel never called seal()
     // explicitly. Cloning the kernel's clock Rc keeps the wrapper independent of
@@ -582,6 +584,8 @@ impl EventStoreLifecycle {
             recovered,
             parent_run_id,
             session: None,
+            opened_environment: None,
+            paused_start_consumed: false,
             halt: HaltSignal::new(),
             clock,
         })
@@ -748,6 +752,8 @@ impl EventStoreLifecycle {
             install_bus_tap(Arc::clone(adapter), session.marker_capture.clone(), clock);
         }
         self.session = Some(session);
+        self.opened_environment = Some(environment);
+        self.paused_start_consumed = false;
         Ok(())
     }
 
@@ -906,6 +912,29 @@ impl EventStoreLifecycle {
             "required event was not captured: unregistered type or duplicate identity"
         );
         Ok(session.flush()?)
+    }
+
+    /// Issues a native trace recorder bound to this actual open writer and run.
+    ///
+    /// # Errors
+    /// Refuses absent/failed sessions or a substituted native installation/run.
+    #[cfg(feature = "live")]
+    pub fn native_trace_recorder(
+        &self,
+        source: nautilus_common::recovery_trace::NativeTraceSource,
+    ) -> anyhow::Result<crate::native_trace::NativeTraceRecorder> {
+        let session = self.session.as_ref().ok_or(EventStoreError::Closed)?;
+        anyhow::ensure!(
+            source.node_instance == self.instance_id
+                && source.journal_run == session.run_id()
+                && !session.is_halted(),
+            "native trace source does not match actual Journal lifecycle"
+        );
+        crate::native_trace::NativeTraceRecorder::new(
+            source,
+            session.writer.as_ref().ok_or(EventStoreError::Closed)?,
+            self.halt.clone(),
+        )
     }
 
     /// Marks the current lifecycle failed when an owner-side persistence contract fails.
@@ -1497,6 +1526,10 @@ impl EventStoreBusTap {
     }
 
     fn capture_marker(&self, topic: Topic, message: &dyn Any, ts_init: UnixNanos, captured: bool) {
+        #[cfg(feature = "live")]
+        if nautilus_common::recovery_trace::historical_active() {
+            return; // The original verified closure already owns its marker/capture evidence.
+        }
         let Some(marker_capture) = self.marker_capture.as_ref() else {
             return;
         };
@@ -1554,6 +1587,27 @@ impl KernelEventStoreTrait for EventStoreLifecycle {
         EventStoreLifecycle::open(self, instance_id, components, environment).map_err(Into::into)
     }
 
+    fn continue_paused_start(&mut self, instance_id: UUID4, child_run_id: &str,
+        components: &RegisteredComponents, environment: Environment) -> anyhow::Result<()> {
+        let session = self.session.as_ref().ok_or(EventStoreError::Closed)?;
+        anyhow::ensure!(!self.paused_start_consumed && !session.is_halted()
+            && session.writer.is_some() && instance_id == self.instance_id
+            && session.manifest().instance_id == instance_id.to_string()
+            && session.run_id() == child_run_id
+            && session.manifest().registered_components == *components
+            && self.opened_environment == Some(environment),
+            "owned paused Journal continuation changed or already consumed");
+        session.flush()?;
+        self.paused_start_consumed = true;
+        Ok(())
+    }
+
+    #[cfg(feature = "live")]
+    fn native_trace_handle(&self, source: nautilus_common::recovery_trace::NativeTraceSource)
+        -> anyhow::Result<Rc<dyn std::any::Any>> {
+        Ok(Rc::new(EventStoreLifecycle::native_trace_recorder(self, source)?))
+    }
+
     fn snapshot_anchorer(&self) -> Option<SnapshotAnchorer> {
         EventStoreLifecycle::snapshot_anchorer(self)
     }
@@ -1574,6 +1628,20 @@ impl KernelEventStoreTrait for EventStoreLifecycle {
         Ok(())
     }
 
+
+    fn failure_retention(&self) -> Option<nautilus_system::event_store::EventStoreFailureRetention> {
+        let session = self.session.as_ref()?;
+        if session.writer.is_none() {
+            return None;
+        }
+        let halt = self.halt.clone();
+        Some(nautilus_system::event_store::EventStoreFailureRetention::new(move |reason| {
+            anyhow::ensure!(!reason.is_empty(), "native failure reason missing");
+            halt.callback()(HaltReason::ExternalPersistence("native dispatch failed".into()));
+            anyhow::ensure!(halt.is_halted(), "actual Journal failure was not latched");
+            Ok(())
+        }))
+    }
 
     fn run_id(&self) -> Option<&str> {
         EventStoreLifecycle::run_id(self)

@@ -62,7 +62,7 @@ use nautilus_common::{
     timer::{TimeEvent, TimeEventCallback},
 };
 use nautilus_core::{
-    DurationNanos, UUID4, UnixNanos, WeakCell,
+    DurationNanos, UnixNanos, WeakCell,
     datetime::{mins_to_secs, secs_to_nanos},
 };
 use nautilus_model::{
@@ -116,6 +116,24 @@ pub struct RecoveryObservationExecutionGate {
     phase: Rc<Cell<bool>>,
     permanent_failure: Rc<Cell<bool>>,
     finished: bool,
+}
+
+/// Borrow-independent containment for this actual engine instance. This capability
+/// can only latch permanent failure; it cannot clear a phase or grant execution.
+#[derive(Clone, Debug)]
+pub struct ExecutionFailureFence(Rc<Cell<bool>>);
+
+impl ExecutionFailureFence {
+    /// Permanently denies submissions, including while an engine callback holds
+    /// a mutable borrow of the engine. Repeated failure is idempotent.
+    pub fn latch(&self) {
+        self.0.set(true);
+    }
+
+    #[must_use]
+    pub fn is_latched(&self) -> bool {
+        self.0.get()
+    }
 }
 impl RecoveryObservationExecutionGate {
     /// # Errors
@@ -366,6 +384,12 @@ impl ExecutionEngine {
     /// A new engine/run is required to clear the fence; remediation stays available.
     pub fn fence_submissions(&self) {
         self.submissions_fenced.set(true);
+    }
+
+    /// Issues a latch-only capability bound to this instance's permanent fence.
+    #[must_use]
+    pub fn failure_fence(&self) -> ExecutionFailureFence {
+        ExecutionFailureFence(self.submissions_fenced.clone())
     }
 
     /// Whether an owner-provided synchronous submission barrier is installed.
@@ -1273,7 +1297,7 @@ impl ExecutionEngine {
             report.reduce_only,
             false, // quote_quantity
             true,  // reconciliation
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_now,
             ts_now,
             report.price,
@@ -1370,7 +1394,7 @@ impl ExecutionEngine {
             true,  // reduce_only: venue-initiated closes always reduce
             false, // quote_quantity
             true,  // reconciliation
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_now,
             ts_now,
             None, // price
@@ -1556,7 +1580,7 @@ impl ExecutionEngine {
                     order.client_order_id(),
                     report.venue_order_id,
                     report.account_id,
-                    UUID4::new(),
+                    nautilus_common::recovery_trace::native_event_uuid(),
                     report.ts_event,
                     ts_now,
                     true, // reconciliation
@@ -1662,7 +1686,7 @@ impl ExecutionEngine {
                     order.client_order_id(),
                     report.venue_order_id,
                     report.account_id,
-                    UUID4::new(),
+                    nautilus_common::recovery_trace::native_event_uuid(),
                     report.ts_accepted,
                     ts_now,
                     true, // reconciliation
@@ -2010,7 +2034,17 @@ impl ExecutionEngine {
     }
 
     fn execute_command(&self, command: TradingCommand) {
+        if nautilus_common::recovery_trace::historical_active()
+            && (self.submissions_fenced.get() || !self.external_clients.is_empty())
+        {
+            nautilus_common::recovery_trace::historical_failure(
+                "historical execution has permanent fence or external transport",
+            );
+            log::error!("Historical execution refused unsupported permanent/external admission");
+            return;
+        }
         if self.recovery_observation_gate.get()
+            && !nautilus_common::recovery_trace::historical_active()
             && !matches!(
                 &command,
                 TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_)
@@ -2027,7 +2061,8 @@ impl ExecutionEngine {
                 | TradingCommand::SubmitOrderList(_)
                 | TradingCommand::ModifyOrder(_)
                 | TradingCommand::ModifyOrders(_)
-        ) && let Err(error) = self.check_submission_guard(&command)
+        ) && !nautilus_common::recovery_trace::historical_active()
+            && let Err(error) = self.check_submission_guard(&command)
         {
             log::error!("Execution submission barrier refused command: {error:#}");
             let orders = match &command {
@@ -2489,7 +2524,12 @@ impl ExecutionEngine {
 
         log_info!("Submit {order}", color = LogColor::Blue);
 
-        if let Err(e) = client.submit_order(cmd) {
+        if let Err(e) = nautilus_common::recovery_trace::native_transport(
+            &client.client_id().to_string(),
+            "execution.submit_order",
+            &cmd.clone(),
+            || client.submit_order(cmd),
+        ) {
             self.deny_order(
                 &order,
                 &OrderDeniedReason::SubmitFailed {
@@ -2652,7 +2692,12 @@ impl ExecutionEngine {
 
         log_info!("Submit {}", cmd.order_list, color = LogColor::Blue);
 
-        if let Err(e) = client.submit_order_list(cmd) {
+        if let Err(e) = nautilus_common::recovery_trace::native_transport(
+            &client.client_id().to_string(),
+            "execution.submit_order_list",
+            &cmd.clone(),
+            || client.submit_order_list(cmd),
+        ) {
             log::error!("Error submitting order list to client: {e}");
             let reason = OrderDeniedReason::SubmitFailed {
                 detail: e.to_string(),
@@ -2709,13 +2754,23 @@ impl ExecutionEngine {
             color = LogColor::Blue
         );
 
-        if let Err(e) = client.modify_order(cmd) {
+        if let Err(e) = nautilus_common::recovery_trace::native_transport(
+            &client.client_id().to_string(),
+            "execution.modify_order",
+            &cmd.clone(),
+            || client.modify_order(cmd),
+        ) {
             log::error!("Error modifying order: {e}");
         }
     }
 
     fn handle_batch_modify_orders(&self, client: &dyn ExecutionClient, cmd: BatchModifyOrders) {
-        if let Err(e) = client.batch_modify_orders(cmd) {
+        if let Err(e) = nautilus_common::recovery_trace::native_transport(
+            &client.client_id().to_string(),
+            "execution.batch_modify_orders",
+            &cmd.clone(),
+            || client.batch_modify_orders(cmd),
+        ) {
             log::error!("Error batch modifying orders: {e}");
         }
     }
@@ -2731,7 +2786,12 @@ impl ExecutionEngine {
             color = LogColor::Blue
         );
 
-        if let Err(e) = client.cancel_order(cmd) {
+        if let Err(e) = nautilus_common::recovery_trace::native_transport(
+            &client.client_id().to_string(),
+            "execution.cancel_order",
+            &cmd.clone(),
+            || client.cancel_order(cmd),
+        ) {
             log::error!("Error canceling order: {e}");
         }
     }
@@ -2748,7 +2808,12 @@ impl ExecutionEngine {
 
         log_info!("Cancel all{side_str}orders", color = LogColor::Blue);
 
-        if let Err(e) = client.cancel_all_orders(venue_command) {
+        if let Err(e) = nautilus_common::recovery_trace::native_transport(
+            &client.client_id().to_string(),
+            "execution.cancel_all_orders",
+            &venue_command.clone(),
+            || client.cancel_all_orders(venue_command),
+        ) {
             log::error!("Error canceling all orders: {e}");
         }
 
@@ -2849,7 +2914,7 @@ impl ExecutionEngine {
                     order.instrument_id(),
                     order.client_order_id(),
                     order.venue_order_id(),
-                    UUID4::new(),
+                    nautilus_common::recovery_trace::native_event_uuid(),
                     command.ts_init,
                     command.params.clone(),
                     correlation_id,
@@ -2874,7 +2939,7 @@ impl ExecutionEngine {
             command.strategy_id,
             command.instrument_id,
             command.order_side,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             command.ts_init,
             command.params.clone(),
             command.correlation_id.or(Some(command.command_id)),
@@ -2895,7 +2960,12 @@ impl ExecutionEngine {
             color = LogColor::Blue
         );
 
-        if let Err(e) = client.batch_cancel_orders(cmd) {
+        if let Err(e) = nautilus_common::recovery_trace::native_transport(
+            &client.client_id().to_string(),
+            "execution.batch_cancel_orders",
+            &cmd.clone(),
+            || client.batch_cancel_orders(cmd),
+        ) {
             log::error!("Error batch canceling orders: {e}");
         }
     }
@@ -2903,7 +2973,12 @@ impl ExecutionEngine {
     fn handle_query_account(&self, client: &dyn ExecutionClient, cmd: QueryAccount) {
         log_info!("Query {}", cmd.account_id, color = LogColor::Blue);
 
-        if let Err(e) = client.query_account(cmd) {
+        if let Err(e) = nautilus_common::recovery_trace::native_transport(
+            &client.client_id().to_string(),
+            "execution.query_account",
+            &cmd.clone(),
+            || client.query_account(cmd),
+        ) {
             log::warn!("Error querying account: {e}");
         }
     }
@@ -2911,7 +2986,12 @@ impl ExecutionEngine {
     fn handle_query_order(&self, client: &dyn ExecutionClient, cmd: QueryOrder) {
         log_info!("Query {}", cmd.client_order_id, color = LogColor::Blue);
 
-        if let Err(e) = client.query_order(cmd) {
+        if let Err(e) = nautilus_common::recovery_trace::native_transport(
+            &client.client_id().to_string(),
+            "execution.query_order",
+            &cmd.clone(),
+            || client.query_order(cmd),
+        ) {
             log::warn!("Error querying order: {e}");
         }
     }
@@ -4360,7 +4440,7 @@ impl ExecutionEngine {
         fill_voided: &OrderFillVoided,
         corrected_qty: Quantity,
     ) -> PositionEvent {
-        let event_id = UUID4::new();
+        let event_id = nautilus_common::recovery_trace::native_event_uuid();
         let ts_init = fill_voided.ts_init;
 
         if position.is_closed() {
@@ -4584,7 +4664,12 @@ impl ExecutionEngine {
         }
 
         let ts_init = self.clock.borrow().timestamp_ns();
-        let event = PositionOpened::create(&position, &fill, UUID4::new(), ts_init);
+        let event = PositionOpened::create(
+            &position,
+            &fill,
+            nautilus_common::recovery_trace::native_event_uuid(),
+            ts_init,
+        );
 
         Ok(vec![PositionEvent::PositionOpened(event)])
     }
@@ -4672,10 +4757,20 @@ impl ExecutionEngine {
         let ts_init = self.clock.borrow().timestamp_ns();
 
         if is_closed {
-            let event = PositionClosed::create(position, fill, UUID4::new(), ts_init);
+            let event = PositionClosed::create(
+                position,
+                fill,
+                nautilus_common::recovery_trace::native_event_uuid(),
+                ts_init,
+            );
             Some(PositionEvent::PositionClosed(event))
         } else {
-            let event = PositionChanged::create(position, fill, UUID4::new(), ts_init);
+            let event = PositionChanged::create(
+                position,
+                fill,
+                nautilus_common::recovery_trace::native_event_uuid(),
+                ts_init,
+            );
             Some(PositionEvent::PositionChanged(event))
         }
     }
@@ -4709,10 +4804,20 @@ impl ExecutionEngine {
         let ts_init = self.clock.borrow().timestamp_ns();
 
         if position.is_closed() {
-            let event = PositionClosed::create(&position, fill, UUID4::new(), ts_init);
+            let event = PositionClosed::create(
+                &position,
+                fill,
+                nautilus_common::recovery_trace::native_event_uuid(),
+                ts_init,
+            );
             Some(PositionEvent::PositionClosed(event))
         } else {
-            let event = PositionChanged::create(&position, fill, UUID4::new(), ts_init);
+            let event = PositionChanged::create(
+                &position,
+                fill,
+                nautilus_common::recovery_trace::native_event_uuid(),
+                ts_init,
+            );
             Some(PositionEvent::PositionChanged(event))
         }
     }
@@ -4771,7 +4876,11 @@ impl ExecutionEngine {
         };
 
         let (fill_split1, fill_split2) = fill
-            .split_for_position_flip(position.quantity, position_id_flip, UUID4::new())
+            .split_for_position_flip(
+                position.quantity,
+                position_id_flip,
+                nautilus_common::recovery_trace::native_event_uuid(),
+            )
             .expect("Invalid position flip split");
 
         if let Some(position_event) = self.update_position(position, &fill_split1) {
@@ -4848,7 +4957,7 @@ impl ExecutionEngine {
             order.instrument_id(),
             order.client_order_id(),
             "Local execution persistence/authorization barrier failed".into(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             now,
             now,
             false,
@@ -4872,7 +4981,7 @@ impl ExecutionEngine {
             order.instrument_id(),
             order.client_order_id(),
             reason.into(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             self.clock.borrow().timestamp_ns(),
             self.clock.borrow().timestamp_ns(),
         );

@@ -62,7 +62,7 @@ fn checkpoint_manager_restore_keeps_actual_fifo_retries_shapes_and_ages_offline(
     let snapshot = source.checkpoint_inventory(at).unwrap();
     let mut restored = ExecutionManager::new(clock.clone(), cache.clone(), config.clone()).unwrap();
     restored
-        .restore_checkpoint_inventory(&snapshot, 1_000_000_000)
+        .restore_checkpoint_inventory_at(&snapshot, 1_000_000_000, dst::time::Instant::now())
         .unwrap();
     assert_eq!(
         restored
@@ -91,7 +91,11 @@ fn checkpoint_manager_restore_keeps_actual_fifo_retries_shapes_and_ages_offline(
         "offline elapsed time cannot refresh recency"
     );
     assert!(restored.fills_recent.within(&fill, Duration::from_secs(2)));
-    assert!(restored.restore_checkpoint_inventory(&snapshot, 0).is_err());
+    assert!(
+        restored
+            .restore_checkpoint_inventory_at(&snapshot, 0, dst::time::Instant::now())
+            .is_err()
+    );
     let mut broken = snapshot.clone();
     let duplicate = broken["fills_processed"][0].clone();
     broken["fills_processed"]
@@ -99,11 +103,19 @@ fn checkpoint_manager_restore_keeps_actual_fifo_retries_shapes_and_ages_offline(
         .unwrap()
         .push(duplicate);
     let mut fresh = ExecutionManager::new(clock.clone(), cache.clone(), config.clone()).unwrap();
-    assert!(fresh.restore_checkpoint_inventory(&broken, 0).is_err());
+    assert!(
+        fresh
+            .restore_checkpoint_inventory_at(&broken, 0, dst::time::Instant::now())
+            .is_err()
+    );
     assert!(!fresh.fills_processed.contains_key(&fill));
     let mut wrong = snapshot.clone();
     wrong["configuration"]["filter_unclaimed_external"] = serde_json::json!(true);
-    assert!(fresh.restore_checkpoint_inventory(&wrong, 0).is_err());
+    assert!(
+        fresh
+            .restore_checkpoint_inventory_at(&wrong, 0, dst::time::Instant::now())
+            .is_err()
+    );
     source.order_query_pending.insert(first);
     assert!(
         source

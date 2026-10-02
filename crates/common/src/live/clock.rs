@@ -50,10 +50,12 @@ struct TimerRestoreSpec {
 }
 
 struct LiveRestoredTimers {
+    clock_id: Option<nautilus_core::UUID4>,
     pause: super::checkpoint::PausedCallbacks,
     source: serde_json::Value,
     tokens: BTreeMap<u64, (String, u64, u64, crate::runner::TimeEventCallbackToken)>,
     inspectors: Vec<TimerInspector>,
+    updaters: BTreeMap<String, Box<dyn Fn(u64, bool) -> anyhow::Result<()>>>,
     restored: std::cell::RefCell<serde_json::Value>,
 }
 impl std::fmt::Debug for LiveRestoredTimers {
@@ -70,7 +72,8 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
     fn verify(&self) -> anyhow::Result<()> {
         self.pause.verify()?;
         anyhow::ensure!(
-            running_timer_inventory(&self.inspectors)? == *self.restored.try_borrow()?,
+            running_timer_inventory(&self.inspectors, self.clock_id)?
+                == *self.restored.try_borrow()?,
             "restored native timer schedules changed while retained"
         );
         Ok(())
@@ -82,14 +85,22 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
         cleanup: bool,
     ) -> anyhow::Result<crate::runner::TimeEventMessage> {
         self.verify()?;
-        let (name, interval, next, token) =
-            self.tokens.get(&source_binding_id).ok_or_else(|| {
-                anyhow::anyhow!("source timer callback binding is not in this actual clock")
-            })?;
+        let (name, interval, _, token) = self.tokens.get(&source_binding_id).ok_or_else(|| {
+            anyhow::anyhow!("source timer callback binding is not in this actual clock")
+        })?;
+        let inventory = self.historical_inventory()?;
+        let next = inventory["timers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|timer| timer["name"].as_str() == Some(name))
+            .unwrap()["next_time_ns"]
+            .as_u64()
+            .unwrap();
         anyhow::ensure!(
             event.name.as_str() == name
-                && event.ts_event.as_u64() <= *next
-                && (*next - event.ts_event.as_u64()) % interval == 0,
+                && event.ts_event.as_u64() <= next
+                && (next - event.ts_event.as_u64()) % interval == 0,
             "pending time event does not match its source owner schedule"
         );
         let lease = token
@@ -97,12 +108,98 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
             .ok_or_else(|| anyhow::anyhow!("restored timer callback closed"))?;
         // Acquiring this actual queued message increments the same native token
         // lease count. Only this known change becomes the next retained state.
-        *self.restored.try_borrow_mut()? = running_timer_inventory(&self.inspectors)?;
+        *self.restored.try_borrow_mut()? =
+            running_timer_inventory(&self.inspectors, self.clock_id)?;
         Ok(if cleanup {
             crate::runner::TimeEventMessage::cleanup(event, lease)
         } else {
             crate::runner::TimeEventMessage::registered(event, lease)
         })
+    }
+    fn historical_inventory(&self) -> anyhow::Result<serde_json::Value> {
+        self.pause.verify()?;
+        let mut actual = running_timer_inventory(&self.inspectors, self.clock_id)?;
+        for timer in actual["timers"]
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("timer inventory absent"))?
+        {
+            let name = timer["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("timer name absent"))?;
+            let (source_id, (_, _, _, token)) = self
+                .tokens
+                .iter()
+                .find(|(_, (registered, _, _, _))| registered == name)
+                .ok_or_else(|| anyhow::anyhow!("actual timer has no retained source binding"))?;
+            anyhow::ensure!(
+                timer["binding"] == token.checkpoint_inventory(),
+                "actual timer callback was replaced"
+            );
+            timer["binding"]["binding_id"] = (*source_id).into();
+        }
+        Ok(actual)
+    }
+    fn apply_historical_inventory(&self, desired: &serde_json::Value) -> anyhow::Result<()> {
+        self.pause.verify()?;
+        let actual = self.historical_inventory()?;
+        let mut unchanged = desired.clone();
+        let desired_timers = desired["timers"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("historical timers absent"))?;
+        let actual_timers = actual["timers"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("actual timers absent"))?;
+        anyhow::ensure!(
+            desired_timers.len() == actual_timers.len(),
+            "historical timer registration changed"
+        );
+        let mut updates = Vec::new();
+        for (desired_timer, actual_timer) in desired_timers.iter().zip(actual_timers) {
+            let name = desired_timer["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("historical timer name absent"))?;
+            let next = desired_timer["next_time_ns"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("historical next deadline absent"))?;
+            let exhausted = match desired_timer["status"].as_str() {
+                Some("active") => false,
+                Some("exhausted") => true,
+                _ => anyhow::bail!("historical timer status unsupported"),
+            };
+            let replacement = unchanged["timers"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|timer| timer["name"].as_str() == Some(name))
+                .unwrap();
+            replacement["next_time_ns"] = actual_timer["next_time_ns"].clone();
+            replacement["status"] = actual_timer["status"].clone();
+            anyhow::ensure!(
+                self.updaters.contains_key(name),
+                "historical timer owner changed"
+            );
+            updates.push((name.to_owned(), next, exhausted));
+        }
+        anyhow::ensure!(
+            unchanged == actual,
+            "historical timer configuration, owner or pending callback count changed"
+        );
+        for (name, next, exhausted) in updates {
+            self.updaters[&name](next, exhausted)?;
+        }
+        *self.restored.try_borrow_mut()? =
+            running_timer_inventory(&self.inspectors, self.clock_id)?;
+        anyhow::ensure!(
+            self.historical_inventory()? == *desired,
+            "actual historical timer advancement disagrees"
+        );
+        Ok(())
+    }
+    fn refresh_after_historical_dispatch(&self) -> anyhow::Result<()> {
+        self.pause.verify()?;
+        *self.restored.try_borrow_mut()? =
+            running_timer_inventory(&self.inspectors, self.clock_id)?;
+        Ok(())
     }
     fn resume(self: Box<Self>) -> anyhow::Result<()> {
         self.verify()?;
@@ -119,6 +216,8 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
 /// The clock holds thread-local runtime state and must remain on its originating thread.
 #[derive(Debug)]
 pub struct LiveClock {
+    native_clock_id: nautilus_core::UUID4,
+    restored_clock_id: Option<nautilus_core::UUID4>,
     checkpoint_gate: super::checkpoint::CheckpointGate,
     checkpoint_read_time: std::rc::Rc<std::cell::Cell<Option<UnixNanos>>>,
     time: &'static AtomicTime,
@@ -133,6 +232,8 @@ impl LiveClock {
     #[must_use]
     pub fn new(sender: Option<Arc<dyn TimeEventSender>>) -> Self {
         Self {
+            native_clock_id: nautilus_core::UUID4::new(),
+            restored_clock_id: None,
             checkpoint_gate: Default::default(),
             checkpoint_read_time: Default::default(),
             time: get_atomic_clock_realtime(),
@@ -167,6 +268,7 @@ impl Default for LiveClock {
 type TimerInspector = Box<dyn Fn() -> anyhow::Result<serde_json::Value>>;
 
 struct LiveClockCheckpoint {
+    clock_id: Option<nautilus_core::UUID4>,
     frozen: super::checkpoint::FrozenCallbacks,
     inventory: serde_json::Value,
     inspectors: Vec<TimerInspector>,
@@ -180,12 +282,20 @@ impl std::fmt::Debug for LiveClockCheckpoint {
             .finish()
     }
 }
-fn running_timer_inventory(inspectors: &[TimerInspector]) -> anyhow::Result<serde_json::Value> {
+fn running_timer_inventory(
+    inspectors: &[TimerInspector],
+    clock_id: Option<nautilus_core::UUID4>,
+) -> anyhow::Result<serde_json::Value> {
     let timers = inspectors
         .iter()
         .map(|inspect| inspect())
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(serde_json::json!({"profile":"live_clock_frozen_registered_schedules.v1","timers":timers}))
+    let mut value =
+        serde_json::json!({"profile":"live_clock_frozen_registered_schedules.v1","timers":timers});
+    if let Some(clock_id) = clock_id {
+        value["native_clock_id"] = serde_json::to_value(clock_id)?;
+    }
+    Ok(value)
 }
 impl crate::clock::TimerCheckpoint for LiveClockCheckpoint {
     fn inventory(&self) -> &serde_json::Value {
@@ -198,7 +308,7 @@ impl crate::clock::TimerCheckpoint for LiveClockCheckpoint {
             "clock checkpoint read view changed"
         );
         anyhow::ensure!(
-            running_timer_inventory(&self.inspectors)? == self.inventory,
+            running_timer_inventory(&self.inspectors, self.clock_id)? == self.inventory,
             "registered timer state changed during checkpoint"
         );
         self.frozen.verify()
@@ -318,6 +428,11 @@ impl Clock for LiveClock {
             );
             Some(callback)
         };
+        let restored_clock_id = inventory
+            .get("native_clock_id")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
         let sender = self.resolve_time_event_sender();
         anyhow::ensure!(
             specs.is_empty() || sender.is_some(),
@@ -353,17 +468,25 @@ impl Clock for LiveClock {
             );
             self.timers.insert(Ustr::from(spec.name.as_str()), timer);
         }
+        let updaters = self
+            .timers
+            .iter()
+            .map(|(name, timer)| Ok((name.to_string(), timer.historical_schedule_updater()?)))
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
         let inspectors = self
             .timers
             .values()
             .map(LiveTimer::checkpoint_inspector)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let restored = running_timer_inventory(&inspectors)?;
+        self.restored_clock_id = restored_clock_id;
+        let restored = running_timer_inventory(&inspectors, restored_clock_id)?;
         Ok(Box::new(LiveRestoredTimers {
+            clock_id: restored_clock_id,
             pause,
             source: inventory.clone(),
             tokens,
             inspectors,
+            updaters,
             restored: std::cell::RefCell::new(restored),
         }))
     }
@@ -382,9 +505,11 @@ impl Clock for LiveClock {
             .values()
             .map(LiveTimer::checkpoint_inspector)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let inventory = running_timer_inventory(&inspectors)?;
+        let clock_id = Some(self.restored_clock_id.unwrap_or(self.native_clock_id));
+        let inventory = running_timer_inventory(&inspectors, clock_id)?;
         frozen.verify()?;
         Ok(Box::new(LiveClockCheckpoint {
+            clock_id,
             frozen,
             inventory,
             inspectors,
@@ -394,27 +519,50 @@ impl Clock for LiveClock {
     }
 
     fn timestamp_ns(&self) -> UnixNanos {
-        self.checkpoint_read_time
+        let actual = self
+            .checkpoint_read_time
             .get()
-            .unwrap_or_else(|| self.time.get_time_ns())
+            .unwrap_or_else(|| self.time.get_time_ns());
+        UnixNanos::from(crate::recovery_trace::native_clock_read(
+            self.restored_clock_id.unwrap_or(self.native_clock_id),
+            "timestamp_ns",
+            actual.as_u64(),
+        ))
     }
 
     fn timestamp_us(&self) -> u64 {
-        self.checkpoint_read_time
+        let actual = self
+            .checkpoint_read_time
             .get()
-            .map_or_else(|| self.time.get_time_us(), |time| time.as_u64() / 1_000)
+            .map_or_else(|| self.time.get_time_us(), |time| time.as_u64() / 1_000);
+        crate::recovery_trace::native_clock_read(
+            self.restored_clock_id.unwrap_or(self.native_clock_id),
+            "timestamp_us",
+            actual,
+        )
     }
 
     fn timestamp_ms(&self) -> u64 {
-        self.checkpoint_read_time
+        let actual = self
+            .checkpoint_read_time
             .get()
-            .map_or_else(|| self.time.get_time_ms(), |time| time.as_u64() / 1_000_000)
+            .map_or_else(|| self.time.get_time_ms(), |time| time.as_u64() / 1_000_000);
+        crate::recovery_trace::native_clock_read(
+            self.restored_clock_id.unwrap_or(self.native_clock_id),
+            "timestamp_ms",
+            actual,
+        )
     }
 
     fn timestamp(&self) -> f64 {
-        self.checkpoint_read_time.get().map_or_else(
+        let actual = self.checkpoint_read_time.get().map_or_else(
             || self.time.get_time(),
             |time| time.as_u64() as f64 / 1_000_000_000.0,
+        );
+        crate::recovery_trace::native_clock_read(
+            self.restored_clock_id.unwrap_or(self.native_clock_id),
+            "timestamp",
+            actual,
         )
     }
 
@@ -812,7 +960,11 @@ mod tests {
     }
 
     #[rstest]
-    fn actual_checkpoint_timer_restore_preserves_overdue_frontier_and_owner_callback_fifo() {
+    #[case(false)]
+    #[case(true)]
+    fn actual_checkpoint_timer_restore_preserves_overdue_frontier_and_owner_callback_fifo(
+        #[case] advance_history: bool,
+    ) {
         let (source_tx, source_rx) = mpsc::channel();
         let mut source = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(source_tx))));
         source.register_default_handler(TimeEventCallback::RustLocal(std::rc::Rc::new(|_| {})));
@@ -879,12 +1031,23 @@ mod tests {
             source_binding
         );
         restored_tx.send(pending).unwrap();
+        let expected_next = if advance_history {
+            let mut advanced = receipt.historical_inventory().unwrap();
+            let timer = &mut advanced["timers"][0];
+            let next = nominal_next + timer["interval_ns"].as_u64().unwrap() * 4;
+            timer["next_time_ns"] = next.into();
+            receipt.apply_historical_inventory(&advanced).unwrap();
+            receipt.verify().unwrap();
+            next
+        } else {
+            nominal_next
+        };
         receipt.resume().unwrap();
         let first = restored_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(first.event(), &source_event);
         assert!(first.dispatch());
         let next = restored_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(next.event().ts_event.as_u64(), nominal_next);
+        assert_eq!(next.event().ts_event.as_u64(), expected_next);
         assert!(next.dispatch());
         assert_eq!(count.get(), 2);
         restored.cancel_timers();

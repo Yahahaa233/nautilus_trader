@@ -21,6 +21,7 @@ crate-type = ["rlib"]
 
 [features]
 default = []
+live = ["nautilus-common/live"]
 defi = ["nautilus-model/defi"]
 examples = ["nautilus-indicators"]
 high-precision = ["nautilus-model/high-precision"]

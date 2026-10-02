@@ -93,7 +93,6 @@ use nautilus_common::{
         Cache,
         database::{CacheDatabaseAdapter, CacheDatabaseFactory},
     },
-    clients::ExecutionClient,
     component::Component,
     enums::{Environment, LogColor},
     live::dst,
@@ -119,7 +118,7 @@ use nautilus_model::{
     orders::Order,
 };
 use nautilus_network::mode::ReconnectRequestOutcome;
-#[cfg(feature = "python")]
+#[cfg(any(feature = "python", feature = "native-tail-replay"))]
 use nautilus_system::trader::Trader;
 use nautilus_system::{config::NautilusKernelConfig, kernel::NautilusKernel};
 use nautilus_trading::{
@@ -178,6 +177,10 @@ mod running_checkpoint;
 pub use running_checkpoint::{
     RunningCheckpointBoundary, RunningCheckpointInventory, RunningCheckpointSchedule,
 };
+#[cfg(feature = "native-tail-replay")]
+mod native_tail;
+#[cfg(feature = "native-tail-replay")]
+pub use native_tail::NativeTailReplayReceipt;
 mod state;
 
 use builder::ExternalMessageBusIngress;
@@ -246,6 +249,15 @@ pub struct LiveNode {
     recovery_adapter_source: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     #[cfg(feature = "dispatch-observer")]
     recovery_engine_source: Option<serde_json::Value>,
+    #[cfg(feature = "native-tail-replay")]
+    historical_replay: Option<nautilus_event_store::native_trace::NativeHistoricalRootReplay>,
+    #[cfg(feature = "native-tail-replay")]
+    historical_timer_admissions: Vec<(String, u64, bool, nautilus_common::timer::TimeEvent, u64)>,
+    #[cfg(feature = "native-tail-replay")]
+    recovery_engine_time: Option<(dst::time::Instant, u64)>,
+    #[cfg(feature = "native-tail-replay")]
+    native_report_contexts:
+        std::cell::RefCell<std::collections::BTreeMap<String, serde_json::Value>>,
     runner: Option<AsyncRunner>,
     config: LiveNodeConfig,
     handle: LiveNodeHandle,
@@ -257,6 +269,8 @@ pub struct LiveNode {
     stream_processors: Vec<StreamProcessor>,
     shutdown_deadline: Option<dst::time::Instant>,
     contain_event_store_failure: bool,
+    #[cfg(feature = "dispatch-observer")]
+    dispatch_failure: std::cell::Cell<bool>,
     #[cfg(feature = "plugin")]
     plugins: plugin::NodePlugins,
 }
@@ -271,7 +285,7 @@ macro_rules! begin_node_dispatch {
                 Ok(guard) => guard,
                 Err(error) => {
                     log::error!("Dispatch begin failed: {error:#}");
-                    $node.handle.stop();
+                    $node.fail_native_dispatch(&format!("dispatch begin failed: {error:#}"));
                     return $fallback;
                 }
             }
@@ -289,9 +303,9 @@ macro_rules! complete_node_dispatch {
     ($node:expr, $guard:expr) => {{
         #[cfg(feature = "dispatch-observer")]
         if let Some(guard) = $guard {
-            if let Err(error) = guard.complete() {
+            if let Err(error) = $node.finish_node_dispatch(guard) {
                 log::error!("Dispatch completion failed: {error:#}");
-                $node.handle.stop();
+                $node.fail_native_dispatch(&format!("dispatch completion failed: {error:#}"));
             }
         }
         #[cfg(not(feature = "dispatch-observer"))]
@@ -302,6 +316,288 @@ macro_rules! complete_node_dispatch {
 }
 
 impl LiveNode {
+    /// Opens this fresh node's actual Journal before its first native root and
+    /// binds the recorder issued by that same store. Registered components stay
+    /// unstarted and native trading stays Halted; normal start consumes the same
+    /// owned Journal continuation exactly once.
+    #[cfg(feature = "native-tail-replay")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_owned_native_trace(
+        &mut self,
+        logical_run: String,
+        configuration_digest: String,
+        codec_profile: String,
+        registered_profile_digest: String,
+        witnesses: impl Fn(
+            crate::dispatch::DispatchSource,
+            &str,
+            &dyn Any,
+        )
+            -> anyhow::Result<Vec<nautilus_common::recovery_trace::NativeReadWitness>>
+        + 'static,
+        verify_witnesses: impl Fn(
+            &[nautilus_common::recovery_trace::NativeReadWitness],
+        ) -> anyhow::Result<()>
+        + 'static,
+    ) -> anyhow::Result<nautilus_event_store::native_trace::NativeTraceRecorder> {
+        anyhow::ensure!(
+            self.state() == NodeState::Idle
+                && !self.handle.should_stop()
+                && !self.recovery_requires_release
+                && self.dispatch_observer.is_some(),
+            "fresh owned native trace requires an unused node and strict observer"
+        );
+        self.kernel
+            .risk_engine
+            .try_borrow_mut()?
+            .set_trading_state(nautilus_model::enums::TradingState::Halted);
+        self.kernel.open_event_store_for_paused_recovery()?;
+        let store = self
+            .kernel
+            .event_store()
+            .context("actual native source Journal missing")?;
+        let source = nautilus_common::recovery_trace::NativeTraceSource {
+            schema_version: 1,
+            node_instance: self.kernel.instance_id(),
+            process_incarnation: nautilus_common::recovery_trace::native_event_uuid(),
+            journal_run: store
+                .run_id()
+                .context("actual native source Journal not opened")?
+                .to_owned(),
+            logical_run,
+            configuration_digest,
+            codec_profile,
+            registered_profile_digest,
+        };
+        let owned_handle = store.native_trace_handle(source);
+        let result = (|| {
+            let handle = owned_handle?;
+            let recorder = handle
+                .downcast::<nautilus_event_store::native_trace::NativeTraceRecorder>()
+                .map_err(|_| {
+                    anyhow::anyhow!("owned Journal returned an unsupported native trace type")
+                })?;
+            self.set_native_recovery_trace((*recorder).clone(), witnesses, verify_witnesses)?;
+            Ok((*recorder).clone())
+        })();
+        if let Err(error) = &result {
+            self.fail_native_dispatch(&format!("owned native trace preparation failed: {error:#}"));
+        }
+        result
+    }
+
+    /// Binds actual Journal tracing before any native startup or runner dispatch.
+    /// All unsupported source read dependencies must fail in the witness collector.
+    /// This does not authorize submissions or replace the ordinary current observation phase.
+    ///
+    /// # Errors
+    /// Refuses a changed installation, absent observer, non-idle node or a prior source root.
+    #[cfg(feature = "native-tail-replay")]
+    pub fn set_native_recovery_trace(
+        &mut self,
+        recorder: nautilus_event_store::native_trace::NativeTraceRecorder,
+        witnesses: impl Fn(
+            crate::dispatch::DispatchSource,
+            &str,
+            &dyn Any,
+        )
+            -> anyhow::Result<Vec<nautilus_common::recovery_trace::NativeReadWitness>>
+        + 'static,
+        verify_witnesses: impl Fn(
+            &[nautilus_common::recovery_trace::NativeReadWitness],
+        ) -> anyhow::Result<()>
+        + 'static,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.state() == NodeState::Idle && !self.handle.should_stop(),
+            "native source trace requires a fresh idle node"
+        );
+        anyhow::ensure!(
+            self.config.queue_monitor.is_none(),
+            "native history queue-monitor state profile is not installed"
+        );
+        let source = recorder.source()?;
+        anyhow::ensure!(
+            source.node_instance == self.kernel.instance_id()
+                && self.kernel.event_store().and_then(|store| store.run_id())
+                    == Some(source.journal_run.as_str()),
+            "native trace is not the actual node Journal installation"
+        );
+        let actual_risk = self.kernel.risk_engine.clone();
+        let actual_clock = self.kernel.clock.clone();
+        let actual_trader = self.kernel.trader.clone();
+        self.dispatch_observer.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("native trace requires the node dispatch observer"))?
+            .attach_native_trace(recorder, move |source, phase, input| {
+                let mut found = witnesses(source, phase, input)?;
+                anyhow::ensure!(!found.iter().any(|witness| witness.component_id.starts_with("native:")),
+                    "caller cannot substitute the native risk witness");
+                found.push(nautilus_common::recovery_trace::NativeReadWitness {
+                    component_id: "native:risk_engine".into(), profile: "native_risk_business_state.v1".into(),
+                    source_version: "native_actual_registered_engine.v1".into(),
+                    payload: serde_json::json!({"trading_state":actual_risk.try_borrow()?.trading_state()}),
+                });
+                let timers = recovery_quiescence::with_registered_timer_inventory_mode(
+                    &actual_clock, &actual_trader, false, |_, inventory, verify, _| {
+                        verify()?; Ok(inventory.clone())
+                    })?;
+                let mut timer_input = serde_json::Value::Null;
+                if source == crate::dispatch::DispatchSource::Time {
+                    let message = input.downcast_ref::<TimeEventMessage>().context("actual timer message absent")?;
+                    let binding = message.checkpoint_callback_binding();
+                    let id = binding["binding_id"].as_u64().context("historical timer is not an owner callback")?;
+                    let owners = timers.iter().filter(|(_, inventory)| inventory["timers"].as_array()
+                        .is_some_and(|entries| entries.iter().any(|entry| entry["binding"]["binding_id"].as_u64() == Some(id))))
+                        .map(|(owner, _)| owner.clone()).collect::<Vec<_>>();
+                    anyhow::ensure!(owners.len() == 1, "actual timer owner binding is missing or ambiguous");
+                    let event = message.event();
+                    timer_input = serde_json::json!({"owner":owners[0],"binding":binding,
+                        "event":{"name":event.name,"event_id":event.event_id,"ts_event":event.ts_event,"ts_init":event.ts_init}});
+                }
+                found.push(nautilus_common::recovery_trace::NativeReadWitness {
+                    component_id: "native:timers".into(), profile: "actual_registered_owner_timer_input.v1".into(),
+                    source_version: "native_actual_registered_clock.v1".into(),
+                    payload: serde_json::json!({"inventory":timers,"input":timer_input,"captured_at_ns":nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64}),
+                });
+                Ok(found)
+            }, move |found| {
+                let external = found.iter().filter(|witness| !witness.component_id.starts_with("native:")).cloned().collect::<Vec<_>>();
+                verify_witnesses(&external)
+            })?;
+        self.bind_native_ingress_codec()
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    fn bind_native_ingress_codec(&self) -> anyhow::Result<()> {
+        let observer = self
+            .dispatch_observer
+            .as_ref()
+            .context("native derived ingress observer absent")?
+            .handle();
+        nautilus_common::recovery_trace::set_native_ingress_encoder(move |source, input| {
+            Ok(observer
+                .encode_historical_source(
+                    dispatch::source_dispatch(source)?,
+                    "native_enqueue",
+                    input,
+                )?
+                .payload)
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "dispatch-observer")]
+    fn finish_node_dispatch(&self, guard: dispatch::NodeDispatchGuard) -> anyhow::Result<()> {
+        #[cfg(feature = "native-tail-replay")]
+        if guard.requires_native_effects() {
+            if let Some(replay) = &self.historical_replay {
+                let timers = self
+                    .recovery_timers
+                    .as_ref()
+                    .context("historical native owner clocks missing")?;
+                timers.refresh_historical_dispatch()?;
+                let expected = replay.expected_effects()?;
+                let scheduled = serde_json::from_value(expected["registered_timers"].clone())?;
+                self.admit_historical_native_timers(
+                    &scheduled,
+                    expected["timer_capture_ns"]
+                        .as_u64()
+                        .context("original timer boundary absent")?,
+                )?;
+            }
+            let effects = self.collect_native_trace_effects()?;
+            return guard.complete_native(effects);
+        }
+        guard.complete()
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    fn collect_native_trace_effects(&self) -> anyhow::Result<serde_json::Value> {
+        recovery_quiescence::with_registered_timer_inventory_mode(
+            &self.kernel.clock,
+            &self.kernel.trader,
+            false,
+            |_, timers, verify, _| {
+                let timer_capture_ns = if let Some(replay) = &self.historical_replay {
+                    replay.expected_effects()?["timer_capture_ns"]
+                        .as_u64()
+                        .context("source timer capture absent")?
+                } else {
+                    nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64
+                };
+                let cache = self.kernel.cache.try_borrow()?;
+                let mut orders = cache
+                    .orders(None, None, None, None, None)
+                    .iter()
+                    .map(|order| (**order).clone())
+                    .collect::<Vec<_>>();
+                let mut positions = cache
+                    .positions(None, None, None, None, None)
+                    .iter()
+                    .map(|position| (**position).clone())
+                    .collect::<Vec<_>>();
+                let mut accounts = cache.accounts_all_owned();
+                orders.sort_by_key(|order| order.client_order_id());
+                positions.sort_by_key(|position| position.id);
+                accounts.sort_by_key(|account| account.id());
+                let mut instrument_ids = cache
+                    .instrument_ids(None)
+                    .into_iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                instrument_ids.sort();
+                let mut market = Vec::new();
+                for id in &instrument_ids {
+                    let mut bar_types = cache
+                        .bar_types(
+                            Some(id),
+                            None,
+                            nautilus_model::enums::AggregationSource::External,
+                        )
+                        .into_iter()
+                        .copied()
+                        .collect::<Vec<_>>();
+                    bar_types.extend(
+                        cache
+                            .bar_types(
+                                Some(id),
+                                None,
+                                nautilus_model::enums::AggregationSource::Internal,
+                            )
+                            .into_iter()
+                            .copied(),
+                    );
+                    bar_types.sort_by_key(ToString::to_string);
+                    let bars = bar_types
+                        .iter()
+                        .map(|kind| serde_json::json!({"type":kind,"bars":cache.bars(kind)}))
+                        .collect::<Vec<_>>();
+                    market.push(serde_json::json!({"instrument":cache.instrument(id),"quotes":cache.quotes(id),
+                        "trades":cache.trades(id),"marks":cache.mark_prices(id),"index_prices":cache.index_prices(id),
+                        "funding":cache.funding_rates(id),"bars":bars}));
+                }
+                let components = Trader::collect_native_recovery_state(&self.kernel.trader)?;
+                let data = self
+                    .kernel
+                    .data_engine
+                    .try_borrow()?
+                    .running_checkpoint_state()?;
+                let manager = self.exec_manager.trace_effects_inventory(
+                    nautilus_common::recovery_trace::scope::effective_activity_instant(),
+                )?;
+                verify()?;
+                Ok(
+                    serde_json::json!({"schema":"NautilusNativeTraceEffects.v1","timer_capture_ns":timer_capture_ns,
+                    "orders":orders, "positions":positions, "accounts":accounts,"market_cache":market,
+                    "components":components, "data_engine":data, "execution_manager":manager,
+                    "registered_timers":if self.historical_replay.is_some() {
+                        self.recovery_timers.as_ref().context("historical owner timer installation missing")?.historical_inventory()?
+                    } else { timers.clone() }, "report_contexts": &*self.native_report_contexts.try_borrow()?,
+                    "risk_state":nautilus_common::recovery_trace::native_risk_state(self.kernel.risk_engine.try_borrow()?.trading_state())}),
+                )
+            },
+        )
+    }
     /// Installs partial dispatch instrumentation before startup; no recovery authority.
     /// # Errors
     /// Rejects duplicate installation or any non-idle node.
@@ -368,7 +664,7 @@ impl LiveNode {
         let guard = match observer.begin_input(input) {
             Ok(guard) => guard,
             Err(error) => {
-                self.handle.stop();
+                self.fail_native_dispatch(&format!("recovery dispatch begin failed: {error:#}"));
                 return Err(error).context("recovery dispatch begin failed");
             }
         };
@@ -377,7 +673,7 @@ impl LiveNode {
         let result = match result {
             Ok(result) => result,
             Err(panic) => {
-                self.handle.stop();
+                self.fail_native_dispatch("recovery dispatch callback panicked");
                 drop(guard);
                 std::panic::resume_unwind(panic);
             }
@@ -385,13 +681,15 @@ impl LiveNode {
         match result {
             Ok(value) => {
                 if let Err(error) = guard.complete() {
-                    self.handle.stop();
+                    self.fail_native_dispatch(&format!(
+                        "recovery dispatch completion failed: {error:#}"
+                    ));
                     return Err(error).context("recovery dispatch completion failed");
                 }
                 Ok(value)
             }
             Err(error) => {
-                self.handle.stop();
+                self.fail_native_dispatch(&format!("recovery dispatch callback failed: {error:#}"));
                 if let Err(abort_error) = guard.rejected() {
                     return Err(error).context(format!(
                         "recovery dispatch callback failed and abort could not be recorded: {abort_error:#}"
@@ -502,11 +800,52 @@ impl LiveNode {
         source: crate::dispatch::DispatchSource,
         input: &dyn std::any::Any,
     ) -> anyhow::Result<Option<dispatch::NodeDispatchGuard>> {
+        #[cfg(feature = "native-tail-replay")]
+        if let Some(replay) = &self.historical_replay {
+            let begin = replay.next_begin()?;
+            let nautilus_common::recovery_trace::NativeTraceRecord::Begin { phase, .. } = &begin
+            else {
+                anyhow::bail!("historical native input missing Begin")
+            };
+            let observer = self
+                .dispatch_observer
+                .as_ref()
+                .context("historical native observer absent")?;
+            let encoded = observer.encode_historical_source(source, phase, input)?;
+            let historical = replay.begin(dispatch::native_source(source)?, &encoded.payload)?;
+            let mut guard = observer.begin_input(crate::dispatch::DispatchInput {
+                source: crate::dispatch::DispatchSource::Replay,
+                phase: "verified_native_tail".into(),
+                payload: serde_json::to_value(&begin)?,
+                batch_index: None,
+            })?;
+            guard.attach_historical(historical)?;
+            return Ok(Some(guard));
+        }
         let phase = format!("{:?}", self.state());
         self.dispatch_observer
             .as_ref()
             .map(|observer| observer.begin(source, &phase, input))
             .transpose()
+    }
+
+    /// All instrumentation failures close the same actual instance before any
+    /// application callback. Stop alone is not containment or durable retention.
+    #[cfg(feature = "dispatch-observer")]
+    fn fail_native_dispatch(&self, reason: &str) {
+        self.dispatch_failure.set(true);
+        if let Err(error) = self.kernel.contain_native_failure(reason) {
+            log::error!("Native failure retention refused: {error:#}");
+        }
+        if let Some(registration) = &self.recovery_observation {
+            let fence = registration.fence.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fence(reason)));
+        }
+        if let Some(registration) = &self.running_checkpoint {
+            let fence = registration.fence.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fence(reason)));
+        }
+        self.handle.stop();
     }
 
     fn note_dispatch_gap(&self, reason: &str) -> bool {
@@ -515,7 +854,7 @@ impl LiveNode {
             && let Err(error) = observer.uncovered(reason)
         {
             log::error!("Dispatch coverage recording failed: {error:#}");
-            self.handle.stop();
+            self.fail_native_dispatch(&format!("dispatch coverage failed: {error:#}"));
             return false;
         }
         #[cfg(not(feature = "dispatch-observer"))]
@@ -530,6 +869,17 @@ impl LiveNode {
     /// Event-store write failures can happen while the node is otherwise idle, so the running
     /// loop must poll this state independently of business-message traffic. A halted store is
     /// never treated as a recoverable transient condition by the live node.
+    fn is_native_historical_dispatch(&self) -> bool {
+        #[cfg(feature = "native-tail-replay")]
+        {
+            self.historical_replay.is_some()
+        }
+        #[cfg(not(feature = "native-tail-replay"))]
+        {
+            false
+        }
+    }
+
     fn event_store_halted(&self) -> bool {
         self.kernel
             .event_store()
@@ -581,7 +931,9 @@ impl LiveNode {
             }
         }
         #[cfg(feature = "dispatch-observer")]
-        if let Some(timers) = &self.recovery_timers {
+        if let Some(timers) = &self.recovery_timers
+            && !self.is_native_historical_dispatch()
+        {
             if let Err(error) = timers.received(&message) {
                 self.fail_recovery_observation(&format!("{error:#}"));
                 return false;
@@ -593,20 +945,21 @@ impl LiveNode {
         if !dispatched && !cleanup {
             if let Some(guard) = guard {
                 let _ = guard.rejected();
-                self.handle.stop();
+                self.fail_native_dispatch("registered timer dispatch was rejected");
             }
             return false;
         }
         #[cfg(feature = "dispatch-observer")]
         {
             if let Some(guard) = guard
-                && let Err(error) = guard.complete()
+                && let Err(error) = self.finish_node_dispatch(guard)
             {
                 log::error!("Timer dispatch completion failed: {error:#}");
-                self.handle.stop();
+                self.fail_native_dispatch(&format!("timer completion failed: {error:#}"));
                 return false;
             }
             if let Some(timers) = &self.recovery_timers
+                && !self.is_native_historical_dispatch()
                 && let Err(error) = timers.processed(retained_event_id)
             {
                 self.fail_recovery_observation(&format!("{error:#}"));
@@ -675,6 +1028,14 @@ impl LiveNode {
             recovery_adapter_source: None,
             #[cfg(feature = "dispatch-observer")]
             recovery_engine_source: None,
+            #[cfg(feature = "native-tail-replay")]
+            historical_replay: None,
+            #[cfg(feature = "native-tail-replay")]
+            historical_timer_admissions: Vec::new(),
+            #[cfg(feature = "native-tail-replay")]
+            recovery_engine_time: None,
+            #[cfg(feature = "native-tail-replay")]
+            native_report_contexts: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
@@ -686,6 +1047,8 @@ impl LiveNode {
             stream_processors: Vec::new(),
             shutdown_deadline: None,
             contain_event_store_failure: false,
+            #[cfg(feature = "dispatch-observer")]
+            dispatch_failure: std::cell::Cell::new(false),
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
         }
@@ -778,6 +1141,14 @@ impl LiveNode {
             recovery_adapter_source: None,
             #[cfg(feature = "dispatch-observer")]
             recovery_engine_source: None,
+            #[cfg(feature = "native-tail-replay")]
+            historical_replay: None,
+            #[cfg(feature = "native-tail-replay")]
+            historical_timer_admissions: Vec::new(),
+            #[cfg(feature = "native-tail-replay")]
+            recovery_engine_time: None,
+            #[cfg(feature = "native-tail-replay")]
+            native_report_contexts: std::cell::RefCell::new(std::collections::BTreeMap::new()),
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
@@ -789,6 +1160,8 @@ impl LiveNode {
             stream_processors: Vec::new(),
             shutdown_deadline: None,
             contain_event_store_failure: false,
+            #[cfg(feature = "dispatch-observer")]
+            dispatch_failure: std::cell::Cell::new(false),
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
         };
@@ -1450,13 +1823,36 @@ impl LiveNode {
     }
 
     fn process_socket_reconnect(&self, command: ReconnectSocket) {
-        let outcome = if command.trader_id == self.config.trader_id {
-            Self::request_socket_reconnect(
-                self.socket_registry
-                    .get(command.client_id, command.endpoint),
-            )
-        } else {
-            SocketReconnectDispatchOutcome::InvalidTrader
+        let mut actual = SocketReconnectDispatchOutcome::Accepted;
+        let result = nautilus_common::recovery_trace::native_transport(
+            command.client_id.as_str(),
+            "socket.request_reconnect",
+            &serde_json::json!({"trader_id":command.trader_id,"client_id":command.client_id,
+                "endpoint":command.endpoint,"ts_init":command.ts_init}),
+            || {
+                actual = if command.trader_id == self.config.trader_id {
+                    Self::request_socket_reconnect(
+                        self.socket_registry
+                            .get(command.client_id, command.endpoint),
+                    )
+                } else {
+                    SocketReconnectDispatchOutcome::InvalidTrader
+                };
+                if actual == SocketReconnectDispatchOutcome::Accepted {
+                    Ok(())
+                } else {
+                    anyhow::bail!("native_socket_outcome:{actual:?}")
+                }
+            },
+        );
+        let outcome = match result {
+            Ok(()) => SocketReconnectDispatchOutcome::Accepted,
+            Err(error) if nautilus_common::recovery_trace::historical_active() => {
+                // The original rejection is preserved as a local disposition. No handle is invoked.
+                log::warn!("Historical socket command kept its original rejection: {error:#}");
+                return;
+            }
+            Err(_) => actual,
         };
 
         if outcome == SocketReconnectDispatchOutcome::Accepted {
@@ -1520,7 +1916,7 @@ impl LiveNode {
             change.venue,
             change.endpoint,
             change.state,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             timestamp,
             timestamp,
         );
@@ -2502,37 +2898,7 @@ impl LiveNode {
 
                     drop(open_order_report_task.take());
 
-                    match result {
-                        ReportTaskOutcome::Completed(result) => {
-                            let client_refs = self
-                                .exec_clients
-                                .iter()
-                                .map(|client| client as &dyn ExecutionClient)
-                                .collect::<Vec<_>>();
-                            let reconciliation = self.exec_manager.reconcile_open_order_reports(
-                                &result.check,
-                                result.reports,
-                                &result.queried_clients,
-                                &result.failed_clients,
-                                &client_refs,
-                            );
-                            self.process_reconciliation_events(&reconciliation.events);
-                            if !reconciliation.targeted_queries.is_empty() {
-                                targeted_order_report_task = Some(
-                                    self.start_targeted_order_report_check(
-                                        reconciliation.targeted_queries,
-                                    ),
-                                );
-                            }
-                        }
-                        ReportTaskOutcome::TimedOut => {
-                            self.cleanup_cancelled_report_tasks(&[]);
-                            log::warn!(
-                                "Open-order report collection expired after {:?}",
-                                self.config.timeout_reconciliation,
-                            );
-                        }
-                    }
+                    targeted_order_report_task = self.apply_open_order_report_outcome(result)?;
                     complete_node_dispatch!(self, query_guard);
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
@@ -2552,26 +2918,7 @@ impl LiveNode {
                         .unwrap_or_default();
                     drop(targeted_order_report_task.take());
 
-                    match result {
-                        ReportTaskOutcome::Completed(result) => {
-                            let client_refs = self
-                                .exec_clients
-                                .iter()
-                                .map(|client| client as &dyn ExecutionClient)
-                                .collect::<Vec<_>>();
-                            let events = self
-                                .exec_manager
-                                .reconcile_targeted_order_reports(result, &client_refs);
-                            self.process_reconciliation_events(&events);
-                        }
-                        ReportTaskOutcome::TimedOut => {
-                            self.cleanup_cancelled_report_tasks(&planned_client_order_ids);
-                            log::warn!(
-                                "Targeted order report collection expired after {:?}",
-                                self.config.timeout_reconciliation,
-                            );
-                        }
-                    }
+                    self.apply_targeted_report_outcome(result, &planned_client_order_ids)?;
                     complete_node_dispatch!(self, query_guard);
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
@@ -2587,21 +2934,7 @@ impl LiveNode {
 
                     drop(position_report_task.take());
 
-                    match result {
-                        ReportTaskOutcome::Completed(PositionReportTaskResult::Positions(result)) => {
-                            position_report_task = self.handle_position_report_result(result);
-                        }
-                        ReportTaskOutcome::Completed(PositionReportTaskResult::Fills(result)) => {
-                            self.handle_position_fill_report_result(result);
-                        }
-                        ReportTaskOutcome::TimedOut => {
-                            self.cleanup_cancelled_report_tasks(&[]);
-                            log::warn!(
-                                "Position report collection expired after {:?}",
-                                self.config.timeout_reconciliation,
-                            );
-                        }
-                    }
+                    position_report_task = self.apply_position_report_outcome(result)?;
                     complete_node_dispatch!(self, query_guard);
                     record_runner_maintenance(&metrics, maintenance_start, metrics_start);
                 }
@@ -2612,6 +2945,10 @@ impl LiveNode {
                     let maintenance_now = dst::time::Instant::now();
                     let maintenance_input = self.native_mutation_input("maintenance.tick", &serde_json::json!({
                         "reconciliation_due":recon_enabled && maintenance_now >= recon_next,
+                        "inflight_check_due":reconciliation::reconciliation_check_due(maintenance_now,last_inflight_check,inflight_interval),
+                        "open_check_due":reconciliation::reconciliation_check_due(maintenance_now,last_open_check,open_interval),
+                        "position_check_due":reconciliation::reconciliation_check_due(maintenance_now,last_position_check,position_interval),
+                        "position_before_open":last_position_check < last_open_check,
                         "purge_orders_due":maintenance_now >= purge_orders_next,
                         "purge_positions_due":maintenance_now >= purge_positions_next,
                         "purge_account_due":maintenance_now >= purge_account_next,
@@ -2861,6 +3198,12 @@ impl LiveNode {
         let _ = self.kernel.cache().borrow().check_residuals();
 
         #[cfg(feature = "dispatch-observer")]
+        if self.dispatch_failure.get() && checkpoint_error.is_none() {
+            checkpoint_error = Some(anyhow::anyhow!(
+                "native dispatch failed: run remains unsealed"
+            ));
+        }
+        #[cfg(feature = "dispatch-observer")]
         if checkpoint_error.is_none() && self.running_checkpoint.is_some() {
             let terminal_result =
                 self.final_checkpoint_before_stop(crate::runner::RunningReceivers {
@@ -2943,7 +3286,7 @@ impl LiveNode {
                 transition.state,
                 transition.queue_depth,
                 transition.mean_dispatch_ns,
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 timestamp,
                 timestamp,
             );
@@ -3111,7 +3454,7 @@ impl LiveNode {
         if !dispatched {
             if let Some(guard) = guard {
                 let _ = guard.rejected();
-                self.handle.stop();
+                self.fail_native_dispatch("native execution event was rejected");
             }
             return;
         }
@@ -3437,6 +3780,9 @@ impl LiveNode {
             Ok(input) => input,
             Err(error) => {
                 log::error!("Stop lifecycle input failed: {error:#}");
+                #[cfg(feature = "dispatch-observer")]
+                self.fail_native_dispatch(&format!("stop lifecycle encoding failed: {error:#}"));
+                #[cfg(not(feature = "dispatch-observer"))]
                 self.handle.stop();
                 return;
             }
@@ -4534,6 +4880,7 @@ mod tests {
             DataActor, DataActorCore, data_actor::DataActorConfig, registry::get_actor_unchecked,
         },
         cache::Cache,
+        clients::ExecutionClient,
         clock::{Clock, TestClock},
         enums::SerializationEncoding,
         live::runner::{get_data_event_sender, get_exec_event_sender, get_system_event_sender},
@@ -5280,7 +5627,7 @@ mod tests {
                 )],
                 Vec::new(),
                 true,
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 UnixNanos::default(),
                 UnixNanos::default(),
                 Some(Currency::USDT()),
@@ -5622,7 +5969,7 @@ mod tests {
         }));
 
         let command = GenerateFillReports::new(
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::from(2_000),
             Some(instrument_id),
             None,
@@ -5684,7 +6031,7 @@ mod tests {
         }));
 
         let command = GenerateFillReports::new(
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::from(2_000),
             Some(instrument_id),
             None,
@@ -5754,7 +6101,7 @@ mod tests {
         }));
 
         let command = GenerateFillReports::new(
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::from(2_000),
             Some(instrument_id),
             None,
@@ -5817,7 +6164,7 @@ mod tests {
         }));
 
         let command = GenerateFillReports::new(
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::from(2_000),
             Some(instrument_id),
             None,
@@ -5874,9 +6221,10 @@ mod tests {
                 Some(dec!(100.0)),
             ),
         ];
-        let mut check = node
-            .exec_manager
-            .prepare_position_report_check(UUID4::new(), &[]);
+        let mut check = node.exec_manager.prepare_position_report_check(
+            nautilus_common::recovery_trace::native_event_uuid(),
+            &[],
+        );
         check.client_coverage.clear();
         let events = node.exec_manager.reconcile_position_reports(
             &check,
@@ -5945,9 +6293,10 @@ mod tests {
             );
         }
 
-        let mut fresh_check = node
-            .exec_manager
-            .prepare_position_report_check(UUID4::new(), &[]);
+        let mut fresh_check = node.exec_manager.prepare_position_report_check(
+            nautilus_common::recovery_trace::native_event_uuid(),
+            &[],
+        );
         node.exec_manager.plan_position_fill_reports(
             &mut fresh_check,
             &[],
@@ -6335,7 +6684,7 @@ mod tests {
                 instrument_id,
                 client_order_id,
                 Some(account_id),
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 UnixNanos::default(),
                 UnixNanos::default(),
                 false,
@@ -6358,7 +6707,7 @@ mod tests {
                     instrument_id,
                     client_order_id,
                     None,
-                    UUID4::new(),
+                    nautilus_common::recovery_trace::native_event_uuid(),
                     UnixNanos::default(),
                     None,
                     None,
@@ -6372,7 +6721,7 @@ mod tests {
             strategy_id,
             instrument_id,
             cancels,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::default(),
             None,
             None,
@@ -6450,7 +6799,7 @@ mod tests {
             None,
             None,
             None,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::default(),
             None,
         );
@@ -6534,7 +6883,7 @@ mod tests {
             None,
             None,
             None,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::default(),
             None,
         );
@@ -7140,7 +7489,7 @@ mod tests {
             order.exec_algorithm_id(),
             Some(position_id),
             None,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::default(),
             None,
         );
@@ -7436,7 +7785,7 @@ mod tests {
                 )],
                 Vec::new(),
                 true,
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 UnixNanos::default(),
                 UnixNanos::default(),
                 Some(Currency::USDT()),
@@ -7523,9 +7872,10 @@ mod tests {
     ) -> PositionReportResult {
         let client_id = ClientId::from("POSITION-FILLS");
         let key = (report.instrument_id, report.account_id);
-        let mut check = node
-            .exec_manager
-            .prepare_position_report_check(UUID4::new(), &[]);
+        let mut check = node.exec_manager.prepare_position_report_check(
+            nautilus_common::recovery_trace::native_event_uuid(),
+            &[],
+        );
         check.client_coverage.insert(
             key,
             ReportClientCoverage::Resolved(IndexSet::from([client_id])),
@@ -8640,7 +8990,7 @@ mod tests {
         let builder = LiveNode::builder(TraderId::from("TRADER-001"), Environment::Live)
             .unwrap()
             .with_name("TestNode")
-            .with_instance_id(UUID4::new())
+            .with_instance_id(nautilus_common::recovery_trace::native_event_uuid())
             .with_load_state(false)
             .with_save_state(true)
             .with_timeout_connection(30)
@@ -9173,13 +9523,13 @@ mod tests {
 
     fn stub_data_command() -> DataCommand {
         use nautilus_common::messages::data::{SubscribeCommand, subscribe::SubscribeInstruments};
-        use nautilus_core::{UUID4, UnixNanos};
+        use nautilus_core::UnixNanos;
         use nautilus_model::identifiers::Venue;
 
         DataCommand::Subscribe(SubscribeCommand::Instruments(SubscribeInstruments::new(
             None,
             Venue::from("TEST"),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::default(),
             None,
             None,
@@ -9283,13 +9633,13 @@ mod tests {
             runner::TimeEventMessage,
             timer::{TimeEvent, TimeEventCallback},
         };
-        use nautilus_core::{UUID4, UnixNanos};
+        use nautilus_core::UnixNanos;
         use ustr::Ustr;
 
         TimeEventMessage::new(
             TimeEvent::new(
                 Ustr::from("test-timer"),
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 UnixNanos::default(),
                 UnixNanos::default(),
             ),
@@ -9299,7 +9649,7 @@ mod tests {
 
     fn stub_trading_command_message() -> TradingCommandMessage {
         use nautilus_common::messages::execution::query::QueryAccount;
-        use nautilus_core::{UUID4, UnixNanos};
+        use nautilus_core::UnixNanos;
         use nautilus_model::identifiers::AccountId;
 
         TradingCommandMessage::new(
@@ -9308,7 +9658,7 @@ mod tests {
                 TraderId::from("TESTER-001"),
                 None,
                 AccountId::from("TEST-001"),
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 UnixNanos::default(),
                 None,
                 None, // correlation_id
@@ -9423,7 +9773,7 @@ mod tests {
     }
 
     fn stub_account_event() -> ExecutionEvent {
-        use nautilus_core::{UUID4, UnixNanos};
+        use nautilus_core::UnixNanos;
         use nautilus_model::{
             enums::AccountType, events::account::state::AccountState, identifiers::AccountId,
         };
@@ -9434,7 +9784,7 @@ mod tests {
             vec![],
             vec![],
             true,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::default(),
             UnixNanos::default(),
             None,
@@ -9584,7 +9934,7 @@ mod tests {
                     TraderId::from("TESTER-001"),
                     None,
                     AccountId::from("TEST-001"),
-                    UUID4::new(),
+                    nautilus_common::recovery_trace::native_event_uuid(),
                     UnixNanos::default(),
                     None,
                     None,

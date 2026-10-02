@@ -15,6 +15,21 @@ pub struct NodeDispatchObserver {
     encoder: Rc<Encoder>,
     uncovered: Rc<RefCell<BTreeSet<String>>>,
     failure: Rc<RefCell<Option<String>>>,
+    #[cfg(feature = "native-tail-replay")]
+    native_trace: Option<nautilus_event_store::native_trace::NativeTraceRecorder>,
+    #[cfg(feature = "native-tail-replay")]
+    verify_read_witnesses:
+        Option<Rc<dyn Fn(&[nautilus_common::recovery_trace::NativeReadWitness]) -> Result<()>>>,
+    #[cfg(feature = "native-tail-replay")]
+    read_witnesses: Option<
+        Rc<
+            dyn Fn(
+                DispatchSource,
+                &str,
+                &dyn Any,
+            ) -> Result<Vec<nautilus_common::recovery_trace::NativeReadWitness>>,
+        >,
+    >,
 }
 impl std::fmt::Debug for NodeDispatchObserver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -33,6 +48,12 @@ impl NodeDispatchObserver {
             observer,
             encoder: Rc::new(encoder),
             failure: Rc::new(RefCell::new(None)),
+            #[cfg(feature = "native-tail-replay")]
+            native_trace: None,
+            #[cfg(feature = "native-tail-replay")]
+            verify_read_witnesses: None,
+            #[cfg(feature = "native-tail-replay")]
+            read_witnesses: None,
             uncovered: Rc::new(RefCell::new(
                 [
                     "startup_buffering_and_flush",
@@ -143,7 +164,55 @@ impl NodeDispatchObserver {
             envelope.source == source && envelope.phase == phase,
             "dispatch codec source/phase mismatch"
         );
+        #[cfg(feature = "native-tail-replay")]
+        if let Some(trace) = &self.native_trace {
+            let source = native_source(source)?;
+            let witnesses = self
+                .read_witnesses
+                .as_ref()
+                .context("native trace source witness collector absent")?(
+                envelope.source,
+                phase,
+                input,
+            )?;
+            let payload = envelope.payload.clone();
+            let mut guard = self.finish_begin(envelope)?;
+            let token = guard
+                .token
+                .as_ref()
+                .context("native dispatch token absent")?;
+            guard.native_trace = Some(trace.begin_native(
+                token.root_sequence(),
+                token.input_sequence(),
+                token.parent_input_sequence(),
+                source,
+                phase,
+                payload,
+                witnesses.clone(),
+            )?);
+            let verify = self
+                .verify_read_witnesses
+                .clone()
+                .context("native read witness verifier absent")?;
+            guard.verify_read_witnesses = Some(Rc::new(move || verify(&witnesses)));
+            return Ok(guard);
+        }
         self.finish_begin(envelope)
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn encode_historical_source(
+        &self,
+        source: DispatchSource,
+        phase: &str,
+        input: &dyn Any,
+    ) -> Result<DispatchInput> {
+        let encoded = (self.encoder)(source, phase, input)?;
+        anyhow::ensure!(
+            encoded.source == source && encoded.phase == phase,
+            "historical native codec source/phase mismatch"
+        );
+        Ok(encoded)
     }
 
     /// Begins a dispatch from an already encoded durable envelope. This is
@@ -174,25 +243,183 @@ impl NodeDispatchObserver {
         Ok(NodeDispatchGuard {
             observer: self.observer.clone(),
             token: Some(token),
+            #[cfg(feature = "native-tail-replay")]
+            native_trace: None,
+            #[cfg(feature = "native-tail-replay")]
+            verify_read_witnesses: None,
+            #[cfg(feature = "native-tail-replay")]
+            historical: None,
         })
     }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn attach_native_trace(
+        &mut self,
+        trace: nautilus_event_store::native_trace::NativeTraceRecorder,
+        witnesses: impl Fn(
+            DispatchSource,
+            &str,
+            &dyn Any,
+        ) -> Result<Vec<nautilus_common::recovery_trace::NativeReadWitness>>
+        + 'static,
+        verify_witnesses: impl Fn(&[nautilus_common::recovery_trace::NativeReadWitness]) -> Result<()>
+        + 'static,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.native_trace.is_none()
+                && self.observer.depth()? == 0
+                && self.observer.completed_root()? == 0,
+            "native source tracing must precede actual dispatch"
+        );
+        nautilus_common::recovery_trace::scope::enable_ingress_receipts()?;
+        self.native_trace = Some(trace);
+        self.read_witnesses = Some(Rc::new(witnesses));
+        self.verify_read_witnesses = Some(Rc::new(verify_witnesses));
+        Ok(())
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn native_trace(
+        &self,
+    ) -> Option<&nautilus_event_store::native_trace::NativeTraceRecorder> {
+        self.native_trace.as_ref()
+    }
+}
+
+#[cfg(feature = "native-tail-replay")]
+pub(super) fn source_dispatch(
+    source: nautilus_common::recovery_trace::NativeInputSource,
+) -> Result<DispatchSource> {
+    use nautilus_common::recovery_trace::NativeInputSource as N;
+    Ok(match source {
+        N::Time => DispatchSource::Time,
+        N::SystemEvent => DispatchSource::SystemEvent,
+        N::SystemCommand => DispatchSource::SystemCommand,
+        N::ExecutionEvent => DispatchSource::ExecutionEvent,
+        N::TradingCommand => DispatchSource::ExecutionCommand,
+        N::DataEvent => DispatchSource::DataEvent,
+        N::DataCommand => DispatchSource::DataCommand,
+        N::ExternalMessage => DispatchSource::ExternalMessage,
+        N::QueryResult => DispatchSource::QueryResult,
+        N::Maintenance => DispatchSource::Maintenance,
+        N::Lifecycle => DispatchSource::Lifecycle,
+        N::Reconciliation => DispatchSource::Reconciliation,
+    })
+}
+#[cfg(feature = "native-tail-replay")]
+pub(super) fn native_source(
+    source: DispatchSource,
+) -> Result<nautilus_common::recovery_trace::NativeInputSource> {
+    use nautilus_common::recovery_trace::NativeInputSource as Native;
+    Ok(match source {
+        DispatchSource::Time => Native::Time,
+        DispatchSource::SystemEvent => Native::SystemEvent,
+        DispatchSource::SystemCommand => Native::SystemCommand,
+        DispatchSource::ExecutionEvent => Native::ExecutionEvent,
+        DispatchSource::ExecutionCommand => Native::TradingCommand,
+        DispatchSource::DataEvent => Native::DataEvent,
+        DispatchSource::DataCommand => Native::DataCommand,
+        DispatchSource::ExternalMessage => Native::ExternalMessage,
+        DispatchSource::QueryResult => Native::QueryResult,
+        DispatchSource::Maintenance => Native::Maintenance,
+        DispatchSource::Lifecycle => Native::Lifecycle,
+        DispatchSource::Reconciliation => Native::Reconciliation,
+        DispatchSource::Replay => {
+            anyhow::bail!("caller Replay is not an original native source producer")
+        }
+    })
 }
 
 /// RAII guard for one acknowledged node dispatch. Dropping an unfinished guard
 /// records cancellation (or failure while unwinding) and poisons the run.
 #[must_use]
-#[derive(Debug)]
 pub struct NodeDispatchGuard {
     observer: DispatchObserver,
     token: Option<DispatchToken>,
+    #[cfg(feature = "native-tail-replay")]
+    native_trace: Option<nautilus_event_store::native_trace::NativeTraceGuard>,
+    #[cfg(feature = "native-tail-replay")]
+    verify_read_witnesses: Option<Rc<dyn Fn() -> Result<()>>>,
+    #[cfg(feature = "native-tail-replay")]
+    historical: Option<nautilus_event_store::native_trace::NativeHistoricalInputGuard>,
+}
+impl std::fmt::Debug for NodeDispatchGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeDispatchGuard")
+            .field("token", &self.token)
+            .finish_non_exhaustive()
+    }
 }
 impl NodeDispatchGuard {
     /// Marks the input complete after all synchronous descendants and state
     /// updates have returned.
     pub fn complete(mut self) -> Result<()> {
+        #[cfg(feature = "native-tail-replay")]
+        anyhow::ensure!(
+            self.native_trace.is_none() && self.historical.is_none(),
+            "actual native effects required for source completion"
+        );
         self.observer
             .complete(self.token.as_ref().context("missing dispatch token")?)?;
         self.token = None;
+        Ok(())
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn requires_native_effects(&self) -> bool {
+        self.native_trace.is_some() || self.historical.is_some()
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn complete_native(mut self, native_effects: serde_json::Value) -> Result<()> {
+        if let Some(historical) = self.historical.take() {
+            historical.complete(native_effects)?;
+            self.observer.complete(
+                self.token
+                    .as_ref()
+                    .context("missing replay dispatch token")?,
+            )?;
+            self.token = None;
+            return Ok(());
+        }
+        let guard = self
+            .native_trace
+            .take()
+            .context("native source guard absent")?;
+        let recorder = guard.recorder_handle();
+        let result = (|| {
+            self.verify_read_witnesses
+                .as_ref()
+                .context("native read witness verifier absent")?()?;
+            guard.complete(native_effects)?;
+            self.observer
+                .complete(self.token.as_ref().context("missing dispatch token")?)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.token = None;
+                Ok(())
+            }
+            Err(error) => {
+                recorder.fail(&format!(
+                    "native source/projection completion failed: {error:#}"
+                ));
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn attach_historical(
+        &mut self,
+        guard: nautilus_event_store::native_trace::NativeHistoricalInputGuard,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.historical.is_none() && self.native_trace.is_none(),
+            "native historical dispatch already attached"
+        );
+        self.historical = Some(guard);
         Ok(())
     }
 

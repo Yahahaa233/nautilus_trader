@@ -89,6 +89,34 @@ pub fn compute_entry_hash(
     write_bytes(&mut hasher, payload);
     write_optional_uuid(&mut hasher, headers.correlation_id.as_ref());
     write_optional_uuid(&mut hasher, headers.causation_id.as_ref());
+    if let Some(origin) = &headers.native_origin {
+        // Absent extension preserves the exact legacy hash contract
+        hasher.update(b"nautilus-native-output-origin/v1");
+        hasher.update(&origin.source.schema_version.to_be_bytes());
+        hasher.update(&origin.source.node_instance.as_bytes());
+        hasher.update(&origin.source.process_incarnation.as_bytes());
+        for value in [
+            &origin.source.journal_run,
+            &origin.source.logical_run,
+            &origin.source.configuration_digest,
+            &origin.source.codec_profile,
+            &origin.source.registered_profile_digest,
+        ] {
+            write_str(&mut hasher, value);
+        }
+        hasher.update(&origin.root_sequence.to_be_bytes());
+        hasher.update(&origin.input_sequence.to_be_bytes());
+        match origin.stack_parent {
+            Some(parent) => {
+                hasher.update(&[1]);
+                hasher.update(&parent.to_be_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hasher.update(&origin.output_ordinal.to_be_bytes());
+    }
     EntryHash(*hasher.finalize().as_bytes())
 }
 
@@ -237,6 +265,7 @@ mod tests {
         ]);
         let mut input = baseline();
         input.headers = Headers {
+            native_origin: None,
             correlation_id: Some(correlation),
             causation_id: Some(causation),
         };

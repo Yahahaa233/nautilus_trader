@@ -249,6 +249,47 @@ impl BusCaptureAdapter {
             return Ok(false);
         }
 
+        #[cfg(feature = "live")]
+        if nautilus_common::recovery_trace::historical_active() {
+            let mut semantic_headers = headers.clone();
+            if semantic_headers.native_origin.is_some() {
+                let reason = "historical caller cannot assign source provenance".to_owned();
+                self.fail_stop_reason(HaltReason::CaptureEncoding(reason.clone()));
+                return Err(CaptureError::Encode(EncodeError::Serialize(reason)));
+            }
+            semantic_headers.native_origin = None;
+            let headers = serde_json::to_value(semantic_headers).map_err(|error| {
+                self.fail_stop_reason(HaltReason::CaptureEncoding(error.to_string()));
+                CaptureError::Encode(EncodeError::Serialize(error.to_string()))
+            })?;
+            let matched = nautilus_common::recovery_trace::historical::output(
+                topic.as_str(),
+                payload_type.as_str(),
+                &encoded.payload,
+                &headers,
+            )
+            .map_err(|error| {
+                self.fail_stop_reason(HaltReason::CaptureEncoding(error.to_string()));
+                CaptureError::Encode(EncodeError::Serialize(error.to_string()))
+            })?;
+            return Ok(matched.is_some());
+        }
+
+        #[cfg(feature = "live")]
+        let mut headers = headers;
+        #[cfg(feature = "live")]
+        {
+            if headers.native_origin.is_some() {
+                let reason = "caller cannot assign native output provenance".to_owned();
+                self.fail_stop_reason(HaltReason::CaptureEncoding(reason.clone()));
+                return Err(CaptureError::Encode(EncodeError::Serialize(reason)));
+            }
+            headers.native_origin = nautilus_common::recovery_trace::scope::next_output_origin()
+                .map_err(|e| {
+                    self.fail_stop_reason(HaltReason::CaptureEncoding(e.to_string()));
+                    CaptureError::Encode(EncodeError::Serialize(e.to_string()))
+                })?;
+        }
         let draft = EntryDraft {
             headers,
             topic,

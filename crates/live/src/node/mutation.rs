@@ -34,6 +34,50 @@ impl NativeMutationInput {
     pub fn kind(&self) -> &str {
         &self.kind
     }
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn payload(&self) -> &serde_json::Value {
+        &self.payload
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn from_verified(
+        root: &nautilus_event_store::native_trace::VerifiedNativeRoot,
+        record: &nautilus_common::recovery_trace::NativeTraceRecord,
+    ) -> Result<Self> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Encoded {
+            schema: String,
+            kind: String,
+            node_instance_id: nautilus_core::UUID4,
+            actual_now_ns: u64,
+            payload: serde_json::Value,
+        }
+        let nautilus_common::recovery_trace::NativeTraceRecord::Begin {
+            source, payload, ..
+        } = record
+        else {
+            anyhow::bail!("native mutation source Begin missing")
+        };
+        anyhow::ensure!(
+            source == root.source(),
+            "native mutation reader source differs"
+        );
+        let decoded: Encoded = serde_json::from_value(payload.clone())?;
+        anyhow::ensure!(
+            decoded.schema == "NautilusNativeMutationInput.v1"
+                && decoded.node_instance_id == source.node_instance
+                && decoded.actual_now_ns > 0
+                && !decoded.kind.is_empty(),
+            "native mutation source identity differs"
+        );
+        Ok(Self {
+            schema: "NautilusNativeMutationInput.v1",
+            kind: decoded.kind,
+            node_instance_id: decoded.node_instance_id,
+            actual_now_ns: decoded.actual_now_ns,
+            payload: decoded.payload,
+        })
+    }
     pub fn canonical_payload(&self) -> Result<serde_json::Value> {
         Ok(serde_json::to_value(self)?)
     }

@@ -499,6 +499,7 @@ mod tests {
         let correlation_id = UUID4::new();
         let causation_id = UUID4::new();
         registry.register_headers::<Sample, _>(move |_| Headers {
+            native_origin: None,
             correlation_id: Some(correlation_id),
             causation_id: Some(causation_id),
         });
@@ -523,6 +524,7 @@ mod tests {
         assert_eq!(
             headers,
             Headers {
+                native_origin: None,
                 correlation_id: Some(correlation_id),
                 causation_id: Some(causation_id),
             },
@@ -645,6 +647,7 @@ mod tests {
                 ])))
             },
             move |_| Headers {
+                native_origin: None,
                 correlation_id: None,
                 causation_id: Some(causation_captured),
             },
@@ -670,6 +673,7 @@ mod tests {
         let correlation = nautilus_core::UUID4::new();
         let correlation_captured = correlation;
         registry.register_headers::<Sample, _>(move |_| Headers {
+            native_origin: None,
             correlation_id: Some(correlation_captured),
             causation_id: None,
         });
@@ -755,6 +759,7 @@ mod tests {
         let causation = nautilus_core::UUID4::new();
         let causation_captured = causation;
         registry.register_headers::<Sample, _>(move |_| Headers {
+            native_origin: None,
             correlation_id: None,
             causation_id: Some(causation_captured),
         });

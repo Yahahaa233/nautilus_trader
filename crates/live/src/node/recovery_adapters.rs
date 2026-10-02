@@ -16,6 +16,7 @@
 //! Installs actual native/adaptor state from the completed same-node frontier.
 use super::{LiveNode, NodeState};
 use anyhow::{Result, ensure};
+use nautilus_common::live::dst;
 use std::collections::{BTreeMap, BTreeSet};
 impl LiveNode {
     /// Installs complete supported native engine state at the source checkpoint
@@ -43,6 +44,7 @@ impl LiveNode {
             source_capture_ns > 0 && manager["captured_at_ns"].as_u64() == Some(source_capture_ns),
             "native manager capture is not the source checkpoint time"
         );
+        let target_at = dst::time::Instant::now();
         let downtime = actual_now
             .checked_sub(source_capture_ns)
             .ok_or_else(|| anyhow::anyhow!("native source capture is in the future"))?;
@@ -50,7 +52,11 @@ impl LiveNode {
         let guard = self.begin_node_dispatch(crate::dispatch::DispatchSource::Lifecycle, &input)?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
             let mut prepared = self.exec_manager.clone();
-            prepared.restore_checkpoint_inventory(manager, downtime)?;
+            prepared.restore_checkpoint_inventory_at(manager, downtime, target_at)?;
+            #[cfg(feature = "native-tail-replay")]
+            {
+                self.recovery_engine_time = Some((target_at, actual_now));
+            }
             let mut data = self.kernel.data_engine.try_borrow_mut()?;
             data.restore_running_checkpoint_state(data_engine)?;
             self.exec_manager = prepared;
@@ -66,7 +72,7 @@ impl LiveNode {
         }
         result?;
         if let Some(guard) = guard {
-            guard.complete()?;
+            self.finish_node_dispatch(guard)?;
         }
         Ok(())
     }
@@ -145,7 +151,7 @@ impl LiveNode {
         result?;
         self.recovery_adapter_source = Some(adapters.clone());
         if let Some(guard) = guard {
-            guard.complete()?;
+            self.finish_node_dispatch(guard)?;
         }
         Ok(())
     }

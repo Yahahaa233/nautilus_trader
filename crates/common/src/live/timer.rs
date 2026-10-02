@@ -170,6 +170,55 @@ impl LiveTimer {
         }))
     }
 
+    /// Mutates the same published task schedule only while its actual producer is paused.
+    /// It cannot create a callback, change its owner, or move a deadline backwards.
+    pub(crate) fn historical_schedule_updater(
+        &self,
+    ) -> anyhow::Result<Box<dyn Fn(u64, bool) -> anyhow::Result<()>>> {
+        let state = self
+            .task_state
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("timer not started"))?;
+        let next = self.next_time_ns.clone();
+        let interval = self.interval_ns.get();
+        let stop = self.stop_time_ns;
+        Ok(Box::new(move |desired, exhausted| {
+            let status = state.status.load(atomic::Ordering::SeqCst);
+            anyhow::ensure!(
+                status == TASK_ACTIVE || status == TASK_EXHAUSTED,
+                "historical timer task is not quiescent"
+            );
+            let previous = next.load(atomic::Ordering::SeqCst);
+            anyhow::ensure!(
+                previous == state.next_time_ns.load(atomic::Ordering::SeqCst)
+                    && desired >= previous
+                    && (desired - previous) % interval == 0,
+                "historical timer schedule moved backwards or changed interval"
+            );
+            anyhow::ensure!(
+                status != TASK_EXHAUSTED || exhausted,
+                "historical timer cannot revive an exhausted task"
+            );
+            if let Some(stop) = stop {
+                anyhow::ensure!(
+                    exhausted || desired <= stop.as_u64(),
+                    "historical active timer exceeds its stop bound"
+                );
+            }
+            next.store(desired, atomic::Ordering::SeqCst);
+            state.next_time_ns.store(desired, atomic::Ordering::SeqCst);
+            state.status.store(
+                if exhausted {
+                    TASK_EXHAUSTED
+                } else {
+                    TASK_ACTIVE
+                },
+                atomic::Ordering::SeqCst,
+            );
+            Ok(())
+        }))
+    }
+
     /// Creates a new [`LiveTimer`] instance.
     ///
     /// # Panics
@@ -401,7 +450,22 @@ impl LiveTimer {
 
                 // `timer.tick` is cancellation safe, if the cancel branch completes
                 // first then no tick has been consumed (no event was ready).
-                let (_, _checkpoint_callback) = checkpoint_gate.callback(timer.tick()).await;
+                let (_, checkpoint_callback) = checkpoint_gate.callback(timer.tick()).await;
+                // A retained producer's real task schedule can advance while paused
+                // during historical replay. Consume that same schedule after the
+                // gate opens, rather than firing the old captured local deadline.
+                if task_state.status.load(atomic::Ordering::SeqCst) != TASK_ACTIVE {
+                    break;
+                }
+                let retained_next = task_state.next_time_ns.load(atomic::Ordering::SeqCst);
+                if retained_next != next_time_ns.as_u64() {
+                    next_time_ns = UnixNanos::from(retained_next);
+                    timer.reset_at(
+                        Instant::now() + timer_start_delay(next_time_ns, clock.get_time_ns()),
+                    );
+                    drop(checkpoint_callback);
+                    continue;
+                }
                 let now_ns = clock.get_time_ns();
 
                 let event = TimeEvent::new(event_name, UUID4::new(), next_time_ns, now_ns);

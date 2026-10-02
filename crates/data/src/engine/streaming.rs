@@ -807,7 +807,7 @@ fn with_dates_for_pipeline(
     end: Option<Timestamp>,
     ts_init: UnixNanos,
 ) -> RequestCommand {
-    let new_id = UUID4::new();
+    let new_id = nautilus_common::recovery_trace::native_event_uuid();
 
     match req {
         RequestCommand::Quotes(cmd) => RequestCommand::Quotes(RequestQuotes {
@@ -1227,10 +1227,10 @@ mod tests {
     #[rstest]
     fn test_build_empty_response_rejects_non_catalog_variant() {
         let request = RequestCommand::Join(RequestJoin::new(
-            vec![UUID4::new()],
+            vec![nautilus_common::recovery_trace::native_event_uuid()],
             None,
             None,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::default(),
             None,
             None,

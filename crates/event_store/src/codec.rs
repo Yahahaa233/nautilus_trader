@@ -31,7 +31,7 @@ use serde::{
 use thiserror::Error;
 
 const MAGIC: [u8; 4] = *b"NESC";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const HEADER_LEN: usize = MAGIC.len() + 1;
 const MAX_COLLECTION_COUNT: usize = 1_048_576;
 
@@ -65,6 +65,7 @@ pub fn decode_from_slice<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CodecEr
     let mut decoder = Decoder {
         input: bytes,
         pos: 0,
+        version: VERSION,
     };
     decoder.read_header()?;
     let value = T::deserialize(&mut decoder)?;
@@ -500,6 +501,7 @@ impl SerializeStructVariant for &mut Encoder {
 struct Decoder<'de> {
     input: &'de [u8],
     pos: usize,
+    version: u8,
 }
 
 impl<'de> Decoder<'de> {
@@ -514,10 +516,10 @@ impl<'de> Decoder<'de> {
         }
 
         let version = self.take(1)?[0];
-        if version != VERSION {
+        if version != 1 && version != VERSION {
             return Err(CodecError::UnsupportedVersion(version));
         }
-
+        self.version = version;
         Ok(())
     }
 
@@ -818,16 +820,27 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
 
     fn deserialize_struct<V>(
         self,
-        _name: &'static str,
+        name: &'static str,
         fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
+        // The v1 Headers wire contract has exactly two positional fields.
+        // Its absent native origin stays absent; never consume the next outer
+        // field or infer provenance from a later row. V2 always writes all three.
+        let remaining = if self.version == 1
+            && name == "Headers"
+            && fields == ["correlation_id", "causation_id", "native_origin"]
+        {
+            2
+        } else {
+            fields.len()
+        };
         visitor.visit_seq(SeqReader {
             dec: self,
-            remaining: fields.len(),
+            remaining,
         })
     }
 
@@ -1066,8 +1079,60 @@ mod tests {
         decode_from_slice(&encode_to_vec(value).expect("encode")).expect("decode")
     }
 
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn native_trace_header_wire_keeps_legacy_unknown_origin_and_following_bytes(
+        #[case] populated: bool,
+    ) {
+        #[derive(Serialize)]
+        struct LegacyHeaders {
+            correlation_id: Option<UUID4>,
+            causation_id: Option<UUID4>,
+        }
+        #[derive(Serialize)]
+        struct LegacyRecord {
+            headers: LegacyHeaders,
+            following: u64,
+        }
+        #[derive(Debug, Deserialize, PartialEq, Serialize)]
+        struct CurrentRecord {
+            headers: Headers,
+            following: u64,
+        }
+        let correlation_id = populated.then(|| UUID4::from_bytes([1; 16]));
+        let causation_id = populated.then(|| UUID4::from_bytes([2; 16]));
+        let original = LegacyRecord {
+            headers: LegacyHeaders {
+                correlation_id,
+                causation_id,
+            },
+            following: 0x1801020304050607,
+        };
+        let mut old = encode_to_vec(&original).unwrap();
+        old[4] = 1; // Original v1 positional body; no native-origin field existed.
+        let decoded: CurrentRecord = decode_from_slice(&old).unwrap();
+        assert_eq!(
+            decoded.headers,
+            Headers {
+                correlation_id,
+                causation_id,
+                native_origin: None
+            }
+        );
+        assert_eq!(decoded.following, original.following);
+        let new = encode_to_vec(&decoded).unwrap();
+        assert_eq!(new[4], VERSION);
+        assert_eq!(decode_from_slice::<CurrentRecord>(&new).unwrap(), decoded);
+        assert_ne!(new.len(), old.len());
+        let mut forged_version = new;
+        forged_version[4] = 1;
+        assert!(decode_from_slice::<CurrentRecord>(&forged_version).is_err());
+    }
+
     fn headers_populated() -> Headers {
         Headers {
+            native_origin: None,
             correlation_id: Some(UUID4::from_bytes([1; 16])),
             causation_id: Some(UUID4::from_bytes([2; 16])),
         }
@@ -1583,6 +1648,7 @@ mod tests {
         let mut decoder = Decoder {
             input: &body,
             pos: 0,
+            version: VERSION,
         };
 
         let value = de::Deserializer::deserialize_identifier(&mut decoder, U32Visitor)
@@ -1599,7 +1665,11 @@ mod tests {
         // self-describing-rejection load as `deserialize_any` (the `wire.rs`
         // invariant). `IgnoredAny::deserialize` drives it directly; assert it
         // rejects rather than silently skipping.
-        let mut decoder = Decoder { input: &[], pos: 0 };
+        let mut decoder = Decoder {
+            input: &[],
+            pos: 0,
+            version: VERSION,
+        };
 
         let err = de::IgnoredAny::deserialize(&mut decoder)
             .expect_err("ignored_any must reject as self-describing");

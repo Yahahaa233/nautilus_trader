@@ -133,6 +133,7 @@
 pub mod actor;
 pub mod cache;
 pub mod clients;
+pub mod recovery_trace;
 pub mod clock;
 pub mod component;
 pub mod config;

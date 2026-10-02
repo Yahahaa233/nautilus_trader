@@ -37,6 +37,10 @@ pub struct Headers {
     pub correlation_id: Option<UUID4>,
     /// The id of the message that directly caused this one, if any.
     pub causation_id: Option<UUID4>,
+    /// Native correlation stamped at actual capture, independent of domain message IDs.
+    /// Old captures retain absent provenance and are not upgraded into recovery evidence.
+    #[serde(default)]
+    pub native_origin: Option<nautilus_common::recovery_trace::NativeOutputOrigin>,
 }
 
 impl Headers {
@@ -46,13 +50,14 @@ impl Headers {
         Self {
             correlation_id: None,
             causation_id: None,
+            native_origin: None,
         }
     }
 
     /// Returns `true` if every header field is unset.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.correlation_id.is_none() && self.causation_id.is_none()
+        self.correlation_id.is_none() && self.causation_id.is_none() && self.native_origin.is_none()
     }
 }
 
@@ -72,6 +77,7 @@ mod tests {
     #[rstest]
     fn populated_headers_are_not_empty() {
         let headers = Headers {
+            native_origin: None,
             correlation_id: Some(UUID4::new()),
             causation_id: None,
         };

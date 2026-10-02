@@ -61,6 +61,8 @@ pub mod hash;
 pub mod headers;
 pub mod kernel;
 pub mod manifest;
+#[cfg(feature = "live")]
+pub mod native_trace;
 pub mod markers;
 pub mod reader;
 pub mod replay;

@@ -59,6 +59,9 @@
 //!   thread. `bind_senders` overwrites any existing TLS contents on the
 //!   thread, so the last caller wins.
 
+#[cfg(feature = "native-tail-replay")]
+use anyhow::Context;
+
 use std::{
     fmt::Debug,
     sync::{
@@ -293,6 +296,68 @@ impl RunningReceivers<'_> {
             data_cmd_rx: self.data_cmd_rx,
         }
     }
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn native_pending_receipts(
+        &self,
+    ) -> anyhow::Result<Vec<nautilus_common::recovery_trace::NativeIngressReceipt>> {
+        let mut pending = Vec::new();
+        macro_rules! receipts {
+            ($field:ident) => {
+                for receipt in self.$field.pending_receipts() {
+                    pending.push(
+                        receipt
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "actual native pending member has no source receipt"
+                                )
+                            })?
+                            .clone(),
+                    );
+                }
+            };
+        }
+        receipts!(time_evt_rx);
+        receipts!(system_evt_rx);
+        receipts!(system_cmd_rx);
+        receipts!(exec_evt_rx);
+        receipts!(exec_cmd_rx);
+        receipts!(data_evt_rx);
+        receipts!(data_cmd_rx);
+        Ok(pending)
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn native_pending_inputs(
+        &self,
+        encode: &dyn Fn(
+            nautilus_common::recovery_trace::NativeInputSource,
+            &dyn std::any::Any,
+        ) -> anyhow::Result<serde_json::Value>,
+    ) -> anyhow::Result<Vec<nautilus_common::recovery_trace::NativePendingInput>> {
+        use nautilus_common::recovery_trace::{NativeInputSource, NativePendingInput};
+        let mut pending = Vec::new();
+        macro_rules! capture {
+            ($field:ident, $source:ident) => {
+                for (message, receipt) in self.$field.pending().zip(self.$field.pending_receipts()) {
+                    let receipt = receipt.context("actual staged input has no native receipt")?.clone();
+                    anyhow::ensure!(receipt.input_source == NativeInputSource::$source, "native staged channel changed");
+                    let any: &dyn std::any::Any = message;
+                    let callback_binding = any.downcast_ref::<TimeEventMessage>().map(TimeEventMessage::checkpoint_callback_binding);
+                    let timer_event = any.downcast_ref::<TimeEventMessage>().map(|message| {
+                        let event = message.event(); serde_json::json!({"name":event.name,"event_id":event.event_id,"ts_event":event.ts_event,"ts_init":event.ts_init})
+                    });
+                    pending.push(NativePendingInput { receipt, payload: encode(NativeInputSource::$source, any)?, callback_binding, timer_event });
+                }
+            };
+        }
+        capture!(time_evt_rx, Time);
+        capture!(system_evt_rx, SystemEvent);
+        capture!(system_cmd_rx, SystemCommand);
+        capture!(exec_evt_rx, ExecutionEvent);
+        capture!(exec_cmd_rx, TradingCommand);
+        capture!(data_evt_rx, DataEvent);
+        capture!(data_cmd_rx, DataCommand);
+        Ok(pending)
+    }
     pub(crate) fn snapshot(
         &mut self,
         ingress: &IngressGate,
@@ -339,14 +404,22 @@ impl AsyncRunner {
         use tokio::sync::mpsc::unbounded_channel; // tokio-import-ok
 
         let ingress = IngressGate::new();
-        let (time_evt_tx, time_evt_rx) = ingress.channel::<TimeEventMessage>();
-        let (system_evt_tx, system_evt_rx) = ingress.channel::<SystemEvent>();
-        let (system_cmd_tx, system_cmd_rx) = ingress.channel::<SystemCommand>();
+        use nautilus_common::recovery_trace::NativeInputSource;
+        let (time_evt_tx, time_evt_rx) =
+            ingress.native_channel::<TimeEventMessage>(NativeInputSource::Time);
+        let (system_evt_tx, system_evt_rx) =
+            ingress.native_channel::<SystemEvent>(NativeInputSource::SystemEvent);
+        let (system_cmd_tx, system_cmd_rx) =
+            ingress.native_channel::<SystemCommand>(NativeInputSource::SystemCommand);
         let (signal_tx, signal_rx) = unbounded_channel::<()>();
-        let (exec_evt_tx, exec_evt_rx) = ingress.channel::<ExecutionEvent>();
-        let (exec_cmd_tx, exec_cmd_rx) = ingress.channel::<TradingCommandMessage>();
-        let (data_evt_tx, data_evt_rx) = ingress.channel::<DataEvent>();
-        let (data_cmd_tx, data_cmd_rx) = ingress.channel::<DataCommand>();
+        let (exec_evt_tx, exec_evt_rx) =
+            ingress.native_channel::<ExecutionEvent>(NativeInputSource::ExecutionEvent);
+        let (exec_cmd_tx, exec_cmd_rx) =
+            ingress.native_channel::<TradingCommandMessage>(NativeInputSource::TradingCommand);
+        let (data_evt_tx, data_evt_rx) =
+            ingress.native_channel::<DataEvent>(NativeInputSource::DataEvent);
+        let (data_cmd_tx, data_cmd_rx) =
+            ingress.native_channel::<DataCommand>(NativeInputSource::DataCommand);
         let recovery_progress = crate::runner_recovery::RunnerRecoveryProgressHandle::new();
 
         Self {
@@ -397,6 +470,75 @@ impl AsyncRunner {
     /// Refuses an unhealthy or already frozen gate.
     pub fn freeze_ingress(&self) -> anyhow::Result<FrozenIngress> {
         self.ingress.freeze()
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn install_native_retained_input(
+        &mut self,
+        guard: &FrozenIngress,
+        event: crate::runner_recovery::RunnerRecoveryEvent,
+        receipt: nautilus_common::recovery_trace::NativeIngressReceipt,
+    ) -> anyhow::Result<()> {
+        use crate::runner_recovery::RunnerRecoveryEvent;
+        use nautilus_common::recovery_trace::NativeInputSource;
+        anyhow::ensure!(
+            guard.belongs_to(&self.ingress),
+            "foreign retained ingress gate"
+        );
+        guard.verify()?;
+        match event {
+            RunnerRecoveryEvent::TimeEvent(message)
+                if receipt.input_source == NativeInputSource::Time =>
+            {
+                self.channels
+                    .time_evt_rx
+                    .append_native_retained(message, receipt)?
+            }
+            RunnerRecoveryEvent::SystemEvent(message)
+                if receipt.input_source == NativeInputSource::SystemEvent =>
+            {
+                self.channels
+                    .system_evt_rx
+                    .append_native_retained(message, receipt)?
+            }
+            RunnerRecoveryEvent::SystemCommand(message)
+                if receipt.input_source == NativeInputSource::SystemCommand =>
+            {
+                self.channels
+                    .system_cmd_rx
+                    .append_native_retained(message, receipt)?
+            }
+            RunnerRecoveryEvent::ExecutionEvent(message)
+                if receipt.input_source == NativeInputSource::ExecutionEvent =>
+            {
+                self.channels
+                    .exec_evt_rx
+                    .append_native_retained(message, receipt)?
+            }
+            RunnerRecoveryEvent::ExecutionCommand(message)
+                if receipt.input_source == NativeInputSource::TradingCommand =>
+            {
+                self.channels
+                    .exec_cmd_rx
+                    .append_native_retained(message, receipt)?
+            }
+            RunnerRecoveryEvent::DataEvent(message)
+                if receipt.input_source == NativeInputSource::DataEvent =>
+            {
+                self.channels
+                    .data_evt_rx
+                    .append_native_retained(message, receipt)?
+            }
+            RunnerRecoveryEvent::DataCommand(message)
+                if receipt.input_source == NativeInputSource::DataCommand =>
+            {
+                self.channels
+                    .data_cmd_rx
+                    .append_native_retained(message, receipt)?
+            }
+            _ => anyhow::bail!("retained original input decoder changed its channel"),
+        }
+        guard.verify()
     }
 
     /// Captures actual retained messages under this runner's live ingress guard.

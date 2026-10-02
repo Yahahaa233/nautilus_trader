@@ -97,6 +97,18 @@ pub trait RestoredTimerCheckpoint: Debug {
         source_binding_id: u64,
         cleanup: bool,
     ) -> anyhow::Result<crate::runner::TimeEventMessage>;
+    /// Advances only the already installed owner schedules under their producer pause.
+    /// The native reader supplies the original inventory; callback bindings cannot change.
+    fn apply_historical_inventory(&self, _inventory: &serde_json::Value) -> anyhow::Result<()> {
+        anyhow::bail!("historical owner timer advancement unsupported")
+    }
+    /// Projects actual restored callback IDs to the exact source IDs proved at installation.
+    fn historical_inventory(&self) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("historical owner timer projection unsupported")
+    }
+    fn refresh_after_historical_dispatch(&self) -> anyhow::Result<()> {
+        self.verify()
+    }
     fn resume(self: Box<Self>) -> anyhow::Result<()>;
 }
 

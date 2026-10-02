@@ -21,6 +21,7 @@ crate-type = ["rlib"]
 
 [features]
 dispatch-observer = []
+native-tail-replay = ["node", "dispatch-observer", "dep:nautilus-event-store", "nautilus-trading/live", "nautilus-system/live"]
 default = ["node", "plugin"]
 fuzz = ["dep:libfuzzer-sys"]
 node = [
@@ -91,6 +92,7 @@ nautilus-core = { workspace = true }
 nautilus-execution = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
+nautilus-event-store = { path = "../event_store", features = ["live"], optional = true }
 
 nautilus-data = { workspace = true, optional = true }
 nautilus-persistence = { workspace = true, optional = true }

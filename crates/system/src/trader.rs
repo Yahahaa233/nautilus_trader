@@ -85,6 +85,12 @@ type ComponentStateSaveFn = fn(Ustr) -> anyhow::Result<PersistedComponentState>;
 struct ComponentStateCallbacks {
     load: ComponentStateLoadFn,
     save: ComponentStateSaveFn,
+    #[cfg(feature = "live")]
+    historical_save: ComponentStateSaveFn,
+    #[cfg(feature = "live")]
+    historical_prepare: fn(Ustr, &dyn std::any::Any) -> anyhow::Result<()>,
+    #[cfg(feature = "live")]
+    historical_lifecycle: fn(Ustr, &str) -> anyhow::Result<()>,
 }
 
 /// Actor and strategy callback results collected without database writes.
@@ -410,6 +416,12 @@ impl Trader {
             ComponentStateCallbacks {
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
+                #[cfg(feature = "live")]
+                historical_save: Self::save_historical_component_state::<T>,
+                #[cfg(feature = "live")]
+                historical_prepare: Self::prepare_historical_component::<T>,
+                #[cfg(feature = "live")]
+                historical_lifecycle: Self::dispatch_historical_lifecycle::<T>,
             },
         );
 
@@ -443,6 +455,12 @@ impl Trader {
             ComponentStateCallbacks {
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
+                #[cfg(feature = "live")]
+                historical_save: Self::save_historical_component_state::<T>,
+                #[cfg(feature = "live")]
+                historical_prepare: Self::prepare_historical_component::<T>,
+                #[cfg(feature = "live")]
+                historical_lifecycle: Self::dispatch_historical_lifecycle::<T>,
             },
         );
 
@@ -560,6 +578,12 @@ impl Trader {
             ComponentStateCallbacks {
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
+                #[cfg(feature = "live")]
+                historical_save: Self::save_historical_component_state::<T>,
+                #[cfg(feature = "live")]
+                historical_prepare: Self::prepare_historical_component::<T>,
+                #[cfg(feature = "live")]
+                historical_lifecycle: Self::dispatch_historical_lifecycle::<T>,
             },
         );
         self.strategy_handler_ids
@@ -676,6 +700,29 @@ impl Trader {
             if let Some(mut strategy) = try_get_actor_unchecked::<T>(&actor_id) {
                 log::debug!("{RECV} {event}");
 
+                #[cfg(feature = "live")]
+                {
+                    let component_id = strategy.component_id().to_string();
+                    if nautilus_common::recovery_trace::historical::dispatch_if_active(
+                        &component_id,
+                        "strategy.handle_time_event",
+                        |boundary| {
+                            DataActor::on_native_recovery_input(&mut *strategy, boundary, &event)
+                        },
+                    ) {
+                        return;
+                    }
+                    if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
+                        nautilus_common::recovery_trace::NativeCallbackRoute {
+                            component_id,
+                            kind: "strategy.handle_time_event".into(),
+                            component_state: format!("{:?}", strategy.state()),
+                        },
+                    ) {
+                        log::error!("native timer callback source refused: {error:#}");
+                        return;
+                    }
+                }
                 if strategy.not_running() {
                     log::trace!("Received message when not running - skipping {event}");
                     return;
@@ -747,6 +794,12 @@ impl Trader {
             ComponentStateCallbacks {
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
+                #[cfg(feature = "live")]
+                historical_save: Self::save_historical_component_state::<T>,
+                #[cfg(feature = "live")]
+                historical_prepare: Self::prepare_historical_component::<T>,
+                #[cfg(feature = "live")]
+                historical_lifecycle: Self::dispatch_historical_lifecycle::<T>,
             },
         );
         self.strategy_handler_ids
@@ -1136,6 +1189,14 @@ impl Trader {
 
         for strategy_id in self.strategy_ids.clone() {
             log::debug!("Stopping strategy {strategy_id}");
+            #[cfg(feature = "live")]
+            nautilus_common::recovery_trace::scope::note_callback(
+                nautilus_common::recovery_trace::NativeCallbackRoute {
+                    component_id: strategy_id.as_str().into(),
+                    kind: "lifecycle.strategy_stop".into(),
+                    component_state: format!("{:?}", component_state(&strategy_id.inner())?),
+                },
+            )?;
             let should_proceed = self
                 .strategy_stop_fns
                 .get_mut(&strategy_id)
@@ -1222,6 +1283,14 @@ impl Trader {
             return Ok(());
         }
 
+        #[cfg(feature = "live")]
+        nautilus_common::recovery_trace::scope::note_callback(
+            nautilus_common::recovery_trace::NativeCallbackRoute {
+                component_id: component_id.as_str().into(),
+                kind: "lifecycle.stop".into(),
+                component_state: format!("{:?}", component_state(&component_id)?),
+            },
+        )?;
         stop_component(&component_id)
     }
 
@@ -1907,6 +1976,186 @@ impl Trader {
                     })
             })
             .collect()
+    }
+
+    /// Installs local routes on the actual registered objects, preserving each
+    /// private versioned business snapshot. No component on_start is invoked.
+    #[cfg(feature = "live")]
+    pub fn prepare_native_recovery(
+        trader: &Rc<RefCell<Self>>,
+        source: &dyn std::any::Any,
+    ) -> anyhow::Result<()> {
+        let (actors, strategies) = {
+            let current = trader.try_borrow()?;
+            (
+                current.actor_state_callbacks()?,
+                current.strategy_state_callbacks()?,
+            )
+        };
+        for (id, callbacks) in actors
+            .iter()
+            .map(|(id, c)| (id.inner(), c))
+            .chain(strategies.iter().map(|(id, c)| (id.inner(), c)))
+        {
+            let before = (callbacks.historical_save)(id)?;
+            (callbacks.historical_prepare)(id, source)?;
+            anyhow::ensure!(
+                (callbacks.historical_save)(id)? == before,
+                "historical local binding changed private business state: {id}"
+            );
+        }
+        let current = trader.try_borrow()?;
+        anyhow::ensure!(
+            current
+                .actor_ids
+                .iter()
+                .copied()
+                .eq(actors.iter().map(|(id, _)| *id))
+                && current
+                    .strategy_ids
+                    .iter()
+                    .copied()
+                    .eq(strategies.iter().map(|(id, _)| *id)),
+            "component registration changed during historical preparation"
+        );
+        Ok(())
+    }
+
+    /// Captures the same original object's explicit historical business profile.
+    #[cfg(feature = "live")]
+    pub fn collect_native_recovery_state(
+        trader: &Rc<RefCell<Self>>,
+    ) -> anyhow::Result<CollectedComponentState> {
+        let (actors, strategies) = {
+            let current = trader.try_borrow()?;
+            (
+                current.actor_state_callbacks()?,
+                current.strategy_state_callbacks()?,
+            )
+        };
+        let mut result = CollectedComponentState {
+            actors: IndexMap::new(),
+            strategies: IndexMap::new(),
+        };
+        for (id, callbacks) in &actors {
+            result
+                .actors
+                .insert(*id, (callbacks.historical_save)(id.inner())?);
+        }
+        for (id, callbacks) in &strategies {
+            result
+                .strategies
+                .insert(*id, (callbacks.historical_save)(id.inner())?);
+        }
+        let current = trader.try_borrow()?;
+        anyhow::ensure!(
+            current
+                .actor_ids
+                .iter()
+                .copied()
+                .eq(actors.iter().map(|(id, _)| *id))
+                && current
+                    .strategy_ids
+                    .iter()
+                    .copied()
+                    .eq(strategies.iter().map(|(id, _)| *id)),
+            "component registration changed during historical business snapshot"
+        );
+        Ok(result)
+    }
+
+    /// Routes only recorded source lifecycle callbacks on their actual registered owners.
+    /// Physical Component admission remains closed; ordinary stop/on_start is not called.
+    #[cfg(feature = "live")]
+    pub fn replay_native_lifecycle(trader: &Rc<RefCell<Self>>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            nautilus_common::recovery_trace::historical::active(),
+            "original trader lifecycle requires verified native history"
+        );
+        let callbacks = {
+            let current = trader.try_borrow()?;
+            anyhow::ensure!(
+                current.exec_algorithm_ids.is_empty(),
+                "native historical execution algorithms unsupported"
+            );
+            current
+                .actor_state_callbacks()?
+                .into_iter()
+                .map(|(id, c)| (id.inner(), c))
+                .chain(
+                    current
+                        .strategy_state_callbacks()?
+                        .into_iter()
+                        .map(|(id, c)| (id.inner(), c)),
+                )
+                .collect::<IndexMap<_, _>>()
+        };
+        while let Some(route) =
+            nautilus_common::recovery_trace::historical::pending_callback_route()?
+        {
+            anyhow::ensure!(
+                route.kind == "lifecycle.stop" || route.kind == "lifecycle.strategy_stop",
+                "unexpected original lifecycle callback: {}",
+                route.kind
+            );
+            let id = Ustr::from(&route.component_id);
+            let callback = callbacks
+                .get(&id)
+                .ok_or_else(|| anyhow::anyhow!("original lifecycle owner unregistered: {id}"))?;
+            (callback.historical_lifecycle)(id, &route.kind)?;
+        }
+        // The original on_stop also records the Trader's own clock read after
+        // component callbacks. Preserve that history without opening its
+        // physical Component lifecycle or consuming live shutdown admission.
+        let clock = trader.try_borrow()?.clock_factory.clock();
+        let stopped = clock.borrow().timestamp_ns();
+        trader.try_borrow_mut()?.ts_stopped = Some(stopped);
+        Ok(())
+    }
+    #[cfg(feature = "live")]
+    fn dispatch_historical_lifecycle<T>(id: Ustr, kind: &str) -> anyhow::Result<()>
+    where
+        T: DataActor + DataActorNative + Debug + 'static,
+    {
+        let mut component = try_get_actor_unchecked::<T>(&id)
+            .ok_or_else(|| anyhow::anyhow!("historical lifecycle owner absent: {id}"))?;
+        let input = nautilus_common::recovery_trace::NativeComponentLifecycle {
+            action: kind.into(),
+            component_id: id.as_str().into(),
+        };
+        anyhow::ensure!(
+            nautilus_common::recovery_trace::historical::dispatch_if_active(
+                id.as_str(),
+                kind,
+                |boundary| component.on_native_recovery_input(boundary, &input)
+            ),
+            "historical lifecycle scope missing"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "live")]
+    fn prepare_historical_component<T>(id: Ustr, source: &dyn std::any::Any) -> anyhow::Result<()>
+    where
+        T: DataActor + DataActorNative + Debug + 'static,
+    {
+        let mut component = try_get_actor_unchecked::<T>(&id)
+            .ok_or_else(|| anyhow::anyhow!("historical component absent: {id}"))?;
+        component.prepare_native_recovery(
+            &nautilus_common::recovery_trace::historical::HistoricalReplayPreparation::new(
+                source,
+                id.as_str(),
+            ),
+        )
+    }
+    #[cfg(feature = "live")]
+    fn save_historical_component_state<T>(id: Ustr) -> anyhow::Result<PersistedComponentState>
+    where
+        T: DataActor + DataActorNative + Debug + 'static,
+    {
+        let component = try_get_actor_unchecked::<T>(&id)
+            .ok_or_else(|| anyhow::anyhow!("historical component absent: {id}"))?;
+        component.on_native_recovery_state()
     }
 
     fn load_component_state<T>(

@@ -26,6 +26,8 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use nautilus_common::{clock::RestoredTimerCheckpoint, runner::TimeEventMessage, timer::TimeEvent};
 use nautilus_core::{UUID4, UnixNanos};
+#[cfg(feature = "native-tail-replay")]
+use std::collections::HashSet;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -76,7 +78,9 @@ pub(super) struct RetainedNodeTimers {
     pub(super) clocks: BTreeMap<String, Option<Box<dyn RestoredTimerCheckpoint>>>,
     source: BTreeMap<String, serde_json::Value>,
     source_pending: Vec<RetainedRecoveryTimerInput>,
-    pending: VecDeque<TimeEventMessage>,
+    pending: RefCell<VecDeque<TimeEventMessage>>,
+    #[cfg(feature = "native-tail-replay")]
+    historical_admitted: RefCell<HashSet<UUID4>>,
     progress: RetainedRecoveryTimerHandoff,
 }
 impl RetainedNodeTimers {
@@ -93,6 +97,7 @@ impl RetainedNodeTimers {
         self.verify()?;
         let actual = self
             .pending
+            .try_borrow()?
             .iter()
             .enumerate()
             .map(|(i, m)| registry.encode(RunnerRecoveryEventRef::TimeEvent(m), i as u64))
@@ -109,10 +114,205 @@ impl RetainedNodeTimers {
     ) -> Result<Vec<RunnerPendingEntry>> {
         self.verify()?;
         self.pending
+            .try_borrow()?
             .iter()
             .enumerate()
             .map(|(i, m)| registry.encode(RunnerRecoveryEventRef::TimeEvent(m), i as u64))
             .collect()
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn historical_inventory(&self) -> Result<BTreeMap<String, serde_json::Value>> {
+        self.clocks
+            .iter()
+            .map(|(owner, receipt)| {
+                Ok((
+                    owner.clone(),
+                    receipt
+                        .as_ref()
+                        .context("historical timer producer was already resumed")?
+                        .historical_inventory()?,
+                ))
+            })
+            .collect()
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn refresh_historical_dispatch(&self) -> Result<()> {
+        for clock in self.clocks.values().flatten() {
+            clock.refresh_after_historical_dispatch()?;
+        }
+        Ok(())
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn apply_historical_inventory(
+        &self,
+        source: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        ensure!(
+            self.clocks.keys().eq(source.keys()),
+            "historical registered timer owner changed"
+        );
+        for (owner, receipt) in &self.clocks {
+            receipt
+                .as_ref()
+                .context("historical timer producer was already resumed")?
+                .apply_historical_inventory(&source[owner])?;
+        }
+        Ok(())
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn admit_historical_timers(
+        &self,
+        before: &BTreeMap<String, serde_json::Value>,
+        admissions: &[(String, u64, bool, TimeEvent, u64)],
+        captured_at_ns: u64,
+    ) -> Result<()> {
+        let mut adjusted = before.clone();
+        let mut pending = self.pending.try_borrow_mut()?;
+        let mut admitted = self.historical_admitted.try_borrow_mut()?;
+        let mut incoming = Vec::new();
+        for (owner, binding, cleanup, event, accepted_at) in admissions {
+            if *accepted_at > captured_at_ns || admitted.contains(&event.event_id) {
+                continue;
+            }
+            if pending
+                .iter()
+                .any(|message| message.event().event_id == event.event_id)
+            {
+                admitted.insert(event.event_id);
+                continue;
+            }
+            let timer = adjusted
+                .get_mut(owner)
+                .context("historical timer admission has unknown owner")?["timers"]
+                .as_array_mut()
+                .context("historical timer schedules absent")?
+                .iter_mut()
+                .find(|timer| timer["binding"]["binding_id"].as_u64() == Some(*binding))
+                .context("historical timer admission changed binding")?;
+            let count = timer["binding"]["state"]
+                .as_u64()
+                .context("historical timer lease count absent")?;
+            ensure!(
+                count > 0 && count < (1u64 << 63),
+                "historical native callback closed or count missing"
+            );
+            timer["binding"]["state"] = (count - 1).into();
+            incoming.push((owner, binding, cleanup, event));
+        }
+        self.apply_historical_inventory(&adjusted)?;
+        for (owner, binding, cleanup, event) in incoming {
+            let message = self.clocks[owner]
+                .as_ref()
+                .context("historical timer owner resumed")?
+                .restore_message(event.clone(), *binding, *cleanup)?;
+            pending.push_back(message);
+            admitted.insert(event.event_id);
+        }
+        ensure!(
+            self.historical_inventory()? == *before,
+            "historical native timer inventory contains an unarchived callback admission"
+        );
+        Ok(())
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn take_historical_retained(&self, id: UUID4) -> Result<TimeEventMessage> {
+        let mut pending = self.pending.try_borrow_mut()?;
+        let index = pending
+            .iter()
+            .position(|message| message.event().event_id == id)
+            .context("sealed original timer message was not actually materialized")?;
+        let message = pending
+            .remove(index)
+            .context("original retained timer disappeared")?;
+        self.progress
+            .0
+            .try_borrow_mut()?
+            .events
+            .remove(&id.to_string());
+        Ok(message)
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn historical_time_message(
+        &mut self,
+        witness: &nautilus_common::recovery_trace::NativeReadWitness,
+    ) -> Result<TimeEventMessage> {
+        ensure!(
+            witness.profile == "actual_registered_owner_timer_input.v1"
+                && witness.source_version == "native_actual_registered_clock.v1",
+            "unknown historical owner timer witness"
+        );
+        let input = &witness.payload["input"];
+        let owner = input["owner"]
+            .as_str()
+            .context("historical timer owner absent")?;
+        let binding = input["binding"]["binding_id"]
+            .as_u64()
+            .context("historical timer binding absent")?;
+        let cleanup = match input["binding"]["kind"].as_str() {
+            Some("registered_owner_thread") => false,
+            Some("registered_cleanup") => true,
+            _ => anyhow::bail!("historical non-owner callback unsupported"),
+        };
+        let event = TimeEvent::new(
+            input["event"]["name"]
+                .as_str()
+                .context("historical timer name absent")?
+                .into(),
+            serde_json::from_value(input["event"]["event_id"].clone())?,
+            serde_json::from_value(input["event"]["ts_event"].clone())?,
+            serde_json::from_value(input["event"]["ts_init"].clone())?,
+        );
+        let mut before: BTreeMap<String, serde_json::Value> =
+            serde_json::from_value(witness.payload["inventory"].clone())?;
+        self.historical_admitted
+            .try_borrow_mut()?
+            .insert(event.event_id);
+        let mut pending = self.pending.try_borrow_mut()?;
+        let retained = pending
+            .iter()
+            .position(|message| message.event().event_id == event.event_id);
+        if let Some(index) = retained {
+            let message = pending
+                .remove(index)
+                .context("retained source event disappeared")?;
+            ensure!(message.event() == &event, "retained timer headers changed");
+            self.apply_historical_inventory(&before)?;
+            self.progress
+                .0
+                .try_borrow_mut()?
+                .events
+                .remove(&event.event_id.to_string());
+            return Ok(message);
+        }
+        // The incoming lease is added by the actual installed callback token, not by a counter setter.
+        let timer = before
+            .get_mut(owner)
+            .context("historical timer owner not installed")?["timers"]
+            .as_array_mut()
+            .context("historical timer inventory absent")?
+            .iter_mut()
+            .find(|timer| timer["binding"]["binding_id"].as_u64() == Some(binding))
+            .context("historical timer callback not in its owner clock")?;
+        let count = timer["binding"]["state"]
+            .as_u64()
+            .context("historical timer lease count absent")?;
+        ensure!(
+            count > 0 && count < (1u64 << 63),
+            "historical timer binding closed or unleased"
+        );
+        timer["binding"]["state"] = (count - 1).into();
+        self.apply_historical_inventory(&before)?;
+        let message = self.clocks[owner]
+            .as_ref()
+            .context("historical timer receipt absent")?
+            .restore_message(event, binding, cleanup)?;
+        let original: BTreeMap<String, serde_json::Value> =
+            serde_json::from_value(witness.payload["inventory"].clone())?;
+        ensure!(
+            self.historical_inventory()? == original,
+            "historical timer has unknown queued callback leases"
+        );
+        Ok(message)
     }
     pub(super) fn resume_observers(
         &mut self,
@@ -137,7 +337,7 @@ impl RetainedNodeTimers {
         self.verify()?;
         // Reserve before moving any owned callback. Old source events form the
         // actual prefix and therefore precede new current-process time events.
-        receiver.prepend_retained(&mut self.pending)?;
+        receiver.prepend_retained(self.pending.get_mut())?;
         for state in self.progress.0.try_borrow_mut()?.events.values_mut() {
             ensure!(state.phase == "retained", "timer handoff already attempted");
             state.phase = "queued";
@@ -282,7 +482,9 @@ impl LiveNode {
                 clocks: restored,
                 source,
                 source_pending: pending,
-                pending: messages,
+                pending: RefCell::new(messages),
+                #[cfg(feature = "native-tail-replay")]
+                historical_admitted: RefCell::new(HashSet::new()),
                 progress: progress.clone(),
             };
             node_timers.verify()?;
@@ -346,7 +548,9 @@ mod tests {
             clocks: BTreeMap::new(),
             source: BTreeMap::new(),
             source_pending: Vec::new(),
-            pending: VecDeque::from([message]),
+            pending: RefCell::new(VecDeque::from([message])),
+            #[cfg(feature = "native-tail-replay")]
+            historical_admitted: RefCell::new(HashSet::new()),
             progress: progress.clone(),
         };
         let (tail_sender, tail_receiver) = tokio::sync::mpsc::unbounded_channel();

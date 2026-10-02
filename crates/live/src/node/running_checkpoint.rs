@@ -115,6 +115,17 @@ mod tests {
             );
             self.trace.borrow_mut().push("seal");
         }
+        fn failure_retention(
+            &self,
+        ) -> Option<nautilus_system::event_store::EventStoreFailureRetention> {
+            let retained = self.retained.clone();
+            Some(
+                nautilus_system::event_store::EventStoreFailureRetention::new(move |_| {
+                    retained.set(true);
+                    Ok(())
+                }),
+            )
+        }
         fn retain_unsealed(&mut self, reason: &str) -> Result<()> {
             ensure!(!reason.is_empty(), "failure reason missing");
             self.retained.set(true);
@@ -480,6 +491,10 @@ pub struct RunningCheckpointBoundary<'a> {
     cache: &'a Cache,
     components: &'a CollectedComponentState,
     verify_frozen: &'a dyn Fn() -> Result<()>,
+    #[cfg(feature = "native-tail-replay")]
+    native_trace_cut: Option<&'a nautilus_event_store::native_trace::NativeTraceCheckpointCut>,
+    #[cfg(feature = "native-tail-replay")]
+    native_trace: Option<&'a nautilus_event_store::native_trace::NativeTraceRecorder>,
 }
 
 impl Debug for RunningCheckpointBoundary<'_> {
@@ -493,6 +508,34 @@ impl Debug for RunningCheckpointBoundary<'_> {
 }
 
 impl RunningCheckpointBoundary<'_> {
+    /// Actual source cut generated while all native queue/adapter/timer guards are held.
+    #[cfg(feature = "native-tail-replay")]
+    #[must_use]
+    pub fn native_trace_cut(
+        &self,
+    ) -> Option<&nautilus_event_store::native_trace::NativeTraceCheckpointCut> {
+        self.native_trace_cut
+    }
+    /// Persists one complete host artifact binding in the actual source Journal at this cut.
+    /// # Errors
+    /// Refuses an absent trace, changed boundary or failed actual durable acknowledgment.
+    #[cfg(feature = "native-tail-replay")]
+    pub fn persist_native_checkpoint(
+        &self,
+        host_checkpoint: serde_json::Value,
+    ) -> Result<nautilus_event_store::writer::DurableEntryAcknowledgment> {
+        self.verify()?;
+        let ack = self
+            .native_trace
+            .context("native trace not installed")?
+            .persist_checkpoint(
+                self.native_trace_cut.context("native cut absent")?,
+                host_checkpoint,
+            )?;
+        self.verify()?;
+        Ok(ack)
+    }
+
     /// Rechecks actual native registrations, adapters, timers, queues and same
     /// completed root while this borrowed boundary's freeze remains held.
     ///
@@ -673,7 +716,7 @@ impl LiveNode {
             let guard = self
                 .begin_node_dispatch(crate::dispatch::DispatchSource::Lifecycle, &input)?
                 .context("final cut observer missing")?;
-            guard.complete()?;
+            self.finish_node_dispatch(guard)?;
             self.checkpoint_completed_root_mode(receivers, false, true)?;
             ensure!(
                 self.terminal_checkpoint.is_some(),
@@ -995,7 +1038,30 @@ impl LiveNode {
                                 Ok(())
                             };
                             verify()?;
+                            #[cfg(feature = "native-tail-replay")]
+                            let native_trace_cut = observer.native_trace().map(|trace| {
+                                ensure!(self.recovery_timers.is_none(),
+                                    "legacy retained timers lack original causal receipts");
+                                let receipts = receivers.native_pending_receipts()?;
+                                let value = serde_json::to_value(&inventory)?;
+                                let digest = nautilus_event_store::native_trace::native_inventory_digest(&value)?;
+                                let mut cut = trace.checkpoint_cut_at(proof.root_sequence(), proof.input_sequence(), digest, receipts, now, inventory.captured_at_ns)?;
+                                cut.pending_inputs = receivers.native_pending_inputs(&|source, input| {
+                                    Ok(observer.encode_historical_source(crate::node::dispatch::source_dispatch(source)?, "native_enqueue", input)?.payload)
+                                })?;
+                                cut.registered_timers = inventory.timers.clone();
+                                cut.native_effects["registered_timers"] = serde_json::to_value(&inventory.timers)?;
+                                cut.native_effects["execution_manager"] = self.exec_manager.trace_effects_inventory(now)?;
+                                cut.native_effects["timer_capture_ns"] = inventory.captured_at_ns.into();
+                                ensure!(cut.pending_inputs.iter().map(|input| &input.receipt).eq(cut.pending.iter()),
+                                    "actual staged source payload/receipt inventory differs");
+                                Ok(cut)
+                            }).transpose()?;
                             let boundary = RunningCheckpointBoundary {
+                                #[cfg(feature = "native-tail-replay")]
+                                native_trace_cut: native_trace_cut.as_ref(),
+                                #[cfg(feature = "native-tail-replay")]
+                                native_trace: observer.native_trace(),
                                 proof: &proof,
                                 pending: &pending,
                                 inventory: &inventory,

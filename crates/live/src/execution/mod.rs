@@ -33,3 +33,6 @@ pub(crate) mod client;
 mod recency;
 mod reconciliation;
 pub(crate) use reconciliation::serialize_ordered_pairs;
+
+#[cfg(feature = "native-tail-replay")]
+pub(crate) use reconciliation::deserialize_ordered_pairs;

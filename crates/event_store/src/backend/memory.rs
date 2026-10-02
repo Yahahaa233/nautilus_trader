@@ -902,6 +902,7 @@ mod tests {
         // Backend treats AppendEntry::index_keys as the sole authority. Headers on
         // the entry are not auto-extracted; the writer/encoder is responsible.
         let headers = Headers {
+            native_origin: None,
             correlation_id: Some(UUID4::new()),
             ..Headers::empty()
         };

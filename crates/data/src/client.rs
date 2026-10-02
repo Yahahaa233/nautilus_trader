@@ -377,7 +377,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_custom,
             data_type,
             "",
-            |client| client.subscribe(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe",
+                    &cmd.clone(),
+                    || client.subscribe(cmd),
+                )
+            },
         )
     }
 
@@ -392,7 +399,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_custom,
             &cmd.data_type,
             "",
-            |client| client.unsubscribe(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe",
+                    &cmd.clone(),
+                    || client.unsubscribe(cmd),
+                )
+            },
         )
     }
 
@@ -407,7 +421,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_instrument_venue,
             cmd.venue,
             "instruments",
-            |client| client.subscribe_instruments(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe_instruments",
+                    &cmd.clone(),
+                    || client.subscribe_instruments(cmd),
+                )
+            },
         )
     }
 
@@ -422,7 +443,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_instrument_venue,
             &cmd.venue,
             "instruments",
-            |client| client.unsubscribe_instruments(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe_instruments",
+                    &cmd.clone(),
+                    || client.unsubscribe_instruments(cmd),
+                )
+            },
         )
     }
 
@@ -437,7 +465,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_instrument,
             cmd.instrument_id,
             "instrument",
-            |client| client.subscribe_instrument(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe_instrument",
+                    &cmd.clone(),
+                    || client.subscribe_instrument(cmd),
+                )
+            },
         )
     }
 
@@ -452,7 +487,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_instrument,
             &cmd.instrument_id,
             "instrument",
-            |client| client.unsubscribe_instrument(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe_instrument",
+                    &cmd.clone(),
+                    || client.unsubscribe_instrument(cmd),
+                )
+            },
         )
     }
 
@@ -467,7 +509,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_book_deltas,
             cmd.instrument_id,
             "order book deltas",
-            |client| client.subscribe_book_deltas(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe_book_deltas",
+                    &cmd.clone(),
+                    || client.subscribe_book_deltas(cmd),
+                )
+            },
         )
     }
 
@@ -482,7 +531,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_book_deltas,
             &cmd.instrument_id,
             "order book deltas",
-            |client| client.unsubscribe_book_deltas(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe_book_deltas",
+                    &cmd.clone(),
+                    || client.unsubscribe_book_deltas(cmd),
+                )
+            },
         )
     }
 
@@ -497,7 +553,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_book_depth10,
             cmd.instrument_id,
             "order book depth",
-            |client| client.subscribe_book_depth10(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe_book_depth10",
+                    &cmd.clone(),
+                    || client.subscribe_book_depth10(cmd),
+                )
+            },
         )
     }
 
@@ -512,7 +575,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_book_depth10,
             &cmd.instrument_id,
             "order book depth",
-            |client| client.unsubscribe_book_depth10(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe_book_depth10",
+                    &cmd.clone(),
+                    || client.unsubscribe_book_depth10(cmd),
+                )
+            },
         )
     }
 
@@ -527,7 +597,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_quotes,
             cmd.instrument_id,
             "quotes",
-            |client| client.subscribe_quotes(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe_quotes",
+                    &cmd.clone(),
+                    || client.subscribe_quotes(cmd),
+                )
+            },
         )
     }
 
@@ -542,7 +619,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_quotes,
             &cmd.instrument_id,
             "quotes",
-            |client| client.unsubscribe_quotes(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe_quotes",
+                    &cmd.clone(),
+                    || client.unsubscribe_quotes(cmd),
+                )
+            },
         )
     }
 
@@ -557,7 +641,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_trades,
             cmd.instrument_id,
             "trades",
-            |client| client.subscribe_trades(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe_trades",
+                    &cmd.clone(),
+                    || client.subscribe_trades(cmd),
+                )
+            },
         )
     }
 
@@ -572,7 +663,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_trades,
             &cmd.instrument_id,
             "trades",
-            |client| client.unsubscribe_trades(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe_trades",
+                    &cmd.clone(),
+                    || client.unsubscribe_trades(cmd),
+                )
+            },
         )
     }
 
@@ -587,7 +685,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_bars,
             cmd.bar_type,
             "bars",
-            |client| client.subscribe_bars(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe_bars",
+                    &cmd.clone(),
+                    || client.subscribe_bars(cmd),
+                )
+            },
         )
     }
 
@@ -602,7 +707,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_bars,
             &cmd.bar_type,
             "bars",
-            |client| client.unsubscribe_bars(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe_bars",
+                    &cmd.clone(),
+                    || client.unsubscribe_bars(cmd),
+                )
+            },
         )
     }
 
@@ -617,7 +729,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_mark_prices,
             cmd.instrument_id,
             "mark prices",
-            |client| client.subscribe_mark_prices(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe_mark_prices",
+                    &cmd.clone(),
+                    || client.subscribe_mark_prices(cmd),
+                )
+            },
         )
     }
 
@@ -632,7 +751,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_mark_prices,
             &cmd.instrument_id,
             "mark prices",
-            |client| client.unsubscribe_mark_prices(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe_mark_prices",
+                    &cmd.clone(),
+                    || client.unsubscribe_mark_prices(cmd),
+                )
+            },
         )
     }
 
@@ -647,7 +773,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_index_prices,
             cmd.instrument_id,
             "index prices",
-            |client| client.subscribe_index_prices(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe_index_prices",
+                    &cmd.clone(),
+                    || client.subscribe_index_prices(cmd),
+                )
+            },
         )
     }
 
@@ -662,7 +795,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_index_prices,
             &cmd.instrument_id,
             "index prices",
-            |client| client.unsubscribe_index_prices(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe_index_prices",
+                    &cmd.clone(),
+                    || client.unsubscribe_index_prices(cmd),
+                )
+            },
         )
     }
 
@@ -677,7 +817,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_funding_rates,
             cmd.instrument_id,
             "funding rates",
-            |client| client.subscribe_funding_rates(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe_funding_rates",
+                    &cmd.clone(),
+                    || client.subscribe_funding_rates(cmd),
+                )
+            },
         )
     }
 
@@ -692,7 +839,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_funding_rates,
             &cmd.instrument_id,
             "funding rates",
-            |client| client.unsubscribe_funding_rates(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe_funding_rates",
+                    &cmd.clone(),
+                    || client.unsubscribe_funding_rates(cmd),
+                )
+            },
         )
     }
 
@@ -710,7 +864,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_instrument_status,
             cmd.instrument_id,
             "instrument status",
-            |client| client.subscribe_instrument_status(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe_instrument_status",
+                    &cmd.clone(),
+                    || client.subscribe_instrument_status(cmd),
+                )
+            },
         )
     }
 
@@ -728,7 +889,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_instrument_status,
             &cmd.instrument_id,
             "instrument status",
-            |client| client.unsubscribe_instrument_status(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe_instrument_status",
+                    &cmd.clone(),
+                    || client.unsubscribe_instrument_status(cmd),
+                )
+            },
         )
     }
 
@@ -743,7 +911,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_instrument_close,
             cmd.instrument_id,
             "instrument close",
-            |client| client.subscribe_instrument_close(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe_instrument_close",
+                    &cmd.clone(),
+                    || client.subscribe_instrument_close(cmd),
+                )
+            },
         )
     }
 
@@ -761,7 +936,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_instrument_close,
             &cmd.instrument_id,
             "instrument close",
-            |client| client.unsubscribe_instrument_close(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe_instrument_close",
+                    &cmd.clone(),
+                    || client.unsubscribe_instrument_close(cmd),
+                )
+            },
         )
     }
 
@@ -776,7 +958,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_option_greeks,
             cmd.instrument_id,
             "option greeks",
-            |client| client.subscribe_option_greeks(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.subscribe_option_greeks",
+                    &cmd.clone(),
+                    || client.subscribe_option_greeks(cmd),
+                )
+            },
         )
     }
 
@@ -791,7 +980,14 @@ impl DataClientAdapter {
             &mut self.subscriptions_option_greeks,
             &cmd.instrument_id,
             "option greeks",
-            |client| client.unsubscribe_option_greeks(cmd),
+            |client| {
+                nautilus_common::recovery_trace::native_transport(
+                    &client.client_id().to_string(),
+                    "data.unsubscribe_option_greeks",
+                    &cmd.clone(),
+                    || client.unsubscribe_option_greeks(cmd),
+                )
+            },
         )
     }
 
@@ -850,7 +1046,12 @@ impl DataClientAdapter {
     ///
     /// Returns an error if the client request fails.
     pub fn request_data(&self, req: RequestCustomData) -> anyhow::Result<()> {
-        self.client.request_data(req)
+        nautilus_common::recovery_trace::native_transport(
+            &self.client.client_id().to_string(),
+            "data.request_data",
+            &req.clone(),
+            || self.client.request_data(req),
+        )
     }
 
     /// Sends a single instrument request to the client.
@@ -859,7 +1060,12 @@ impl DataClientAdapter {
     ///
     /// Returns an error if the client fails to process the request.
     pub fn request_instrument(&self, req: RequestInstrument) -> anyhow::Result<()> {
-        self.client.request_instrument(req)
+        nautilus_common::recovery_trace::native_transport(
+            &self.client.client_id().to_string(),
+            "data.request_instrument",
+            &req.clone(),
+            || self.client.request_instrument(req),
+        )
     }
 
     /// Sends a batch instruments request to the client.
@@ -868,7 +1074,12 @@ impl DataClientAdapter {
     ///
     /// Returns an error if the client fails to process the request.
     pub fn request_instruments(&self, req: RequestInstruments) -> anyhow::Result<()> {
-        self.client.request_instruments(req)
+        nautilus_common::recovery_trace::native_transport(
+            &self.client.client_id().to_string(),
+            "data.request_instruments",
+            &req.clone(),
+            || self.client.request_instruments(req),
+        )
     }
 
     /// Sends a book snapshot request for a given instrument.
@@ -877,7 +1088,12 @@ impl DataClientAdapter {
     ///
     /// Returns an error if the client fails to process the book snapshot request.
     pub fn request_book_snapshot(&self, req: RequestBookSnapshot) -> anyhow::Result<()> {
-        self.client.request_book_snapshot(req)
+        nautilus_common::recovery_trace::native_transport(
+            &self.client.client_id().to_string(),
+            "data.request_book_snapshot",
+            &req.clone(),
+            || self.client.request_book_snapshot(req),
+        )
     }
 
     /// Sends a quotes request for a given instrument.
@@ -886,7 +1102,12 @@ impl DataClientAdapter {
     ///
     /// Returns an error if the client fails to process the quotes request.
     pub fn request_quotes(&self, req: RequestQuotes) -> anyhow::Result<()> {
-        self.client.request_quotes(req)
+        nautilus_common::recovery_trace::native_transport(
+            &self.client.client_id().to_string(),
+            "data.request_quotes",
+            &req.clone(),
+            || self.client.request_quotes(req),
+        )
     }
 
     /// Sends a trades request for a given instrument.
@@ -895,7 +1116,12 @@ impl DataClientAdapter {
     ///
     /// Returns an error if the client fails to process the trades request.
     pub fn request_trades(&self, req: RequestTrades) -> anyhow::Result<()> {
-        self.client.request_trades(req)
+        nautilus_common::recovery_trace::native_transport(
+            &self.client.client_id().to_string(),
+            "data.request_trades",
+            &req.clone(),
+            || self.client.request_trades(req),
+        )
     }
 
     /// Sends a funding rates request for a given instrument.
@@ -904,7 +1130,12 @@ impl DataClientAdapter {
     ///
     /// Returns an error if the client fails to process the trades request.
     pub fn request_funding_rates(&self, req: RequestFundingRates) -> anyhow::Result<()> {
-        self.client.request_funding_rates(req)
+        nautilus_common::recovery_trace::native_transport(
+            &self.client.client_id().to_string(),
+            "data.request_funding_rates",
+            &req.clone(),
+            || self.client.request_funding_rates(req),
+        )
     }
 
     /// Sends an option-chain reference price request.
@@ -916,7 +1147,12 @@ impl DataClientAdapter {
         &self,
         req: RequestOptionChainReferencePrice,
     ) -> anyhow::Result<()> {
-        self.client.request_option_chain_reference_price(req)
+        nautilus_common::recovery_trace::native_transport(
+            &self.client.client_id().to_string(),
+            "data.request_option_chain_reference_price",
+            &req.clone(),
+            || self.client.request_option_chain_reference_price(req),
+        )
     }
 
     /// Sends a bars request for a given instrument and bar type.
@@ -925,7 +1161,12 @@ impl DataClientAdapter {
     ///
     /// Returns an error if the client fails to process the bars request.
     pub fn request_bars(&self, req: RequestBars) -> anyhow::Result<()> {
-        self.client.request_bars(req)
+        nautilus_common::recovery_trace::native_transport(
+            &self.client.client_id().to_string(),
+            "data.request_bars",
+            &req.clone(),
+            || self.client.request_bars(req),
+        )
     }
 
     /// Sends an order book depths request for a given instrument.
@@ -934,6 +1175,11 @@ impl DataClientAdapter {
     ///
     /// Returns an error if the client fails to process the order book depths request.
     pub fn request_book_depth(&self, req: RequestBookDepth) -> anyhow::Result<()> {
-        self.client.request_book_depth(req)
+        nautilus_common::recovery_trace::native_transport(
+            &self.client.client_id().to_string(),
+            "data.request_book_depth",
+            &req.clone(),
+            || self.client.request_book_depth(req),
+        )
     }
 }

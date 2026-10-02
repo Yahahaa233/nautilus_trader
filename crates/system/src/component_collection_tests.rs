@@ -60,6 +60,16 @@ fn register(
         ComponentStateCallbacks {
             load,
             save: save_actor,
+            #[cfg(feature = "live")]
+            historical_save: save_actor,
+            #[cfg(feature = "live")]
+            historical_prepare: |_, _| {
+                anyhow::bail!("collection fixture has no historical preparation")
+            },
+            #[cfg(feature = "live")]
+            historical_lifecycle: |_, _| {
+                anyhow::bail!("collection fixture has no historical lifecycle")
+            },
         },
     );
     trader.strategy_state_callbacks.insert(
@@ -67,6 +77,16 @@ fn register(
         ComponentStateCallbacks {
             load,
             save: save_strategy,
+            #[cfg(feature = "live")]
+            historical_save: save_strategy,
+            #[cfg(feature = "live")]
+            historical_prepare: |_, _| {
+                anyhow::bail!("collection fixture has no historical preparation")
+            },
+            #[cfg(feature = "live")]
+            historical_lifecycle: |_, _| {
+                anyhow::bail!("collection fixture has no historical lifecycle")
+            },
         },
     );
 }

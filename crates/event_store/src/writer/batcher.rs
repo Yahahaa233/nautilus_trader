@@ -75,6 +75,16 @@ pub(super) enum WriterMessage {
         /// Durable high-watermark after the flush.
         ack: SyncSender<Result<u64, EventStoreError>>,
     },
+    /// Fingerprints the actual committed prefix without accepting caller hashes.
+    DurablePrefix {
+        ack: SyncSender<Result<super::DurableJournalPrefix, EventStoreError>>,
+    },
+    /// Appends one exact row after earlier queued drafts commit.
+    AppendDurable {
+        draft: EntryDraft,
+        ts_publish: UnixNanos,
+        ack: SyncSender<Result<super::DurableEntryAcknowledgment, EventStoreError>>,
+    },
     /// Records a cache snapshot anchor after all pending entries have been flushed.
     RecordSnapshotAnchor {
         /// Cache-owned reference to the snapshot blob.
@@ -217,6 +227,50 @@ pub(super) fn run(
 
                 batch_deadline = None;
             }
+            Ok(WriterMessage::DurablePrefix { ack }) => {
+                if !flush(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref()) {
+                    let _ = ack.send(Err(EventStoreError::Closed));
+                    return;
+                }
+                let result = super::read_durable_prefix(backend.as_ref());
+                let failed = result.is_err();
+                if let Err(e) = &result {
+                    halt.fire(HaltReason::from_backend_error(e));
+                }
+                let _ = ack.send(result);
+                if failed {
+                    return;
+                }
+                batch_deadline = None;
+            }
+            Ok(WriterMessage::AppendDurable {
+                draft,
+                ts_publish,
+                ack,
+            }) => {
+                if !flush(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref()) {
+                    let _ = ack.send(Err(EventStoreError::Closed));
+                    return;
+                }
+                let append = build_append_entry(draft, ts_publish, next_seq);
+                let acknowledgment = super::DurableEntryAcknowledgment {
+                    sequence: append.entry.seq,
+                    entry_hash: append.entry.entry_hash,
+                };
+                match backend.append_batch(std::slice::from_ref(&append)) {
+                    Ok(watermark) => {
+                        next_seq += 1;
+                        high_watermark.store(watermark, Ordering::Release);
+                        let _ = ack.send(Ok(acknowledgment));
+                    }
+                    Err(e) => {
+                        halt.fire(HaltReason::from_backend_error(&e));
+                        let _ = ack.send(Err(e));
+                        return;
+                    }
+                }
+                batch_deadline = None;
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if !batch.is_empty()
                     && !flush(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref())
@@ -293,6 +347,12 @@ fn drain_pending(rx: &Receiver<WriterMessage>, batch: &mut Vec<AppendEntry>, nex
                 let _ = ack.send(Err(EventStoreError::Backend(
                     "writer is closing before snapshot anchor".to_string(),
                 )));
+            }
+            WriterMessage::DurablePrefix { ack } => {
+                let _ = ack.send(Err(EventStoreError::Closed));
+            }
+            WriterMessage::AppendDurable { ack, .. } => {
+                let _ = ack.send(Err(EventStoreError::Closed));
             }
         }
     }

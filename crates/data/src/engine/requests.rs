@@ -628,7 +628,7 @@ mod tests {
             None,
             None,
             None,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             UnixNanos::default(),
             Some(params),
         )

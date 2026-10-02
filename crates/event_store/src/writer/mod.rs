@@ -99,6 +99,63 @@ pub struct EntryDraft {
     pub index_keys: Vec<IndexKey>,
 }
 
+/// An exact durable prefix read by the actual owning backend after its queued writes commit.
+/// It is evidence about archived bytes and grants no execution authority.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableJournalPrefix {
+    pub run_id: String,
+    pub sequence: u64,
+    pub entry_hash_digest: String,
+}
+
+/// An append acknowledgment issued after the actual backend committed this exact row.
+#[derive(Clone, Debug)]
+pub struct DurableEntryAcknowledgment {
+    pub(crate) sequence: u64,
+    pub(crate) entry_hash: crate::hash::EntryHash,
+}
+impl DurableEntryAcknowledgment {
+    /// Returns the actual assigned Journal sequence.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+    /// Returns the actual committed row hash.
+    #[must_use]
+    pub const fn entry_hash(&self) -> crate::hash::EntryHash {
+        self.entry_hash
+    }
+}
+
+pub(crate) fn read_durable_prefix(
+    backend: &dyn crate::backend::EventStore,
+) -> Result<DurableJournalPrefix, crate::error::EventStoreError> {
+    let sequence = backend.high_watermark()?;
+    let manifest = backend.manifest()?;
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"nautilus-native-journal-prefix/v1");
+    digest.update(&(manifest.run_id.len() as u64).to_be_bytes());
+    digest.update(manifest.run_id.as_bytes());
+    digest.update(&sequence.to_be_bytes());
+    for seq in 1..=sequence {
+        let entry = backend.scan_seq(seq)?.ok_or_else(|| {
+            crate::error::EventStoreError::Backend("native prefix row absent".into())
+        })?;
+        if entry.seq != seq || entry.recompute_hash() != entry.entry_hash {
+            return Err(crate::error::EventStoreError::Backend(
+                "native prefix integrity mismatch".into(),
+            ));
+        }
+        digest.update(entry.entry_hash.as_bytes());
+    }
+    Ok(DurableJournalPrefix {
+        run_id: manifest.run_id,
+        sequence,
+        entry_hash_digest: digest.finalize().to_hex().to_string(),
+    })
+}
+
 impl EntryDraft {
     /// Creates a new [`EntryDraft`] with no sidecar index keys.
     #[must_use]
@@ -335,6 +392,49 @@ mod imp {
             let tx = self.tx.as_ref().ok_or(EventStoreError::Closed)?;
             let (ack, ack_rx) = mpsc::sync_channel(1);
             self.request_ack(tx, WriterMessage::Flush { ack }, &ack_rx, "flush")
+        }
+
+        /// Commits preceding writes and fingerprints their actual backend rows.
+        ///
+        /// # Errors
+        /// Refuses closure, halt, timeout, absent or corrupt source entries.
+        pub fn durable_prefix(&self) -> Result<super::DurableJournalPrefix, EventStoreError> {
+            if self.halted.load(Ordering::Acquire) {
+                return Err(EventStoreError::Closed);
+            }
+            let tx = self.tx.as_ref().ok_or(EventStoreError::Closed)?;
+            let (ack, ack_rx) = mpsc::sync_channel(1);
+            self.request_ack(
+                tx,
+                WriterMessage::DurablePrefix { ack },
+                &ack_rx,
+                "native prefix",
+            )
+        }
+
+        /// Appends and acknowledges the exact actual backend row.
+        ///
+        /// # Errors
+        /// Refuses closure, halt, backpressure or failed durable append.
+        pub fn append_durable(
+            &self,
+            draft: EntryDraft,
+        ) -> Result<super::DurableEntryAcknowledgment, EventStoreError> {
+            if self.halted.load(Ordering::Acquire) {
+                return Err(EventStoreError::Closed);
+            }
+            let tx = self.tx.as_ref().ok_or(EventStoreError::Closed)?;
+            let (ack, ack_rx) = mpsc::sync_channel(1);
+            self.request_ack(
+                tx,
+                WriterMessage::AppendDurable {
+                    draft,
+                    ts_publish: self.clock.get_time_ns(),
+                    ack,
+                },
+                &ack_rx,
+                "native durable append",
+            )
         }
 
         fn request_ack<T>(
@@ -599,6 +699,50 @@ mod imp {
                 return Err(EventStoreError::Closed);
             }
             Ok(self.high_watermark.load(Ordering::Acquire))
+        }
+
+        /// Reads the actual synchronous backend's complete durable prefix.
+        ///
+        /// # Errors
+        /// Refuses closure and invalid source entries.
+        pub fn durable_prefix(&self) -> Result<super::DurableJournalPrefix, EventStoreError> {
+            let inner = self.inner.lock();
+            if inner.closed {
+                return Err(EventStoreError::Closed);
+            }
+            super::read_durable_prefix(inner.backend.as_ref())
+        }
+
+        /// Appends and acknowledges the exact synchronous backend row.
+        ///
+        /// # Errors
+        /// Refuses closure and failed durable append.
+        pub fn append_durable(
+            &self,
+            draft: EntryDraft,
+        ) -> Result<super::DurableEntryAcknowledgment, EventStoreError> {
+            let mut inner = self.inner.lock();
+            if inner.closed {
+                return Err(EventStoreError::Closed);
+            }
+            let sequence = inner.next_seq;
+            let append = batcher::build_append_entry(draft, self.clock.get_time_ns(), sequence);
+            let entry_hash = append.entry.entry_hash;
+            match inner.backend.append_batch(std::slice::from_ref(&append)) {
+                Ok(watermark) => {
+                    inner.next_seq = sequence + 1;
+                    self.high_watermark.store(watermark, Ordering::Release);
+                    Ok(super::DurableEntryAcknowledgment {
+                        sequence,
+                        entry_hash,
+                    })
+                }
+                Err(e) => {
+                    (self.halt)(HaltReason::from_backend_error(&e));
+                    inner.closed = true;
+                    Err(e)
+                }
+            }
         }
 
         /// Records a snapshot anchor at the current durable high-watermark.

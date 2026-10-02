@@ -1,6 +1,106 @@
 //! A shared, fail-closed boundary for all live runner ingress channels.
+use super::dst;
+use crate::recovery_trace::{NativeIngressReceipt, NativeInputSource, scope};
+use nautilus_core::{UUID4, time::duration_since_unix_epoch};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::SendError};
+use std::task::{Context, Poll};
+use tokio::sync::mpsc::{
+    UnboundedReceiver, UnboundedSender,
+    error::{SendError, TryRecvError},
+};
+
+/// The message and its actual ingress evidence remain one physical queue entry.
+#[derive(Debug)]
+pub struct NativeIngressMessage<T> {
+    message: T,
+    receipt: NativeIngressReceipt,
+}
+impl<T> NativeIngressMessage<T> {
+    /// Returns the original message and its inseparable native receipt.
+    #[must_use]
+    pub fn into_parts(self) -> (T, NativeIngressReceipt) {
+        (self.message, self.receipt)
+    }
+}
+
+#[derive(Debug)]
+struct TraceChannel {
+    id: UUID4,
+    source: NativeInputSource,
+    anchor_wall_ns: u64,
+    anchor_instant: dst::time::Instant,
+}
+
+#[derive(Debug)]
+enum SenderKind<T> {
+    Raw(UnboundedSender<T>),
+    Native(UnboundedSender<NativeIngressMessage<T>>, Arc<TraceChannel>),
+}
+
+/// The actual native receiver numbers messages in physical FIFO order, including
+/// staged checkpoint prefixes. Producers never hold a mutex across arbitrary wakers.
+#[derive(Debug)]
+pub struct NativeIngressReceiver<T> {
+    receiver: UnboundedReceiver<NativeIngressMessage<T>>,
+    next_ordinal: Option<u64>,
+    gate: IngressGate,
+}
+impl<T> NativeIngressReceiver<T> {
+    fn number(&mut self, mut message: NativeIngressMessage<T>) -> NativeIngressMessage<T> {
+        message.receipt.channel_ordinal = self.next_ordinal.unwrap_or(0);
+        self.next_ordinal = self.next_ordinal.and_then(|value| value.checked_add(1));
+        if self.next_ordinal.is_none() {
+            self.gate.invalidate();
+        }
+        message
+    }
+    /// Returns the real number of channel-resident messages.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.receiver.len()
+    }
+    /// Returns whether the actual receiver is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.receiver.is_empty()
+    }
+    /// Closes future admission without dropping queued evidence.
+    pub fn close(&mut self) {
+        self.receiver.close();
+    }
+    /// Returns whether the actual channel is closed.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.receiver.is_closed()
+    }
+    /// Receives and numbers the oldest physical entry.
+    ///
+    /// # Errors
+    /// Returns the actual channel empty/disconnected error.
+    pub fn try_recv(&mut self) -> Result<NativeIngressMessage<T>, TryRecvError> {
+        let message = self.receiver.try_recv()?;
+        Ok(self.number(message))
+    }
+    /// Polls the actual oldest physical entry without inventing an enqueue acknowledgment.
+    pub fn poll_recv(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<NativeIngressMessage<T>>> {
+        match self.receiver.poll_recv(context) {
+            Poll::Ready(Some(message)) => Poll::Ready(Some(self.number(message))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+impl<T> Clone for SenderKind<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Raw(sender) => Self::Raw(sender.clone()),
+            Self::Native(sender, trace) => Self::Native(sender.clone(), trace.clone()),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct State {
@@ -29,10 +129,40 @@ impl IngressGate {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         (
             IngressSender {
-                sender,
+                sender: SenderKind::Raw(sender),
                 gate: self.clone(),
             },
             receiver,
+        )
+    }
+
+    /// Creates an owned channel that preserves actual admission time and FIFO identity.
+    /// Retained sender clones share admission; the actual receiver assigns physical FIFO ordinals.
+    #[must_use]
+    pub fn native_channel<T>(
+        &self,
+        source: NativeInputSource,
+    ) -> (IngressSender<T>, NativeIngressReceiver<T>) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let trace = TraceChannel {
+            id: UUID4::new(),
+            source,
+            anchor_wall_ns: duration_since_unix_epoch()
+                .as_nanos()
+                .try_into()
+                .expect("current Unix time exceeds native receipt range"),
+            anchor_instant: dst::time::Instant::now(),
+        };
+        (
+            IngressSender {
+                sender: SenderKind::Native(sender, Arc::new(trace)),
+                gate: self.clone(),
+            },
+            NativeIngressReceiver {
+                receiver,
+                next_ordinal: Some(1),
+                gate: self.clone(),
+            },
         )
     }
 
@@ -165,7 +295,7 @@ impl IngressGate {
 /// A private sender prevents retained clones from bypassing the gate.
 #[derive(Debug)]
 pub struct IngressSender<T> {
-    sender: UnboundedSender<T>,
+    sender: SenderKind<T>,
     gate: IngressGate,
 }
 impl<T> Clone for IngressSender<T> {
@@ -181,7 +311,7 @@ impl<T> From<UnboundedSender<T>> for IngressSender<T> {
     /// with its own gate; wrapping an external channel does not prove ownership.
     fn from(sender: UnboundedSender<T>) -> Self {
         Self {
-            sender,
+            sender: SenderKind::Raw(sender),
             gate: IngressGate::new(),
         }
     }
@@ -192,7 +322,45 @@ impl<T> IngressSender<T> {
     /// # Errors
     /// Returns the original message when frozen, poisoned, or disconnected.
     /// A send attempted during capture invalidates that capture.
-    pub fn send(&self, message: T) -> Result<(), SendError<T>> {
+    pub fn send(&self, message: T) -> Result<(), SendError<T>>
+    where
+        T: 'static,
+    {
+        // History verifies the original intent before the admission mutex; it must
+        // not create a second physical FIFO entry while the real runner is frozen.
+        let trace_active = scope::capture_active() || crate::recovery_trace::historical::active();
+        let encoded = if trace_active {
+            let SenderKind::Native(_, trace) = &self.sender else {
+                crate::recovery_trace::historical_failure(
+                    "historical/source derived send used an unowned raw channel",
+                );
+                return Err(SendError(message));
+            };
+            let payload = match crate::recovery_trace::encode_native_ingress(trace.source, &message)
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    crate::recovery_trace::historical_failure(&format!(
+                        "native derived codec failed: {error:#}"
+                    ));
+                    return Err(SendError(message));
+                }
+            };
+            match crate::recovery_trace::historical::queued(trace.source, &payload) {
+                Ok(Some(true)) => return Ok(()),
+                Ok(Some(false)) => return Err(SendError(message)),
+                Ok(None) => Some(payload),
+                Err(error) => {
+                    crate::recovery_trace::historical_failure(&format!(
+                        "native derived queue differs: {error:#}"
+                    ));
+                    return Err(SendError(message));
+                }
+            }
+        } else {
+            None
+        };
+        let mut derived = None;
         {
             let Ok(mut state) = self.gate.0.lock() else {
                 return Err(SendError(message));
@@ -216,7 +384,47 @@ impl<T> IngressSender<T> {
             gate: &self.gate,
             completed: false,
         };
-        let result = self.sender.send(message);
+        let result = match &self.sender {
+            SenderKind::Raw(sender) => sender.send(message),
+            SenderKind::Native(sender, trace) => {
+                let wall_ns = u64::try_from(duration_since_unix_epoch().as_nanos());
+                let elapsed_ns = u64::try_from(trace.anchor_instant.elapsed().as_nanos());
+                let (Ok(wall_ns), Ok(elapsed_ns)) = (wall_ns, elapsed_ns) else {
+                    self.gate.invalidate();
+                    return Err(SendError(message));
+                };
+                let receipt = NativeIngressReceipt {
+                    message_id: UUID4::new(),
+                    channel_id: trace.id,
+                    channel_ordinal: 0,
+                    input_source: trace.source,
+                    clock_anchor_wall_ns: trace.anchor_wall_ns,
+                    accepted_elapsed_ns: elapsed_ns,
+                    accepted_wall_ns: wall_ns,
+                    caused_by: scope::current_cause(),
+                };
+                if let Some(payload) = encoded {
+                    derived = Some(crate::recovery_trace::NativeQueuedOutput {
+                        receipt: receipt.clone(),
+                        payload,
+                        accepted: false,
+                    });
+                }
+                match sender.send(NativeIngressMessage { message, receipt }) {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(SendError(e.0.message)),
+                }
+            }
+        };
+        if let Some(mut derived) = derived {
+            derived.accepted = result.is_ok();
+            if let Err(error) = scope::note_queued_output(derived) {
+                self.gate.invalidate();
+                crate::recovery_trace::historical_failure(&format!(
+                    "native queued source receipt failed: {error:#}"
+                ));
+            }
+        }
         permit.finish(result.is_ok());
         result
     }
@@ -234,16 +442,26 @@ impl<T> IngressSender<T> {
     /// Compares the underlying channel without exposing a raw sender.
     #[must_use]
     pub fn same_channel(&self, other: &Self) -> bool {
-        self.sender.same_channel(&other.sender)
+        match (&self.sender, &other.sender) {
+            (SenderKind::Raw(a), SenderKind::Raw(b)) => a.same_channel(b),
+            (SenderKind::Native(a, _), SenderKind::Native(b, _)) => a.same_channel(b),
+            _ => false,
+        }
     }
     /// Returns whether the receiver is closed; this does not prove gate health.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.sender.is_closed()
+        match &self.sender {
+            SenderKind::Raw(sender) => sender.is_closed(),
+            SenderKind::Native(sender, _) => sender.is_closed(),
+        }
     }
     /// Waits for receiver closure, independently of admission state.
     pub async fn closed(&self) {
-        self.sender.closed().await;
+        match &self.sender {
+            SenderKind::Raw(sender) => sender.closed().await,
+            SenderKind::Native(sender, _) => sender.closed().await,
+        }
     }
 }
 

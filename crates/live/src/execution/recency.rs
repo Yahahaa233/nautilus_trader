@@ -40,7 +40,10 @@ where
     K: Eq + Hash,
 {
     pub(crate) fn mark(&mut self, key: K) {
-        self.inner.insert(key, dst::time::Instant::now());
+        self.inner.insert(
+            key,
+            nautilus_common::recovery_trace::scope::effective_activity_instant(),
+        );
     }
 
     pub(crate) fn checkpoint_entries(
@@ -110,7 +113,10 @@ where
 
     #[must_use]
     pub(crate) fn elapsed(&self, key: &K) -> Option<Duration> {
-        self.elapsed_at(key, dst::time::Instant::now())
+        self.elapsed_at(
+            key,
+            nautilus_common::recovery_trace::scope::effective_activity_instant(),
+        )
     }
 
     #[must_use]
@@ -121,7 +127,7 @@ where
     }
 
     pub(crate) fn prune_older_than(&mut self, ttl: Duration) {
-        let now = dst::time::Instant::now();
+        let now = nautilus_common::recovery_trace::scope::effective_activity_instant();
         self.inner.retain(|_, marked_at| {
             now.checked_duration_since(*marked_at)
                 .is_none_or(|elapsed| elapsed <= ttl)

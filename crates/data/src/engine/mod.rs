@@ -1179,7 +1179,7 @@ impl DataEngine {
                 let unsubscribe =
                     active
                         .command
-                        .into_unsubscribe(UUID4::new(), command.ts_init, Some(owner_id));
+                        .into_unsubscribe(nautilus_common::recovery_trace::native_event_uuid(), command.ts_init, Some(owner_id));
                 publish_external_data_command(previous_key.0, &unsubscribe);
             }
         }
@@ -1588,7 +1588,7 @@ impl DataEngine {
                 .request
                 .child_params(state.parent.params.as_ref(), request_id),
         );
-        let child_request_id = UUID4::new();
+        let child_request_id = nautilus_common::recovery_trace::native_event_uuid();
         let ts_init = self.clock.borrow().timestamp_ns();
 
         match source {
@@ -3178,7 +3178,7 @@ impl DataEngine {
                         cmd.book_type,
                         cmd.client_id,
                         cmd.venue,
-                        UUID4::new(),
+                        nautilus_common::recovery_trace::native_event_uuid(),
                         cmd.ts_init,
                         cmd.depth,
                         true, // managed
@@ -3422,7 +3422,7 @@ impl DataEngine {
                     leg_id,
                     cmd.client_id,
                     cmd.venue,
-                    UUID4::new(),
+                    nautilus_common::recovery_trace::native_event_uuid(),
                     cmd.ts_init,
                     Some(cmd.command_id),
                     cmd.params.clone(),
@@ -3469,7 +3469,7 @@ impl DataEngine {
                 leg_id,
                 subscribe.client_id,
                 subscribe.venue,
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 cmd.ts_init,
                 Some(subscribe.command_id),
                 subscribe.params.clone(),
@@ -3570,7 +3570,7 @@ impl DataEngine {
                 source.command.instrument_id,
                 source.command.client_id,
                 source.command.venue,
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 cmd.ts_init,
                 Some(source.command.command_id),
                 source.command.params,
@@ -3637,7 +3637,7 @@ impl DataEngine {
                         source_type,
                         command.client_id,
                         command.venue,
-                        UUID4::new(),
+                        nautilus_common::recovery_trace::native_event_uuid(),
                         command.ts_init,
                         Some(command.command_id),
                         command.params.clone(),
@@ -3717,7 +3717,7 @@ impl DataEngine {
                 .map(|c| c.client_id);
 
             if let Some(client_id) = resolved_client_id {
-                let request_id = UUID4::new();
+                let request_id = nautilus_common::recovery_trace::native_event_uuid();
                 let ts_init = self.clock.borrow().timestamp_ns();
 
                 let sample_instrument_id = {
@@ -3966,7 +3966,7 @@ impl DataEngine {
                 instrument_id,
                 Some(client_id),
                 Some(series_id.venue),
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 ts_init,
                 None,
                 None,
@@ -4021,7 +4021,7 @@ impl DataEngine {
             bootstrap.instrument_id,
             Some(bootstrap.client_id),
             Some(bootstrap.venue),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             self.clock.borrow().timestamp_ns(),
             None,
             None,
@@ -4100,7 +4100,7 @@ impl DataEngine {
                 *instrument_id,
                 client_id,
                 Some(venue),
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 ts_init,
                 None,
                 None,
@@ -4109,7 +4109,7 @@ impl DataEngine {
                 *instrument_id,
                 client_id,
                 Some(venue),
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 ts_init,
                 None,
                 None,
@@ -4119,7 +4119,7 @@ impl DataEngine {
                     *instrument_id,
                     client_id,
                     Some(venue),
-                    UUID4::new(),
+                    nautilus_common::recovery_trace::native_event_uuid(),
                     ts_init,
                     None,
                     None,
@@ -5003,7 +5003,7 @@ impl DataEngine {
                     composite_bar_type,
                     cmd.client_id,
                     cmd.venue,
-                    UUID4::new(),
+                    nautilus_common::recovery_trace::native_event_uuid(),
                     cmd.ts_init,
                     Some(cmd.command_id),
                     cmd.params.clone(),
@@ -5015,7 +5015,7 @@ impl DataEngine {
                 cmd.bar_type.instrument_id(),
                 cmd.client_id,
                 cmd.venue,
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 cmd.ts_init,
                 Some(cmd.command_id),
                 cmd.params.clone(),
@@ -5026,7 +5026,7 @@ impl DataEngine {
                 cmd.bar_type.instrument_id(),
                 cmd.client_id,
                 cmd.venue,
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 cmd.ts_init,
                 Some(cmd.command_id),
                 cmd.params.clone(),
@@ -5094,7 +5094,7 @@ impl DataEngine {
                     composite_bar_type,
                     cmd.client_id,
                     cmd.venue,
-                    UUID4::new(),
+                    nautilus_common::recovery_trace::native_event_uuid(),
                     cmd.ts_init,
                     Some(cmd.command_id),
                     cmd.params.clone(),
@@ -5108,7 +5108,7 @@ impl DataEngine {
                 cmd.bar_type.instrument_id(),
                 cmd.client_id,
                 cmd.venue,
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 cmd.ts_init,
                 Some(cmd.command_id),
                 cmd.params.clone(),
@@ -5121,7 +5121,7 @@ impl DataEngine {
                 cmd.bar_type.instrument_id(),
                 cmd.client_id,
                 cmd.venue,
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 cmd.ts_init,
                 Some(cmd.command_id),
                 cmd.params.clone(),
@@ -5860,7 +5860,7 @@ fn build_continuous_future_subscribe_inner(
     correlation_id: UUID4,
     ts_init: UnixNanos,
 ) -> DataCommand {
-    let command_id = UUID4::new();
+    let command_id = nautilus_common::recovery_trace::native_event_uuid();
     let child_venue = Some(segment_instrument_id.venue);
 
     match source {
@@ -5915,7 +5915,7 @@ fn build_continuous_future_unsubscribe_command(
     child_params.shift_remove("last_post_instrument_id");
     child_params.shift_remove("first_pre_instrument_id");
     child_params.shift_remove("bar_types");
-    let command_id = UUID4::new();
+    let command_id = nautilus_common::recovery_trace::native_event_uuid();
     let child_venue = Some(segment_instrument_id.venue);
 
     match source {

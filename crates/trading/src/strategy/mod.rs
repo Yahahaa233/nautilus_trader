@@ -1354,6 +1354,33 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = StrategyNative::strategy_core(self)
+                .actor
+                .actor_id
+                .to_string();
+            if nautilus_common::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_order_event",
+                |boundary| self.on_native_recovery_input(boundary, &event),
+            ) {
+                return;
+            }
+            if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
+                nautilus_common::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_order_event".into(),
+                    component_state: format!(
+                        "{:?}",
+                        StrategyNative::strategy_core(self).actor.state()
+                    ),
+                },
+            ) {
+                log::error!("Native strategy callback refused: {error:#}");
+                return;
+            }
+        }
         if !nautilus_common::actor::recovery_observation::callback_admitted(
             &StrategyNative::strategy_core(self).actor.actor_id.inner(),
         ) {
@@ -1523,6 +1550,33 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        #[cfg(feature = "live")]
+        {
+            let component_id = StrategyNative::strategy_core(self)
+                .actor
+                .actor_id
+                .to_string();
+            if nautilus_common::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "handle_position_event",
+                |boundary| self.on_native_recovery_input(boundary, &event),
+            ) {
+                return;
+            }
+            if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
+                nautilus_common::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "handle_position_event".into(),
+                    component_state: format!(
+                        "{:?}",
+                        StrategyNative::strategy_core(self).actor.state()
+                    ),
+                },
+            ) {
+                log::error!("Native strategy callback refused: {error:#}");
+                return;
+            }
+        }
         if !nautilus_common::actor::recovery_observation::callback_admitted(
             &StrategyNative::strategy_core(self).actor.actor_id.inner(),
         ) {

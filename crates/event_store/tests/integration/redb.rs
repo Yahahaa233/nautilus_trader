@@ -1098,6 +1098,7 @@ fn scan_range_reports_gap_at_tail_when_iter_ends_early() {
 fn append_extracts_no_indices_when_keys_empty() {
     let (_tmp, mut backend) = open_backend();
     let headers = Headers {
+        native_origin: None,
         correlation_id: Some(UUID4::new()),
         ..Headers::empty()
     };

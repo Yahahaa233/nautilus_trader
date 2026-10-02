@@ -124,7 +124,7 @@ pub(super) struct RecoveryObservationRegistration {
     arm: Rc<Arm>,
     before_start: Rc<BeforeStart>,
     validate_release: Rc<dyn Fn(&RecoveryReleaseBoundary<'_>) -> Result<()>>,
-    fence: Rc<dyn Fn(&str)>,
+    pub(super) fence: Rc<dyn Fn(&str)>,
     admission: Option<RecoveryObservationAdmission>,
     execution_gate: Option<RecoveryObservationExecutionGate>,
     suspended_checkpoint: Option<RunningCheckpointRegistration>,
@@ -514,7 +514,7 @@ impl LiveNode {
                 self.begin_node_dispatch(crate::dispatch::DispatchSource::Lifecycle, &lifecycle)?;
             self.kernel.start_trader_after_recovery_observation()?;
             if let Some(guard) = lifecycle_guard {
-                guard.complete()?;
+                self.finish_node_dispatch(guard)?;
             }
             self.validate_recovery_startup_freshness(&registration)?;
             ensure!(
@@ -662,12 +662,7 @@ impl LiveNode {
     }
 
     pub(super) fn fail_recovery_observation(&self, reason: &str) {
-        self.kernel.exec_engine.borrow().fence_submissions();
-        if let Some(registration) = &self.recovery_observation {
-            let fence = registration.fence.clone();
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fence(reason)));
-        }
-        self.handle.stop();
+        self.fail_native_dispatch(reason);
     }
 }
 

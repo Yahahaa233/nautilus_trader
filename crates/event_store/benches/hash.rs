@@ -36,6 +36,7 @@ fn payload_of(size: usize) -> Bytes {
 
 fn populated_headers() -> Headers {
     Headers {
+        native_origin: None,
         correlation_id: Some(UUID4::new()),
         causation_id: Some(UUID4::new()),
     }

@@ -38,7 +38,7 @@ use nautilus_common::{
     runner::{TradingCommandMessage, try_get_trading_cmd_sender},
     throttler::{RateLimit, Throttler},
 };
-use nautilus_core::{UUID4, WeakCell};
+use nautilus_core::WeakCell;
 use nautilus_execution::trailing::{
     trailing_stop_calculate_with_bid_ask, trailing_stop_calculate_with_last,
 };
@@ -272,7 +272,7 @@ impl RiskEngine {
                                     order.instrument_id(),
                                     order.client_order_id(),
                                     reason.as_str().into(),
-                                    UUID4::new(),
+                                    nautilus_common::recovery_trace::native_event_uuid(),
                                     timestamp,
                                     timestamp,
                                 ));
@@ -294,7 +294,7 @@ impl RiskEngine {
             "ORDER_SUBMIT_THROTTLER",
             success_handler,
             Some(failure_handler),
-            Ustr::from(UUID4::new().as_str()),
+            Ustr::from(nautilus_common::recovery_trace::native_event_uuid().as_str()),
         )
     }
 
@@ -338,7 +338,7 @@ impl RiskEngine {
             "ORDER_MODIFY_THROTTLER",
             success_handler,
             Some(failure_handler),
-            Ustr::from(UUID4::new().as_str()),
+            Ustr::from(nautilus_common::recovery_trace::native_event_uuid().as_str()),
         )
     }
 
@@ -377,7 +377,7 @@ impl RiskEngine {
             submit_order.instrument_id,
             submit_order.client_order_id,
             reason.into(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             timestamp,
             timestamp,
         ))
@@ -395,7 +395,7 @@ impl RiskEngine {
             order.instrument_id(),
             order.client_order_id(),
             reason.into(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             timestamp,
             timestamp,
             false,
@@ -435,19 +435,27 @@ impl RiskEngine {
     ///
     /// [`TradingState::Halted`] denies all new submit and modify commands.
     pub fn set_trading_state(&mut self, state: TradingState) {
-        if state == self.trading_state {
+        if state == nautilus_common::recovery_trace::native_risk_state(self.trading_state) {
             log::warn!("No change to trading state: already set to {state:?}");
             return;
         }
 
-        self.trading_state = state;
+        if !nautilus_common::recovery_trace::set_native_historical_risk_state(state) {
+            self.trading_state = state;
+        }
 
         let ts_now = self.clock.borrow().timestamp_ns();
         let trader_id = get_message_bus().borrow().trader_id;
 
         let config = self.config_as_map();
-        let event =
-            TradingStateChanged::new(trader_id, state, config, UUID4::new(), ts_now, ts_now);
+        let event = TradingStateChanged::new(
+            trader_id,
+            state,
+            config,
+            nautilus_common::recovery_trace::native_event_uuid(),
+            ts_now,
+            ts_now,
+        );
 
         msgbus::publish_any(MessagingSwitchboard::risk_events_topic(), &event);
 
@@ -2241,7 +2249,7 @@ impl RiskEngine {
             order.instrument_id(),
             order.client_order_id(),
             reason.into(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             self.clock.borrow().timestamp_ns(),
             self.clock.borrow().timestamp_ns(),
         ));
@@ -2266,7 +2274,7 @@ impl RiskEngine {
             order.instrument_id(),
             order.client_order_id(),
             reason.into(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_event,
             ts_event,
             false,
@@ -2279,7 +2287,7 @@ impl RiskEngine {
     }
 
     fn execution_gateway(&mut self, command: TradingCommand) {
-        match self.trading_state {
+        match nautilus_common::recovery_trace::native_risk_state(self.trading_state) {
             TradingState::Halted => match command {
                 TradingCommand::SubmitOrder(submit_order) => {
                     let order = {

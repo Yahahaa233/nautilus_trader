@@ -437,6 +437,7 @@ fn extract_order_event_any_identity(event: &OrderEventAny) -> UUID4 {
 
 fn headers_from_fields(correlation_id: Option<UUID4>, causation_id: Option<UUID4>) -> Headers {
     Headers {
+        native_origin: None,
         correlation_id,
         causation_id,
     }
