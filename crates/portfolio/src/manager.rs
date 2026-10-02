@@ -19,7 +19,7 @@ use std::{cell::RefCell, cmp::Ordering, fmt::Debug, rc::Rc};
 
 use ahash::{AHashMap, AHashSet};
 use nautilus_common::{cache::Cache, clock::Clock};
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     accounts::{
         Account, AccountAny, BaseAccount, BettingAccount, CashAccount, MarginAccount, WalletAccount,
@@ -1340,7 +1340,7 @@ impl AccountsManager {
             margin_account.balances.clone().into_values().collect(),
             margins,
             false,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_event,
             self.clock.borrow().timestamp_ns(),
             margin_account.base_currency(),
@@ -1358,7 +1358,7 @@ impl AccountsManager {
             account.balances().into_values().collect(),
             vec![],
             false,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_event,
             self.clock.borrow().timestamp_ns(),
             account.base_currency(),
@@ -1376,7 +1376,7 @@ impl AccountsManager {
             betting_account.balances.clone().into_values().collect(),
             vec![],
             false,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_event,
             self.clock.borrow().timestamp_ns(),
             betting_account.base_currency(),
@@ -1485,6 +1485,9 @@ fn base_account_mut(account: &mut AccountAny) -> &mut BaseAccount {
         AccountAny::Wallet(wallet) => wallet,
     }
 }
+
+#[cfg(test)]
+use nautilus_core::UUID4;
 
 #[cfg(test)]
 mod tests {

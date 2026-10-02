@@ -19,7 +19,7 @@
 //! reports become zero or more `OrderEventAny`s that are safe to apply to the local order model.
 
 use nautilus_common::enums::LogColor;
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     enums::{LiquiditySide, OrderStatus, OrderType},
     events::{
@@ -490,7 +490,7 @@ pub fn generate_external_order_status_events_with_commission(
         order.client_order_id(),
         report.venue_order_id,
         *account_id,
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         report.ts_accepted,
         ts_now,
         true, // reconciliation
@@ -572,7 +572,7 @@ pub fn generate_external_order_status_events_with_commission(
                 order.client_order_id(),
                 *account_id,
                 Ustr::from(reason),
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 report.ts_last,
                 ts_now,
                 true, // reconciliation
@@ -647,7 +647,7 @@ fn create_reconciliation_fill_voids(
             fill.position_id,
             report.cancel_reason.as_deref().map(Ustr::from),
             None,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             report.ts_last,
             ts_now,
             true,
@@ -709,7 +709,7 @@ fn create_reconciliation_terminal_fill_void(
         None,
         report.cancel_reason.as_deref().map(Ustr::from),
         None,
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         report.ts_last,
         ts_now,
         true,
@@ -731,7 +731,7 @@ fn create_external_terminal_event(
             order.strategy_id(),
             order.instrument_id(),
             order.client_order_id(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             report.ts_last,
             ts_now,
             true, // reconciliation
@@ -744,7 +744,7 @@ fn create_external_terminal_event(
             order.strategy_id(),
             order.instrument_id(),
             order.client_order_id(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             report.ts_last,
             ts_now,
             true, // reconciliation
@@ -829,7 +829,7 @@ pub fn reconcile_fill_report(
         report.last_px,
         instrument.quote_currency(),
         report.liquidity_side,
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         report.ts_event,
         ts_now,
         true, // reconciliation
@@ -883,7 +883,7 @@ pub(super) fn create_reconciliation_accepted(
         order.client_order_id(),
         order.venue_order_id().unwrap_or(report.venue_order_id),
         account_id,
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         report.ts_accepted,
         ts_now,
         true, // reconciliation
@@ -907,7 +907,7 @@ pub fn create_reconciliation_rejected(
         order.client_order_id(),
         account_id,
         Ustr::from(reason),
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         ts_now,
         ts_now,
         true, // reconciliation
@@ -942,7 +942,7 @@ pub fn create_reconciliation_triggered(
         order.strategy_id(),
         order.instrument_id(),
         order.client_order_id(),
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         report.ts_triggered.unwrap_or(ts_now),
         ts_now,
         true, // reconciliation
@@ -963,7 +963,7 @@ pub(super) fn create_reconciliation_canceled(
         order.strategy_id(),
         order.instrument_id(),
         order.client_order_id(),
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         report.ts_last,
         ts_now,
         true, // reconciliation
@@ -985,7 +985,7 @@ pub(super) fn create_reconciliation_expired(
         order.strategy_id(),
         order.instrument_id(),
         order.client_order_id(),
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         report.ts_last,
         ts_now,
         true, // reconciliation
@@ -1023,7 +1023,7 @@ pub(super) fn create_reconciliation_updated(
         order.instrument_id(),
         order.client_order_id(),
         report.quantity,
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         report.ts_last,
         ts_now,
         true, // reconciliation
@@ -1111,7 +1111,7 @@ pub(super) fn create_inferred_fill(
         last_px,
         instrument.quote_currency(),
         liquidity_side,
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         report.ts_last,
         ts_now,
         true, // reconciliation
@@ -1187,7 +1187,7 @@ pub fn create_incremental_inferred_fill(
         last_px,
         instrument.quote_currency(),
         liquidity_side,
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         report.ts_last,
         ts_now,
         true, // reconciliation
@@ -1318,7 +1318,7 @@ pub fn create_inferred_fill_for_qty(
         last_px,
         instrument.quote_currency(),
         liquidity_side,
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         report.ts_last,
         ts_now,
         true, // reconciliation

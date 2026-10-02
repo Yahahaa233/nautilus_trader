@@ -38,7 +38,7 @@ const fn default_report_log_level() -> LogLevel {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct GenerateOrderStatusReport {
-    #[builder(default = "UUID4::new()")]
+    #[builder(default = "crate::recovery_trace::native_event_uuid()")]
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
     #[builder(default)]
@@ -105,7 +105,7 @@ impl Display for GenerateOrderStatusReport {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct GenerateOrderStatusReports {
-    #[builder(default = "UUID4::new()")]
+    #[builder(default = "crate::recovery_trace::native_event_uuid()")]
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
     pub open_only: bool,
@@ -180,7 +180,7 @@ impl Display for GenerateOrderStatusReports {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct GenerateFillReports {
-    #[builder(default = "UUID4::new()")]
+    #[builder(default = "crate::recovery_trace::native_event_uuid()")]
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
     #[builder(default)]
@@ -256,7 +256,7 @@ impl Display for GenerateFillReports {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct GeneratePositionStatusReports {
-    #[builder(default = "UUID4::new()")]
+    #[builder(default = "crate::recovery_trace::native_event_uuid()")]
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
     #[builder(default)]
@@ -322,7 +322,7 @@ pub struct GenerateExecutionMassStatus {
     pub client_id: ClientId,
     #[builder(default)]
     pub venue: Option<Venue>,
-    #[builder(default = "UUID4::new()")]
+    #[builder(default = "crate::recovery_trace::native_event_uuid()")]
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
     #[builder(default)]

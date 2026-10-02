@@ -484,7 +484,7 @@ impl RequestJoin {
             request_ids: self.request_ids.clone(),
             start,
             end,
-            request_id: UUID4::new(),
+            request_id: crate::recovery_trace::native_event_uuid(),
             ts_init,
             params: self.params.clone(),
             correlation_id: Some(self.request_id),

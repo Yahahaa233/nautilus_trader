@@ -4893,7 +4893,10 @@ impl DataActorCore {
         self.unsubscribe_all_defi(&mut commands);
 
         for command in commands {
-            if let Some(command) = command.into_unsubscribe(UUID4::new(), self.timestamp_ns()) {
+            if let Some(command) = command.into_unsubscribe(
+                crate::recovery_trace::native_event_uuid(),
+                self.timestamp_ns(),
+            ) {
                 self.send_data_cmd(command);
             }
         }
@@ -5227,7 +5230,10 @@ impl DataActorCore {
             return;
         };
         let command = retained
-            .into_unsubscribe(UUID4::new(), self.timestamp_ns())
+            .into_unsubscribe(
+                crate::recovery_trace::native_event_uuid(),
+                self.timestamp_ns(),
+            )
             .unwrap_or(fallback);
         self.send_data_cmd(command);
     }
@@ -5257,7 +5263,7 @@ impl DataActorCore {
             self.trader_id().unwrap(),
             self.actor_id.inner(),
             reason,
-            UUID4::new(),
+            crate::recovery_trace::native_event_uuid(),
             self.timestamp_ns(),
             None, // correlation_id
         );
@@ -5384,7 +5390,7 @@ impl DataActorCore {
             data_type,
             client_id,
             venue: None,
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -5478,7 +5484,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -5503,7 +5509,7 @@ impl DataActorCore {
         let command = DataCommand::Subscribe(SubscribeCommand::Instruments(SubscribeInstruments {
             client_id,
             venue,
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -5529,7 +5535,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -5560,7 +5566,7 @@ impl DataActorCore {
             book_type,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             depth,
             managed,
@@ -5592,7 +5598,7 @@ impl DataActorCore {
             book_type,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             depth: NonZeroUsize::new(10),
             managed,
@@ -5626,7 +5632,7 @@ impl DataActorCore {
                 book_type,
                 client_id,
                 venue: Some(instrument_id.venue),
-                command_id: UUID4::new(),
+                command_id: crate::recovery_trace::native_event_uuid(),
                 ts_init: self.timestamp_ns(),
                 depth,
                 interval_ms,
@@ -5654,7 +5660,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -5680,7 +5686,7 @@ impl DataActorCore {
             bar_type,
             client_id,
             venue: Some(bar_type.instrument_id().venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -5706,7 +5712,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -5732,7 +5738,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -5759,7 +5765,7 @@ impl DataActorCore {
                 instrument_id,
                 client_id,
                 venue: Some(instrument_id.venue),
-                command_id: UUID4::new(),
+                command_id: crate::recovery_trace::native_event_uuid(),
                 ts_init: self.timestamp_ns(),
                 correlation_id: None,
                 params,
@@ -5786,7 +5792,7 @@ impl DataActorCore {
                 instrument_id,
                 client_id,
                 venue: Some(instrument_id.venue),
-                command_id: UUID4::new(),
+                command_id: crate::recovery_trace::native_event_uuid(),
                 ts_init: self.timestamp_ns(),
                 correlation_id: None,
                 params,
@@ -5813,7 +5819,7 @@ impl DataActorCore {
                 instrument_id,
                 client_id,
                 venue: Some(instrument_id.venue),
-                command_id: UUID4::new(),
+                command_id: crate::recovery_trace::native_event_uuid(),
                 ts_init: self.timestamp_ns(),
                 correlation_id: None,
                 params,
@@ -5841,7 +5847,7 @@ impl DataActorCore {
                 instrument_id,
                 client_id,
                 venue: Some(instrument_id.venue),
-                command_id: UUID4::new(),
+                command_id: crate::recovery_trace::native_event_uuid(),
                 ts_init: self.timestamp_ns(),
                 correlation_id: None,
                 params,
@@ -5884,7 +5890,7 @@ impl DataActorCore {
             series_id,
             strike_range,
             snapshot_interval_ms,
-            UUID4::new(),
+            crate::recovery_trace::native_event_uuid(),
             self.timestamp_ns(),
             client_id,
             Some(series_id.venue),
@@ -5917,7 +5923,7 @@ impl DataActorCore {
             data_type,
             client_id,
             venue: None,
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -5988,7 +5994,7 @@ impl DataActorCore {
         let command = UnsubscribeCommand::Instruments(UnsubscribeInstruments {
             client_id,
             venue,
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6013,7 +6019,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6042,7 +6048,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6071,7 +6077,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6098,7 +6104,7 @@ impl DataActorCore {
             interval_ms,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6123,7 +6129,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6148,7 +6154,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6174,7 +6180,7 @@ impl DataActorCore {
             bar_type,
             client_id,
             venue: Some(bar_type.instrument_id().venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6199,7 +6205,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6224,7 +6230,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6249,7 +6255,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6274,7 +6280,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6299,7 +6305,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6324,7 +6330,7 @@ impl DataActorCore {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
-            command_id: UUID4::new(),
+            command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
             correlation_id: None,
             params,
@@ -6346,7 +6352,7 @@ impl DataActorCore {
 
         let command = UnsubscribeCommand::OptionChain(UnsubscribeOptionChain::new(
             series_id,
-            UUID4::new(),
+            crate::recovery_trace::native_event_uuid(),
             self.timestamp_ns(),
             client_id,
             Some(series_id.venue),
@@ -6376,7 +6382,7 @@ impl DataActorCore {
         let now = self.clock_ref().utc_now();
         check_timestamps(now, start, end)?;
 
-        let request_id = UUID4::new();
+        let request_id = crate::recovery_trace::native_event_uuid();
         let command = RequestCommand::Data(RequestCustomData {
             client_id,
             data_type,
@@ -6416,7 +6422,7 @@ impl DataActorCore {
         let now = self.clock_ref().utc_now();
         check_timestamps(now, start, end)?;
 
-        let request_id = UUID4::new();
+        let request_id = crate::recovery_trace::native_event_uuid();
         let command = RequestCommand::Instrument(RequestInstrument {
             instrument_id,
             start,
@@ -6455,7 +6461,7 @@ impl DataActorCore {
         let now = self.clock_ref().utc_now();
         check_timestamps(now, start, end)?;
 
-        let request_id = UUID4::new();
+        let request_id = crate::recovery_trace::native_event_uuid();
         let command = RequestCommand::Instruments(RequestInstruments {
             venue,
             start,
@@ -6490,7 +6496,7 @@ impl DataActorCore {
     ) -> anyhow::Result<UUID4> {
         self.check_registered();
 
-        let request_id = UUID4::new();
+        let request_id = crate::recovery_trace::native_event_uuid();
         let command = RequestCommand::BookSnapshot(RequestBookSnapshot {
             instrument_id,
             depth,
@@ -6530,7 +6536,7 @@ impl DataActorCore {
         let now = self.clock_ref().utc_now();
         check_timestamps(now, start, end)?;
 
-        let request_id = UUID4::new();
+        let request_id = crate::recovery_trace::native_event_uuid();
         let command = RequestCommand::BookDeltas(RequestBookDeltas {
             instrument_id,
             start,
@@ -6573,7 +6579,7 @@ impl DataActorCore {
         let now = self.clock_ref().utc_now();
         check_timestamps(now, start, end)?;
 
-        let request_id = UUID4::new();
+        let request_id = crate::recovery_trace::native_event_uuid();
         let command = RequestCommand::BookDepth(RequestBookDepth {
             instrument_id,
             start,
@@ -6616,7 +6622,7 @@ impl DataActorCore {
         let now = self.clock_ref().utc_now();
         check_timestamps(now, start, end)?;
 
-        let request_id = UUID4::new();
+        let request_id = crate::recovery_trace::native_event_uuid();
         let command = RequestCommand::Quotes(RequestQuotes {
             instrument_id,
             start,
@@ -6658,7 +6664,7 @@ impl DataActorCore {
         let now = self.clock_ref().utc_now();
         check_timestamps(now, start, end)?;
 
-        let request_id = UUID4::new();
+        let request_id = crate::recovery_trace::native_event_uuid();
         let command = RequestCommand::Trades(RequestTrades {
             instrument_id,
             start,
@@ -6706,7 +6712,7 @@ impl DataActorCore {
         let now = self.clock_ref().utc_now();
         check_timestamps(now, start, end)?;
 
-        let request_id = UUID4::new();
+        let request_id = crate::recovery_trace::native_event_uuid();
         let command = RequestCommand::Bars(RequestBars {
             bar_type,
             start,
@@ -6748,7 +6754,7 @@ impl DataActorCore {
         let now = self.clock_ref().utc_now();
         check_timestamps(now, start, end)?;
 
-        let request_id = UUID4::new();
+        let request_id = crate::recovery_trace::native_event_uuid();
         let command = RequestCommand::FundingRates(RequestFundingRates {
             instrument_id,
             start,

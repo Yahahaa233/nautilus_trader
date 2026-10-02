@@ -40,7 +40,9 @@ use nautilus_common::{
     msgbus::{self, MessagingSwitchboard},
     timer::TimeEvent,
 };
-use nautilus_core::{DurationNanos, Params, UUID4};
+#[cfg(test)]
+use nautilus_core::UUID4;
+use nautilus_core::{DurationNanos, Params};
 use nautilus_execution::order_manager::OrderManagerAction;
 use nautilus_model::{
     enums::{OrderSide, OrderStatus, PositionSide, TimeInForce},
@@ -375,7 +377,7 @@ pub trait Strategy: DataActor {
             exec_algorithm_id,
             position_id,
             params,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_init,
             None, // correlation_id
         );
@@ -542,7 +544,7 @@ pub trait Strategy: DataActor {
             quantity,
             price,
             trigger_price,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             StrategyNative::strategy_core_mut(self)
                 .clock_mut()
                 .timestamp_ns(),
@@ -711,7 +713,7 @@ pub trait Strategy: DataActor {
                 quantity,
                 price,
                 trigger_price,
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 ts_init,
                 params.clone(),
                 None, // correlation_id
@@ -729,7 +731,7 @@ pub trait Strategy: DataActor {
             strategy_id,
             instrument_id,
             modifies,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_init,
             params,
             None, // correlation_id
@@ -784,7 +786,7 @@ pub trait Strategy: DataActor {
             order.instrument_id(),
             order.client_order_id(),
             order.venue_order_id(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_init,
             params,
             None, // correlation_id
@@ -884,7 +886,7 @@ pub trait Strategy: DataActor {
                 instrument_id,
                 order.client_order_id(),
                 order.venue_order_id(),
-                UUID4::new(),
+                nautilus_common::recovery_trace::native_event_uuid(),
                 ts_init,
                 params.clone(),
                 None, // correlation_id
@@ -902,7 +904,7 @@ pub trait Strategy: DataActor {
             strategy_id,
             instrument_id,
             cancels,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_init,
             params,
             None, // correlation_id
@@ -1026,7 +1028,7 @@ pub trait Strategy: DataActor {
             order.instrument_id(),
             order.client_order_id(),
             order.account_id(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_now,
             ts_now,
             false,
@@ -1049,7 +1051,7 @@ pub trait Strategy: DataActor {
             order.instrument_id(),
             order.client_order_id(),
             order.account_id(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_now,
             ts_now,
             false,
@@ -1087,7 +1089,7 @@ pub trait Strategy: DataActor {
         let ts_init = core.clock_mut().timestamp_ns();
 
         if !strategy_only {
-            let command_id = UUID4::new();
+            let command_id = nautilus_common::recovery_trace::native_event_uuid();
             let command = CancelAllOrders::new(
                 trader_id,
                 client_id,
@@ -1398,7 +1400,7 @@ pub trait Strategy: DataActor {
             trader_id,
             client_id,
             account_id,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_init,
             params,
             None, // correlation_id
@@ -1438,7 +1440,7 @@ pub trait Strategy: DataActor {
             order.instrument_id(),
             order.client_order_id(),
             order.venue_order_id(),
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_init,
             params,
             None, // correlation_id
@@ -2216,7 +2218,7 @@ pub trait Strategy: DataActor {
             order.instrument_id(),
             order.client_order_id(),
             reason,
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             ts_now,
             ts_now,
         );
@@ -2511,7 +2513,7 @@ where
         order.exec_algorithm_id(),
         position_id,
         params,
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         ts_init,
         None, // correlation_id
     );
@@ -2588,7 +2590,7 @@ fn reject_unsubmitted_modification(
         command.instrument_id,
         command.client_order_id,
         reason,
-        UUID4::new(),
+        nautilus_common::recovery_trace::native_event_uuid(),
         now,
         now,
         false,

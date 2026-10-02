@@ -158,7 +158,7 @@ impl OrderManager {
             order.exec_algorithm_id(),
             position_id,
             None, // params
-            UUID4::new(),
+            nautilus_common::recovery_trace::native_event_uuid(),
             self.clock.borrow().timestamp_ns(),
             correlation_id,
         );

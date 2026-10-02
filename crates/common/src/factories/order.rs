@@ -18,7 +18,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use indexmap::IndexMap;
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     enums::{ContingencyType, OrderSide, OrderType, TimeInForce, TrailingOffsetType, TriggerType},
     identifiers::{
@@ -197,7 +197,7 @@ impl OrderFactory {
             order_side,
             quantity,
             time_in_force.unwrap_or(TimeInForce::Gtc),
-            UUID4::new(),
+            crate::recovery_trace::native_event_uuid(),
             self.clock.borrow().timestamp_ns(),
             reduce_only.unwrap_or(false),
             quote_quantity.unwrap_or(false),
@@ -309,7 +309,7 @@ impl OrderFactory {
             exec_algorithm_params,
             exec_spawn_id,
             tags,
-            UUID4::new(),
+            crate::recovery_trace::native_event_uuid(),
             self.clock.borrow().timestamp_ns(),
         )?;
         Ok(OrderAny::Limit(order))
@@ -411,7 +411,7 @@ impl OrderFactory {
             exec_algorithm_params,
             exec_spawn_id,
             tags,
-            UUID4::new(),
+            crate::recovery_trace::native_event_uuid(),
             self.clock.borrow().timestamp_ns(),
         )?;
         Ok(OrderAny::StopMarket(order))
@@ -521,7 +521,7 @@ impl OrderFactory {
             exec_algorithm_params,
             exec_spawn_id,
             tags,
-            UUID4::new(),
+            crate::recovery_trace::native_event_uuid(),
             self.clock.borrow().timestamp_ns(),
         )?;
         Ok(OrderAny::StopLimit(order))
@@ -608,7 +608,7 @@ impl OrderFactory {
             exec_algorithm_params,
             exec_spawn_id,
             tags,
-            UUID4::new(),
+            crate::recovery_trace::native_event_uuid(),
             self.clock.borrow().timestamp_ns(),
         )?;
         Ok(OrderAny::MarketToLimit(order))
@@ -706,7 +706,7 @@ impl OrderFactory {
             exec_algorithm_params,
             exec_spawn_id,
             tags,
-            UUID4::new(),
+            crate::recovery_trace::native_event_uuid(),
             self.clock.borrow().timestamp_ns(),
         )?;
         Ok(OrderAny::MarketIfTouched(order))
@@ -816,7 +816,7 @@ impl OrderFactory {
             exec_algorithm_params,
             exec_spawn_id,
             tags,
-            UUID4::new(),
+            crate::recovery_trace::native_event_uuid(),
             self.clock.borrow().timestamp_ns(),
         )?;
         Ok(OrderAny::LimitIfTouched(order))
@@ -934,7 +934,7 @@ impl OrderFactory {
             exec_algorithm_params,
             exec_spawn_id,
             tags,
-            UUID4::new(),
+            crate::recovery_trace::native_event_uuid(),
             self.clock.borrow().timestamp_ns(),
         )?;
 
@@ -1065,7 +1065,7 @@ impl OrderFactory {
             exec_algorithm_params,
             exec_spawn_id,
             tags,
-            UUID4::new(),
+            crate::recovery_trace::native_event_uuid(),
             self.clock.borrow().timestamp_ns(),
         )?;
 
@@ -1313,7 +1313,7 @@ impl OrderFactory {
                 order_side,
                 quantity,
                 time_in_force,
-                UUID4::new(),
+                crate::recovery_trace::native_event_uuid(),
                 ts_init,
                 false, // reduce_only
                 quote_quantity,
@@ -1350,7 +1350,7 @@ impl OrderFactory {
                 entry_exec_algorithm_params,
                 entry_exec_spawn_id,
                 entry_tags,
-                UUID4::new(),
+                crate::recovery_trace::native_event_uuid(),
                 ts_init,
             )?),
             OrderType::MarketIfTouched => {
@@ -1380,7 +1380,7 @@ impl OrderFactory {
                     entry_exec_algorithm_params,
                     entry_exec_spawn_id,
                     entry_tags,
-                    UUID4::new(),
+                    crate::recovery_trace::native_event_uuid(),
                     ts_init,
                 )?)
             }
@@ -1417,7 +1417,7 @@ impl OrderFactory {
                     entry_exec_algorithm_params,
                     entry_exec_spawn_id,
                     entry_tags,
-                    UUID4::new(),
+                    crate::recovery_trace::native_event_uuid(),
                     ts_init,
                 )?)
             }
@@ -1453,7 +1453,7 @@ impl OrderFactory {
                 entry_exec_algorithm_params,
                 entry_exec_spawn_id,
                 entry_tags,
-                UUID4::new(),
+                crate::recovery_trace::native_event_uuid(),
                 ts_init,
             )?),
             other => anyhow::bail!("invalid `entry_order_type`, was {other}"),
@@ -1494,7 +1494,7 @@ impl OrderFactory {
                 tp_exec_algorithm_params,
                 tp_exec_spawn_id,
                 tp_tags,
-                UUID4::new(),
+                crate::recovery_trace::native_event_uuid(),
                 ts_init,
             )?),
             OrderType::LimitIfTouched => {
@@ -1530,7 +1530,7 @@ impl OrderFactory {
                     tp_exec_algorithm_params,
                     tp_exec_spawn_id,
                     tp_tags,
-                    UUID4::new(),
+                    crate::recovery_trace::native_event_uuid(),
                     ts_init,
                 )?)
             }
@@ -1561,7 +1561,7 @@ impl OrderFactory {
                     tp_exec_algorithm_params,
                     tp_exec_spawn_id,
                     tp_tags,
-                    UUID4::new(),
+                    crate::recovery_trace::native_event_uuid(),
                     ts_init,
                 )?)
             }
@@ -1601,7 +1601,7 @@ impl OrderFactory {
                     tp_exec_algorithm_params,
                     tp_exec_spawn_id,
                     tp_tags,
-                    UUID4::new(),
+                    crate::recovery_trace::native_event_uuid(),
                     ts_init,
                 )?;
                 OrderAny::TrailingStopMarket(order)
@@ -1653,7 +1653,7 @@ impl OrderFactory {
                     tp_exec_algorithm_params,
                     tp_exec_spawn_id,
                     tp_tags,
-                    UUID4::new(),
+                    crate::recovery_trace::native_event_uuid(),
                     ts_init,
                 )?;
                 OrderAny::TrailingStopLimit(order)
@@ -1694,7 +1694,7 @@ impl OrderFactory {
                 sl_exec_algorithm_params,
                 sl_exec_spawn_id,
                 sl_tags,
-                UUID4::new(),
+                crate::recovery_trace::native_event_uuid(),
                 ts_init,
             )?),
             OrderType::TrailingStopMarket => {
@@ -1733,7 +1733,7 @@ impl OrderFactory {
                     sl_exec_algorithm_params,
                     sl_exec_spawn_id,
                     sl_tags,
-                    UUID4::new(),
+                    crate::recovery_trace::native_event_uuid(),
                     ts_init,
                 )?;
                 OrderAny::TrailingStopMarket(order)

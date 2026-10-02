@@ -817,6 +817,8 @@ mod tests {
                     input.downcast_ref::<nautilus_common::messages::ExecutionEvent>()
                 {
                     serde_json::to_value(value)?
+                } else if let Some(command) = input.downcast_ref::<nautilus_common::runner::TradingCommandMessage>() {
+                    serde_json::json!({"endpoint":command.endpoint().to_string(),"command":command.command()})
                 } else if let Some(events) =
                     input.downcast_ref::<Vec<nautilus_model::events::OrderEventAny>>()
                 {
@@ -1071,3 +1073,7 @@ mod tests {
 #[cfg(all(test, not(madsim)))]
 #[path = "native_tail_framework_tests.rs"]
 mod framework_tests;
+
+#[cfg(test)]
+#[path = "native_tail_uuid_tests.rs"]
+mod uuid_tests;
