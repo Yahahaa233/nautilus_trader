@@ -3759,7 +3759,13 @@ mod tests {
 
         trader.add_strategy(strategy).unwrap();
         trader.start_components().unwrap();
-        trader.stop_components().unwrap();
+
+        // A flat managed stop completes immediately. Initiate an ordinary
+        // market exit to exercise the timer route independently of stopping.
+        {
+            let mut strategy = get_actor_unchecked::<TimerRoutingStrategy>(&strategy_id.inner());
+            strategy.market_exit().unwrap();
+        }
 
         let clock = trader.get_component_clocks().into_iter().next().unwrap();
         let dispatched = dispatch_component_time_events(&clock, UnixNanos::from(1_000_000));
@@ -3771,7 +3777,13 @@ mod tests {
         assert_eq!(strategy.post_market_exits, 1);
         assert_eq!(strategy.post_market_exits_on_callback, Some(1));
         assert!(!strategy.is_exiting());
-        assert_eq!(strategy.state(), ComponentState::Stopped);
+        assert_eq!(strategy.state(), ComponentState::Running);
+        drop(strategy);
+        trader.stop_components().unwrap();
+        assert_eq!(
+            component_state(&strategy_id.inner()).unwrap(),
+            ComponentState::Stopped
+        );
     }
 
     #[rstest]

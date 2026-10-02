@@ -154,6 +154,7 @@ pub struct BacktestEngine {
     backtest_start: Option<UnixNanos>,
     backtest_end: Option<UnixNanos>,
     funding_error: Option<String>,
+    stop_error: Option<String>,
     replay_observer: Option<Rc<RefCell<dyn ReplayTimestampObserver>>>,
     last_observer_ns: Option<UnixNanos>,
 }
@@ -225,6 +226,7 @@ impl BacktestEngine {
             backtest_start: None,
             backtest_end: None,
             funding_error: None,
+            stop_error: None,
             replay_observer: None,
             last_observer_ns: None,
         })
@@ -753,7 +755,7 @@ impl BacktestEngine {
         run_config_id: Option<String>,
         streaming: bool,
     ) -> anyhow::Result<()> {
-        if let Some(error) = &self.funding_error {
+        if let Some(error) = self.funding_error.as_ref().or(self.stop_error.as_ref()) {
             anyhow::bail!("{error}");
         }
         self.check_module_errors()?;
@@ -953,7 +955,10 @@ impl BacktestEngine {
                     &self.kernel.clock,
                     data,
                 )?;
-                let observed_data = self.replay_observer.as_ref().map(|_| data_ref_to_owned(data));
+                let observed_data = self
+                    .replay_observer
+                    .as_ref()
+                    .map(|_| data_ref_to_owned(data));
                 self.kernel.data_engine.borrow_mut().process_data_ref(data);
                 (settlement_scope, observed_data)
             };
@@ -1048,8 +1053,8 @@ impl BacktestEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if actor or strategy state cannot be saved or a simulation module cannot
-    /// produce its diagnostics.
+    /// Returns an error if registered components do not stop cleanly, actor or strategy
+    /// state cannot be saved, or a simulation module cannot produce its diagnostics.
     pub fn end(&mut self) -> anyhow::Result<()> {
         if let Some(error) = &self.funding_error {
             anyhow::bail!("{error}");
@@ -1107,10 +1112,24 @@ impl BacktestEngine {
 
         self.settle_venues(ts_now, SettlementScope::All);
 
+        // Recheck managed stops against settled orders and positions without
+        // advancing market time or dispatching unrelated strategy timers.
+        let mut stop_errors = Vec::new();
         for strategy_id in self.running_strategy_ids() {
-            log::error!(
-                "Strategy {strategy_id} is still RUNNING after the backtest end sequence; its stop did not complete",
+            if let Err(e) = self.kernel.trader.borrow_mut().stop_strategy(&strategy_id) {
+                stop_errors.push(format!("{strategy_id}: {e:#}"));
+            }
+        }
+        let stop_result = self.ensure_stopped().and_then(|()| {
+            anyhow::ensure!(
+                stop_errors.is_empty(),
+                "Backtest stop failed: {}",
+                stop_errors.join("; ")
             );
+            Ok(())
+        });
+        if let Err(e) = &stop_result {
+            self.stop_error = Some(format!("{e:#}"));
         }
 
         let save_result = self.kernel.save_trader_state();
@@ -1136,7 +1155,44 @@ impl BacktestEngine {
         self.log_post_run();
         save_result?;
         diagnostics_result?;
-        streaming_result
+        streaming_result?;
+        stop_result
+    }
+
+    /// Checks that registered components have completed their stop transitions.
+    ///
+    /// Components never started in an event-store replay may remain ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unresolved, active, or faulted component states.
+    pub fn ensure_stopped(&self) -> anyhow::Result<()> {
+        if let Some(error) = &self.stop_error {
+            anyhow::bail!("{error}");
+        }
+        let allow_unstarted = self.run_started.is_none() || self.kernel.is_event_store_replay();
+        let trader = self.kernel.trader.borrow();
+        let ids = trader
+            .actor_ids()
+            .into_iter()
+            .map(|id| id.inner())
+            .chain(trader.strategy_ids().into_iter().map(|id| id.inner()))
+            .chain(trader.exec_algorithm_ids().into_iter().map(|id| id.inner()));
+        let mut invalid = Vec::new();
+        for id in ids {
+            match component_state(&id) {
+                Ok(ComponentState::Stopped | ComponentState::Disposed) => {}
+                Ok(ComponentState::PreInitialized | ComponentState::Ready) if allow_unstarted => {}
+                Ok(state) => invalid.push(format!("{id}={state:?}")),
+                Err(e) => invalid.push(format!("{id}=unresolved ({e})")),
+            }
+        }
+        anyhow::ensure!(
+            invalid.is_empty(),
+            "Backtest stop incomplete: {}",
+            invalid.join("; ")
+        );
+        Ok(())
     }
 
     /// Returns registered strategies whose state resolves to `Running` after the end sequence.
@@ -1217,6 +1273,7 @@ impl BacktestEngine {
         self.backtest_start = None;
         self.backtest_end = None;
         self.funding_error = None;
+        self.stop_error = None;
         self.replay_observer = None;
         self.last_observer_ns = None;
         self.iteration = 0;
@@ -1408,7 +1465,7 @@ impl BacktestEngine {
             .collect();
         drop(trader);
 
-        let outcome = if self.funding_error.is_some() {
+        let outcome = if self.funding_error.is_some() || self.stop_error.is_some() {
             CanonicalRunOutcome::Failed
         } else if self.run_finished.is_none() {
             CanonicalRunOutcome::Incomplete
@@ -1417,7 +1474,7 @@ impl BacktestEngine {
         } else {
             CanonicalRunOutcome::Completed
         };
-        let diagnostics = self
+        let mut diagnostics: Vec<_> = self
             .funding_error
             .as_ref()
             .map(|_| CanonicalDiagnostic {
@@ -1425,6 +1482,11 @@ impl BacktestEngine {
             })
             .into_iter()
             .collect();
+        if self.stop_error.is_some() {
+            diagnostics.push(CanonicalDiagnostic {
+                code: CanonicalDiagnosticCode::ComponentStopFailed,
+            });
+        }
         let statistics = nautilus_analysis::PortfolioStatistics {
             pnls: result.stats_pnls,
             returns: result.stats_returns,
@@ -2594,7 +2656,13 @@ mod tests {
                 .side(OrderSide::Buy)
                 .quantity(Quantity::from("1.000"))
                 .build();
-            let fill = OrderFilledTestBuilder::new(&order, &instrument).build();
+            let fill = OrderFilledTestBuilder::new(&order, &instrument)
+                .account_id(AccountId::from("BINANCE-001"))
+                .position_id(PositionId::from(
+                    format!("{}-{strategy_id}", instrument.id()).as_str(),
+                ))
+                .last_px(Price::from("1000.00"))
+                .build();
             let OrderEventAny::Filled(fill) = fill else {
                 unreachable!();
             };
@@ -3529,12 +3597,193 @@ mod tests {
             false,
         );
 
-        assert!(result.is_ok());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Backtest stop incomplete")
+        );
         assert_eq!(
             component_state(&strategy_id.inner()).unwrap(),
             ComponentState::Running
         );
         assert_eq!(engine.running_strategy_ids(), vec![strategy_id]);
+        assert!(engine.ensure_stopped().is_err());
+        nautilus_common::component::stop_component(&strategy_id.inner()).unwrap();
+        assert_eq!(
+            component_state(&strategy_id.inner()).unwrap(),
+            ComponentState::Stopped
+        );
+        assert!(engine.ensure_stopped().is_err());
+        let canonical = engine.get_canonical_result().unwrap();
+        assert_eq!(canonical.as_value()["run"]["outcome"], "failed");
+        assert_eq!(
+            canonical.as_value()["diagnostics"][0]["code"],
+            "component-stop-failed"
+        );
+        CanonicalBacktestResult::from_slice(&canonical.to_bytes().unwrap()).unwrap();
+        assert!(
+            engine
+                .run(Some(0.into()), Some(1.into()), None, true)
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    fn test_end_completes_flat_managed_stop_at_original_boundary() {
+        let mut engine = create_engine();
+        let id = StrategyId::from("FLAT-MANAGED-STOP-001");
+        engine
+            .add_strategy(TestStrategy::new(StrategyConfig {
+                strategy_id: Some(id),
+                manage_stop: true,
+                ..Default::default()
+            }))
+            .unwrap();
+        engine
+            .run(Some(0.into()), Some(1.into()), None, false)
+            .unwrap();
+        assert_eq!(
+            component_state(&id.inner()).unwrap(),
+            ComponentState::Stopped
+        );
+        engine.ensure_stopped().unwrap();
+        assert_eq!(engine.backtest_end, Some(UnixNanos::from(0)));
+    }
+
+    #[rstest]
+    fn test_end_completes_managed_stop_after_terminal_close() {
+        let (mut engine, id) = create_engine_with_strategy(true);
+        let instrument = crypto_perpetual_ethusdt();
+        let quote = QuoteTick::new(
+            instrument.id(),
+            Price::from("1000.00"),
+            Price::from("1001.00"),
+            Quantity::from("10.000"),
+            Quantity::from("10.000"),
+            1.into(),
+            1.into(),
+        );
+        engine
+            .add_data(vec![Data::Quote(quote)], None, true, true)
+            .unwrap();
+        engine
+            .run(Some(0.into()), Some(2.into()), None, false)
+            .unwrap();
+        assert_eq!(
+            component_state(&id.inner()).unwrap(),
+            ComponentState::Stopped
+        );
+        assert_eq!(
+            engine
+                .kernel
+                .cache
+                .borrow()
+                .positions_open_count(None, None, Some(&id), None, None),
+            0
+        );
+        engine.ensure_stopped().unwrap();
+        assert_eq!(engine.backtest_end, Some(UnixNanos::from(1)));
+    }
+
+    #[rstest]
+    fn test_end_completes_managed_stop_after_terminal_cancel() {
+        let mut engine = create_engine();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let id = StrategyId::from("CANCEL-MANAGED-001");
+        engine.add_instrument(&instrument).unwrap();
+        engine
+            .add_strategy(TestStrategy::new(StrategyConfig {
+                strategy_id: Some(id),
+                manage_stop: true,
+                ..Default::default()
+            }))
+            .unwrap();
+        engine
+            .venues
+            .get(&instrument.id().venue)
+            .unwrap()
+            .borrow_mut()
+            .initialize_account();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(engine.trader_id())
+            .strategy_id(id)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-TERMINAL-CANCEL"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("100.00"))
+            .build();
+        engine
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(ClientId::from("BINANCE")), false)
+            .unwrap();
+        send_execution_command(TradingCommand::SubmitOrder(create_submit_order_command(
+            &order,
+        )));
+        engine.drain_command_queues();
+        engine.settle_venues(0.into(), SettlementScope::All);
+        assert_eq!(
+            engine
+                .kernel
+                .cache
+                .borrow()
+                .order(&order.client_order_id())
+                .unwrap()
+                .status(),
+            OrderStatus::Accepted
+        );
+        engine
+            .run(Some(0.into()), Some(1.into()), None, false)
+            .unwrap();
+        assert_eq!(
+            engine
+                .kernel
+                .cache
+                .borrow()
+                .order(&order.client_order_id())
+                .unwrap()
+                .status(),
+            OrderStatus::Canceled
+        );
+        assert_eq!(
+            component_state(&id.inner()).unwrap(),
+            ComponentState::Stopped
+        );
+        engine.ensure_stopped().unwrap();
+        assert_eq!(engine.backtest_end, Some(UnixNanos::from(0)));
+    }
+
+    #[derive(Debug)]
+    struct FailingStopStrategy {
+        core: StrategyCore,
+    }
+    impl DataActor for FailingStopStrategy {
+        fn on_stop(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("stop probe failed")
+        }
+    }
+    nautilus_strategy!(FailingStopStrategy);
+
+    #[rstest]
+    fn test_end_rejects_failed_stop() {
+        let mut engine = create_engine();
+        let id = StrategyId::from("FAILING-STOP-001");
+        engine
+            .add_strategy(FailingStopStrategy {
+                core: StrategyCore::new(StrategyConfig {
+                    strategy_id: Some(id),
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
+        let e = engine
+            .run(Some(0.into()), Some(1.into()), None, false)
+            .unwrap_err();
+        assert!(e.to_string().contains("FAILING-STOP-001=Stopping"));
+        assert!(engine.ensure_stopped().is_err());
     }
 
     #[rstest]

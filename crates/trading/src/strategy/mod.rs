@@ -2079,6 +2079,8 @@ pub trait Strategy: DataActor {
 
         if let Err(e) = hook_result {
             log::error!("{actor_id} Error in post_market_exit: {e:?}");
+            StrategyNative::strategy_core_mut(self).pending_stop = should_stop;
+            return;
         }
 
         if should_stop {
@@ -2149,8 +2151,8 @@ pub trait Strategy: DataActor {
                     return true; // Proceed with stop
                 }
 
-                if pending_stop {
-                    return false; // Already waiting for market exit
+                if pending_stop && !is_exiting {
+                    return false; // A previous exit initiation did not complete
                 }
 
                 core.pending_stop = true;
@@ -2168,8 +2170,29 @@ pub trait Strategy: DataActor {
 
         if manage_stop {
             if should_initiate_exit && let Err(e) = self.market_exit() {
-                log::warn!("Market exit failed during stop: {e}, proceeding with stop");
-                StrategyNative::strategy_core_mut(self).pending_stop = false;
+                log::error!("Market exit failed during stop: {e}");
+                return false;
+            }
+            // Settlement can complete before the next timer callback, especially
+            // at the backtest boundary, so repeated stop requests check actual exposure.
+            let core = StrategyNative::strategy_core_mut(self);
+            let strategy_id = core.strategy_id();
+            let cache = core.cache_ref();
+            let flat = strategy_id.is_some_and(|id| {
+                cache.orders_open_count(None, None, Some(&id), None, None) == 0
+                    && cache.orders_inflight_count(None, None, Some(&id), None, None) == 0
+                    && cache.orders_emulated_count(None, None, Some(&id), None, None) == 0
+                    && cache.positions_open_count(None, None, Some(&id), None, None) == 0
+            });
+            drop(cache);
+            if flat {
+                self.cancel_market_exit();
+                if let Err(e) = catch_unwind(AssertUnwindSafe(|| self.post_market_exit())) {
+                    log::error!("Error in post_market_exit during stop: {e:?}");
+                    let core = StrategyNative::strategy_core_mut(self);
+                    core.pending_stop = true;
+                    return false;
+                }
                 return true;
             }
             debug_assert!(
@@ -6519,9 +6542,9 @@ mod tests {
         // This should not panic - it should catch the panic in post_market_exit
         strategy.finalize_market_exit();
 
-        // State should still be reset
+        // Cleanup must not turn a failed exit hook into a completed stop.
         assert!(!strategy.core.is_exiting);
-        assert!(!strategy.core.pending_stop);
+        assert!(strategy.core.pending_stop);
     }
 
     #[rstest]
@@ -6803,7 +6826,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_stop_with_manage_stop_true_defers_when_running() {
+    fn test_stop_with_manage_stop_true_completes_when_flat() {
         let config = StrategyConfig {
             strategy_id: Some(StrategyId::from("TEST-001")),
             order_id_tag: Some("001".to_string()),
@@ -6833,9 +6856,57 @@ mod tests {
 
         let should_proceed = Strategy::stop(&mut strategy);
 
-        // Should set pending_stop and defer
-        assert!(!should_proceed);
+        assert!(should_proceed);
+        assert!(!strategy.core.pending_stop);
+        assert!(!strategy.core.is_exiting);
+        assert!(strategy.core.clock_mut().timer_names().is_empty());
+    }
+
+    #[rstest]
+    fn test_stop_with_manage_stop_true_rejects_exit_timer_failure() {
+        let mut strategy = TestStrategy::new(StrategyConfig {
+            strategy_id: Some(StrategyId::from("TEST-001")),
+            order_id_tag: Some("001".to_string()),
+            manage_stop: true,
+            ..Default::default()
+        });
+        register_strategy(&mut strategy);
+        start_strategy(&mut strategy);
+        strategy.core.config.market_exit_interval_ms = u64::MAX;
+        assert!(!Strategy::stop(&mut strategy));
         assert!(strategy.core.pending_stop);
+        assert_eq!(strategy.state(), ComponentState::Running);
+        assert!(!Strategy::stop(&mut strategy));
+    }
+
+    #[rstest]
+    fn test_stop_with_manage_stop_true_rejects_exit_hook_panic() {
+        let mut strategy = FailingPostExitStrategy::new(StrategyConfig {
+            strategy_id: Some(StrategyId::from("TEST-001")),
+            manage_stop: true,
+            ..Default::default()
+        });
+        let trader_id = TraderId::from("TRADER-001");
+        let clock = Rc::new(RefCell::new(TestClock::new()));
+        clock
+            .borrow_mut()
+            .register_default_handler(TimeEventCallback::from(|_event: TimeEvent| {}));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let portfolio = Rc::new(RefCell::new(Portfolio::new(
+            clock.clone(),
+            cache.clone(),
+            None,
+        )));
+        strategy
+            .core
+            .register(trader_id, clock, cache, portfolio)
+            .unwrap();
+        strategy.initialize().unwrap();
+        strategy.start().unwrap();
+        assert!(!Strategy::stop(&mut strategy));
+        assert!(strategy.core.pending_stop);
+        assert_eq!(strategy.state(), ComponentState::Running);
+        assert!(!Strategy::stop(&mut strategy));
     }
 
     #[rstest]
