@@ -289,7 +289,9 @@ impl LiveNode {
                     .get_all_clients()
                     .len();
             ensure!(
-                clients == 0 || self.recovery_adapter_source.is_some(),
+                clients == 0
+                    || (self.recovery_adapter_source.is_some()
+                        && self.recovery_engine_source.is_some()),
                 "restored actual clients require source adapter and native subscription inventory"
             );
         }

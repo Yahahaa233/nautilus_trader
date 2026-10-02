@@ -219,7 +219,9 @@ impl ExecutionManager {
             })
             .collect::<Vec<_>>();
         Ok(serde_json::json!({
-            "schema":"NautilusExecutionManagerCheckpoint.v1",
+            "schema":"NautilusExecutionManagerCheckpoint.v2",
+            "configuration":self.config,
+            "captured_at_ns":self.timestamp_ns().as_u64(),
             "monotonic_offsets":"age_ns_at_common_boundary",
             "order_activity":self.order_activity.checkpoint_entries(at)?,
             "order_inflight_checks":inflight,
@@ -236,6 +238,174 @@ impl ExecutionManager {
             "position_recon":positions,
             "position_recon_tolerances":self.position_recon_tolerances,
         }))
+    }
+
+    /// Installs actual checkpoint state before recovery-tail event dispatch.
+    /// Source monotonic ages include real elapsed wall time, never restart at now.
+    pub(crate) fn restore_checkpoint_inventory(
+        &mut self,
+        source: &serde_json::Value,
+        downtime_ns: u64,
+    ) -> anyhow::Result<()> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Inflight {
+            client_order_id: ClientOrderId,
+            submitted_age_ns: u64,
+            retry_count: u32,
+            last_query_age_ns: Option<u64>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PositionState {
+            key: InstrumentAccountKey,
+            retries: u32,
+            report_shape: String,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Snapshot {
+            schema: String,
+            configuration: ExecutionManagerConfig,
+            captured_at_ns: u64,
+            monotonic_offsets: String,
+            order_activity: Vec<(ClientOrderId, u64)>,
+            order_inflight_checks: Vec<Inflight>,
+            order_query_recency: Vec<(ClientOrderId, u64)>,
+            order_query_pending: Vec<ClientOrderId>,
+            order_recon_retries: Vec<(ClientOrderId, u32)>,
+            order_coverage_unresolved: Vec<ClientOrderId>,
+            order_coverage_warnings: Vec<ClientOrderId>,
+            order_lookback_warnings: Vec<ClientOrderId>,
+            fills_processed: Vec<(FillKey, u64)>,
+            fills_recent: Vec<(FillKey, u64)>,
+            position_activity: Vec<(InstrumentAccountKey, u64)>,
+            position_activity_revisions: Vec<(InstrumentAccountKey, u64)>,
+            position_recon: Vec<PositionState>,
+            position_recon_tolerances: IndexMap<AccountId, Decimal>,
+        }
+        let snapshot: Snapshot = serde_json::from_value(source.clone())?;
+        anyhow::ensure!(
+            snapshot.captured_at_ns > 0,
+            "native manager capture time missing"
+        );
+        anyhow::ensure!(
+            snapshot.schema == "NautilusExecutionManagerCheckpoint.v2"
+                && snapshot.monotonic_offsets == "age_ns_at_common_boundary"
+                && serde_json::to_value(&snapshot.configuration)?
+                    == serde_json::to_value(&self.config)?
+                && snapshot.order_query_pending.is_empty(),
+            "native manager source configuration/profile or query ownership differs"
+        );
+        let at = dst::time::Instant::now();
+        let fresh = self.checkpoint_inventory(at)?;
+        for (key, value) in fresh.as_object().expect("native manager is an object") {
+            if matches!(
+                key.as_str(),
+                "schema" | "configuration" | "monotonic_offsets" | "captured_at_ns"
+            ) {
+                continue;
+            }
+            anyhow::ensure!(
+                value.as_array().is_some_and(Vec::is_empty)
+                    || value.as_object().is_some_and(serde_json::Map::is_empty),
+                "native manager already owns state: {key}"
+            );
+        }
+        fn pairs<K: Eq + std::hash::Hash, V>(
+            source: Vec<(K, V)>,
+        ) -> anyhow::Result<IndexMap<K, V>> {
+            anyhow::ensure!(
+                source.len() <= 1_000_000,
+                "oversized native manager entries"
+            );
+            let len = source.len();
+            let map = source.into_iter().collect::<IndexMap<_, _>>();
+            anyhow::ensure!(map.len() == len, "duplicate native manager identity");
+            Ok(map)
+        }
+        fn set<K: Eq + std::hash::Hash>(source: Vec<K>) -> anyhow::Result<IndexSet<K>> {
+            anyhow::ensure!(source.len() <= 1_000_000, "oversized native manager set");
+            let len = source.len();
+            let set = source.into_iter().collect::<IndexSet<_>>();
+            anyhow::ensure!(set.len() == len, "duplicate native manager identity");
+            Ok(set)
+        }
+        let age = |value: u64| -> anyhow::Result<dst::time::Instant> {
+            let value = value
+                .checked_add(downtime_ns)
+                .ok_or_else(|| anyhow::anyhow!("native manager age overflow"))?;
+            at.checked_sub(Duration::from_nanos(value))
+                .ok_or_else(|| anyhow::anyhow!("native manager source age out of monotonic range"))
+        };
+        let mut inflight = Vec::new();
+        for value in snapshot.order_inflight_checks {
+            anyhow::ensure!(
+                value
+                    .last_query_age_ns
+                    .is_none_or(|query| query <= value.submitted_age_ns),
+                "inflight query precedes submission"
+            );
+            inflight.push((
+                value.client_order_id,
+                InflightCheck {
+                    submitted_at: age(value.submitted_age_ns)?,
+                    retry_count: value.retry_count,
+                    last_query_at: value.last_query_age_ns.map(age).transpose()?,
+                },
+            ));
+        }
+        let mut positions = Vec::new();
+        for value in snapshot.position_recon {
+            let shape = match value.report_shape.as_str() {
+                "unambiguous" => PositionReportShape::Unambiguous,
+                "multi_leg" => PositionReportShape::MultiLeg,
+                _ => anyhow::bail!("unknown native position report shape"),
+            };
+            positions.push((
+                value.key,
+                PositionReconciliationState {
+                    report_shape: shape,
+                    retries: value.retries,
+                },
+            ));
+        }
+        anyhow::ensure!(
+            snapshot
+                .position_recon_tolerances
+                .values()
+                .all(|v| *v >= Decimal::ZERO),
+            "negative native position reconciliation tolerance"
+        );
+        let order_activity = RecencyMap::from_checkpoint(snapshot.order_activity, at, downtime_ns)?;
+        let order_inflight_checks = pairs(inflight)?;
+        let order_query_recency =
+            RecencyMap::from_checkpoint(snapshot.order_query_recency, at, downtime_ns)?;
+        let order_recon_retries = pairs(snapshot.order_recon_retries)?;
+        let order_coverage_unresolved = set(snapshot.order_coverage_unresolved)?;
+        let order_coverage_warnings = set(snapshot.order_coverage_warnings)?;
+        let order_lookback_warnings = set(snapshot.order_lookback_warnings)?;
+        let fills_processed =
+            RecencyMap::from_checkpoint(snapshot.fills_processed, at, downtime_ns)?;
+        let fills_recent = RecencyMap::from_checkpoint(snapshot.fills_recent, at, downtime_ns)?;
+        let position_activity =
+            RecencyMap::from_checkpoint(snapshot.position_activity, at, downtime_ns)?;
+        let position_activity_revisions = pairs(snapshot.position_activity_revisions)?;
+        let position_recon = pairs(positions)?;
+        self.order_activity = order_activity;
+        self.order_inflight_checks = order_inflight_checks;
+        self.order_query_recency = order_query_recency;
+        self.order_recon_retries = order_recon_retries;
+        self.order_coverage_unresolved = order_coverage_unresolved;
+        self.order_coverage_warnings = order_coverage_warnings;
+        self.order_lookback_warnings = order_lookback_warnings;
+        self.fills_processed = fills_processed;
+        self.fills_recent = fills_recent;
+        self.position_activity = position_activity;
+        self.position_activity_revisions = position_activity_revisions;
+        self.position_recon = position_recon;
+        self.position_recon_tolerances = snapshot.position_recon_tolerances;
+        Ok(())
     }
 
     /// Creates a new [`ExecutionManager`] instance.
@@ -7315,3 +7485,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "manager_checkpoint_tests.rs"]
+mod checkpoint_tests;

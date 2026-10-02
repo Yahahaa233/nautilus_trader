@@ -58,6 +58,31 @@ where
             .collect()
     }
 
+    pub(crate) fn from_checkpoint(
+        entries: Vec<(K, u64)>,
+        at: dst::time::Instant,
+        downtime_ns: u64,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            entries.len() <= 1_000_000,
+            "oversized native recency inventory"
+        );
+        let mut inner = IndexMap::new();
+        for (key, age_ns) in entries {
+            let age = age_ns
+                .checked_add(downtime_ns)
+                .ok_or_else(|| anyhow::anyhow!("native recency age overflow"))?;
+            let instant = at.checked_sub(Duration::from_nanos(age)).ok_or_else(|| {
+                anyhow::anyhow!("source recency predates supported monotonic range")
+            })?;
+            anyhow::ensure!(
+                inner.insert(key, instant).is_none(),
+                "duplicate native recency identity"
+            );
+        }
+        Ok(Self { inner })
+    }
+
     #[must_use]
     pub(crate) fn contains_key(&self, key: &K) -> bool {
         self.inner.contains_key(key)

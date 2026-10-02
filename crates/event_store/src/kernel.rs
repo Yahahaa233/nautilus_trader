@@ -1561,6 +1561,19 @@ impl KernelEventStoreTrait for EventStoreLifecycle {
     fn seal(&mut self, ts_init: UnixNanos) {
         EventStoreLifecycle::seal(self, ts_init);
     }
+    fn retain_unsealed(&mut self, reason: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(!reason.is_empty(), "failed boundary reason missing");
+        EventStoreLifecycle::abort(
+            self,
+            HaltReason::ExternalPersistence("native final boundary failed".into()),
+        );
+        anyhow::ensure!(
+            EventStoreLifecycle::is_halted(self),
+            "actual event-store failure was not latched"
+        );
+        Ok(())
+    }
+
 
     fn run_id(&self) -> Option<&str> {
         EventStoreLifecycle::run_id(self)
@@ -2815,6 +2828,62 @@ mod tests {
             .expect("second run present");
         assert_eq!(m1.status, RunStatus::Ended);
         assert_eq!(m2.status, RunStatus::Ended);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn checkpoint_failed_terminal_boundary_never_writes_run_ended_or_seals_on_drop(
+        #[case] explicit_seal: bool,
+    ) {
+        let tmp = TempDir::new().expect("tempdir");
+        let instance_id = UUID4::new();
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let mut store = EventStoreLifecycle::boot(
+            Some(make_config(tmp.path().to_path_buf())),
+            instance_id,
+            clock,
+        )
+        .expect("boot real redb lifecycle");
+        store
+            .open(
+                instance_id,
+                &RegisteredComponents::default(),
+                Environment::Backtest,
+            )
+            .expect("open actual run");
+        let run_id = store.run_id().unwrap().to_string();
+        assert_eq!(store.flush().expect("durable RunStarted"), 1);
+        assert!(KernelEventStoreTrait::retain_unsealed(&mut store, "").is_err());
+        assert!(!store.is_halted());
+        KernelEventStoreTrait::retain_unsealed(&mut store, "checkpoint persistence failed")
+            .expect("permanent actual writer latch");
+        assert!(store.is_halted());
+        assert!(store.flush().is_err());
+        if explicit_seal {
+            store.seal(UnixNanos::from(99));
+        }
+        drop(store);
+        let manifest = RedbBackend::list_runs(tmp.path(), &instance_id.to_string())
+            .unwrap()
+            .into_iter()
+            .find(|m| m.run_id == run_id)
+            .unwrap();
+        assert_eq!(manifest.status, RunStatus::Running);
+        assert!(manifest.end_ts_init.is_none());
+        let mut backend = RedbBackend::new(tmp.path().to_path_buf());
+        assert!(matches!(
+            backend.open_run(manifest),
+            Err(EventStoreError::CrashedPredecessor)
+        ));
+        assert_eq!(
+            backend.scan_seq(1).unwrap().unwrap().topic.as_ref(),
+            RUN_STARTED_TOPIC
+        );
+        assert!(
+            backend.scan_seq(2).unwrap().is_none(),
+            "no RunEnded after failed native cut"
+        );
     }
 
     #[rstest]

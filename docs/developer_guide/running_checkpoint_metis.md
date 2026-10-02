@@ -176,3 +176,55 @@ are retained. These tests certify the specified independent fork slices, not
 consumer governance, original Demo, a private venue account or complete S3.
 Historical coverage/replay, native manager/data-pipeline state, the exact
 consumer caller and final approved source migration still require actual closure.
+
+
+The native-manager/DataEngine batch ran 90 tests: 90 passed, 7081 outside the
+scoped filter skipped, final wrapper exit 0. This seven-crate check also includes
+the actual EventStoreLifecycle writer hook, with redb evidence that neither an
+explicit seal nor Drop writes RunEnded/Ended after a failed terminal boundary.
+The first batch's test-enum compile failure remains recorded separately.
+
+`LiveNode::restore_registered_engine_checkpoint(&manager, &data_engine,
+source_capture_ns, &watermark) -> Result<()>` now installs real native state.
+It requires Idle, Halted recovery, the same already installed cut frontier,
+restored cache/components, unused native engines, and one installation. The
+manager schema is `NautilusExecutionManagerCheckpoint.v2`, with exact native
+configuration and `captured_at_ns`. Actual ordered inflight/retry state, fill
+recency/deduplication, order/position revisions and reconciliation shapes are
+restored. Real offline elapsed wall time is added to stored monotonic ages;
+restart cannot refresh native recency. Duplicate, oversized, future/overflow,
+changed-configuration and pending-query sources refuse restoration. The source
+is recorded through the actual native lifecycle observer before mutation.
+`RunningCheckpointInventory::execution_manager()` and `data_engine()` expose
+these actual source projections.
+
+DataEngine uses `native_data_engine_external_bars_no_internal_pipelines.v1`.
+Every owned aggregation, book, request/join/time-range, continuous-future,
+option/Greek, synthetic, buffered, deferred and feature-specific pipeline is
+projected from its actual private container. Nonempty unsupported families fail
+with their concrete family/count. Resident continuous-future/option helpers own
+only WeakCell routing; their actual same-engine binding is verified separately,
+while their mutable request/subscription maps remain fully checked. Routing,
+client order, configuration, complete family set and counters are restored once
+before any tail processing. Missing families or an actual live request pipeline
+are rejected rather than represented as empty.
+
+Consumer ordering is cut-only cache -> restored components -> authenticated
+same-cut native frontier -> engine cut installation -> actual native typed tail
+replay -> real adapter attachment/restoration -> sealed Observation. Retained
+owner-bound source timers may be installed at the cut and remain unprocessed
+until restored startup. Their queued/received/processed proof is separate from
+the completed native event frontier. A terminal cut can verify a RunEnded-only
+suffix; nonterminal cache-only tail application does not update ExecutionManager
+or DataEngine and is not a complete native restoration path. Historical mutation
+replay/coverage and exact consumer/venue acceptance remain explicit work.
+
+Authoritative record:
+`/Volumes/My PSSD/CQS/trading-checkpoint-validation/manager-data-engine-2/`.
+Log SHA256: `996c79a7c1170c30c726f31190a704b13d2485dc98eafde3649ea1fc38a8761f`.
+Tracked pre/post diff SHA256:
+`cc71ea0cbc05807afa71c51f782ce3922778b6dcae67e00a28d7008fef0a9a2a`;
+both new module hashes remained unchanged. Peak tree RSS was 3193712 KiB with two
+jobs. This explanatory documentation was appended only after successful tests;
+it is not part of the tested Rust-source diff. The batch proves the restricted
+independent-fork APIs, not full S3, original Demo or a private venue grant.

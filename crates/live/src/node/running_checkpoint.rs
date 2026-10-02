@@ -406,11 +406,20 @@ pub struct RunningCheckpointInventory {
     retained_recovery_timers: Option<serde_json::Value>,
     restored_adapters: Option<BTreeMap<String, serde_json::Value>>,
     data_client_state: BTreeMap<String, serde_json::Value>,
+    data_engine: serde_json::Value,
     message_bus_mode: &'static str,
     execution_authorized: bool,
 }
 
 impl RunningCheckpointInventory {
+    #[must_use]
+    pub const fn execution_manager(&self) -> &serde_json::Value {
+        &self.execution_manager
+    }
+    #[must_use]
+    pub const fn data_engine(&self) -> &serde_json::Value {
+        &self.data_engine
+    }
     /// True only for the final cut which permanently closes actual admission.
     #[must_use]
     pub fn is_terminal_cut(&self) -> bool {
@@ -790,6 +799,7 @@ impl LiveNode {
                     .is_empty(),
                 "execution algorithm private state unsupported"
             );
+            let data_engine_state = data.running_checkpoint_state()?;
             let mut adapters = Vec::new();
             let data_client_state = data
                 .get_clients()
@@ -930,6 +940,7 @@ impl LiveNode {
                                 retained_recovery_timers: retained_timers.clone(),
                                 restored_adapters: self.recovery_adapter_source.clone(),
                                 data_client_state: data_client_state.clone(),
+                                data_engine: data_engine_state.clone(),
                                 message_bus_mode: "local_only",
                                 execution_authorized: false,
                             };
@@ -959,6 +970,10 @@ impl LiveNode {
                                     Trader::collect_component_state(&self.kernel.trader)?
                                         == components,
                                     "component state changed during checkpoint"
+                                );
+                                ensure!(
+                                    data.running_checkpoint_state()? == data_engine_state,
+                                    "actual native DataEngine internal inventory changed"
                                 );
                                 ensure!(
                                     self.exec_manager.checkpoint_inventory(now)? == manager,

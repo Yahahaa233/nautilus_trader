@@ -244,6 +244,8 @@ pub struct LiveNode {
     recovery_timers: Option<recovery_timers::RetainedNodeTimers>,
     #[cfg(feature = "dispatch-observer")]
     recovery_adapter_source: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[cfg(feature = "dispatch-observer")]
+    recovery_engine_source: Option<serde_json::Value>,
     runner: Option<AsyncRunner>,
     config: LiveNodeConfig,
     handle: LiveNodeHandle,
@@ -671,6 +673,8 @@ impl LiveNode {
             recovery_timers: None,
             #[cfg(feature = "dispatch-observer")]
             recovery_adapter_source: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_engine_source: None,
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,
@@ -772,6 +776,8 @@ impl LiveNode {
             recovery_timers: None,
             #[cfg(feature = "dispatch-observer")]
             recovery_adapter_source: None,
+            #[cfg(feature = "dispatch-observer")]
+            recovery_engine_source: None,
             handle: LiveNodeHandle::with_ingress(runner.ingress_gate()),
             runner: Some(runner),
             config,

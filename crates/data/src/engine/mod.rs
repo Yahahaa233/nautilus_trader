@@ -38,6 +38,7 @@ pub mod pool;
 #[cfg(feature = "streaming")]
 mod streaming;
 
+mod checkpoint;
 mod commands;
 mod handlers;
 mod requests;
@@ -197,6 +198,7 @@ pub struct DataEngine {
     subscribed_synthetic_trades: AHashMap<InstrumentId, usize>,
     buffered_deltas_map: AHashMap<InstrumentId, OrderBookDeltas>,
     deltas_frame: Vec<OrderBookDelta>,
+    checkpoint_restored: bool,
     command_count: u64,
     data_count: u64,
     request_count: u64,
@@ -277,6 +279,7 @@ impl DataEngine {
             subscribed_synthetic_trades: AHashMap::new(),
             buffered_deltas_map: AHashMap::new(),
             deltas_frame: Vec::new(),
+            checkpoint_restored: false,
             command_count: 0,
             data_count: 0,
             request_count: 0,

@@ -28,7 +28,8 @@ use nautilus_model::identifiers::{ClientOrderId, InstrumentId, TraderId};
     clippy::struct_excessive_bools,
     reason = "config flags mirror the live execution engine configuration surface"
 )]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionManagerConfig {
     /// The trader ID for generated orders.
     pub trader_id: TraderId,
