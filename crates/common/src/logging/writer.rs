@@ -976,18 +976,22 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+            use std::os::unix::{
+                fs::{MetadataExt, PermissionsExt},
+                process::CommandExt,
+            };
 
-            // SAFETY: geteuid only reads the current process effective UID.
-            let effective_uid = unsafe { libc::geteuid() };
-            // A chmod fixture cannot deny container root. Run the same original
-            // assertion in an owned child with no root UID/GID, never skip it.
+            // Observe the filesystem owner of our freshly created directory,
+            // rather than use an unsafe process-identity call in this fixture.
+            let temp = tempdir().unwrap();
+            let filesystem_owner_uid = std::fs::metadata(temp.path()).unwrap().uid();
+            // Some root environments bypass chmod. The physical probe decides
+            // whether the same assertion needs an owned unprivileged child.
             if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
-                assert_ne!(effective_uid, 0);
+                assert_eq!(filesystem_owner_uid, 65534);
                 assert_refused(std::path::Path::new(&directory));
                 return;
             }
-            let temp = tempdir().unwrap();
             std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
             let directory = temp.path().join("unwritable");
             std::fs::create_dir(&directory).unwrap();
@@ -1013,7 +1017,14 @@ mod tests {
                 std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
                     .unwrap();
             } else {
-                assert_eq!(effective_uid, 0, "non-root fixture unexpectedly writable");
+                assert_eq!(
+                    filesystem_owner_uid, 0,
+                    "non-root filesystem owner fixture unexpectedly writable"
+                );
+                let child_temp = temp.path().join("child-temp");
+                std::fs::create_dir(&child_temp).unwrap();
+                std::fs::set_permissions(&child_temp, std::fs::Permissions::from_mode(0o777))
+                    .unwrap();
                 let status = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
@@ -1021,6 +1032,7 @@ mod tests {
                         "--nocapture",
                     ])
                     .env(CHILD_DIRECTORY, &directory)
+                    .env("TMPDIR", &child_temp)
                     .gid(65534)
                     .uid(65534)
                     .status();
