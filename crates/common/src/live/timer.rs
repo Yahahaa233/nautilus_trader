@@ -112,6 +112,9 @@ impl LiveTimer {
     /// start. Async tasks never infer a dispatch owner from ambient context.
     pub(crate) fn with_owner_clock_id(mut self, clock_id: UUID4) -> Self {
         self.owner_clock_id = Some(clock_id);
+        if let OwnerCallback::Registered { token, .. } = &self.callback {
+            token.bind_owner_clock(clock_id);
+        }
         self
     }
 
@@ -398,6 +401,9 @@ impl LiveTimer {
                 // return None on every fire.
                 if token.is_closed() {
                     *token = register_time_event_callback(callback.clone());
+                    if let Some(owner) = self.owner_clock_id {
+                        token.bind_owner_clock(owner);
+                    }
                 }
                 WorkerDispatch::Registered(token.clone())
             }

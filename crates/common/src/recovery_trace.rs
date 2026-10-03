@@ -1232,7 +1232,8 @@ pub mod historical {
                 .context("unrecorded historical Clock read")?;
             ensure!(
                 read.clock_id == clock_id && read.operation == operation,
-                "historical Clock owner/read order mismatch"
+                "historical Clock owner/read order mismatch at read {}: expected {}/{}, actual {}/{}",
+                frame.next_clock, read.clock_id, read.operation, clock_id, operation
             );
             let value = read.value.clone();
             frame.next_clock += 1;

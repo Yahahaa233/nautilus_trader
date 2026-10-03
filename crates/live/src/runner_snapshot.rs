@@ -88,12 +88,23 @@ impl<T> Receiver<T> {
 #[derive(Debug)]
 pub struct SnapshotReceiver<T> {
     prefix: VecDeque<Retained<T>>,
+    // Installed only by the reader-issued native tail while the actual runner is
+    // frozen. Its original receipts stay visible to capture, but cannot be
+    // dispatched by startup or Observing before the private fresh release.
+    #[cfg(feature = "native-tail-replay")]
+    recovered_prefix: VecDeque<Retained<T>>,
+    #[cfg(feature = "native-tail-replay")]
+    recovered_prefix_released: bool,
     receiver: Receiver<T>,
 }
 impl<T> From<UnboundedReceiver<T>> for SnapshotReceiver<T> {
     fn from(receiver: UnboundedReceiver<T>) -> Self {
         Self {
             prefix: VecDeque::new(),
+            #[cfg(feature = "native-tail-replay")]
+            recovered_prefix: VecDeque::new(),
+            #[cfg(feature = "native-tail-replay")]
+            recovered_prefix_released: false,
             receiver: Receiver::Raw(receiver),
         }
     }
@@ -102,6 +113,10 @@ impl<T> From<NativeIngressReceiver<T>> for SnapshotReceiver<T> {
     fn from(receiver: NativeIngressReceiver<T>) -> Self {
         Self {
             prefix: VecDeque::new(),
+            #[cfg(feature = "native-tail-replay")]
+            recovered_prefix: VecDeque::new(),
+            #[cfg(feature = "native-tail-replay")]
+            recovered_prefix_released: false,
             receiver: Receiver::Native(receiver),
         }
     }
@@ -110,11 +125,21 @@ impl<T> SnapshotReceiver<T> {
     /// Returns the total number of retained and channel-resident messages.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.prefix.len() + self.receiver.len()
+        #[cfg(feature = "native-tail-replay")]
+        let recovered = self.recovered_prefix.len();
+        #[cfg(not(feature = "native-tail-replay"))]
+        let recovered = 0;
+        recovered + self.prefix.len() + self.receiver.len()
     }
     /// Returns whether both storage locations are empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Actual dispatch readiness excludes the privately held historical prefix.
+    /// Inventory emptiness remains separate and includes all retained messages.
+    #[cfg(feature = "node")]
+    pub(crate) fn dispatch_is_empty(&self) -> bool {
         self.prefix.is_empty() && self.receiver.len() == 0
     }
     /// Closes further channel admission while preserving retained messages.
@@ -175,13 +200,20 @@ impl<T> SnapshotReceiver<T> {
     }
 
     pub(super) fn pending(&self) -> impl Iterator<Item = &T> {
-        self.prefix.iter().map(|entry| &entry.message)
+        #[cfg(feature = "native-tail-replay")]
+        let retained = self.recovered_prefix.iter().chain(self.prefix.iter());
+        #[cfg(not(feature = "native-tail-replay"))]
+        let retained = self.prefix.iter();
+        retained.map(|entry| &entry.message)
     }
     /// Returns original evidence for each actual staged FIFO member.
     /// Raw compatibility channels explicitly return absent receipts.
     #[cfg(feature = "native-tail-replay")]
     pub(super) fn pending_receipts(&self) -> impl Iterator<Item = Option<&NativeIngressReceipt>> {
-        self.prefix.iter().map(|entry| entry.receipt.as_ref())
+        self.recovered_prefix
+            .iter()
+            .chain(self.prefix.iter())
+            .map(|entry| entry.receipt.as_ref())
     }
     #[cfg(feature = "native-tail-replay")]
     pub(crate) fn append_native_retained(
@@ -190,22 +222,44 @@ impl<T> SnapshotReceiver<T> {
         receipt: NativeIngressReceipt,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.receiver.len() == 0,
-            "unowned actual input appeared during native handoff"
+            !self.recovered_prefix_released && self.prefix.is_empty() && self.receiver.len() == 0,
+            "unowned actual input appeared during native handoff or its release already occurred"
         );
-        if let Some(previous) = self.prefix.back().and_then(|entry| entry.receipt.as_ref()) {
+        if let Some(previous) = self
+            .recovered_prefix
+            .back()
+            .and_then(|entry| entry.receipt.as_ref())
+        {
             anyhow::ensure!(
                 previous.channel_id == receipt.channel_id
                     && previous.channel_ordinal.checked_add(1) == Some(receipt.channel_ordinal),
                 "restored native FIFO is not contiguous"
             );
         }
-        self.prefix.try_reserve(1)?;
-        self.prefix.push_back(Retained {
+        self.recovered_prefix.try_reserve(1)?;
+        self.recovered_prefix.push_back(Retained {
             message,
             receipt: Some(receipt),
         });
         Ok(())
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn prepare_recovered_prefix_release(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.recovered_prefix_released,
+            "native retained release already occurred"
+        );
+        self.prefix.try_reserve(self.recovered_prefix.len())?;
+        Ok(())
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn release_recovered_prefix(&mut self) {
+        // All seven receivers reserve before the fresh lifecycle commits. No
+        // allocation or fallible operation can split this ordered handoff.
+        while let Some(entry) = self.recovered_prefix.pop_back() {
+            self.prefix.push_front(entry);
+        }
+        self.recovered_prefix_released = true;
     }
     pub(crate) fn prepend_retained(&mut self, retained: &mut VecDeque<T>) -> anyhow::Result<()> {
         self.prefix.try_reserve(retained.len())?;
@@ -243,6 +297,110 @@ mod tests {
         );
         assert_eq!(receiver.recv().await, None);
         assert!(receiver.is_empty());
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    #[test]
+    fn recovered_native_prefix_is_retained_until_private_release_and_precedes_fresh_tail() {
+        use nautilus_common::{live::ingress::IngressGate, recovery_trace::NativeInputSource};
+        let parent = IngressGate::new();
+        let (original_sender, mut original_receiver) =
+            parent.native_channel::<&'static str>(NativeInputSource::TradingCommand);
+        original_sender.send("original-first").unwrap();
+        original_sender.send("original-second").unwrap();
+        let (first, first_receipt) = original_receiver.try_recv().unwrap().into_parts();
+        let (second, second_receipt) = original_receiver.try_recv().unwrap().into_parts();
+        let original_receipts = vec![first_receipt.clone(), second_receipt.clone()];
+        let child = IngressGate::new();
+        let (current_sender, current_receiver) =
+            child.native_channel::<&'static str>(NativeInputSource::TradingCommand);
+        let mut receiver = SnapshotReceiver::from(current_receiver);
+        receiver
+            .append_native_retained(first, first_receipt)
+            .unwrap();
+        receiver
+            .append_native_retained(second, second_receipt)
+            .unwrap();
+        assert!(!receiver.is_empty());
+        assert!(receiver.dispatch_is_empty());
+        assert!(matches!(
+            receiver.try_recv_retained(),
+            Err(TryRecvError::Empty)
+        ));
+        assert_eq!(
+            receiver.pending().copied().collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(
+            receiver
+                .pending_receipts()
+                .map(|r| r.unwrap().clone())
+                .collect::<Vec<_>>(),
+            original_receipts
+        );
+        current_sender.send("fresh-observation").unwrap();
+        let fresh = receiver.try_recv_retained().unwrap();
+        assert_eq!(fresh.message, "fresh-observation");
+        assert_ne!(
+            fresh.receipt.unwrap().channel_id,
+            original_receipts[0].channel_id
+        );
+        assert_eq!(receiver.len(), 2);
+        current_sender.send("later-current").unwrap();
+        receiver.stage().unwrap();
+        receiver.prepare_recovered_prefix_release().unwrap();
+        receiver.release_recovered_prefix();
+        let original = receiver.try_recv_retained().unwrap();
+        assert_eq!(
+            (original.message, original.receipt.as_ref()),
+            (first, Some(&original_receipts[0]))
+        );
+        let original = receiver.try_recv_retained().unwrap();
+        assert_eq!(
+            (original.message, original.receipt.as_ref()),
+            (second, Some(&original_receipts[1]))
+        );
+        assert_eq!(
+            receiver.try_recv_retained().unwrap().message,
+            "later-current"
+        );
+        assert!(receiver.prepare_recovered_prefix_release().is_err());
+        assert!(
+            receiver
+                .append_native_retained(first, original_receipts[0].clone())
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    #[test]
+    fn failed_or_closed_startup_preserves_original_recovered_receipts_without_dispatch() {
+        use nautilus_common::{live::ingress::IngressGate, recovery_trace::NativeInputSource};
+        let parent = IngressGate::new();
+        let (sender, mut original_receiver) =
+            parent.native_channel::<String>(NativeInputSource::TradingCommand);
+        sender
+            .send("uncertain-original-command".to_owned())
+            .unwrap();
+        let (message, receipt) = original_receiver.try_recv().unwrap().into_parts();
+        let original = receipt.clone();
+        let child = IngressGate::new();
+        let (_, current) = child.native_channel::<String>(NativeInputSource::TradingCommand);
+        let mut receiver = SnapshotReceiver::from(current);
+        receiver.append_native_retained(message, receipt).unwrap();
+        receiver.close();
+        assert!(matches!(
+            receiver.try_recv_retained(),
+            Err(TryRecvError::Disconnected)
+        ));
+        receiver.stage().unwrap();
+        assert_eq!(receiver.len(), 1);
+        assert_eq!(
+            receiver.pending().next().unwrap(),
+            "uncertain-original-command"
+        );
+        assert_eq!(receiver.pending_receipts().next().unwrap(), Some(&original));
+        assert!(receiver.dispatch_is_empty());
     }
 
     #[test]

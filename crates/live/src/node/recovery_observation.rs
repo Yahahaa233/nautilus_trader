@@ -528,6 +528,9 @@ impl LiveNode {
                 "recovery startup stop requested"
             );
             registration.execution_gate.as_ref().unwrap().verify()?;
+            // Allocate for every original FIFO before any release state changes.
+            #[cfg(feature = "native-tail-replay")]
+            receivers.prepare_recovered_prefix_release()?;
             ensure!(
                 matches!(
                     self.handle.try_release_observing(),
@@ -536,8 +539,17 @@ impl LiveNode {
                 "sealed recovery transition failed"
             );
             self.handoff_recovered_timers(receivers)?;
+            // Timer handoff may have prepended more real messages to Time.
+            // Re-reserve all original prefixes after it, before either gate is
+            // released, so the final FIFO movement cannot allocate or split.
+            #[cfg(feature = "native-tail-replay")]
+            receivers.prepare_recovered_prefix_release()?;
             registration.execution_gate.take().unwrap().finish()?;
             registration.admission.take().unwrap().finish()?;
+            // Only this privately verified fresh startup permits the preserved
+            // original prefix to reach its ordinary native dispatch handler.
+            #[cfg(feature = "native-tail-replay")]
+            receivers.release_recovered_prefix();
             self.recovery_requires_release = false;
             self.running_checkpoint = registration.suspended_checkpoint.take();
             Ok(())

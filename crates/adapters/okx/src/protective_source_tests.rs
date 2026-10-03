@@ -174,6 +174,8 @@ async fn actual_http_protection_submit_raw_trigger_and_child_fills_keep_original
     assert_eq!(http.response_body_json, response); // whitespace and unknown raw field retained
     assert!(http.request_ns <= http.received_ns && http.received_ns >= start);
     assert!(!first.execution_authorized && !first.venue_command_causation_available);
+    let submitted_request: Value = serde_json::from_str(&http.request_body_json)?;
+    assert_eq!(submitted_request["sz"], order.quantity().to_string());
     let mut template: Value =
         serde_json::from_str(include_str!("../test_data/ws_orders_algo_states.json"))?;
     template["arg"]["uid"] = "123".into();
@@ -183,23 +185,29 @@ async fn actual_http_protection_submit_raw_trigger_and_child_fills_keep_original
     row["clOrdId"] = "VENUE-GENERATED-CHILD".into();
     row["ordId"] = "".into();
     row["ordIdList"] = json!([]);
-    row["sz"] = "1".into();
+    row["sz"] = submitted_request["sz"].clone();
     row["ordType"] = "conditional".into();
     row["state"] = "live".into();
-    row["tdMode"] = "cross".into();
+    row["tdMode"] = submitted_request["tdMode"].clone();
     row["posSide"] = "net".into();
     row["slTriggerPx"] = "95000.00".into();
     row["slTriggerPxType"] = "mark".into();
     row["slOrdPx"] = "-1".into();
     row["triggerTime"] = "".into();
+    // This new pre-trigger wire must not retain the source template's
+    // already-triggered 0.01 quantity/price. It describes the actual one-
+    // contract Submit above; no ctVal conversion occurs in this adapter.
+    row["actualSz"] = "0".into();
+    row["actualPx"] = "".into();
     let millis = || client.clock.get_time_ns().as_u64() / 1_000_000;
     // A venue millisecond event must be inside the actual nanosecond window;
     // wait for that original fixture time instead of retiming a captured event.
     while millis() * 1_000_000 < start {
         tokio::task::yield_now().await;
     }
-    row["cTime"] = millis().to_string().into();
-    row["uTime"] = millis().to_string().into();
+    let accepted_ms = millis();
+    row["cTime"] = accepted_ms.to_string().into();
+    row["uTime"] = accepted_ms.to_string().into();
     template["data"] = json!([row.clone()]);
     dispatch(&client, serde_json::to_string(&template)?, &instruments).await;
     sources.extend(take_sources(&mut data_rx));
@@ -210,7 +218,7 @@ async fn actual_http_protection_submit_raw_trigger_and_child_fills_keep_original
             .any(|v| v["Accepted"]["type"] == "OrderAccepted")
     );
     // Real algorithm update links a unique child. No ACK supplied as a terminal.
-    while millis() * 1_000_000 <= start {
+    while millis() <= accepted_ms {
         tokio::task::yield_now().await;
     }
     let trigger = millis();
@@ -219,6 +227,8 @@ async fn actual_http_protection_submit_raw_trigger_and_child_fills_keep_original
     row["ordIdList"] = json!(["PROTECTION-CHILD"]);
     row["triggerTime"] = trigger.to_string().into();
     row["uTime"] = trigger.to_string().into();
+    row["actualSz"] = submitted_request["sz"].clone();
+    row["actualPx"] = "94990".into();
     template["data"] = json!([row]);
     dispatch(&client, serde_json::to_string(&template)?, &instruments).await;
     sources.extend(take_sources(&mut data_rx));
@@ -237,7 +247,8 @@ async fn actual_http_protection_submit_raw_trigger_and_child_fills_keep_original
     fill["algoClOrdId"] = "OPROTECTION1".into();
     fill["clOrdId"] = "".into();
     fill["side"] = "sell".into();
-    fill["sz"] = "1".into();
+    fill["sz"] = submitted_request["sz"].clone();
+    fill["tdMode"] = submitted_request["tdMode"].clone();
     fill["ordType"] = "market".into();
     fill["reduceOnly"] = "true".into();
     fill["feeCcy"] = "USDT".into();
@@ -267,6 +278,18 @@ async fn actual_http_protection_submit_raw_trigger_and_child_fills_keep_original
         .iter()
         .filter_map(|v| v.get("Filled"))
         .collect::<Vec<_>>();
+    let updates = events
+        .iter()
+        .filter_map(|v| v.get("Updated"))
+        .collect::<Vec<_>>();
+    assert!(!updates.is_empty());
+    for update in updates {
+        assert_eq!(
+            Decimal::from_str_exact(update["quantity"].as_str().unwrap())?,
+            Decimal::from_str_exact(submitted_request["sz"].as_str().unwrap())?,
+            "actual child binding must preserve the submitted contract unit"
+        );
+    }
     assert_eq!(fills.len(), 2);
     assert_eq!(
         Decimal::from_str_exact(fills[0]["last_qty"].as_str().unwrap())?,

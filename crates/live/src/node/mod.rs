@@ -473,10 +473,16 @@ impl LiveNode {
                     let message = input.downcast_ref::<TimeEventMessage>().context("actual timer message absent")?;
                     let binding = message.checkpoint_callback_binding();
                     let id = binding["binding_id"].as_u64().context("historical timer is not an owner callback")?;
-                    let owners = timers.iter().filter(|(_, inventory)| inventory["timers"].as_array()
+                    let active_owners = timers.iter().filter(|(_, inventory)| inventory["timers"].as_array()
                         .is_some_and(|entries| entries.iter().any(|entry| entry["binding"]["binding_id"].as_u64() == Some(id))))
                         .map(|(owner, _)| owner.clone()).collect::<Vec<_>>();
-                    anyhow::ensure!(owners.len() == 1, "actual timer owner binding is missing or ambiguous");
+                    let clock_id = message.checkpoint_owner_clock_id()
+                        .context("actual queued timer lease has no original owner Clock")?;
+                    let owners = timers.iter().filter(|(_, inventory)| {
+                        inventory["native_clock_id"] == serde_json::json!(clock_id)
+                    }).map(|(owner, _)| owner.clone()).collect::<Vec<_>>();
+                    anyhow::ensure!(owners.len() == 1 && (active_owners.is_empty() || active_owners == owners),
+                        "actual timer owner binding is missing, ambiguous or differs from its original lease");
                     let event = message.event();
                     timer_input = serde_json::json!({"owner":owners[0],"binding":binding,
                         "event":{"name":event.name,"event_id":event.event_id,"ts_event":event.ts_event,"ts_init":event.ts_init}});
@@ -2932,16 +2938,16 @@ impl LiveNode {
             // report/data input or another channel. Empty snapshots leave all
             // receivers armed so a newly arriving message wakes the loop.
             let runner_channels_ready = [
-                !time_evt_rx.is_empty(),
-                !system_evt_rx.is_empty(),
-                !system_cmd_rx.is_empty(),
-                !exec_evt_rx.is_empty(),
-                !exec_cmd_rx.is_empty(),
+                !time_evt_rx.dispatch_is_empty(),
+                !system_evt_rx.dispatch_is_empty(),
+                !system_cmd_rx.dispatch_is_empty(),
+                !exec_evt_rx.dispatch_is_empty(),
+                !exec_cmd_rx.dispatch_is_empty(),
                 external_msgbus_rx
                     .as_ref()
                     .is_some_and(|rx| !rx.is_empty() || rx.is_closed()),
-                !data_evt_rx.is_empty(),
-                !data_cmd_rx.is_empty(),
+                !data_evt_rx.dispatch_is_empty(),
+                !data_cmd_rx.dispatch_is_empty(),
             ];
             let selected_runner_channel =
                 next_ready_runner_channel(&runner_channels_ready, next_runner_channel);

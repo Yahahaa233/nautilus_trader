@@ -77,6 +77,8 @@ struct TimeEventCallbackId(NonZeroU64);
 struct TimeEventCallbackTokenInner {
     id: TimeEventCallbackId,
     owner: ThreadId,
+    #[cfg(feature = "live")]
+    owner_clock_id: std::sync::OnceLock<nautilus_core::UUID4>,
     state: AtomicUsize,
 }
 
@@ -90,6 +92,19 @@ struct TimeEventCallbackEntry {
 pub(crate) struct TimeEventCallbackToken(Arc<TimeEventCallbackTokenInner>);
 
 impl TimeEventCallbackToken {
+    #[cfg(feature = "live")]
+    pub(crate) fn bind_owner_clock(&self, clock_id: nautilus_core::UUID4) {
+        // Only the actual LiveTimer factory binds this existing callback token.
+        // A closed queued lease retains the same identity after timer removal.
+        if self.0.owner_clock_id.set(clock_id).is_err() {
+            assert_eq!(
+                self.0.owner_clock_id.get(),
+                Some(&clock_id),
+                "timer callback owner Clock changed"
+            );
+        }
+    }
+
     pub(crate) fn checkpoint_inventory(&self) -> serde_json::Value {
         serde_json::json!({"binding_id":self.0.id.0.get(),
             "state":self.0.state.load(Ordering::Acquire),
@@ -107,6 +122,8 @@ impl TimeEventCallbackToken {
         let token = Self(Arc::new(TimeEventCallbackTokenInner {
             id,
             owner: thread::current().id(),
+            #[cfg(feature = "live")]
+            owner_clock_id: std::sync::OnceLock::new(),
             state: AtomicUsize::new(0),
         }));
         TIME_EVENT_CALLBACKS.with(|callbacks| {
@@ -318,6 +335,21 @@ impl TimeEventMessage {
     #[must_use]
     pub const fn event(&self) -> &TimeEvent {
         &self.event
+    }
+
+    /// Clock identity attached once by the actual native timer factory. A
+    /// queued lease retains its owner after cancellation; this read-only ID
+    /// cannot register a callback or restore timer/dispatch authority.
+    #[cfg(feature = "live")]
+    #[must_use]
+    pub fn checkpoint_owner_clock_id(&self) -> Option<nautilus_core::UUID4> {
+        let token = match &self.dispatch {
+            TimeEventDispatch::Registered(lease) | TimeEventDispatch::Cleanup(lease) => &lease.0,
+            TimeEventDispatch::Direct(_) => return None,
+        };
+        (token.owner == thread::current().id())
+            .then(|| token.owner_clock_id.get().copied())
+            .flatten()
     }
 
     /// Actual callback binding evidence. Identifiers bind this process only and

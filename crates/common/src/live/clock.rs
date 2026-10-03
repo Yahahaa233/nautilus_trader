@@ -1427,6 +1427,84 @@ mod tests {
         drop(source_message);
     }
 
+    #[test]
+    fn actual_canceled_queued_timer_retains_original_clock_owner_without_reviving_timer() {
+        let (tx, rx) = mpsc::channel();
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let called = count.clone();
+        let mut source = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(tx))));
+        source.register_default_handler(TimeEventCallback::RustLocal(std::rc::Rc::new(
+            move |_| called.set(called.get() + 1),
+        )));
+        let initial = source.freeze_running_timer_checkpoint().unwrap();
+        initial.verify().unwrap();
+        let owner = initial.inventory()["native_clock_id"].clone();
+        // Abandoning a verified freeze permanently closes this real producer.
+        // Release the original boundary before expecting its actual 20ms fire.
+        initial.finish().unwrap();
+        source
+            .set_timer_ns(
+                "cancel-with-queued-lease",
+                DurationNanos::from_millis(20),
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let original = rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(original.checkpoint_owner_clock_id().unwrap()).unwrap(),
+            owner
+        );
+        let original_binding = original.checkpoint_callback_binding();
+        let original = std::thread::spawn(move || {
+            assert!(
+                original.checkpoint_owner_clock_id().is_none(),
+                "foreign thread cannot authenticate the actual owner"
+            );
+            original
+        })
+        .join()
+        .unwrap();
+        source.cancel_timer("cancel-with-queued-lease");
+        let frozen = loop {
+            match source.freeze_running_timer_checkpoint() {
+                Ok(frozen) => break frozen,
+                Err(error)
+                    if error.to_string() == "adapter requests or callbacks remain in flight" =>
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "original timer did not become quiescent: {error:#}"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("original canceled timer checkpoint failed: {error:#}"),
+            }
+        };
+        assert_eq!(frozen.inventory()["native_clock_id"], owner);
+        assert!(frozen.inventory()["timers"].as_array().unwrap().is_empty());
+        assert_eq!(source.timer_count(), 0);
+        assert_eq!(original.checkpoint_callback_binding(), original_binding);
+        assert_eq!(
+            serde_json::to_value(original.checkpoint_owner_clock_id().unwrap()).unwrap(),
+            owner
+        );
+        frozen.verify().unwrap();
+        frozen.finish().unwrap();
+        assert!(
+            original.dispatch(),
+            "the original closed queued lease must still dispatch exactly once"
+        );
+        assert_eq!(count.get(), 1);
+        assert_eq!(source.timer_count(), 0);
+    }
+
     #[rstest]
     #[case("valid")]
     #[case("missing_lease")]

@@ -299,6 +299,27 @@ impl RunningReceivers<'_> {
         }
     }
     #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn prepare_recovered_prefix_release(&mut self) -> anyhow::Result<()> {
+        self.time_evt_rx.prepare_recovered_prefix_release()?;
+        self.system_evt_rx.prepare_recovered_prefix_release()?;
+        self.system_cmd_rx.prepare_recovered_prefix_release()?;
+        self.exec_evt_rx.prepare_recovered_prefix_release()?;
+        self.exec_cmd_rx.prepare_recovered_prefix_release()?;
+        self.data_evt_rx.prepare_recovered_prefix_release()?;
+        self.data_cmd_rx.prepare_recovered_prefix_release()?;
+        Ok(())
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn release_recovered_prefix(&mut self) {
+        self.time_evt_rx.release_recovered_prefix();
+        self.system_evt_rx.release_recovered_prefix();
+        self.system_cmd_rx.release_recovered_prefix();
+        self.exec_evt_rx.release_recovered_prefix();
+        self.exec_cmd_rx.release_recovered_prefix();
+        self.data_evt_rx.release_recovered_prefix();
+        self.data_cmd_rx.release_recovered_prefix();
+    }
+    #[cfg(feature = "native-tail-replay")]
     pub(crate) fn native_pending_receipts(
         &self,
     ) -> anyhow::Result<Vec<nautilus_common::recovery_trace::NativeIngressReceipt>> {
@@ -343,7 +364,7 @@ impl RunningReceivers<'_> {
                     let receipt = receipt.context("actual staged input has no native receipt")?.clone();
                     anyhow::ensure!(receipt.input_source == NativeInputSource::$source, "native staged channel changed");
                     let any: &dyn std::any::Any = message;
-                    let callback_binding = any.downcast_ref::<TimeEventMessage>().map(TimeEventMessage::checkpoint_callback_binding);
+                    let callback_binding = any.downcast_ref::<TimeEventMessage>().map(TimeEventMessage::native_input_callback_binding);
                     let timer_event = any.downcast_ref::<TimeEventMessage>().map(|message| {
                         let event = message.event(); serde_json::json!({"name":event.name,"event_id":event.event_id,"ts_event":event.ts_event,"ts_init":event.ts_init})
                     });

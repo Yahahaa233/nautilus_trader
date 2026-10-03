@@ -1043,16 +1043,48 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(
             handle.stop();
             return;
         }
-        for event in [
+        for (index, event) in [
             DataEvent::Data(Data::Quote(quote)),
             DataEvent::Data(Data::Trade(trade)),
             DataEvent::Data(Data::Bar(bar)),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             data.send(event).unwrap();
-            progress.notified().await;
+            loop {
+                progress.notified().await;
+                let actual =
+                    get_actor_unchecked::<FrameworkStrategy>(&StrategyId::from(STRATEGY).inner());
+                // Maintenance also notifies this waiter. Only the original
+                // business callback proves this input reached its real owner.
+                if actual.callbacks[index] == [3, 4, 5][index] {
+                    assert_eq!(actual.state(), ComponentState::Running);
+                    break;
+                }
+            }
         }
+        let original_denied = denied.clone();
         exec.send(ExecutionEvent::Order(denied)).unwrap();
-        progress.notified().await;
+        loop {
+            progress.notified().await;
+            let actual =
+                get_actor_unchecked::<FrameworkStrategy>(&StrategyId::from(STRATEGY).inner());
+            let cache = actual.cache_ref();
+            let applied = actual.denied == 8
+                && cache
+                    .order(&ClientOrderId::from(ORDER))
+                    .is_some_and(|order| {
+                        order.status() == OrderStatus::Denied
+                            && order.last_event() == &original_denied
+                    });
+            if applied {
+                // Stop admission only after this exact original terminal event
+                // and its business callback completed while the owner ran.
+                assert_eq!(actual.state(), ComponentState::Running);
+                break;
+            }
+        }
         handle.stop();
     };
     let mut producer = std::pin::pin!(produced);
