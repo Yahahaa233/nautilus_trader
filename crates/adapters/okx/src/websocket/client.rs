@@ -60,8 +60,8 @@ use nautilus_network::{
     mode::ConnectionMode,
     ratelimiter::quota::Quota,
     websocket::{
-        AUTHENTICATION_TIMEOUT_SECS, AuthTracker, SubscriptionState, TEXT_PING, TransportBackend,
-        WebSocketClient, WebSocketConfig, channel_message_handler,
+        AUTHENTICATION_TIMEOUT_SECS, AuthTracker, EpochMessageHandler, SubscriptionState,
+        TEXT_PING, TransportBackend, WebSocketClient, WebSocketConfig,
     },
 };
 use parking_lot::Mutex;
@@ -478,8 +478,7 @@ pub struct OKXWebSocketClient {
     out_rx: Option<crate::checkpoint::RetainedInbox<OKXWsMessage>>,
     checkpoint_gate: nautilus_common::live::checkpoint::CheckpointGate,
     checkpoint_recovery: Option<recovery::SocketRecoveryPlan>,
-    checkpoint_raw:
-        Option<crate::checkpoint::RetainedInbox<tokio_tungstenite::tungstenite::Message>>,
+    checkpoint_raw: Option<crate::checkpoint::RetainedInbox<crate::checkpoint::SocketRawInput>>,
     checkpoint_commands: Option<crate::checkpoint::RetainedInbox<HandlerCommand>>,
     checkpoint_outbox: Option<crate::checkpoint::RetainedInbox<OKXWsMessage>>,
     checkpoint_pending: Arc<parking_lot::Mutex<std::collections::VecDeque<OKXWsMessage>>>,
@@ -502,6 +501,8 @@ pub struct OKXWebSocketClient {
     pub(crate) pending_cancels: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) retained_cancel_contexts: Arc<DashMap<String, PendingCancelInfo>>,
     pub(crate) pending_amends: Arc<DashMap<String, PendingOrderInfo>>,
+    pub(crate) operation_ack_contexts: crate::operation_ack::OperationAckContexts,
+    pub(crate) operation_ack_request_ids: crate::operation_ack::OperationAckRequestIds,
     option_greeks_subs: Arc<AtomicMap<InstrumentId, AHashSet<OKXGreeksType>>>,
     /// Per-base-pair refcount for the `index-tickers` channel. Multiple
     /// instruments commonly share one base pair (e.g. `BTC-USDT-SWAP` and
@@ -659,6 +660,8 @@ impl OKXWebSocketClient {
             pending_cancels: Arc::new(DashMap::new()),
             retained_cancel_contexts: Arc::new(DashMap::new()),
             pending_amends: Arc::new(DashMap::new()),
+            operation_ack_contexts: Default::default(),
+            operation_ack_request_ids: Default::default(),
             option_greeks_subs: Arc::new(AtomicMap::new()),
             index_pair_subscribers: Arc::new(DashMap::new()),
             index_pair_transition: Arc::new(tokio::sync::Mutex::new(())),
@@ -741,7 +744,7 @@ impl OKXWebSocketClient {
         let raw = self
             .checkpoint_raw
             .as_ref()
-            .map(crate::checkpoint::RetainedInbox::raw_prefix)
+            .map(|inbox| inbox.raw_prefix())
             .transpose()?;
         Ok(
             serde_json::json!({"profile":"okx_live_socket_retained_raw_prefix.v2",
@@ -910,6 +913,8 @@ impl OKXWebSocketClient {
                 && self.pending_cancels.is_empty()
                 && self.pending_amends.is_empty()
                 && self.retained_submit_contexts.is_empty()
+                && self.operation_ack_contexts.lock().is_empty()
+                && self.operation_ack_request_ids.lock().is_empty()
                 && self.subscriptions_state.is_empty()
                 && self.subscriptions_inst_type.is_empty()
                 && self.subscriptions_inst_family.is_empty()
@@ -1115,7 +1120,30 @@ impl OKXWebSocketClient {
         // Reset signal so is_active()/is_closed() work after a previous close()
         self.signal.store(false, Ordering::Release);
 
-        let (message_handler, raw_rx) = channel_message_handler();
+        let connection_instance_id = nautilus_core::UUID4::new();
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let clock = self.clock;
+        let message_handler: EpochMessageHandler = Arc::new(move |epoch, message| {
+            match tokio_tungstenite::tungstenite::Message::try_from(message) {
+                Ok(message) => {
+                    // The actual network reader's epoch and receive time enter
+                    // the same retained FIFO before parser/dispatcher work.
+                    let received_ns = clock.get_time_ns().as_u64();
+                    let input = crate::checkpoint::SocketRawInput {
+                        message,
+                        received_ns,
+                        connection: Some(crate::operation_ack::OrderOperationAckConnection {
+                            instance_id: connection_instance_id,
+                            epoch,
+                        }),
+                    };
+                    if raw_tx.send(input).is_err() {
+                        log::debug!("OKX raw inbox closed");
+                    }
+                }
+                Err(error) => log::error!("OKX owned raw message conversion failed: {error}"),
+            }
+        });
 
         // No-op ping handler: handler owns the WebSocketClient and responds to pings directly
         // in the message loop for minimal latency (see handler.rs TEXT_PONG response)
@@ -1181,9 +1209,9 @@ impl OKXWebSocketClient {
             ),
         ];
 
-        let client = WebSocketClient::builder()
+        let client = WebSocketClient::epoch_builder()
             .config(config)
-            .message_handler(message_handler)
+            .epoch_handler(message_handler)
             .keyed_quotas(keyed_quotas)
             .default_quota(*OKX_WS_CONNECTION_QUOTA)
             .maybe_state_sink(self.socket_control.as_ref().map(|control| control.sink()))
@@ -1217,6 +1245,8 @@ impl OKXWebSocketClient {
         let auth_tracker = self.auth_tracker.clone();
         let subscriptions_state = self.subscriptions_state.clone();
         let clock = self.clock;
+        let operation_ack_contexts = self.operation_ack_contexts.clone();
+        let operation_ack_request_ids = self.operation_ack_request_ids.clone();
 
         let handler_task = {
             let auth_tracker = auth_tracker.clone();
@@ -1244,6 +1274,11 @@ impl OKXWebSocketClient {
                     auth_tracker.clone(),
                     subscriptions_state.clone(),
                     clock,
+                )
+                .with_operation_ack_contexts(
+                    operation_ack_contexts,
+                    operation_ack_request_ids,
+                    connection_instance_id,
                 )
                 .with_recovery_raw_input(recovery_raw)
                 .with_checkpoint_pending_messages(checkpoint_pending)
@@ -3017,6 +3052,7 @@ impl OKXWebSocketClient {
             request_id: Some(request_id),
             client_order_ids,
             op: Some(super::enums::OKXWsOperation::BatchOrders),
+            operation_ack: None,
         };
 
         self.send_cmd(cmd).await
@@ -3049,6 +3085,7 @@ impl OKXWebSocketClient {
             request_id: Some(request_id),
             client_order_ids,
             op: Some(super::enums::OKXWsOperation::BatchCancelOrders),
+            operation_ack: None,
         };
 
         self.send_cmd(cmd).await
@@ -3081,6 +3118,7 @@ impl OKXWebSocketClient {
             request_id: Some(request_id),
             client_order_ids,
             op: Some(super::enums::OKXWsOperation::BatchAmendOrders),
+            operation_ack: None,
         };
 
         self.send_cmd(cmd).await
@@ -3493,6 +3531,7 @@ impl OKXWebSocketClient {
             request_id: Some(request_id),
             client_order_ids: vec![client_order_id],
             op: Some(super::enums::OKXWsOperation::Order),
+            operation_ack: None,
         };
 
         let result = self.send_cmd(cmd).await;
@@ -3537,6 +3576,72 @@ impl OKXWebSocketClient {
         rpi_taker_access: Option<bool>,
         rpi_px_round: Option<bool>,
         command_id: nautilus_core::UUID4,
+    ) -> Result<(), OKXWsError> {
+        self.modify_order_inner(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            price,
+            quantity,
+            venue_order_id,
+            new_px_usd,
+            new_px_vol,
+            rpi_taker_access,
+            rpi_px_round,
+            command_id,
+            None,
+        )
+        .await
+    }
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn modify_order_with_command(
+        &self,
+        original: &nautilus_common::messages::execution::ModifyOrder,
+        account_id: AccountId,
+        routed_venue_order_id: Option<VenueOrderId>,
+        new_px_usd: Option<String>,
+        new_px_vol: Option<String>,
+        rpi_taker_access: Option<bool>,
+        rpi_px_round: Option<bool>,
+    ) -> Result<(), OKXWsError> {
+        self.modify_order_inner(
+            original.trader_id,
+            original.strategy_id,
+            original.instrument_id,
+            Some(original.client_order_id),
+            original.price,
+            original.quantity,
+            routed_venue_order_id,
+            new_px_usd,
+            new_px_vol,
+            rpi_taker_access,
+            rpi_px_round,
+            original.command_id,
+            Some((
+                account_id,
+                serde_json::to_string(original)
+                    .map_err(|e| OKXWsError::JsonError(e.to_string()))?,
+            )),
+        )
+        .await
+    }
+    #[expect(clippy::too_many_arguments)]
+    async fn modify_order_inner(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        price: Option<Price>,
+        quantity: Option<Quantity>,
+        venue_order_id: Option<VenueOrderId>,
+        new_px_usd: Option<String>,
+        new_px_vol: Option<String>,
+        rpi_taker_access: Option<bool>,
+        rpi_px_round: Option<bool>,
+        command_id: nautilus_core::UUID4,
+        original: Option<(AccountId, String)>,
     ) -> Result<(), OKXWsError> {
         let _checkpoint_request = self
             .checkpoint_gate
@@ -3622,6 +3727,15 @@ impl OKXWebSocketClient {
             request_id: Some(request_id),
             client_order_ids: client_order_id.into_iter().collect(),
             op: Some(super::enums::OKXWsOperation::AmendOrder),
+            operation_ack: original.map(|(account_id, command_payload_json)| {
+                crate::operation_ack::PreparedOperationAck {
+                    operation: "amend-order".into(),
+                    command_payload_json,
+                    account_id,
+                    instrument_id_code: inst_id_code,
+                    routed_venue_order_id: venue_order_id,
+                }
+            }),
         };
 
         let result = self.send_cmd(cmd).await;
@@ -3658,14 +3772,38 @@ impl OKXWebSocketClient {
             client_order_id,
             venue_order_id,
             None,
+            None,
         )
         .await
     }
+    #[cfg(test)]
     pub(crate) async fn cancel_order_with_command(
         &self,
         command: &nautilus_common::messages::execution::CancelOrder,
         account_id: AccountId,
     ) -> Result<(), OKXWsError> {
+        self.cancel_order_with_original(command, command, account_id)
+            .await
+    }
+    pub(crate) async fn cancel_order_with_original(
+        &self,
+        command: &nautilus_common::messages::execution::CancelOrder,
+        original: &nautilus_common::messages::execution::CancelOrder,
+        account_id: AccountId,
+    ) -> Result<(), OKXWsError> {
+        if command.command_id != original.command_id
+            || command.trader_id != original.trader_id
+            || command.strategy_id != original.strategy_id
+            || command.instrument_id != original.instrument_id
+            || command.client_order_id != original.client_order_id
+            || command.ts_init != original.ts_init
+        {
+            return Err(OKXWsError::ClientError(
+                "routed Cancel differs from original native identity".into(),
+            ));
+        }
+        let original_payload =
+            serde_json::to_string(original).map_err(|e| OKXWsError::JsonError(e.to_string()))?;
         self.cancel_order_inner(
             command.trader_id,
             command.strategy_id,
@@ -3678,6 +3816,7 @@ impl OKXWebSocketClient {
                 serde_json::to_string(command)
                     .map_err(|error| OKXWsError::JsonError(error.to_string()))?,
             )),
+            Some(original_payload),
         )
         .await
     }
@@ -3689,6 +3828,7 @@ impl OKXWebSocketClient {
         client_order_id: Option<ClientOrderId>,
         venue_order_id: Option<VenueOrderId>,
         original: Option<(nautilus_core::UUID4, AccountId, String)>,
+        original_ack_payload: Option<String>,
     ) -> Result<(), OKXWsError> {
         let _checkpoint_request = self
             .checkpoint_gate
@@ -3780,6 +3920,15 @@ impl OKXWebSocketClient {
             request_id: Some(request_id),
             client_order_ids: client_order_id.into_iter().collect(),
             op: Some(super::enums::OKXWsOperation::CancelOrder),
+            operation_ack: original_ack_payload.map(|command_payload_json| {
+                crate::operation_ack::PreparedOperationAck {
+                    operation: "cancel-order".into(),
+                    command_payload_json,
+                    account_id: original.as_ref().expect("paired original Cancel").1,
+                    instrument_id_code: inst_id_code,
+                    routed_venue_order_id: venue_order_id,
+                }
+            }),
         };
 
         let result = self.send_cmd(cmd).await;
@@ -3868,6 +4017,7 @@ impl OKXWebSocketClient {
             request_id: Some(request_id),
             client_order_ids: Vec::new(),
             op: Some(super::enums::OKXWsOperation::MassCancel),
+            operation_ack: None,
         };
 
         self.send_cmd(cmd).await
@@ -4298,6 +4448,7 @@ impl OKXWebSocketClient {
             request_id: Some(request_id),
             client_order_ids: vec![client_order_id],
             op: Some(super::enums::OKXWsOperation::OrderAlgo),
+            operation_ack: None,
         };
 
         self.send_cmd(cmd).await
@@ -4365,6 +4516,7 @@ impl OKXWebSocketClient {
             request_id: Some(request_id),
             client_order_ids: client_order_id.into_iter().collect(),
             op: Some(super::enums::OKXWsOperation::CancelAlgos),
+            operation_ack: None,
         };
 
         self.send_cmd(cmd).await

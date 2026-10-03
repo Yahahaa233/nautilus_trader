@@ -700,6 +700,7 @@ mod tests {
     #[case("wrong_front")]
     #[case("changed_binding")]
     #[case("missing_lease")]
+    #[case("foreign_owner")]
     fn checkpoint_actual_cross_owner_timer_admission_keeps_original_fifo(#[case] fault: &str) {
         use crate::runner_recovery::{
             RunnerRecoveryChannel, RunnerRecoveryCodec, RunnerRecoveryEnvelope, RunnerRecoveryEvent,
@@ -822,12 +823,15 @@ mod tests {
         if fault == "changed_binding" {
             admissions[1].1 += 9999;
         }
+        if fault == "foreign_owner" {
+            admissions[1].0 = "foreign-original-owner".to_owned();
+        }
         if fault == "missing_lease" {
             before.get_mut("owner-A").unwrap()["timers"][0]["binding"]["state"] =
                 (1u64 << 63).into();
         }
         let result = timers.admit_historical_timers(&before, &admissions, captured);
-        if matches!(fault, "changed_binding" | "missing_lease") {
+        if matches!(fault, "changed_binding" | "missing_lease" | "foreign_owner") {
             assert!(result.is_err());
             assert!(
                 timers.pending.borrow().is_empty(),

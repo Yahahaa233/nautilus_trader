@@ -280,7 +280,7 @@ impl OKXWebSocketClient {
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            recovery.raw.release(
+            recovery.raw.release_owned(
                 self.checkpoint_raw
                     .as_ref()
                     .context("actual raw socket receiver missing")?,

@@ -116,6 +116,7 @@ pub enum OKXWsMessage {
     OriginalOrderResponse {
         payload_json: String,
         received_ns: u64,
+        connection: Option<crate::operation_ack::OrderOperationAckConnection>,
         message: Box<OKXWsMessage>,
     },
     /// Order book snapshot or update.

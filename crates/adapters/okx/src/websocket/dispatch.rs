@@ -187,6 +187,8 @@ pub struct WsDispatchState {
     pub(crate) pending_cancels: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) retained_cancel_contexts: Arc<DashMap<String, PendingCancelInfo>>,
     pub(crate) pending_amends: Arc<DashMap<String, PendingOrderInfo>>,
+    pub(crate) operation_ack_contexts: crate::operation_ack::OperationAckContexts,
+    pub(crate) operation_ack_request_ids: crate::operation_ack::OperationAckRequestIds,
     accepted_venue_order_ids: Mutex<FifoCacheMap<ClientOrderId, VenueOrderId, DEDUP_CAPACITY>>,
     triggered_orders: DedupCache<ClientOrderId>,
     filled_orders: DedupCache<ClientOrderId>,
@@ -209,6 +211,8 @@ impl Default for WsDispatchState {
             pending_cancels: Arc::new(DashMap::new()),
             retained_cancel_contexts: Arc::new(DashMap::new()),
             pending_amends: Arc::new(DashMap::new()),
+            operation_ack_contexts: Default::default(),
+            operation_ack_request_ids: Default::default(),
             accepted_venue_order_ids: Mutex::new(FifoCacheMap::new()),
             triggered_orders: DedupCache::new(),
             filled_orders: DedupCache::new(),
@@ -243,6 +247,11 @@ impl WsDispatchState {
             retained_submit_contexts: std::collections::BTreeMap<String, PendingSubmitInfo>,
             #[serde(default)]
             retained_cancel_contexts: std::collections::BTreeMap<String, PendingCancelInfo>,
+            #[serde(default)]
+            operation_ack_contexts:
+                std::collections::BTreeMap<String, crate::operation_ack::PendingOperationAck>,
+            #[serde(default)]
+            operation_ack_request_ids: std::collections::BTreeSet<String>,
         }
         fn distinct<K: Eq + Hash>(values: impl IntoIterator<Item = K>) -> anyhow::Result<()> {
             let mut keys = std::collections::HashSet::new();
@@ -299,6 +308,52 @@ impl WsDispatchState {
                         .is_some_and(|identity| identity.strategy_id == info.strategy_id
                             && identity.instrument_id == info.instrument_id),
                 "cancel retained original acknowledgement or identity changed"
+            );
+        }
+        anyhow::ensure!(
+            source.operation_ack_request_ids.len() <= crate::operation_ack::OPERATION_ACK_CAPACITY
+                && source
+                    .operation_ack_request_ids
+                    .iter()
+                    .all(|id| id.len() == 32 && id.bytes().all(|v| v.is_ascii_hexdigit()))
+                && source
+                    .operation_ack_contexts
+                    .keys()
+                    .all(|key| source.operation_ack_request_ids.contains(key)),
+            "original operation ACK history or pending request key changed"
+        );
+        anyhow::ensure!(
+            source.operation_ack_contexts.len() <= crate::operation_ack::OPERATION_ACK_CAPACITY,
+            "original operation ACK inventory exceeds capacity"
+        );
+        let retained_bytes =
+            source
+                .operation_ack_contexts
+                .values()
+                .try_fold(0usize, |total, entry| {
+                    entry.retained_bytes().and_then(|n| {
+                        total
+                            .checked_add(n)
+                            .ok_or_else(|| anyhow::anyhow!("ACK source byte overflow"))
+                    })
+                })?;
+        anyhow::ensure!(
+            retained_bytes <= crate::operation_ack::OPERATION_ACK_PENDING_BYTES,
+            "ACK source byte bound exceeded"
+        );
+        for (key, context) in &source.operation_ack_contexts {
+            context.binding.validate(&context.operation)?;
+            anyhow::ensure!(
+                key == &context.binding.request_id
+                    && context.binding.matched_item_index.is_none()
+                    && context.binding.matched_item.is_none()
+                    && source
+                        .order_identities
+                        .get(&context.binding.client_order_id)
+                        .is_some_and(|identity| identity.strategy_id
+                            == context.binding.strategy_id
+                            && identity.instrument_id == context.binding.instrument_id),
+                "original ACK request differs from source dispatch identity"
             );
         }
         for (key, identity) in &source.order_identities {
@@ -373,6 +428,8 @@ impl WsDispatchState {
         for (key, value) in source.order_identities {
             self.order_identities.insert(key, value);
         }
+        *self.operation_ack_contexts.lock() = source.operation_ack_contexts;
+        *self.operation_ack_request_ids.lock() = source.operation_ack_request_ids;
         for (key, context) in source.retained_submit_contexts {
             self.retained_submit_contexts.insert(key, context);
         }
@@ -432,6 +489,39 @@ impl WsDispatchState {
                     .all(|entry| entry.acknowledgement.is_some() && !entry.association_uncertain),
             "cancel original acknowledgement remains unresolved"
         );
+        let operation_ack_contexts = self.operation_ack_contexts.lock();
+        let operation_ack_request_ids = self.operation_ack_request_ids.lock();
+        anyhow::ensure!(
+            operation_ack_request_ids.len() <= crate::operation_ack::OPERATION_ACK_CAPACITY
+                && operation_ack_contexts
+                    .keys()
+                    .all(|key| operation_ack_request_ids.contains(key)),
+            "original operation ACK history differs from pending contexts"
+        );
+        anyhow::ensure!(
+            operation_ack_contexts.len() <= crate::operation_ack::OPERATION_ACK_CAPACITY,
+            "original operation ACK inventory exceeds capacity"
+        );
+        let retained_bytes = operation_ack_contexts
+            .values()
+            .try_fold(0usize, |total, entry| {
+                entry.retained_bytes().and_then(|n| {
+                    total
+                        .checked_add(n)
+                        .ok_or_else(|| anyhow::anyhow!("ACK source byte overflow"))
+                })
+            })?;
+        anyhow::ensure!(
+            retained_bytes <= crate::operation_ack::OPERATION_ACK_PENDING_BYTES,
+            "ACK source byte bound exceeded"
+        );
+        for (key, context) in operation_ack_contexts.iter() {
+            context.binding.validate(&context.operation)?;
+            anyhow::ensure!(
+                key == &context.binding.request_id,
+                "original operation ACK key differs"
+            );
+        }
         let bindings = self.lifecycle_bindings.lock();
         let mut inventory = serde_json::json!({
             "order_identities":self.order_identities.iter().map(|entry| (*entry.key(), *entry.value()))
@@ -452,6 +542,13 @@ impl WsDispatchState {
             "terminal_client_by_parent":bindings.terminal_client_by_parent.checkpoint_entries(),
             "pending_linked_children":0,
         });
+        if !operation_ack_request_ids.is_empty() {
+            inventory["operation_ack_request_ids"] =
+                serde_json::to_value(&*operation_ack_request_ids)?;
+        }
+        if !operation_ack_contexts.is_empty() {
+            inventory["operation_ack_contexts"] = serde_json::to_value(&*operation_ack_contexts)?;
+        }
         if !self.retained_submit_contexts.is_empty() {
             inventory["retained_submit_contexts"] = serde_json::to_value(
                 self.retained_submit_contexts
@@ -809,6 +906,7 @@ impl WsDispatchState {
 fn capture_original_operation_ack(
     payload_json: &str,
     received_ns: u64,
+    connection: Option<crate::operation_ack::OrderOperationAckConnection>,
     message: &OKXWsMessage,
     trader_id: TraderId,
     account_id: AccountId,
@@ -900,6 +998,55 @@ fn capture_original_operation_ack(
             matched_item_index: (!data.is_empty()).then_some(0),
             matched_item: data.first().cloned(),
         });
+    let operation = match op {
+        OKXWsOperation::AmendOrder => Some("amend-order"),
+        OKXWsOperation::CancelOrder => Some("cancel-order"),
+        _ => None,
+    };
+    let original_management = operation.and_then(|operation| {
+        let context = id
+            .as_ref()
+            .and_then(|id| state.operation_ack_contexts.lock().get(id).cloned())?;
+        let binding = &context.binding;
+        let original_identity = state.order_identity(binding.client_order_id);
+        let eligible = context.operation == operation
+            && connection.as_ref() == Some(&binding.connection)
+            && binding.trader_id == trader_id
+            && binding.account_id == account_id
+            && binding.issued_ns <= received_ns
+            && state
+                .accepted_venue_order_id(&binding.client_order_id)
+                .is_none_or(|venue| Some(venue) == binding.routed_venue_order_id)
+            && (original_identity.is_some_and(|identity| {
+                identity.strategy_id == binding.strategy_id
+                    && identity.instrument_id == binding.instrument_id
+            }) || state.contains_terminal(&binding.client_order_id))
+            && ((data.len() == 1
+                && data[0]["clOrdId"].as_str() == Some(binding.client_order_id.as_str())
+                && binding
+                    .routed_venue_order_id
+                    .is_none_or(|venue| data[0]["ordId"].as_str() == Some(venue.as_str())))
+                || (data.is_empty() && code != "0"));
+        eligible.then_some(context)
+    });
+    let original_request_id = original_management
+        .as_ref()
+        .map(|v| v.binding.request_id.clone());
+    let management_binding = original_management.map(|mut context| {
+        context.binding.matched_item_index = (!data.is_empty()).then_some(0);
+        context.binding.matched_item = data.first().cloned();
+        context.binding
+    });
+    let matched_modify = if operation == Some("amend-order") {
+        management_binding.clone()
+    } else {
+        None
+    };
+    let matched_cancel = if operation == Some("cancel-order") {
+        management_binding
+    } else {
+        None
+    };
     state
         .protection_sources
         .operation_ack(OrderOperationAckSource {
@@ -909,11 +1056,20 @@ fn capture_original_operation_ack(
             websocket_payload_json: payload_json.to_owned(),
             received_ns,
             matched_submit,
+            matched_modify,
+            matched_cancel,
+            connection,
             ts_event: UnixNanos::from(received_ns),
             ts_init,
             execution_authorized: false,
             order_state_effect: false,
-        })
+        })?;
+    if let Some(request_id) = original_request_id {
+        // The original raw source has entered native Custom ingress. Remove
+        // only this resolved request; duplicate frames are still captured unbound.
+        state.operation_ack_contexts.lock().remove(&request_id);
+    }
+    Ok(())
 }
 
 /// Dispatches a WebSocket message with cross-stream deduplication.
@@ -960,12 +1116,14 @@ pub fn dispatch_ws_message(
     let message = if let OKXWsMessage::OriginalOrderResponse {
         payload_json,
         received_ns,
+        connection,
         message,
     } = message
     {
         let capture = capture_original_operation_ack(
             &payload_json,
             received_ns,
+            connection,
             &message,
             emitter.trader_id(),
             account_id,

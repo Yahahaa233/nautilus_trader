@@ -85,6 +85,7 @@ pub enum HandlerCommand {
         request_id: Option<String>,
         client_order_ids: Vec<ClientOrderId>,
         op: Option<OKXWsOperation>,
+        operation_ack: Option<crate::operation_ack::PreparedOperationAck>,
     },
 }
 
@@ -129,7 +130,10 @@ pub(super) struct OKXWsFeedHandler {
     signal: Arc<AtomicBool>,
     inner: Option<WebSocketClient>,
     cmd_rx: crate::checkpoint::RetainedInbox<HandlerCommand>,
-    raw_rx: crate::checkpoint::RetainedInbox<Message>,
+    raw_rx: crate::checkpoint::SocketRawInbox,
+    operation_ack_contexts: crate::operation_ack::OperationAckContexts,
+    operation_ack_request_ids: crate::operation_ack::OperationAckRequestIds,
+    connection_instance_id: Option<nautilus_core::UUID4>,
     out_tx: tokio::sync::mpsc::UnboundedSender<OKXWsMessage>,
     auth_tracker: AuthTracker,
     subscriptions_state: SubscriptionState,
@@ -143,7 +147,7 @@ impl OKXWsFeedHandler {
     pub(super) fn new(
         signal: Arc<AtomicBool>,
         cmd_rx: impl Into<crate::checkpoint::RetainedInbox<HandlerCommand>>,
-        raw_rx: impl Into<crate::checkpoint::RetainedInbox<Message>>,
+        raw_rx: impl Into<crate::checkpoint::SocketRawInbox>,
         out_tx: tokio::sync::mpsc::UnboundedSender<OKXWsMessage>,
         auth_tracker: AuthTracker,
         subscriptions_state: SubscriptionState,
@@ -157,12 +161,27 @@ impl OKXWsFeedHandler {
             inner: None,
             cmd_rx: cmd_rx.into(),
             raw_rx: raw_rx.into(),
+            operation_ack_contexts: Default::default(),
+            operation_ack_request_ids: Default::default(),
+            connection_instance_id: None,
             out_tx,
             auth_tracker,
             subscriptions_state,
             retry_manager: create_websocket_retry_manager(),
             pending_messages: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
         }
+    }
+
+    pub(super) fn with_operation_ack_contexts(
+        mut self,
+        contexts: crate::operation_ack::OperationAckContexts,
+        request_ids: crate::operation_ack::OperationAckRequestIds,
+        instance_id: nautilus_core::UUID4,
+    ) -> Self {
+        self.operation_ack_contexts = contexts;
+        self.operation_ack_request_ids = request_ids;
+        self.connection_instance_id = Some(instance_id);
+        self
     }
 
     pub(super) fn with_checkpoint_gate(
@@ -257,6 +276,70 @@ impl OKXWsFeedHandler {
             .map_err(OKXWsError::TransportSend)
     }
 
+    async fn send_original_operation(
+        &self,
+        payload: String,
+        keys: Option<&[Ustr]>,
+        original: &crate::operation_ack::PreparedOperationAck,
+    ) -> Result<(), OKXWsError> {
+        let _transmit = self
+            .checkpoint_gate
+            .enter_request()
+            .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
+        let client = self.inner.as_ref().ok_or(OKXWsError::NoActiveClient)?;
+        let instance_id = self.connection_instance_id.ok_or_else(|| {
+            OKXWsError::ClientError("original operation transport instance is absent".into())
+        })?;
+        let epoch = client.connection_epoch();
+        let context = original
+            .bind_actual_send(
+                &payload,
+                crate::operation_ack::OrderOperationAckConnection { instance_id, epoch },
+                self.clock.get_time_ns().as_u64(),
+            )
+            .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
+        {
+            let mut contexts = self.operation_ack_contexts.lock();
+            let mut request_ids = self.operation_ack_request_ids.lock();
+            if contexts.len() >= crate::operation_ack::OPERATION_ACK_CAPACITY
+                || request_ids.len() >= crate::operation_ack::OPERATION_ACK_CAPACITY
+                || request_ids.contains(&context.binding.request_id)
+            {
+                return Err(OKXWsError::ClientError(
+                    "original operation ACK capacity or duplicate command".into(),
+                ));
+            }
+            let bytes = contexts.values().try_fold(
+                context
+                    .retained_bytes()
+                    .map_err(|e| OKXWsError::ClientError(e.to_string()))?,
+                |total, entry| {
+                    entry
+                        .retained_bytes()
+                        .ok()
+                        .and_then(|n| total.checked_add(n))
+                        .ok_or_else(|| {
+                            OKXWsError::ClientError(
+                                "original operation ACK retained byte overflow".into(),
+                            )
+                        })
+                },
+            )?;
+            if bytes > crate::operation_ack::OPERATION_ACK_PENDING_BYTES {
+                return Err(OKXWsError::ClientError(
+                    "original operation ACK retained byte bound exceeded".into(),
+                ));
+            }
+            request_ids.insert(context.binding.request_id.clone());
+            contexts.insert(context.binding.request_id.clone(), context);
+        }
+        // Keep the original context on every send failure: it may have reached
+        // the venue. A later actual raw ACK can resolve it; never auto resend.
+        client
+            .send_text_on_connection(payload, keys, epoch)
+            .await
+            .map_err(OKXWsError::TransportSend)
+    }
     pub(super) async fn send_pong(&self) -> anyhow::Result<()> {
         match self.send_on_connection(TEXT_PONG.to_string(), None).await {
             Ok(()) => {
@@ -271,13 +354,15 @@ impl OKXWsFeedHandler {
     }
 
     pub(super) async fn next(&mut self) -> Option<OKXWsMessage> {
-        if let Some(message) = self.pending_messages.lock().pop_front() {
-            return Some(message);
-        }
-
         let mut poll_raw_next = false;
 
         loop {
+            // A real Send or parsed frame may enqueue its original outcome
+            // while this call remains inside the loop. Drain that same queue
+            // before any new input or stop check, as at the original entry.
+            if let Some(message) = self.pending_messages.lock().pop_front() {
+                return Some(message);
+            }
             if self.signal.load(Ordering::Acquire) {
                 log::debug!("Stop signal received");
                 return None;
@@ -322,11 +407,12 @@ impl OKXWsFeedHandler {
                             request_id,
                             client_order_ids,
                             op,
+                            operation_ack,
                         } => {
-                            if let Err(e) = self.send_on_connection(
-                                payload,
-                                rate_limit_keys.as_deref(),
-                            ).await {
+                            let sent=if let Some(original)=operation_ack.as_ref() {
+                                self.send_original_operation(payload,rate_limit_keys.as_deref(),original).await
+                            } else {self.send_on_connection(payload,rate_limit_keys.as_deref()).await};
+                            if let Err(e) = sent {
                                 log::error!("Failed to send message: error={e}");
 
                                 if let Some(request_id) = request_id {
@@ -354,7 +440,7 @@ impl OKXWsFeedHandler {
                     let event = match msg {
                         Some(msg) => {
                             let msg = if let Some(recovery) = &self.recovery_raw {
-                                match recovery.retain_current(msg) {
+                                match recovery.retain_current_owned(msg) {
                                     Ok(Some(msg)) => msg,
                                     Ok(None) => continue,
                                     Err(error) => {
@@ -365,20 +451,21 @@ impl OKXWsFeedHandler {
                                     }
                                 }
                             } else { msg };
-                            if let Message::Text(text) = &msg {
+                            let connection=msg.connection;
+                            let received_ns=if msg.received_ns!=0 {msg.received_ns} else {self.clock.get_time_ns().as_u64()};
+                            if let Message::Text(text) = &msg.message {
                                 // This timestamp belongs to the actual received frame,
                                 // before any parsing/return or dispatcher queue delay.
-                                let received_ns = self.clock.get_time_ns().as_u64();
                                 let raw: Result<Value, _> = serde_json::from_str(text);
                                 if raw.as_ref().is_ok_and(|value| value.get("op").is_some()) {
-                                    original_response_payload = Some((text.to_string(), received_ns));
+                                    original_response_payload = Some((text.to_string(), received_ns, connection));
                                 }
                                 if raw.as_ref().is_ok_and(|v| matches!(v["arg"]["channel"].as_str(),
                                     Some("orders" | "orders-algo" | "algo-advance"))) {
                                     original_order_payload = Some(text.to_string());
                                 }
                             }
-                            match Self::parse_raw_message(msg) {
+                            match Self::parse_raw_message(msg.message) {
                             Some(event) => event,
                             None => continue,
                             }
@@ -424,14 +511,14 @@ impl OKXWsFeedHandler {
                             id, op, code, msg, data,
                         } => {
                             let response = OKXWsMessage::OrderResponse { id, op, code, msg, data };
-                            let Some((payload_json, received_ns)) = original_response_payload else {
+                            let Some((payload_json, received_ns, connection)) = original_response_payload else {
                                 log::error!("Operation response lacks its actual raw-inbox original");
                                 self.signal.store(true, Ordering::Release);
                                 self.auth_tracker.fail("operation response original absent");
                                 return None;
                             };
                             return Some(OKXWsMessage::OriginalOrderResponse {
-                                payload_json, received_ns, message: Box::new(response),
+                                payload_json, received_ns, connection, message: Box::new(response),
                             });
                         }
                         OKXWsFrame::Data { arg, data } => {
@@ -949,6 +1036,7 @@ mod tests {
             request_id: None,
             client_order_ids: Vec::new(),
             op: None,
+            operation_ack: None,
         };
 
         let debug = format!("{authenticate:?} {send:?}");

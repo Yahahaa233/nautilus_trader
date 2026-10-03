@@ -228,6 +228,8 @@ impl OKXExecutionClient {
             ws_private.pending_amends.clone(),
         );
         dispatch.retained_submit_contexts = ws_private.retained_submit_contexts.clone();
+        dispatch.operation_ack_contexts = ws_private.operation_ack_contexts.clone();
+        dispatch.operation_ack_request_ids = ws_private.operation_ack_request_ids.clone();
         let dispatch =
             dispatch.with_retained_cancel_contexts(ws_private.retained_cancel_contexts.clone());
         crate::protection::register_source_type()?;
@@ -1196,7 +1198,7 @@ impl OKXExecutionClient {
         });
     }
 
-    fn cancel_ws_order(&self, cmd: &CancelOrder) {
+    fn cancel_ws_order(&self, cmd: &CancelOrder, original: &CancelOrder) {
         self.ensure_order_identity(cmd.client_order_id, cmd.strategy_id, cmd.instrument_id);
 
         let ws_private = self.ws_private.clone();
@@ -1208,9 +1210,10 @@ impl OKXExecutionClient {
             .or(cmd.venue_order_id);
 
         let account_id = self.emitter.account_id();
+        let original = original.clone();
         self.spawn_task("cancel_order", async move {
             let result = ws_private
-                .cancel_order_with_command(&command, account_id)
+                .cancel_order_with_original(&command, &original, account_id)
                 .await;
 
             if let Err(e) = result {
@@ -2862,19 +2865,14 @@ impl ExecutionClient for OKXExecutionClient {
 
         self.spawn_task("modify_order", async move {
             let result = ws_private
-                .modify_order(
-                    command.trader_id,
-                    command.strategy_id,
-                    command.instrument_id,
-                    Some(command.client_order_id),
-                    command.price,
-                    command.quantity,
+                .modify_order_with_command(
+                    &cmd,
+                    emitter.account_id(),
                     command.venue_order_id,
                     new_px_usd,
                     new_px_vol,
                     rpi_taker_access,
                     rpi_px_round,
-                    command.command_id,
                 )
                 .await;
 
@@ -2931,7 +2929,7 @@ impl ExecutionClient for OKXExecutionClient {
             .or(cmd.venue_order_id);
 
         match route {
-            OrderCommandRoute::RegularWs => self.cancel_ws_order(&cmd),
+            OrderCommandRoute::RegularWs => self.cancel_ws_order(&cmd, &original),
             OrderCommandRoute::AlgoHttp => {
                 self.cancel_algo_order(&cmd, serde_json::to_string(&original)?)
             }

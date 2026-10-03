@@ -17,6 +17,7 @@ use nautilus_model::{
 
 struct ActualCaller {
     client: OKXWebSocketClient,
+    actual_stream: Option<std::pin::Pin<Box<dyn futures_util::Stream<Item = OKXWsMessage>>>>,
     dispatch: WsDispatchState,
     emitter: ExecutionEventEmitter,
     receiver: tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
@@ -28,7 +29,26 @@ struct ActualCaller {
 }
 impl ActualCaller {
     async fn new() -> anyhow::Result<Self> {
-        let client = OKXWebSocketClient::default();
+        Self::new_with_url(None).await
+    }
+    async fn new_with_url(url: Option<String>) -> anyhow::Result<Self> {
+        let actual_transport = url.is_some();
+        let order_type = if actual_transport {
+            OrderType::Limit
+        } else {
+            OrderType::Market
+        };
+        let mut client = OKXWebSocketClient::new(
+            url,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            TransportBackend::default(),
+            None,
+        )?;
         let (sender, mut commands) = tokio::sync::mpsc::unbounded_channel();
         *client.cmd_tx.write().await = sender;
         let command_id = UUID4::new();
@@ -39,15 +59,20 @@ impl ActualCaller {
             strategy_id: "STRATEGY-001".into(),
             instrument_id: "BTC-USDT-SWAP.OKX".into(),
             order_side: OrderSide::Buy,
-            order_type: OrderType::Market,
+            order_type,
         };
-        let order = OrderTestBuilder::new(OrderType::Market)
+        let mut builder = OrderTestBuilder::new(order_type);
+        builder
             .trader_id(trader)
             .strategy_id(identity.strategy_id)
             .instrument_id(identity.instrument_id)
             .client_order_id(identity.client_order_id)
-            .quantity("0.03".into())
-            .build();
+            .quantity("0.03".into());
+        let order = if order_type == OrderType::Limit {
+            builder.price("100.00".into()).build()
+        } else {
+            builder.build()
+        };
         let command = nautilus_common::messages::execution::SubmitOrder::from_order(
             &order,
             trader,
@@ -64,6 +89,9 @@ impl ActualCaller {
         let contract = InstrumentAny::CryptoPerpetual(instrument);
         client.cache_instruments(std::slice::from_ref(&contract));
         client.cache_inst_id_code(Ustr::from("BTC-USDT-SWAP"), 10459);
+        if actual_transport {
+            client.connect().await?;
+        }
         client
             .submit_order_with_context(
                 Some(original),
@@ -76,7 +104,7 @@ impl ActualCaller {
                 identity.order_type,
                 Quantity::from("0.03"),
                 Some(TimeInForce::Gtc),
-                None,
+                (order_type == OrderType::Limit).then(|| Price::from("100.00")),
                 None,
                 Some(false),
                 Some(false),
@@ -92,25 +120,30 @@ impl ActualCaller {
                 None,
             )
             .await?;
-        let HandlerCommand::Send {
-            payload,
-            request_id,
-            client_order_ids,
-            op,
-            ..
-        } = commands.try_recv()?
-        else {
-            anyhow::bail!("production caller did not issue a wire Send");
+        let wire = if actual_transport {
+            serde_json::Value::Null
+        } else {
+            let HandlerCommand::Send {
+                payload,
+                request_id,
+                client_order_ids,
+                op,
+                ..
+            } = commands.try_recv()?
+            else {
+                anyhow::bail!("production caller did not issue a wire Send");
+            };
+            let wire: serde_json::Value = serde_json::from_str(&payload)?;
+            anyhow::ensure!(
+                wire["op"] == "order"
+                    && wire["id"] == command_id.to_string().replace('-', "")
+                    && request_id.as_deref() == wire["id"].as_str()
+                    && client_order_ids == vec![identity.client_order_id]
+                    && op == Some(super::super::enums::OKXWsOperation::Order),
+                "actual wire lost original command identity"
+            );
+            wire
         };
-        let wire: serde_json::Value = serde_json::from_str(&payload)?;
-        anyhow::ensure!(
-            wire["op"] == "order"
-                && wire["id"] == command_id.to_string().replace('-', "")
-                && request_id.as_deref() == wire["id"].as_str()
-                && client_order_ids == vec![identity.client_order_id]
-                && op == Some(super::super::enums::OKXWsOperation::Order),
-            "actual wire request lost original command identity"
-        );
         assert_eq!(
             client
                 .pending_orders
@@ -125,6 +158,8 @@ impl ActualCaller {
             client.pending_amends.clone(),
         );
         dispatch.retained_submit_contexts = client.retained_submit_contexts.clone();
+        dispatch.operation_ack_contexts = client.operation_ack_contexts.clone();
+        dispatch.operation_ack_request_ids = client.operation_ack_request_ids.clone();
         dispatch
             .order_identities
             .insert(identity.client_order_id, identity);
@@ -142,8 +177,15 @@ impl ActualCaller {
         );
         emitter.set_sender(sender);
         emitter.emit_order_submitted_with_causation(&order, command_id);
+        // stream() owns the one real output receiver. Keep it for the entire
+        // actual transport caller; never take/drop it once per incoming frame.
+        let actual_stream = actual_transport.then(|| {
+            Box::pin(client.stream())
+                as std::pin::Pin<Box<dyn futures_util::Stream<Item = OKXWsMessage>>>
+        });
         Ok(Self {
             client,
+            actual_stream,
             dispatch,
             emitter,
             receiver,
@@ -235,14 +277,21 @@ impl ActualCaller {
             let DataEvent::Data(Data::Custom(source)) = event else {
                 panic!("ACK used another ingress family")
             };
-            values.push(
+            if let Some(ack) = source
+                .data
+                .as_any()
+                .downcast_ref::<OrderOperationAckSource>()
+            {
+                values.push(ack.clone());
+            } else {
                 source
                     .data
                     .as_any()
-                    .downcast_ref::<OrderOperationAckSource>()
-                    .expect("actual ACK source type differs")
-                    .clone(),
-            );
+                    .downcast_ref::<crate::protection::OrderProtectionSource>()
+                    .expect("actual original ingress type differs")
+                    .validate()
+                    .unwrap();
+            }
         }
         values
     }
@@ -731,5 +780,512 @@ async fn actual_raw_ack_capture_failure_latches_original_gate_and_cannot_resolve
         caller.events().is_empty(),
         "failed source must not admit another business dispatch"
     );
+    Ok(())
+}
+
+/// A real local WebSocket connection. The production network reader supplies
+/// epoch and receive time; tests control only protocol frames and never venue authority.
+struct ManagementWire {
+    url: String,
+    frames: tokio::sync::mpsc::UnboundedSender<String>,
+    requests: tokio::sync::mpsc::UnboundedReceiver<String>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl ManagementWire {
+    async fn start() -> anyhow::Result<Self> {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("ws://{}/ws/v5/private", listener.local_addr()?);
+        let (frames, mut outgoing) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (requests_tx, requests) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let (mut sink, mut reader) = websocket.split();
+            loop {
+                tokio::select! {
+                    frame=outgoing.recv()=>match frame {
+                        Some(frame)=>sink.send(tokio_tungstenite::tungstenite::Message::Text(frame.into())).await.unwrap(),
+                        None=>break,
+                    },
+                    input=reader.next()=>match input {
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Text(frame)))=>{
+                            if frame.as_str()=="ping" {sink.send(tokio_tungstenite::tungstenite::Message::Text("pong".into())).await.unwrap();}
+                            else {requests_tx.send(frame.to_string()).unwrap();}
+                        }
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(bytes)))=>{
+                            sink.send(tokio_tungstenite::tungstenite::Message::Pong(bytes)).await.unwrap();
+                        }
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))|None=>break,
+                        Some(Ok(_))=>{},
+                        Some(Err(_))=>break,
+                    },
+                }
+            }
+        });
+        Ok(Self {
+            url,
+            frames,
+            requests,
+            task,
+        })
+    }
+    async fn request(&mut self) -> anyhow::Result<String> {
+        tokio::time::timeout(Duration::from_secs(5), self.requests.recv())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("actual local WebSocket request was not sent"))
+    }
+}
+impl Drop for ManagementWire {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl ActualCaller {
+    async fn next_actual_frame(&mut self) -> anyhow::Result<()> {
+        use futures_util::StreamExt;
+        let stream = self.actual_stream.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("original actual transport output receiver is not installed")
+        })?;
+        let input = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("actual raw WebSocket inbox closed"))?;
+        self.dispatch(input);
+        Ok(())
+    }
+    fn management_order_frame(&self, state: &str, req_id: Option<&str>) -> String {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_data/ws_orders.json")).unwrap();
+        let mut row = fixture["data"][0].clone();
+        row["clOrdId"] = self.identity.client_order_id.to_string().into();
+        row["instId"] = self.identity.instrument_id.symbol.to_string().into();
+        row["ordType"] = "limit".into();
+        row["side"] = "buy".into();
+        row["state"] = state.into();
+        row["sz"] = if req_id.is_some() { "0.04" } else { "0.03" }.into();
+        row["px"] = "100.00".into();
+        row["accFillSz"] = "0".into();
+        row["fillSz"] = "0".into();
+        row["fillPx"] = "".into();
+        row["fillTime"] = "".into();
+        row["tradeId"] = "".into();
+        row["avgPx"] = "".into();
+        row["fee"] = "0".into();
+        row["feeCcy"] = "USDT".into();
+        if let Some(req_id) = req_id {
+            row["reqId"] = req_id.into();
+            row["amendResult"] = "0".into();
+        }
+        serde_json::json!({"arg":{"channel":"orders","instType":"SWAP"},"data":[row]}).to_string()
+    }
+    fn management_raw_ack(&self, request: &serde_json::Value, code: &str) -> String {
+        serde_json::json!({"id":request["id"],"op":request["op"],"code":"0","msg":"",
+            "inTime":"1700000000000010","outTime":"1700000000000020","data":[{
+            "clOrdId":self.identity.client_order_id.as_str(),"ordId":"2497956918703120384",
+            "sCode":code,"sMsg":if code=="0" {""} else {"controlled request rejection"},
+            "original_extra":"not reconstructed"}]})
+        .to_string()
+    }
+    fn modification(&self) -> nautilus_common::messages::execution::ModifyOrder {
+        nautilus_common::messages::execution::ModifyOrder::new(
+            "TRADER-001".into(),
+            None,
+            self.identity.strategy_id,
+            self.identity.instrument_id,
+            self.identity.client_order_id,
+            None,
+            Some("0.04".into()),
+            None,
+            None,
+            UUID4::new(),
+            get_atomic_clock_realtime().get_time_ns(),
+            None,
+            None,
+        )
+    }
+    fn cancellation(&self) -> nautilus_common::messages::execution::CancelOrder {
+        nautilus_common::messages::execution::CancelOrder::new(
+            "TRADER-001".into(),
+            None,
+            self.identity.strategy_id,
+            self.identity.instrument_id,
+            self.identity.client_order_id,
+            None,
+            UUID4::new(),
+            get_atomic_clock_realtime().get_time_ns(),
+            None,
+            None,
+        )
+    }
+}
+async fn actual_management_caller() -> anyhow::Result<(ActualCaller, ManagementWire)> {
+    let mut wire = ManagementWire::start().await?;
+    let mut caller = ActualCaller::new_with_url(Some(wire.url.clone())).await?;
+    caller.wire = serde_json::from_str(&wire.request().await?)?;
+    anyhow::ensure!(
+        caller.wire["op"] == "order"
+            && caller.wire["id"] == caller.command_id.to_string().replace('-', ""),
+        "actual initial Submit request lost original identity"
+    );
+    caller.events();
+    wire.frames
+        .send(caller.management_order_frame("live", None))?;
+    caller.next_actual_frame().await?;
+    assert!(matches!(&caller.events()[..], [OrderEventAny::Accepted(_)]));
+    caller.ack_sources();
+    wire.frames
+        .send(caller.raw_ack(caller.wire["id"].as_str().unwrap(), "0"))?;
+    caller.next_actual_frame().await?;
+    let submit_sources = caller.ack_sources();
+    assert_eq!(submit_sources.len(), 1);
+    assert!(submit_sources[0].matched_submit.is_some());
+    assert!(caller.events().is_empty());
+    Ok((caller, wire))
+}
+
+#[tokio::test]
+async fn actual_modify_raw_ack_before_and_after_updated_preserves_original_command_without_backfill()
+-> anyhow::Result<()> {
+    for after_updated in [false, true] {
+        let (mut caller, mut wire) = actual_management_caller().await?;
+        let command = caller.modification();
+        caller
+            .client
+            .modify_order_with_command(
+                &command,
+                "OKX-001".into(),
+                Some("2497956918703120384".into()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        let request_text = wire.request().await?;
+        let request: serde_json::Value = serde_json::from_str(&request_text)?;
+        assert_eq!(
+            request["id"],
+            command.command_id.to_string().replace('-', "")
+        );
+        assert_eq!(request["args"][0]["newSz"], "0.04");
+        let update = caller.management_order_frame("live", request["id"].as_str());
+        let mut original_updated = None;
+        if after_updated {
+            wire.frames.send(update.clone())?;
+            caller.next_actual_frame().await?;
+            let events = caller.events();
+            let [OrderEventAny::Updated(event)] = events.as_slice() else {
+                anyhow::bail!("actual Updated missing: {events:?}")
+            };
+            assert_eq!(event.causation_id, Some(command.command_id));
+            original_updated = Some(serde_json::to_vec(&events)?);
+        }
+        let raw = caller.management_raw_ack(&request, "0");
+        wire.frames.send(raw.clone())?;
+        caller.next_actual_frame().await?;
+        assert!(
+            caller.events().is_empty(),
+            "raw ACK cannot create or replace Updated"
+        );
+        let sources = caller.ack_sources();
+        let [source] = sources.as_slice() else {
+            anyhow::bail!("actual Modify ACK source missing")
+        };
+        source.validate()?;
+        let binding = source
+            .matched_modify
+            .as_ref()
+            .expect("original Modify binding absent");
+        assert_eq!(
+            serde_json::from_str::<nautilus_common::messages::execution::ModifyOrder>(
+                &binding.command_payload_json
+            )?,
+            command
+        );
+        assert_eq!(binding.request_payload_json, request_text);
+        assert_eq!(source.websocket_payload_json, raw);
+        assert!(source.matched_submit.is_none() && source.matched_cancel.is_none());
+        assert!(caller.client.operation_ack_contexts.lock().is_empty());
+        if !after_updated {
+            assert!(
+                caller
+                    .client
+                    .pending_amends
+                    .contains_key(caller.identity.client_order_id.as_str()),
+                "ACK is not amendment result"
+            );
+            wire.frames.send(update)?;
+            caller.next_actual_frame().await?;
+            assert!(
+                matches!(&caller.events()[..],[OrderEventAny::Updated(event)] if event.causation_id==Some(command.command_id))
+            );
+        } else {
+            assert!(original_updated.is_some());
+        }
+        let mut forged = source.clone();
+        forged.matched_modify.as_mut().unwrap().command_id = UUID4::new();
+        assert!(forged.validate().is_err());
+        let mut forged = source.clone();
+        forged.matched_modify.as_mut().unwrap().request_payload_json =
+            request_text.replace("0.04", "0.05");
+        assert!(forged.validate().is_err());
+        let mut forged = source.clone();
+        forged.connection.as_mut().unwrap().epoch += 1;
+        assert!(forged.validate().is_err());
+        caller.client.close().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn actual_cancel_raw_ack_after_terminal_preserves_native_original_and_exports_management_sources()
+-> anyhow::Result<()> {
+    let (mut caller, mut wire) = actual_management_caller().await?;
+    let modify = caller.modification();
+    caller
+        .client
+        .modify_order_with_command(
+            &modify,
+            "OKX-001".into(),
+            Some("2497956918703120384".into()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    let modify_request_text = wire.request().await?;
+    let modify_request: serde_json::Value = serde_json::from_str(&modify_request_text)?;
+    wire.frames
+        .send(caller.management_raw_ack(&modify_request, "0"))?;
+    caller.next_actual_frame().await?;
+    assert!(
+        caller.events().is_empty(),
+        "Modify ACK alone cannot emit Updated"
+    );
+    let modify_sources = caller.ack_sources();
+    assert_eq!(modify_sources.len(), 1);
+    modify_sources[0].validate()?;
+    assert!(modify_sources[0].matched_modify.is_some());
+    wire.frames
+        .send(caller.management_order_frame("live", modify_request["id"].as_str()))?;
+    caller.next_actual_frame().await?;
+    let original_updated = caller.events();
+    assert!(
+        matches!(&original_updated[..],[OrderEventAny::Updated(event)] if event.causation_id==Some(modify.command_id))
+    );
+    caller.ack_sources();
+    let command = caller.cancellation();
+    let mut routed = command.clone();
+    routed.venue_order_id = Some("2497956918703120384".into());
+    caller
+        .client
+        .cancel_order_with_original(&routed, &command, "OKX-001".into())
+        .await?;
+    let request_text = wire.request().await?;
+    let request: serde_json::Value = serde_json::from_str(&request_text)?;
+    assert_eq!(request["op"], "cancel-order");
+    wire.frames
+        .send(caller.management_order_frame("canceled", None))?;
+    caller.next_actual_frame().await?;
+    let originals = caller.events();
+    let [OrderEventAny::Canceled(event)] = originals.as_slice() else {
+        anyhow::bail!("actual terminal original missing: {originals:?}")
+    };
+    assert!(
+        event.causation_id.is_none(),
+        "late ACK cannot pre-exist terminal"
+    );
+    let original_bytes = serde_json::to_vec(&originals)?;
+    let raw = caller.management_raw_ack(&request, "0");
+    wire.frames.send(raw.clone())?;
+    caller.next_actual_frame().await?;
+    assert!(
+        caller.events().is_empty(),
+        "ACK after terminal cannot backfill or re-emit Canceled"
+    );
+    assert_eq!(serde_json::to_vec(&originals)?, original_bytes);
+    let sources = caller.ack_sources();
+    let [source] = sources.as_slice() else {
+        anyhow::bail!("actual Cancel raw source missing")
+    };
+    source.validate()?;
+    let binding = source
+        .matched_cancel
+        .as_ref()
+        .expect("original Cancel ACK absent");
+    assert_eq!(
+        serde_json::from_str::<nautilus_common::messages::execution::CancelOrder>(
+            &binding.command_payload_json
+        )?,
+        command
+    );
+    assert_eq!(binding.routed_venue_order_id, routed.venue_order_id);
+    assert_eq!(binding.request_payload_json, request_text);
+    assert_eq!(source.websocket_payload_json, raw);
+    assert!(caller.client.operation_ack_contexts.lock().is_empty());
+    wire.frames.send(raw)?;
+    caller.next_actual_frame().await?;
+    let duplicates = caller.ack_sources();
+    assert_eq!(duplicates.len(), 1);
+    assert!(duplicates[0].matched_cancel.is_none());
+    assert!(caller.events().is_empty());
+    if let Some(path) = std::env::var_os("METIS_TEST_OKX_MANAGEMENT_ACK_EXPORT_PATH") {
+        let path = std::path::PathBuf::from(path);
+        anyhow::ensure!(
+            path.is_absolute() && !path.exists(),
+            "management ACK export requires a new absolute directory"
+        );
+        std::fs::create_dir(&path)?;
+        let evidence = serde_json::json!({"schema":"OKXManagementOperationAckCallerEvidence.v1",
+            "sdk_native_node":false,"venue_io":false,"loopback_websocket":true,"execution_authorized":false,
+            "original_cancel":serde_json::to_value(&command)?,"routed_cancel":serde_json::to_value(&routed)?,
+            "original_modify":serde_json::to_value(&modify)?,"original_native_updated":original_updated,
+            "original_native_terminal":originals,"modify_ack_sources":modify_sources,
+            "cancel_ack_sources":sources,"duplicate_sources":duplicates});
+        std::fs::write(
+            path.join("evidence.json"),
+            serde_json::to_vec_pretty(&evidence)?,
+        )?;
+    }
+    caller.client.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn actual_management_raw_foreign_request_identity_and_recovery_context_cannot_gain_ack_binding()
+-> anyhow::Result<()> {
+    let (mut caller, mut wire) = actual_management_caller().await?;
+    let command = caller.modification();
+    caller
+        .client
+        .modify_order_with_command(
+            &command,
+            "OKX-001".into(),
+            Some("2497956918703120384".into()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    let request_text = wire.request().await?;
+    let request: serde_json::Value = serde_json::from_str(&request_text)?;
+    let original = caller.client.operation_ack_contexts.lock().clone();
+    assert_eq!(original.len(), 1);
+    for field in ["id", "clOrdId", "ordId"] {
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&caller.management_raw_ack(&request, "0"))?;
+        if field == "id" {
+            raw[field] = "foreign-original-request".into();
+        } else {
+            raw["data"][0][field] = "foreign-original-identity".into();
+        }
+        wire.frames.send(raw.to_string())?;
+        caller
+            .next_actual_frame()
+            .await
+            .map_err(|error| anyhow::anyhow!("foreign {field} raw ACK phase: {error:#}"))?;
+        let observations = caller.ack_sources();
+        assert_eq!(observations.len(), 1);
+        assert!(
+            observations[0].matched_modify.is_none() && observations[0].matched_cancel.is_none()
+        );
+        assert!(caller.events().is_empty());
+        assert_eq!(caller.client.operation_ack_contexts.lock().len(), 1);
+    }
+    // A valid early native Updated removes the ordinary pending outcome, not
+    // the still-unreceived raw ACK request context.
+    wire.frames
+        .send(caller.management_order_frame("live", request["id"].as_str()))?;
+    caller
+        .next_actual_frame()
+        .await
+        .map_err(|error| anyhow::anyhow!("original early Updated phase: {error:#}"))?;
+    assert!(matches!(&caller.events()[..], [OrderEventAny::Updated(_)]));
+    caller.ack_sources();
+    let cut = caller.dispatch.checkpoint_inventory()?;
+    let restored = WsDispatchState::default();
+    restored.restore_checkpoint(&cut)?;
+    assert_eq!(restored.checkpoint_inventory()?, cut);
+    let req = request["id"].as_str().unwrap();
+    let mut changed = cut.clone();
+    changed["operation_ack_contexts"][req]["binding"]["command_id"] =
+        UUID4::new().to_string().into();
+    assert!(
+        WsDispatchState::default()
+            .restore_checkpoint(&changed)
+            .is_err()
+    );
+    let mut changed = cut.clone();
+    changed["operation_ack_contexts"][req]["binding"]["instrument_id_code"] = 99999.into();
+    assert!(
+        WsDispatchState::default()
+            .restore_checkpoint(&changed)
+            .is_err()
+    );
+    // An old socket/epoch cannot satisfy the current request. Preserve the raw
+    // observation without promoting it or consuming the pending original.
+    caller
+        .client
+        .operation_ack_contexts
+        .lock()
+        .get_mut(req)
+        .unwrap()
+        .binding
+        .connection
+        .epoch += 1;
+    wire.frames.send(caller.management_raw_ack(&request, "0"))?;
+    caller
+        .next_actual_frame()
+        .await
+        .map_err(|error| anyhow::anyhow!("foreign socket epoch raw ACK phase: {error:#}"))?;
+    assert!(caller.ack_sources()[0].matched_modify.is_none());
+    assert_eq!(caller.client.operation_ack_contexts.lock().len(), 1);
+    *caller.client.operation_ack_contexts.lock() = original;
+    wire.frames.send(caller.management_raw_ack(&request, "0"))?;
+    caller
+        .next_actual_frame()
+        .await
+        .map_err(|error| anyhow::anyhow!("restored original context raw ACK phase: {error:#}"))?;
+    assert!(caller.ack_sources()[0].matched_modify.is_some());
+    assert!(caller.events().is_empty());
+    assert!(caller.client.operation_ack_contexts.lock().is_empty());
+    let recorded_ids = caller.client.operation_ack_request_ids.lock().clone();
+    assert!(recorded_ids.contains(req));
+    caller
+        .client
+        .modify_order_with_command(
+            &command,
+            "OKX-001".into(),
+            Some("2497956918703120384".into()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    // The actual handler publishes SendFailed and the normal native error path,
+    // never a second wire message. The request tombstone survives ACK cleanup.
+    caller.next_actual_frame().await.map_err(|error| {
+        anyhow::anyhow!("duplicate original command SendFailed phase: {error:#}")
+    })?;
+    let rejections = caller.events();
+    let [OrderEventAny::ModifyRejected(rejected)] = rejections.as_slice() else {
+        anyhow::bail!("duplicate original command did not reach the native rejection path");
+    };
+    assert_eq!(rejected.causation_id, Some(command.command_id));
+    assert!(
+        rejected
+            .reason
+            .as_str()
+            .contains("original operation ACK capacity or duplicate command")
+    );
+    assert!(wire.requests.try_recv().is_err());
+    assert_eq!(
+        *caller.client.operation_ack_request_ids.lock(),
+        recorded_ids
+    );
+    caller.client.close().await?;
     Ok(())
 }

@@ -114,8 +114,8 @@ impl<T> RetainedInbox<T> {
 
 #[derive(Debug, Default)]
 struct RecoveryRawState {
-    source: VecDeque<Message>,
-    current: VecDeque<Message>,
+    source: VecDeque<SocketRawInput>,
+    current: VecDeque<SocketRawInput>,
     released: bool,
     failed: bool,
     current_bytes: usize,
@@ -147,7 +147,42 @@ impl RecoveryRawPrefix {
             Ping(Vec<u8>),
             Pong(Vec<u8>),
         }
-        let raw: Raw = serde_json::from_value(raw.clone())?;
+        let raw_original = raw;
+        let mut metadata = VecDeque::new();
+        let legacy = if raw["schema"] == "OKXRetainedRawInput.v2" {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct OwnedFrame {
+                frame: serde_json::Value,
+                received_ns: u64,
+                connection: Option<crate::operation_ack::OrderOperationAckConnection>,
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct OwnedRaw {
+                schema: String,
+                fifo: Vec<OwnedFrame>,
+                cut: String,
+            }
+            let owned: OwnedRaw = serde_json::from_value(raw.clone())?;
+            ensure!(
+                owned.schema == "OKXRetainedRawInput.v2" && owned.fifo.len() <= 100_000,
+                "unsupported owned raw input schema or bound"
+            );
+            let mut frames = Vec::new();
+            for item in owned.fifo {
+                ensure!(
+                    item.connection.is_some() == (item.received_ns != 0),
+                    "owned raw connection/time is incomplete"
+                );
+                metadata.push_back((item.received_ns, item.connection));
+                frames.push(item.frame);
+            }
+            serde_json::json!({"schema":"OKXRetainedRawInput.v1","fifo":frames,"cut":owned.cut})
+        } else {
+            raw_original.clone()
+        };
+        let raw: Raw = serde_json::from_value(legacy)?;
         ensure!(
             raw.schema == "OKXRetainedRawInput.v1"
                 && raw.cut == "retained_prefix_before_checkpoint_new_arrivals_remain_post_cut"
@@ -174,7 +209,12 @@ impl RecoveryRawPrefix {
                 Self::economic_input(&message)?,
                 "historical socket control input cannot authenticate or confirm a fresh session"
             );
-            source.push_back(message);
+            let (received_ns, connection) = metadata.pop_front().unwrap_or((0, None));
+            source.push_back(SocketRawInput {
+                message,
+                received_ns,
+                connection,
+            });
         }
         Ok(Self(Mutex::new(RecoveryRawState {
             source,
@@ -198,13 +238,22 @@ impl RecoveryRawPrefix {
             && value.get("event").is_none()
             && value.get("op").is_none())
     }
+    #[cfg(test)]
     pub(crate) fn retain_current(&self, message: Message) -> Result<Option<Message>> {
+        Ok(self
+            .retain_current_owned(SocketRawInput::legacy(message))?
+            .map(|v| v.message))
+    }
+    pub(crate) fn retain_current_owned(
+        &self,
+        message: SocketRawInput,
+    ) -> Result<Option<SocketRawInput>> {
         let mut state = self.0.lock();
         ensure!(!state.failed, "socket recovery input failed");
         if state.released {
             return Ok(Some(message));
         }
-        match Self::economic_input(&message) {
+        match Self::economic_input(&message.message) {
             Ok(true) => {
                 ensure!(
                     state.current.len() < 100_000,
@@ -212,7 +261,7 @@ impl RecoveryRawPrefix {
                 );
                 state.current_bytes = state
                     .current_bytes
-                    .checked_add(message.len())
+                    .checked_add(message.message.len())
                     .context("fresh raw byte bound overflow")?;
                 ensure!(
                     state.current_bytes <= 64 * 1024 * 1024,
@@ -228,7 +277,22 @@ impl RecoveryRawPrefix {
             }
         }
     }
+    #[cfg(test)]
     pub(crate) fn release(&self, inbox: &RetainedInbox<Message>) -> Result<()> {
+        let mut state = self.0.lock();
+        ensure!(
+            !state.failed && !state.released,
+            "socket recovery input release invalid"
+        );
+        let current = std::mem::take(&mut state.current);
+        state.source.try_reserve(current.len())?;
+        state.source.extend(current);
+        let mut legacy = state.source.drain(..).map(|v| v.message).collect();
+        inbox.prepend(&mut legacy)?;
+        state.released = true;
+        Ok(())
+    }
+    pub(crate) fn release_owned(&self, inbox: &RetainedInbox<SocketRawInput>) -> Result<()> {
         let mut state = self.0.lock();
         ensure!(
             !state.failed && !state.released,
@@ -251,6 +315,7 @@ impl RecoveryRawPrefix {
     }
 }
 
+#[cfg(test)]
 impl RetainedInbox<Message> {
     pub(crate) fn freeze_raw_prefix(&self) -> Result<serde_json::Value> {
         self.stage()?;
@@ -433,5 +498,81 @@ mod tests {
         assert_eq!(captured, inbox.raw_prefix().unwrap());
         assert_eq!(inbox.recv().await, Some(Message::Text("before".into())));
         assert_eq!(inbox.recv().await, Some(Message::Text("after".into())));
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SocketRawInput {
+    pub(crate) message: Message,
+    pub(crate) received_ns: u64,
+    pub(crate) connection: Option<crate::operation_ack::OrderOperationAckConnection>,
+}
+impl SocketRawInput {
+    fn legacy(message: Message) -> Self {
+        Self {
+            message,
+            received_ns: 0,
+            connection: None,
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub(crate) enum SocketRawInbox {
+    Legacy(RetainedInbox<Message>),
+    Owned(RetainedInbox<SocketRawInput>),
+}
+impl From<UnboundedReceiver<Message>> for SocketRawInbox {
+    fn from(rx: UnboundedReceiver<Message>) -> Self {
+        Self::Legacy(rx.into())
+    }
+}
+impl From<RetainedInbox<Message>> for SocketRawInbox {
+    fn from(rx: RetainedInbox<Message>) -> Self {
+        Self::Legacy(rx)
+    }
+}
+impl From<RetainedInbox<SocketRawInput>> for SocketRawInbox {
+    fn from(rx: RetainedInbox<SocketRawInput>) -> Self {
+        Self::Owned(rx)
+    }
+}
+impl SocketRawInbox {
+    pub(crate) async fn recv(&self) -> Option<SocketRawInput> {
+        match self {
+            Self::Legacy(rx) => rx.recv().await.map(SocketRawInput::legacy),
+            Self::Owned(rx) => rx.recv().await,
+        }
+    }
+}
+impl RetainedInbox<SocketRawInput> {
+    pub(crate) fn freeze_raw_prefix(&self) -> Result<serde_json::Value> {
+        self.stage()?;
+        self.raw_prefix()
+    }
+    pub(crate) fn raw_prefix(&self) -> Result<serde_json::Value> {
+        let inbox = self.0.lock();
+        if inbox.prefix.is_empty() {
+            return Ok(
+                serde_json::json!({"schema":"OKXRetainedRawInput.v1","fifo":[],
+                "cut":"retained_prefix_before_checkpoint_new_arrivals_remain_post_cut"}),
+            );
+        }
+        let frames=inbox.prefix.iter().map(|input| -> Result<serde_json::Value> {
+            let frame=match &input.message {
+                Message::Text(v)=>serde_json::json!({"kind":"text","body":v.as_str()}),
+                Message::Binary(v)=>serde_json::json!({"kind":"binary","body":v.as_ref()}),
+                Message::Ping(v)=>serde_json::json!({"kind":"ping","body":v.as_ref()}),
+                Message::Pong(v)=>serde_json::json!({"kind":"pong","body":v.as_ref()}),
+                Message::Close(_)=>anyhow::bail!("socket close frame prevents healthy checkpoint"),
+                Message::Frame(_)=>anyhow::bail!("unparsed socket frame checkpoint unsupported"),
+            };
+            ensure!(input.connection.is_some() == (input.received_ns!=0),
+                "socket ingress original connection/time is incomplete");
+            Ok(serde_json::json!({"frame":frame,"received_ns":input.received_ns,"connection":input.connection}))
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(
+            serde_json::json!({"schema":"OKXRetainedRawInput.v2","fifo":frames,
+            "cut":"retained_prefix_before_checkpoint_new_arrivals_remain_post_cut"}),
+        )
     }
 }

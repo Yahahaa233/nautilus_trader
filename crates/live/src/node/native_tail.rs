@@ -788,6 +788,7 @@ fn original_timer_admissions(
         ))
     };
     let mut admissions = Vec::new();
+    let mut ingress_receipts = Vec::new();
     for root in trace.roots() {
         for record in root.inputs() {
             if let NativeTraceRecord::Begin {
@@ -802,6 +803,11 @@ fn original_timer_admissions(
                     .find(|witness| witness.component_id == "native:timers")
                     .context("original native owner witness missing")?
                     .payload["input"];
+                let ingress = receipt
+                    .ingress
+                    .as_ref()
+                    .context("original timer ingress receipt missing")?;
+                ingress_receipts.push(ingress.clone());
                 admissions.push(parse(
                     input["owner"]
                         .as_str()
@@ -809,11 +815,7 @@ fn original_timer_admissions(
                         .into(),
                     &input["binding"],
                     &input["event"],
-                    receipt
-                        .ingress
-                        .as_ref()
-                        .context("original timer ingress receipt missing")?
-                        .accepted_wall_ns,
+                    ingress.accepted_wall_ns,
                 )?);
             }
         }
@@ -846,6 +848,7 @@ fn original_timer_admissions(
             owners.len() == 1,
             "original final timer owner missing or ambiguous"
         );
+        ingress_receipts.push(pending.receipt.clone());
         admissions.push(parse(
             owners[0].clone(),
             binding,
@@ -856,7 +859,11 @@ fn original_timer_admissions(
             pending.receipt.accepted_wall_ns,
         )?);
     }
-    admissions.sort_by_key(|(_, _, _, _, accepted)| *accepted);
+    // Verified Begin/input order, followed by the sealed final pending prefix,
+    // is the original physical Time-channel order. Producer wall samples occur
+    // before concurrent sends and can invert by microseconds; they only govern
+    // whether a lease existed at a sampled boundary, never its FIFO position.
+    verify_original_timer_channel_fifo(&ingress_receipts)?;
     let mut ids = std::collections::HashSet::new();
     ensure!(
         admissions
@@ -865,6 +872,25 @@ fn original_timer_admissions(
         "duplicate original timer event identity"
     );
     Ok(admissions)
+}
+
+fn verify_original_timer_channel_fifo(
+    receipts: &[nautilus_common::recovery_trace::NativeIngressReceipt],
+) -> Result<()> {
+    let mut last = std::collections::HashMap::new();
+    for receipt in receipts {
+        ensure!(
+            receipt.input_source == NativeInputSource::Time && receipt.channel_ordinal > 0,
+            "original timer admission has no physical Time-channel ordinal"
+        );
+        if let Some(previous) = last.insert(receipt.channel_id, receipt.channel_ordinal) {
+            ensure!(
+                previous.checked_add(1) == Some(receipt.channel_ordinal),
+                "original timer admission changed physical channel FIFO"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(test, not(madsim)))]
@@ -889,6 +915,98 @@ mod tests {
     use nautilus_system::event_store::EventStoreConfig;
     use rstest::rstest;
     use std::{cell::RefCell, rc::Rc, time::Duration};
+
+    #[test]
+    #[ignore = "requires the immutable actual Capital40 sealed Redb and original cut"]
+    fn actual_verified_timer_fifo_rejects_changed_ordinal_and_keeps_inverted_wall_samples() {
+        let root = std::path::PathBuf::from(
+            std::env::var("METIS_TEST_ORIGINAL_TIMER_FIFO_SOURCE_PATH")
+                .expect("original sealed timer source path is required"),
+        );
+        assert!(root.is_absolute());
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("source-composite.json")).unwrap())
+                .unwrap();
+        let body = &envelope["body"];
+        let cut: nautilus_event_store::native_trace::NativeTraceCheckpointCut =
+            serde_json::from_value(
+                body["payload"]["components"]["components"]["native_trace_cut"].clone(),
+            )
+            .unwrap();
+        assert!(
+            cut.pending_inputs.is_empty(),
+            "the actual original cut is empty"
+        );
+        let reader = EventStoreReader::new(
+            RedbBackend::open_sealed(
+                root.join("new-journal"),
+                &cut.source.node_instance.to_string(),
+                &cut.source.journal_run,
+            )
+            .unwrap(),
+        );
+        let trace = reader
+            .verify_native_tail(&cut.source, &cut, reader.high_watermark().unwrap())
+            .unwrap();
+        assert!(trace.initial_cut_sealed());
+        let mut receipts = Vec::new();
+        let mut ids = Vec::new();
+        for original in trace.roots() {
+            for record in original.inputs() {
+                if let NativeTraceRecord::Begin {
+                    input_source: NativeInputSource::Time,
+                    receipt,
+                    read_witnesses,
+                    ..
+                } = record
+                {
+                    let input = &read_witnesses
+                        .iter()
+                        .find(|w| w.component_id == "native:timers")
+                        .unwrap()
+                        .payload["input"];
+                    receipts.push(receipt.ingress.as_ref().unwrap().clone());
+                    ids.push(
+                        serde_json::from_value::<nautilus_core::UUID4>(
+                            input["event"]["event_id"].clone(),
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+        for pending in trace.final_pending().unwrap() {
+            if pending.receipt.input_source == NativeInputSource::Time {
+                receipts.push(pending.receipt.clone());
+                ids.push(
+                    serde_json::from_value::<nautilus_core::UUID4>(
+                        pending.timer_event.as_ref().unwrap()["event_id"].clone(),
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        assert!(
+            receipts
+                .windows(2)
+                .any(|pair| pair[0].channel_id == pair[1].channel_id
+                    && pair[0].accepted_wall_ns > pair[1].accepted_wall_ns),
+            "the real source must exercise producer-sample inversion"
+        );
+        let ordered = original_timer_admissions(&trace).unwrap();
+        assert_eq!(
+            ordered.iter().map(|v| v.3.event_id).collect::<Vec<_>>(),
+            ids
+        );
+        verify_original_timer_channel_fifo(&receipts).unwrap();
+        let mut changed = receipts.clone();
+        changed[1].channel_ordinal = changed[0].channel_ordinal;
+        assert!(verify_original_timer_channel_fifo(&changed).is_err());
+        changed[1].channel_ordinal = receipts[1].channel_ordinal.checked_add(1).unwrap();
+        assert!(verify_original_timer_channel_fifo(&changed).is_err());
+        changed[1].input_source = NativeInputSource::DataEvent;
+        assert!(verify_original_timer_channel_fifo(&changed).is_err());
+    }
 
     #[derive(Debug)]
     struct InstrumentCodec;
