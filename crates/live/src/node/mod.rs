@@ -2921,6 +2921,21 @@ impl LiveNode {
         let mut checkpoint_error = None;
 
         loop {
+            // Adapter source publication can fail on a transport task between
+            // native roots. Observe that exact shared gate before any next
+            // business callback, including when no new data was enqueued.
+            if let Err(error) = self.handle.verify_ingress_health() {
+                #[cfg(feature = "dispatch-observer")]
+                self.fail_native_dispatch(&format!("native ingress producer failed: {error:#}"));
+                #[cfg(not(feature = "dispatch-observer"))]
+                {
+                    let _ = self.kernel.contain_native_failure(&format!(
+                        "native ingress producer failed: {error:#}"
+                    ));
+                    self.handle.stop();
+                }
+                return Err(error);
+            }
             let shutdown_deadline = self.shutdown_deadline;
             let is_shutting_down = self.state() == NodeState::ShuttingDown;
             let is_running = matches!(self.state(), NodeState::Running | NodeState::Observing);

@@ -152,6 +152,12 @@ impl Default for LiveNodeHandle {
 }
 
 impl LiveNodeHandle {
+    pub(super) fn verify_ingress_health(&self) -> anyhow::Result<()> {
+        // A legitimate snapshot freeze, recovery pause, or terminal boundary
+        // is not a producer failure. Only the original poisoned gate is fatal.
+        self.ingress.verify()
+    }
+
     /// Creates a new handle with default (`Idle`) state.
     #[must_use]
     pub fn new() -> Self {

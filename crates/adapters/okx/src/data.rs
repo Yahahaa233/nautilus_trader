@@ -797,6 +797,7 @@ impl OKXDataClient {
                 }
             }
             OKXWsMessage::OriginalOrderData { .. }
+            | OKXWsMessage::OriginalOrderResponse { .. }
             | OKXWsMessage::Orders(_)
             | OKXWsMessage::SpreadOrders(_)
             | OKXWsMessage::AlgoOrders(_)

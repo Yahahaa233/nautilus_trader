@@ -109,6 +109,7 @@ struct State {
     frozen: bool,
     snapshot_stopped: bool,
     poisoned: bool,
+    first_failure: Option<String>,
     terminal: bool,
 }
 
@@ -181,7 +182,11 @@ impl IngressGate {
             .0
             .lock()
             .map_err(|_| anyhow::anyhow!("ingress mutex poisoned"))?;
-        anyhow::ensure!(!state.poisoned, "ingress invalidated");
+        anyhow::ensure!(
+            !state.poisoned,
+            "ingress invalidated: {}",
+            state.first_failure.as_deref().unwrap_or("boundary failure")
+        );
         Ok(())
     }
 
@@ -196,9 +201,23 @@ impl IngressGate {
             .map_err(|_| anyhow::anyhow!("ingress mutex poisoned"))?;
         anyhow::ensure!(
             !state.poisoned && !state.frozen && !state.terminal,
-            "ingress is not open and healthy"
+            "ingress is not open and healthy: {}",
+            state.first_failure.as_deref().unwrap_or("boundary failure")
         );
         Ok(())
+    }
+
+    /// Latches the first producer failure on this same owned admission boundary.
+    /// It cannot clear failure, renew a source timestamp, or create a new input.
+    pub fn fail(&self, reason: &str) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.poisoned = true;
+        if state.first_failure.is_none() {
+            state.first_failure = Some(reason.chars().take(256).collect());
+        }
     }
 
     /// Permanently rejects subsequent sends and invalidates any active capture.
@@ -428,6 +447,12 @@ impl<T> IngressSender<T> {
         permit.finish(result.is_ok());
         result
     }
+    /// Permanently closes this sender's original admission boundary after a
+    /// producer capture failure. The owner observes the same first-fault reason.
+    pub fn fail(&self, reason: &str) {
+        self.gate.fail(reason);
+    }
+
     /// Invalidates an active capture when this sender is replaced or rebound.
     /// Ordinary replacement leaves open admission usable.
     pub fn invalidate_snapshot(&self) {
@@ -754,6 +779,26 @@ mod tests {
         let frozen = gate.freeze().unwrap();
         assert_eq!(receiver.try_recv().unwrap(), 42);
         frozen.finish().unwrap();
+    }
+
+    #[test]
+    fn producer_first_failure_closes_original_gate_but_legitimate_freeze_is_healthy() {
+        let gate = IngressGate::new();
+        let (sender, mut receiver) = gate.channel();
+        let frozen = gate.freeze().unwrap();
+        gate.verify().unwrap();
+        assert!(gate.verify_open().is_err());
+        frozen.finish().unwrap();
+        sender.send(1).unwrap();
+        sender.fail("actual original ACK persistence failed");
+        let first = gate.verify().unwrap_err().to_string();
+        sender.fail("later callback symptom");
+        assert_eq!(gate.verify().unwrap_err().to_string(), first);
+        assert!(first.contains("actual original ACK persistence failed"));
+        assert!(sender.send(2).is_err());
+        assert!(gate.freeze().is_err());
+        assert_eq!(receiver.try_recv().unwrap(), 1);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

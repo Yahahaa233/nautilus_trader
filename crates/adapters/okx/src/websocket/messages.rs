@@ -111,6 +111,13 @@ pub enum OKXWsMessage {
         payload_json: String,
         message: Box<OKXWsMessage>,
     },
+    /// Exact operation ACK text and raw-inbox receipt time. The parsed response
+    /// is the same one produced by that text, not a reconstructed ACK.
+    OriginalOrderResponse {
+        payload_json: String,
+        received_ns: u64,
+        message: Box<OKXWsMessage>,
+    },
     /// Order book snapshot or update.
     BookData {
         arg: OKXWebSocketArg,

@@ -350,6 +350,7 @@ impl OKXWsFeedHandler {
 
                 msg = self.raw_rx.recv() => {
                     let mut original_order_payload = None;
+                    let mut original_response_payload = None;
                     let event = match msg {
                         Some(msg) => {
                             let msg = if let Some(recovery) = &self.recovery_raw {
@@ -365,7 +366,13 @@ impl OKXWsFeedHandler {
                                 }
                             } else { msg };
                             if let Message::Text(text) = &msg {
+                                // This timestamp belongs to the actual received frame,
+                                // before any parsing/return or dispatcher queue delay.
+                                let received_ns = self.clock.get_time_ns().as_u64();
                                 let raw: Result<Value, _> = serde_json::from_str(text);
+                                if raw.as_ref().is_ok_and(|value| value.get("op").is_some()) {
+                                    original_response_payload = Some((text.to_string(), received_ns));
+                                }
                                 if raw.as_ref().is_ok_and(|v| matches!(v["arg"]["channel"].as_str(),
                                     Some("orders" | "orders-algo" | "algo-advance"))) {
                                     original_order_payload = Some(text.to_string());
@@ -416,8 +423,15 @@ impl OKXWsFeedHandler {
                         OKXWsFrame::OrderResponse {
                             id, op, code, msg, data,
                         } => {
-                            return Some(OKXWsMessage::OrderResponse {
-                                id, op, code, msg, data,
+                            let response = OKXWsMessage::OrderResponse { id, op, code, msg, data };
+                            let Some((payload_json, received_ns)) = original_response_payload else {
+                                log::error!("Operation response lacks its actual raw-inbox original");
+                                self.signal.store(true, Ordering::Release);
+                                self.auth_tracker.fail("operation response original absent");
+                                return None;
+                            };
+                            return Some(OKXWsMessage::OriginalOrderResponse {
+                                payload_json, received_ns, message: Box::new(response),
                             });
                         }
                         OKXWsFrame::Data { arg, data } => {

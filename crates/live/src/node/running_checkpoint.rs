@@ -914,6 +914,67 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn actual_producer_ingress_first_failure_fences_native_owner_and_retains_unsealed() {
+        let trace = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let retained = Rc::new(Cell::new(false));
+        let store = TerminalStore {
+            trace: trace.clone(),
+            retained: retained.clone(),
+        };
+        let mut node =
+            LiveNode::builder(TraderId::from("ACK-PRODUCER-FAILURE"), Environment::Sandbox)
+                .unwrap()
+                .with_reconciliation(false)
+                .with_delay_post_stop_secs(0)
+                .with_delay_shutdown_secs(0)
+                .with_event_store(move |_, _| Ok(Box::new(store)))
+                .build()
+                .unwrap();
+        node.set_dispatch_observer(NodeDispatchObserver::new(
+            DispatchObserver::new("ack-source-first-failure".into(), |_| Ok(())).unwrap(),
+            |source, phase, input| {
+                let native = input
+                    .downcast_ref::<super::super::NativeMutationInput>()
+                    .ok_or_else(|| anyhow::anyhow!("unexpected source-failure caller input"))?;
+                Ok(DispatchInput {
+                    source,
+                    phase: phase.into(),
+                    payload: native.canonical_payload()?,
+                    batch_index: None,
+                })
+            },
+        ))
+        .unwrap();
+        let handle = node.handle();
+        let driver = async {
+            while handle.state() != NodeState::Running {
+                tokio::task::yield_now().await;
+            }
+            let sender = nautilus_common::live::runner::get_data_event_sender();
+            sender.fail("original operation ACK source persistence failed");
+            let input =
+                DataEvent::Instrument(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()));
+            assert!(sender.send(input).is_err());
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(node.run_with_mode(NodeRunMode::Hosted), driver)
+        })
+        .await
+        .expect("actual producer failure owner timed out");
+        assert!(
+            format!("{:#}", result.unwrap_err())
+                .contains("original operation ACK source persistence failed")
+        );
+        assert!(node.kernel.exec_engine.borrow().submissions_fenced());
+        assert!(retained.get());
+        node.kernel.dispose();
+        assert!(
+            !trace.borrow().contains(&"seal"),
+            "producer source failure must never invoke normal seal"
+        );
+    }
+
     #[rstest]
     #[case(false, false)]
     #[case(true, false)]

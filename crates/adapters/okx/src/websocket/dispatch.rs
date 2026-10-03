@@ -317,6 +317,10 @@ impl WsDispatchState {
                 "source order context differs"
             );
         }
+        anyhow::ensure!(
+            source.retained_submit_contexts.len() <= super::client::RETAINED_SUBMIT_CAPACITY,
+            "source ordinary submit inventory exceeds capacity"
+        );
         for (key, context) in &source.retained_submit_contexts {
             context.validate()?;
             anyhow::ensure!(
@@ -405,6 +409,11 @@ impl WsDispatchState {
         Ok(())
     }
     pub(crate) fn checkpoint_inventory(&self) -> anyhow::Result<serde_json::Value> {
+        self.protection_sources.verify()?;
+        anyhow::ensure!(
+            self.retained_submit_contexts.len() <= super::client::RETAINED_SUBMIT_CAPACITY,
+            "ordinary original submit inventory exceeds capacity"
+        );
         anyhow::ensure!(
             self.pending_orders.is_empty()
                 && self.pending_cancels.is_empty()
@@ -598,8 +607,18 @@ impl WsDispatchState {
         let pending = self.pending_linked_children.lock();
         let removed_context = self.order_contexts.remove(&client_order_id).is_some();
         self.order_identities.remove(&client_order_id);
-        self.retained_submit_contexts
-            .remove(client_order_id.as_str());
+        // A terminal update can beat the actual operation ACK. Preserve only
+        // its still-pending original request, never invent an ACK or resolved cut.
+        let retain_unacknowledged = self.contains_terminal(&client_order_id)
+            && self.pending_orders.contains_key(client_order_id.as_str())
+            && self
+                .retained_submit_contexts
+                .get(client_order_id.as_str())
+                .is_some_and(|context| context.acknowledged_response.is_none());
+        if !retain_unacknowledged {
+            self.retained_submit_contexts
+                .remove(client_order_id.as_str());
+        }
         self.retained_cancel_contexts
             .remove(client_order_id.as_str());
         drop(pending);
@@ -786,6 +805,117 @@ impl WsDispatchState {
     }
 }
 
+#[expect(clippy::too_many_arguments)]
+fn capture_original_operation_ack(
+    payload_json: &str,
+    received_ns: u64,
+    message: &OKXWsMessage,
+    trader_id: TraderId,
+    account_id: AccountId,
+    state: &WsDispatchState,
+    ts_init: UnixNanos,
+) -> anyhow::Result<()> {
+    use crate::operation_ack::{OrderOperationAckSource, SOURCE_SCHEMA, SubmitAckCommandBinding};
+    let OKXWsMessage::OrderResponse {
+        id,
+        op,
+        code,
+        msg,
+        data,
+    } = message
+    else {
+        anyhow::bail!("original operation response has a non-response payload");
+    };
+    let parsed: super::messages::OKXWsFrame = serde_json::from_str(payload_json)?;
+    let super::messages::OKXWsFrame::OrderResponse {
+        id: original_id,
+        op: original_op,
+        code: original_code,
+        msg: original_msg,
+        data: original_data,
+    } = parsed
+    else {
+        anyhow::bail!("original operation frame has a different family");
+    };
+    anyhow::ensure!(
+        &original_id == id
+            && &original_op == op
+            && &original_code == code
+            && &original_msg == msg
+            && &original_data == data,
+        "original operation response differs from parsed dispatcher input"
+    );
+    let original = if *op == OKXWsOperation::Order && data.len() == 1 {
+        data[0]["clOrdId"].as_str().and_then(|client| {
+            state
+                .retained_submit_contexts
+                .get(client)
+                .map(|entry| entry.clone())
+        })
+    } else if *op == OKXWsOperation::Order && data.is_empty() && code != "0" {
+        let mut matches = state
+            .retained_submit_contexts
+            .iter()
+            .filter(|entry| Some(entry.request_id.as_str()) == id.as_deref());
+        let first = matches.next().map(|entry| entry.clone());
+        if matches.next().is_none() {
+            first
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let matched_submit = original
+        .filter(|original| {
+            let identity = state
+                .order_identity(original.identity.client_order_id)
+                .or_else(|| {
+                    state
+                        .contains_terminal(&original.identity.client_order_id)
+                        .then_some(original.identity)
+                });
+            let venue_matches = data.first().is_none_or(|item| {
+                state
+                    .accepted_venue_order_id(&original.identity.client_order_id)
+                    .is_none_or(|accepted| item["ordId"].as_str() == Some(accepted.as_str()))
+            });
+            original.trader_id == trader_id
+                && venue_matches
+                && identity.is_some_and(|identity| {
+                    original.matches(
+                        id.as_deref(),
+                        original.identity.client_order_id.as_str(),
+                        account_id,
+                        &identity,
+                    )
+                })
+        })
+        .map(|original| SubmitAckCommandBinding {
+            command_id: original.command_id,
+            command_payload_json: original.command_payload_json.to_string(),
+            request_id: original.request_id,
+            identity: original.identity,
+            account_id: original.account_id,
+            matched_item_index: (!data.is_empty()).then_some(0),
+            matched_item: data.first().cloned(),
+        });
+    state
+        .protection_sources
+        .operation_ack(OrderOperationAckSource {
+            schema: SOURCE_SCHEMA.into(),
+            trader_id,
+            adapter_account_id: account_id,
+            websocket_payload_json: payload_json.to_owned(),
+            received_ns,
+            matched_submit,
+            ts_event: UnixNanos::from(received_ns),
+            ts_init,
+            execution_authorized: false,
+            order_state_effect: false,
+        })
+}
+
 /// Dispatches a WebSocket message with cross-stream deduplication.
 ///
 /// For orders with a tracked identity (submitted through this client), produces
@@ -804,6 +934,9 @@ pub fn dispatch_ws_message(
     order_state_cache: &mut AHashMap<ClientOrderId, OrderStateSnapshot>,
     clock: &AtomicTime,
 ) {
+    if state.protection_sources.verify().is_err() {
+        return;
+    }
     let guard = instruments.load();
     let instruments: &AHashMap<Ustr, InstrumentAny> = &guard;
 
@@ -824,7 +957,35 @@ pub fn dispatch_ws_message(
     } else {
         message
     };
+    let message = if let OKXWsMessage::OriginalOrderResponse {
+        payload_json,
+        received_ns,
+        message,
+    } = message
+    {
+        let capture = capture_original_operation_ack(
+            &payload_json,
+            received_ns,
+            &message,
+            emitter.trader_id(),
+            account_id,
+            state,
+            clock.get_time_ns(),
+        );
+        if let Err(error) = capture {
+            state.protection_sources.fail_operation_ack();
+            log::error!("Original operation ACK source capture failed: {error:#}");
+            return;
+        }
+        *message
+    } else {
+        message
+    };
     match message {
+        OKXWsMessage::OriginalOrderResponse { .. } => {
+            state.protection_sources.fail_operation_ack();
+            log::error!("Nested original operation response envelope refused");
+        }
         OKXWsMessage::OriginalOrderData { .. } => {
             log::error!("Nested protective stream envelope refused");
         }
@@ -955,8 +1116,13 @@ pub fn dispatch_ws_message(
                             if let Some(mut original) =
                                 state.retained_submit_contexts.get_mut(cl_ord_id)
                             {
-                                let Some(identity) =
-                                    state.order_identity(original.identity.client_order_id)
+                                let Some(identity) = state
+                                    .order_identity(original.identity.client_order_id)
+                                    .or_else(|| {
+                                        state
+                                            .contains_terminal(&original.identity.client_order_id)
+                                            .then_some(original.identity)
+                                    })
                                 else {
                                     continue;
                                 };
@@ -988,6 +1154,13 @@ pub fn dispatch_ws_message(
                                         "id":id,"op":op,"code":code,"msg":msg,"data":data,"received_ns":ts_init.as_u64()}));
                                 }
                                 state.pending_orders.remove(cl_ord_id);
+                                let terminal =
+                                    state.contains_terminal(&original.identity.client_order_id);
+                                drop(original);
+                                if terminal {
+                                    state.retained_submit_contexts.remove(cl_ord_id);
+                                    state.remove_accepted(&identity.client_order_id);
+                                }
                             } else {
                                 state.pending_orders.remove(cl_ord_id);
                             }
@@ -2603,7 +2776,12 @@ fn dispatch_parsed_order_event(
     if is_terminal {
         state.insert_terminal(client_order_id);
         state.remove_order_tracking(client_order_id);
-        state.remove_accepted(&client_order_id);
+        if !state
+            .retained_submit_contexts
+            .contains_key(client_order_id.as_str())
+        {
+            state.remove_accepted(&client_order_id);
+        }
         order_state_cache.remove(&client_order_id);
         // Keep fee_cache and filled_qty_cache entries: replayed terminal
         // messages go through the untracked report path and need prior

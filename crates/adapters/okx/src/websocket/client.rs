@@ -143,6 +143,9 @@ mod recovery;
 
 /// Maximum subscription args per subscribe/unsubscribe websocket message.
 const OKX_WS_SUBSCRIPTION_ARGS_MAX_PER_MESSAGE: usize = 256;
+// Same finite order-source bound as the dispatcher's retained/dedup inventory.
+// At capacity a new submit is NotSent; unresolved original requests are never evicted.
+pub(crate) const RETAINED_SUBMIT_CAPACITY: usize = 10_000;
 
 const RECONNECT_AUTH_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const RECONNECT_AUTH_RETRY_MAX: Duration = Duration::from_secs(30);
@@ -385,7 +388,8 @@ impl PendingCancelInfo {
             && ack["request_id"].as_str() == Some(self.request_id.as_str())
             && ack["code"] == "0"
             && ack["matched_item"]["sCode"] == "0"
-            && ack["matched_item"]["ordId"].as_str() == event.venue_order_id.as_ref().map(|id| id.as_str())
+            && ack["matched_item"]["ordId"].as_str()
+                == event.venue_order_id.as_ref().map(|id| id.as_str())
             && ack["matched_item"]["clOrdId"].as_str() == Some(self.client_order_id.as_str()))
         .then_some(self.command_id)
     }
@@ -494,6 +498,7 @@ pub struct OKXWebSocketClient {
     spot_trade_quote_ccy: Arc<Mutex<Option<Ustr>>>,
     pub(crate) pending_orders: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) retained_submit_contexts: Arc<DashMap<String, PendingSubmitInfo>>,
+    retained_submit_admission: Arc<Mutex<()>>,
     pub(crate) pending_cancels: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) retained_cancel_contexts: Arc<DashMap<String, PendingCancelInfo>>,
     pub(crate) pending_amends: Arc<DashMap<String, PendingOrderInfo>>,
@@ -650,6 +655,7 @@ impl OKXWebSocketClient {
             spot_trade_quote_ccy: Arc::new(Mutex::new(None)),
             pending_orders: Arc::new(DashMap::new()),
             retained_submit_contexts: Arc::new(DashMap::new()),
+            retained_submit_admission: Arc::new(Mutex::new(())),
             pending_cancels: Arc::new(DashMap::new()),
             retained_cancel_contexts: Arc::new(DashMap::new()),
             pending_amends: Arc::new(DashMap::new()),
@@ -3453,6 +3459,13 @@ impl OKXWebSocketClient {
             ));
         }
         if let Some(context) = original.as_ref() {
+            // Same cloned client admission lock; do not hold it across send/await.
+            let _admission = self.retained_submit_admission.lock();
+            if self.retained_submit_contexts.len() >= RETAINED_SUBMIT_CAPACITY {
+                return Err(OKXWsError::ClientError(
+                    "ordinary original submit capacity exhausted".into(),
+                ));
+            }
             match self.retained_submit_contexts.entry(cl_ord_key.clone()) {
                 dashmap::mapref::entry::Entry::Occupied(_) => {
                     return Err(OKXWsError::ClientError(

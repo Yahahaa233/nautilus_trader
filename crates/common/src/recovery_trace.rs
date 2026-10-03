@@ -892,6 +892,59 @@ pub mod historical {
         next_queued: usize,
         native_risk_state: Option<serde_json::Value>,
     }
+    impl Frame {
+        fn source_context(&self) -> String {
+            match &self.input {
+                NativeTraceRecord::Begin {
+                    input_source,
+                    root_sequence,
+                    input_sequence,
+                    ..
+                } => format!("source={input_source:?} root={root_sequence} input={input_sequence}"),
+                _ => "source=unsupported".to_owned(),
+            }
+        }
+
+        // Diagnose only the original, reader-issued owner roster. This does not
+        // read a Clock, consume a receipt, or accept a different owner.
+        fn source_clock_owner_class(&self, id: nautilus_core::UUID4) -> &'static str {
+            let NativeTraceRecord::Begin { read_witnesses, .. } = &self.input else {
+                return "source_unsupported";
+            };
+            let mut witnesses = read_witnesses
+                .iter()
+                .filter(|w| w.component_id == "native:timers");
+            let Some(witness) = witnesses.next() else {
+                return "source_absent";
+            };
+            if witnesses.next().is_some() {
+                return "source_ambiguous";
+            }
+            if witness.profile != "actual_registered_owner_timer_input.v1"
+                || witness.source_version != "native_actual_registered_clock.v1"
+            {
+                return "source_unsupported";
+            }
+            let Some(inventory) = witness.payload["inventory"].as_object() else {
+                return "source_unsupported";
+            };
+            let original_id = serde_json::json!(id);
+            let mut owners = inventory
+                .iter()
+                .filter(|(_, value)| value["native_clock_id"] == original_id);
+            let Some((owner, _)) = owners.next() else {
+                return "source_unmapped";
+            };
+            if owners.next().is_some() {
+                return "source_ambiguous";
+            }
+            if owner == "kernel" {
+                "kernel"
+            } else {
+                "component"
+            }
+        }
+    }
     thread_local! { static CURRENT: RefCell<Vec<Rc<RefCell<Frame>>>> = const { RefCell::new(Vec::new()) }; }
 
     /// Scoped callback routing issued by the native reader/replayer. A caller cannot use
@@ -1089,7 +1142,20 @@ pub mod historical {
                         && frame.next_uuid == frame.uuid_draws.len()
                         && frame.next_clock == frame.clock_reads.len()
                         && frame.next_output == frame.outputs.len(),
-                    "historical callback effects incomplete: {:?}",
+                    "historical callback effects incomplete: {} callbacks={}/{} queued={}/{} transport={}/{} uuid={}/{} clock={}/{} outputs={}/{} failure={:?}",
+                    frame.source_context(),
+                    frame.next,
+                    frame.routes.len(),
+                    frame.next_queued,
+                    frame.queued_outputs.len(),
+                    frame.next_transport,
+                    frame.transports.len(),
+                    frame.next_uuid,
+                    frame.uuid_draws.len(),
+                    frame.next_clock,
+                    frame.clock_reads.len(),
+                    frame.next_output,
+                    frame.outputs.len(),
                     frame.failure
                 );
             }
@@ -1232,8 +1298,10 @@ pub mod historical {
                 .context("unrecorded historical Clock read")?;
             ensure!(
                 read.clock_id == clock_id && read.operation == operation,
-                "historical Clock owner/read order mismatch at read {}: expected {}/{}, actual {}/{}",
-                frame.next_clock, read.clock_id, read.operation, clock_id, operation
+                "historical Clock owner/read order mismatch at read {}: expected {}/{} owner={}, actual {}/{} owner={}; {}",
+                frame.next_clock, read.clock_id, read.operation,
+                frame.source_clock_owner_class(read.clock_id), clock_id, operation,
+                frame.source_clock_owner_class(clock_id), frame.source_context()
             );
             let value = read.value.clone();
             frame.next_clock += 1;

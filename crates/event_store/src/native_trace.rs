@@ -1028,7 +1028,14 @@ impl NativeHistoricalInputGuard {
         self.scope
             .take()
             .context("historical callback scope absent")?
-            .finish()?;
+            .finish()
+            .map_err(|error| {
+                let context = format!(
+                    "historical native callback verification failed: root={} input={} records={}/{}: {error:#}",
+                    state.root.root_sequence(), self.input, state.next, state.root.inputs.len()
+                );
+                error.context(context)
+            })?;
         if native_effects != &actual_effects {
             // Report only bounded, fixed SDK field names. Actual account/business
             // values and arbitrary witness keys must not leak into error logs.
@@ -2223,6 +2230,81 @@ mod tests {
         );
         drop(writer);
     }
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn actual_native_clock_failure_reports_original_cursors_without_consuming_missing_read(
+        #[case] changed_owner: bool,
+    ) {
+        use nautilus_common::{clock::Clock, live::clock::LiveClock};
+        let (trace, writer, backend, source, _) = actual_journal();
+        let cut = cut(&trace);
+        let original_clock = LiveClock::default();
+        let guard = trace
+            .begin_native(
+                2,
+                2,
+                None,
+                NativeInputSource::Maintenance,
+                "running",
+                serde_json::json!({"due": true}),
+                vec![],
+            )
+            .unwrap();
+        let original = original_clock.timestamp_ns();
+        guard
+            .complete(serde_json::json!({"source_time": original}))
+            .unwrap();
+        let verified = EventStoreReader::new(backend)
+            .verify_native_tail(&source, &cut, writer.high_watermark())
+            .unwrap();
+        let replay = NativeHistoricalRootReplay::new(&verified.roots()[0]);
+        let historical = replay
+            .begin(
+                NativeInputSource::Maintenance,
+                &serde_json::json!({"due": true}),
+            )
+            .unwrap();
+        if changed_owner {
+            let changed_clock = LiveClock::default();
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                changed_clock.timestamp_ns()
+            }))
+            .expect_err("a different real Clock must remain rejected");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap();
+            assert!(message.contains("historical Clock owner/read order mismatch at read 0"));
+            assert!(message.contains("source=Maintenance root=2 input=2"));
+            assert!(message.contains("owner=source_absent"));
+        }
+        let error = historical
+            .complete(serde_json::json!({"source_time": original}))
+            .unwrap_err();
+        let message = format!("{error:#}");
+        for expected in [
+            "root=2 input=2 records=1/2",
+            "callbacks=0/0",
+            "queued=0/0",
+            "transport=0/0",
+            "uuid=0/0",
+            "clock=0/1",
+            "outputs=0/0",
+        ] {
+            assert!(
+                message.contains(expected),
+                "missing original cursor: {expected}: {message}"
+            );
+        }
+        assert!(
+            replay.next_begin().is_err(),
+            "a failed root cannot advance to another input"
+        );
+        drop(writer);
+    }
+
     fn actual_child_journal(
         parent: &NativeTraceSource,
     ) -> (
