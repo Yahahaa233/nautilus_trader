@@ -1434,7 +1434,7 @@ mod tests {
         let bytes = encode_to_vec(&RunStatus::Running).unwrap();
 
         assert_eq!(&bytes[..4], b"NESC");
-        assert_eq!(bytes[4], 1);
+        assert_eq!(bytes[4], 2);
     }
 
     #[rstest]
@@ -1449,14 +1449,32 @@ mod tests {
     }
 
     #[rstest]
-    fn header_unsupported_version_rejected() {
+    #[case(0)]
+    #[case(3)]
+    #[case(u8::MAX)]
+    fn header_unsupported_version_rejected(#[case] version: u8) {
         let mut bytes = encode_to_vec(&entry(Headers::empty())).unwrap();
-        bytes[4] = 2;
+        bytes[4] = version;
 
         assert!(matches!(
             decode_from_slice::<EventStoreEntry>(&bytes),
-            Err(CodecError::UnsupportedVersion(2))
+            Err(CodecError::UnsupportedVersion(actual)) if actual == version
         ));
+    }
+
+    #[rstest]
+    fn header_legacy_v1_and_current_v2_are_both_readable() {
+        let mut bytes = encode_to_vec(&RunStatus::Running).unwrap();
+        assert_eq!(bytes[4], 2);
+        assert_eq!(
+            decode_from_slice::<RunStatus>(&bytes).unwrap(),
+            RunStatus::Running
+        );
+        bytes[4] = 1;
+        assert_eq!(
+            decode_from_slice::<RunStatus>(&bytes).unwrap(),
+            RunStatus::Running
+        );
     }
 
     #[rstest]

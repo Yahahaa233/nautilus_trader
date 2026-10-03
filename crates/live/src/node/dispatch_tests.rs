@@ -392,6 +392,94 @@ fn final_drain_records_each_discarded_system_input() {
 }
 
 #[test]
+fn final_drain_discard_record_failure_contains_node_and_stops_remaining_inputs() {
+    use crate::dispatch::{DispatchInput, DispatchObserver};
+
+    for encoder_fails in [false, true] {
+        let mut node =
+            LiveNode::builder(TraderId::from("DISPATCH-DRAIN-001"), Environment::Sandbox)
+                .unwrap()
+                .with_reconciliation(false)
+                .build()
+                .unwrap();
+        let attempts = Rc::new(Cell::new(0));
+        let output = attempts.clone();
+        let protocol = DispatchObserver::new("fixture".into(), move |_| {
+            output.set(output.get() + 1);
+            anyhow::bail!("discard sink unavailable")
+        })
+        .unwrap();
+        node.set_dispatch_observer(NodeDispatchObserver::new(
+            protocol,
+            move |source, phase, _| {
+                if encoder_fails {
+                    anyhow::bail!("discard codec unavailable");
+                }
+                Ok(DispatchInput {
+                    source,
+                    phase: phase.into(),
+                    payload: serde_json::json!({"fixture":true}),
+                    batch_index: None,
+                })
+            },
+        ))
+        .unwrap();
+
+        let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (system_evt_tx, system_evt_rx) = tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+        let (system_cmd_tx, system_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
+        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (_exec_cmd_tx, exec_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+
+        system_evt_tx
+            .send(SystemEvent::SocketState(SocketStateChange::new(
+                ClientId::from("BINANCE"),
+                Some(Venue::from("BINANCE")),
+                "fixture".into(),
+                SocketState::Disconnected,
+            )))
+            .unwrap();
+        system_cmd_tx.send(stub_system_command()).unwrap();
+
+        let mut time_rx = crate::runner::SnapshotReceiver::from(time_rx);
+        let mut system_evt_rx = crate::runner::SnapshotReceiver::from(system_evt_rx);
+        let mut system_cmd_rx = crate::runner::SnapshotReceiver::from(system_cmd_rx);
+        let mut exec_evt_rx = crate::runner::SnapshotReceiver::from(exec_evt_rx);
+        let mut exec_cmd_rx = crate::runner::SnapshotReceiver::from(exec_cmd_rx);
+        let mut data_evt_rx = crate::runner::SnapshotReceiver::from(data_evt_rx);
+        let mut data_cmd_rx = crate::runner::SnapshotReceiver::from(data_cmd_rx);
+        node.drain_channels(
+            &mut time_rx,
+            &mut system_evt_rx,
+            &mut system_cmd_rx,
+            &mut exec_evt_rx,
+            &mut exec_cmd_rx,
+            &mut data_evt_rx,
+            &mut data_cmd_rx,
+        );
+
+        assert!(node.dispatch_failure.get());
+        assert!(node.kernel.is_shutdown_requested());
+        assert!(node.handle.should_stop());
+        assert_eq!(attempts.get(), usize::from(!encoder_fails));
+        // The command must remain queued after the first failed durable discard.
+        // Continuing would erase an unrecorded input and mutate a contained node.
+        assert!(system_cmd_rx.try_recv().is_ok());
+        assert!(
+            node.record_shutdown_discarded(
+                crate::dispatch::DispatchSource::SystemCommand,
+                &stub_system_command(),
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn paused_queue_capture_holds_gate_through_callback_and_rejects_failure() {
     use crate::dispatch::DispatchObserver;
     use crate::runner_recovery::{RunnerRecoveryCodecRegistry, RunnerRecoveryWatermark};

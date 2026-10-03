@@ -3869,7 +3869,25 @@ impl LiveNode {
     }
 
     async fn finalize_stop(&mut self) -> anyhow::Result<()> {
-        self.disconnect_stop().await?;
+        if let Err(error) = self.disconnect_stop().await {
+            // A failed disconnect can never certify the final boundary, but
+            // must still stop engines and timers before exposing Stopped.
+            let mut errors = vec![error.to_string()];
+            if let Err(retention_error) =
+                self.kernel.prohibit_event_store_seal(&format!("{error:#}"))
+            {
+                errors.push(format!(
+                    "failed to retain unsealed shutdown: {retention_error:#}"
+                ));
+            }
+            if let Err(cleanup_error) = self.kernel.finish_stop_without_seal().await {
+                errors.push(format!(
+                    "failed while cleaning up shutdown: {cleanup_error:#}"
+                ));
+            }
+            self.handle.set_stopped();
+            anyhow::bail!("{}", errors.join("; "));
+        }
         self.drain_runner_pending();
         #[cfg(feature = "dispatch-observer")]
         if self.running_checkpoint.is_some() && self.terminal_checkpoint.is_none() {
@@ -3974,6 +3992,18 @@ impl LiveNode {
             .map_err(|error| anyhow::anyhow!("failed while finalizing kernel shutdown: {error:#}"))
     }
 
+    #[cfg(feature = "dispatch-observer")]
+    fn record_shutdown_discarded(
+        &self,
+        source: crate::dispatch::DispatchSource,
+        input: &dyn std::any::Any,
+    ) -> anyhow::Result<()> {
+        if let Some(observer) = &self.dispatch_observer {
+            observer.record_discarded(source, &format!("{:?}", self.state()), input)?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::unused_unit)]
     #[expect(
         clippy::too_many_arguments,
@@ -3997,11 +4027,29 @@ impl LiveNode {
         }
 
         while let Ok(event) = system_evt_rx.try_recv() {
-            self.process_system_events(vec![event]);
+            #[cfg(feature = "dispatch-observer")]
+            if let Err(error) =
+                self.record_shutdown_discarded(crate::dispatch::DispatchSource::SystemEvent, &event)
+            {
+                self.fail_native_dispatch(&format!("shutdown discard recording failed: {error:#}"));
+                return;
+            }
+            #[cfg(not(feature = "dispatch-observer"))]
+            let _ = event;
+            // Reconnection and other system mutations are no longer admissible
+            // after the final runner boundary. Retain the discarded input only.
             drained += 1;
         }
         while let Ok(command) = system_cmd_rx.try_recv() {
-            self.process_system_commands(vec![command]);
+            #[cfg(feature = "dispatch-observer")]
+            if let Err(error) = self
+                .record_shutdown_discarded(crate::dispatch::DispatchSource::SystemCommand, &command)
+            {
+                self.fail_native_dispatch(&format!("shutdown discard recording failed: {error:#}"));
+                return;
+            }
+            #[cfg(not(feature = "dispatch-observer"))]
+            let _ = command;
             drained += 1;
         }
 

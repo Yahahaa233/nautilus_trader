@@ -568,16 +568,152 @@ fn test_ambiguous_modify_send_failure_does_not_emit_order_modify_rejected() {
 }
 
 #[rstest]
-fn test_explicit_venue_modify_rejection_emits_order_modify_rejected() {
+#[tokio::test]
+async fn test_explicit_venue_modify_rejection_emits_order_modify_rejected() {
+    let (messages, _) = tokio::sync::broadcast::channel(4);
+    let (amendments, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let state = Arc::new(WsTeardownState {
+        messages: Some(messages),
+        amendments: Some(amendments),
+        ..Default::default()
+    });
+    let router = create_exec_test_router()
+        .route(
+            "/ws/v5/private",
+            get(handle_exec_ws_upgrade).with_state(state.clone()),
+        )
+        .route(
+            "/ws/v5/business",
+            get(handle_exec_ws_upgrade).with_state(state.clone()),
+        )
+        .route(
+            "/api/v5/public/instruments",
+            get(|| async {
+                Json(load_test_data("http_get_instruments_swap.json")).into_response()
+            }),
+        )
+        .route(
+            "/api/v5/account/trade-fee",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    let (mut client, mut rx, cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+            config.base_url_ws_private = Some(format!("ws://{addr}/ws/v5/private"));
+            config.base_url_ws_business = Some(format!("ws://{addr}/ws/v5/business"));
+            config.max_retries = 0;
+        });
+    client.start().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), client.connect())
+        .await
+        .unwrap()
+        .unwrap();
+    let _ = drain_events(&mut rx);
     let cid = ClientOrderId::new("O-modify-explicit-reject");
-    let events = dispatch_explicit_rejection_response(OKXWsOperation::AmendOrder, cid);
-
+    let instrument_id = InstrumentId::from("BTC-USD-SWAP.OKX");
+    let order = build_test_limit_order(instrument_id, cid);
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+        .unwrap();
+    let command_id = UUID4::new();
+    let command = ModifyOrder::new(
+        TraderId::from("TESTER-001"),
+        Some(*OKX_CLIENT_ID),
+        order.strategy_id(),
+        instrument_id,
+        cid,
+        Some(VenueOrderId::from("12345")),
+        Some(Quantity::from("2")),
+        Some(Price::from("2001.0")),
+        None,
+        command_id,
+        UnixNanos::default(),
+        None,
+        None,
+    );
+    client.modify_order(command).unwrap();
+    let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .expect("actual amend request must reach the local venue");
+    let request_id = command_id.to_string().replace('-', "");
+    assert_eq!(request["id"], request_id);
+    assert_eq!(request["args"][0]["reqId"], request_id);
+    assert_eq!(request["args"][0]["clOrdId"], cid.as_str());
+    let rejection = |id: &str| {
+        json!({
+            "id": id, "op": "amend-order", "code": "1", "msg": "All operations failed",
+            "data": [{"sCode": "51000", "sMsg": "Order rejected by venue",
+                      "clOrdId": cid.as_str(), "ordId": "12345"}],
+        })
+    };
+    state
+        .messages
+        .as_ref()
+        .unwrap()
+        .send(rejection("old-request"))
+        .unwrap();
     assert!(
-        contains_order_event(&events, |event| matches!(
-            event,
-            OrderEventAny::ModifyRejected(_)
-        )),
-        "explicit venue modify rejection should emit OrderModifyRejected: {events:?}"
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            recv_order_event_matching(&mut rx, |event| matches!(
+                event,
+                OrderEventAny::ModifyRejected(_)
+            ),)
+        )
+        .await
+        .is_err(),
+        "a stale request must not reject the current amendment"
+    );
+    state
+        .messages
+        .as_ref()
+        .unwrap()
+        .send(rejection(&request_id))
+        .unwrap();
+    let event = recv_order_event_matching(&mut rx, |event| {
+        matches!(
+            event, OrderEventAny::ModifyRejected(rejected) if rejected.client_order_id == cid
+        )
+    })
+    .await;
+    let OrderEventAny::ModifyRejected(rejected) = event else {
+        unreachable!()
+    };
+    assert_eq!(rejected.client_order_id, cid);
+    assert_eq!(rejected.instrument_id, instrument_id);
+    assert_eq!(rejected.strategy_id, order.strategy_id());
+    assert_eq!(rejected.venue_order_id, Some(VenueOrderId::from("12345")));
+    assert_eq!(rejected.causation_id, Some(command_id));
+    assert!(
+        rejected.reason.contains("51000") && rejected.reason.contains("Order rejected by venue")
+    );
+    tokio::time::timeout(Duration::from_secs(5), client.disconnect())
+        .await
+        .expect("owned execution client cleanup must finish")
+        .unwrap();
+    wait_until_async(
+        || async { state.closed.load(Ordering::Relaxed) == 2 },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(state.opened.load(Ordering::Relaxed), 2);
+    assert_eq!(state.closed.load(Ordering::Relaxed), 2);
+    server.abort();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("owned venue server must be reaped")
+            .unwrap_err()
+            .is_cancelled()
     );
 }
 
@@ -2937,6 +3073,7 @@ struct WsTeardownState {
     opened: Arc<AtomicUsize>,
     closed: Arc<AtomicUsize>,
     messages: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    amendments: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
 }
 
 async fn handle_exec_ws_upgrade(
@@ -2972,6 +3109,14 @@ async fn handle_exec_ws_socket(mut socket: WebSocket, state: Arc<WsTeardownState
                 continue;
             }
         };
+
+        if let Message::Text(text) = &message
+            && let Some(amendments) = &state.amendments
+            && let Ok(request) = serde_json::from_str::<serde_json::Value>(text)
+            && request["op"] == "amend-order"
+        {
+            amendments.send(request).unwrap();
+        }
 
         if let Message::Text(text) = message
             && text.contains("\"op\":\"login\"")
@@ -4773,28 +4918,52 @@ async fn test_generate_mass_status_fails_when_pending_algo_orders_are_unavailabl
 }
 
 #[rstest]
+#[case::page_cap(false, 50, "挂单分页达到上限，无法证明查询完整")]
+#[case::duplicate_ids(true, 1, "挂单分页出现重复订单，需重新查询")]
 #[tokio::test]
-async fn test_generate_mass_status_fails_when_pending_algo_pagination_is_incomplete() {
+async fn test_generate_mass_status_fails_when_pending_algo_pagination_is_incomplete(
+    #[case] duplicate_ids: bool,
+    #[case] expected_attempts: usize,
+    #[case] expected_reason: &str,
+) {
     let pending_attempts = Arc::new(AtomicUsize::new(0));
     let handler_attempts = Arc::clone(&pending_attempts);
     let pending_order = load_test_data("http_get_orders_algo_pending.json")["data"][0].clone();
-    let pending_page = json!({
-        "code": "0",
-        "msg": "",
-        "data": vec![pending_order; 100],
-    });
     let empty = get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() });
     let router = Router::new()
         .route("/api/v5/trade/orders-pending", empty.clone())
         .route("/api/v5/trade/orders-history", empty.clone())
         .route(
             "/api/v5/trade/orders-algo-pending",
-            get(move || {
+            get(move |Query(params): Query<HashMap<String, String>>| {
                 let attempts = Arc::clone(&handler_attempts);
-                let page = pending_page.clone();
+                let pending_order = pending_order.clone();
                 async move {
-                    attempts.fetch_add(1, Ordering::Relaxed);
-                    Json(page).into_response()
+                    let page_index = attempts.fetch_add(1, Ordering::Relaxed);
+                    assert!(
+                        page_index < expected_attempts,
+                        "pagination exceeded the actual safety cap"
+                    );
+                    assert_eq!(params.get("limit").map(String::as_str), Some("100"));
+                    if page_index == 0 {
+                        assert!(!params.contains_key("after"));
+                    } else {
+                        assert_eq!(
+                            params.get("after"),
+                            Some(&(100_001 - page_index * 100).to_string())
+                        );
+                    }
+                    let data: Vec<_> = (0..100)
+                        .map(|index| {
+                            let mut order = pending_order.clone();
+                            if !duplicate_ids {
+                                order["algoId"] =
+                                    json!((100_000 - page_index * 100 - index).to_string());
+                            }
+                            order
+                        })
+                        .collect();
+                    Json(json!({"code": "0", "msg": "", "data": data})).into_response()
                 }
             }),
         )
@@ -4820,10 +4989,11 @@ async fn test_generate_mass_status_fails_when_pending_algo_pagination_is_incompl
     let error = client.generate_mass_status(None).await.unwrap_err();
 
     assert!(
-        format!("{error:#}").contains("did not establish complete coverage"),
+        format!("{error:#}").contains("Failed to fetch pending algo order reports")
+            && format!("{error:#}").contains(expected_reason),
         "was {error:#}"
     );
-    assert_eq!(pending_attempts.load(Ordering::Relaxed), 50);
+    assert_eq!(pending_attempts.load(Ordering::Relaxed), expected_attempts);
 }
 
 #[rstest]
