@@ -83,9 +83,112 @@ pub(super) struct RetainedNodeTimers {
     pending: RefCell<VecDeque<TimeEventMessage>>,
     #[cfg(feature = "native-tail-replay")]
     historical_admitted: RefCell<HashSet<UUID4>>,
+    #[cfg(feature = "native-tail-replay")]
+    native_continuation: Option<NativeTimerContinuation>,
     progress: RetainedRecoveryTimerHandoff,
 }
+
+/// Minted only after reader-issued tail replay commits its audit to this same child writer.
+#[cfg(feature = "native-tail-replay")]
+#[derive(Debug)]
+struct NativeTimerContinuation {
+    original: nautilus_common::recovery_trace::NativeTraceSource,
+    initial_watermark: RunnerRecoveryWatermark,
+    final_watermark: RunnerRecoveryWatermark,
+    target_instance: UUID4,
+    original_pending: Vec<nautilus_common::recovery_trace::NativePendingInput>,
+    audit: nautilus_event_store::native_trace::NativeReplayContinuationReceipt,
+}
 impl RetainedNodeTimers {
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn bind_native_continuation(
+        &mut self,
+        trace: &nautilus_event_store::native_trace::VerifiedNativeTrace,
+        final_watermark: &RunnerRecoveryWatermark,
+        recorder: &nautilus_event_store::native_trace::NativeTraceRecorder,
+        audit: &nautilus_event_store::native_trace::NativeReplayContinuationReceipt,
+    ) -> Result<()> {
+        self.verify()?;
+        let progress = self.progress.0.try_borrow()?;
+        ensure!(
+            self.native_continuation.is_none()
+                && trace.initial_cut_sealed()
+                && trace.incomplete_suffix().is_empty()
+                && progress.watermark.dispatch_watermark == trace.cut().last_input_sequence
+                && progress.watermark.checkpoint_sequence == final_watermark.checkpoint_sequence
+                && progress.watermark.recovery_id == final_watermark.recovery_id
+                && final_watermark.dispatch_watermark == trace.final_cut()?.last_input_sequence
+                && self.source == trace.cut().registered_timers
+                && self.historical_inventory()? == trace.final_cut()?.registered_timers
+                && self.pending.try_borrow()?.is_empty()
+                && audit.original() == trace.source()
+                && audit.child().node_instance == progress.node_instance_id,
+            "native timer continuation lacks its same verified source/final owner state"
+        );
+        audit.verify_original_trace(trace)?;
+        audit.verify_recorder(recorder)?;
+        self.native_continuation = Some(NativeTimerContinuation {
+            original: trace.source().clone(),
+            initial_watermark: progress.watermark.clone(),
+            final_watermark: final_watermark.clone(),
+            target_instance: progress.node_instance_id,
+            original_pending: trace.final_pending()?.to_vec(),
+            audit: audit.clone(),
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn verify_native_continuation(
+        &self,
+        recorder: &nautilus_event_store::native_trace::NativeTraceRecorder,
+        frontier: &RunnerRecoveryWatermark,
+        target_instance: UUID4,
+        release_pending: bool,
+        pending: &[nautilus_common::recovery_trace::NativePendingInput],
+    ) -> Result<()> {
+        self.verify()?;
+        let proof = self
+            .native_continuation
+            .as_ref()
+            .context("legacy retained timers lack original causal receipts")?;
+        let progress = self.progress.0.try_borrow()?;
+        ensure!(
+            proof.initial_watermark == progress.watermark
+                && proof.final_watermark == *frontier
+                && proof.target_instance == target_instance
+                && proof.target_instance == progress.node_instance_id
+                && proof.original == *proof.audit.original()
+                && self.pending.try_borrow()?.is_empty(),
+            "native timer continuation source/frontier/owner changed"
+        );
+        proof.audit.verify_recorder(recorder)?;
+        let mut channels = HashSet::new();
+        for original in &proof.original_pending {
+            if !channels.insert(original.receipt.channel_id) {
+                continue;
+            }
+            let expected = proof
+                .original_pending
+                .iter()
+                .filter(|input| input.receipt.channel_id == original.receipt.channel_id)
+                .collect::<Vec<_>>();
+            let actual = pending
+                .iter()
+                .filter(|input| input.receipt.channel_id == original.receipt.channel_id)
+                .collect::<Vec<_>>();
+            ensure!(
+                if release_pending {
+                    actual == expected
+                } else {
+                    expected.ends_with(&actual)
+                },
+                "native timer continuation original FIFO payload or receipt changed"
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn verify(&self) -> Result<()> {
         for clock in self.clocks.values().flatten() {
             clock.try_borrow()?.verify()?;
@@ -556,6 +659,8 @@ impl LiveNode {
                 pending: RefCell::new(messages),
                 #[cfg(feature = "native-tail-replay")]
                 historical_admitted: RefCell::new(HashSet::new()),
+                #[cfg(feature = "native-tail-replay")]
+                native_continuation: None,
                 progress: progress.clone(),
             };
             node_timers.verify()?;
@@ -709,6 +814,8 @@ mod tests {
             source_pending: Vec::new(),
             pending: RefCell::new(VecDeque::new()),
             historical_admitted: RefCell::new(HashSet::new()),
+            #[cfg(feature = "native-tail-replay")]
+            native_continuation: None,
             progress,
         };
         let captured = nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64;
@@ -817,6 +924,8 @@ mod tests {
             pending: RefCell::new(VecDeque::from([message])),
             #[cfg(feature = "native-tail-replay")]
             historical_admitted: RefCell::new(HashSet::new()),
+            #[cfg(feature = "native-tail-replay")]
+            native_continuation: None,
             progress: progress.clone(),
         };
         let (tail_sender, tail_receiver) = tokio::sync::mpsc::unbounded_channel();

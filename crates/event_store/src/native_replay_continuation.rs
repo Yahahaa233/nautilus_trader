@@ -132,6 +132,12 @@ impl PreparedNativeReplayContinuation {
             acknowledgment,
             completed_dispatch: self.completed_dispatch,
             last_dispatch_input: self.next_input - 1,
+            recorder: self.recorder.clone(),
+            original_cut_prefix: self.record.original_cut_prefix.clone(),
+            original_end_prefix: self.record.original_end_prefix.clone(),
+            original_cut_input: self.record.original_cut_input,
+            original_final_root: self.record.original_final_root,
+            original_final_input: self.record.original_final_input,
         })
     }
 }
@@ -145,15 +151,71 @@ impl Drop for PreparedNativeReplayContinuation {
 }
 
 /// Actual non-economic child audit acknowledgment. No Deserialize or public constructor.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NativeReplayContinuationReceipt {
     child: NativeTraceSource,
     original: NativeTraceSource,
     acknowledgment: DurableEntryAcknowledgment,
     completed_dispatch: Option<(u64, u64)>,
     last_dispatch_input: u64,
+    recorder: NativeTraceRecorder,
+    original_cut_prefix: DurableJournalPrefix,
+    original_end_prefix: DurableJournalPrefix,
+    original_cut_input: u64,
+    original_final_root: u64,
+    original_final_input: u64,
 }
 impl NativeReplayContinuationReceipt {
+    /// Rechecks the exact reader-issued original cut and sealed final native frontier.
+    /// # Errors
+    /// Refuses another cut/tail, including one from the same logical or physical run.
+    pub fn verify_original_trace(&self, trace: &VerifiedNativeTrace) -> Result<()> {
+        let final_cut = trace.final_cut()?;
+        ensure!(
+            trace.initial_cut_sealed()
+                && trace.incomplete_suffix().is_empty()
+                && *trace.source() == self.original
+                && trace.cut().prefix == self.original_cut_prefix
+                && trace.cut().last_input_sequence == self.original_cut_input
+                && trace.end_prefix == self.original_end_prefix
+                && final_cut.completed_root == self.original_final_root
+                && final_cut.last_input_sequence == self.original_final_input,
+            "native replay continuation original reader cut or sealed tail changed"
+        );
+        Ok(())
+    }
+
+    /// Revalidates this actual audit against the same owning recorder and healthy writer.
+    /// This receipt cannot authorize a replacement recorder, even with equal source DTOs.
+    /// # Errors
+    /// Refuses a foreign recorder, failed owner, replaced run or lost durable audit prefix.
+    pub fn verify_recorder(&self, recorder: &NativeTraceRecorder) -> Result<()> {
+        ensure!(
+            Rc::ptr_eq(&self.recorder.0, &recorder.0),
+            "native replay continuation belongs to a different owned recorder"
+        );
+        let state = recorder
+            .0
+            .try_borrow()
+            .context("native continuation verification reentered")?;
+        state.check()?;
+        ensure!(
+            state.source == self.child
+                && state.parent_run.as_deref() == Some(self.original.journal_run.as_str())
+                && state.replay_continued
+                && state.stack.is_empty()
+                && state.next_input > self.last_dispatch_input,
+            "native replay continuation child cursor or original binding changed"
+        );
+        let prefix = state.writer()?.durable_prefix()?;
+        ensure!(
+            prefix.run_id == self.child.journal_run
+                && prefix.sequence >= self.acknowledgment.sequence(),
+            "native replay continuation durable audit is no longer owned"
+        );
+        Ok(())
+    }
+
     #[must_use]
     pub const fn child(&self) -> &NativeTraceSource {
         &self.child

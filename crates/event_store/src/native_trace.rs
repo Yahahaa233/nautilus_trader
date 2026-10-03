@@ -2512,6 +2512,34 @@ mod tests {
     }
 
     #[rstest]
+    fn native_historical_continuation_receipt_verifies_same_recorder_and_rejects_foreign_or_failed_owner()
+     {
+        let (original, _original_writer) = original_continuation_source();
+        let (trace, _writer, _backend, _, halt) = actual_child_journal(original.source());
+        cut(&trace);
+        let original_receipt = replay_original_continuation_root(&original);
+        let audit = trace
+            .prepare_historical_continuation(&original, &[original_receipt])
+            .unwrap()
+            .commit()
+            .unwrap();
+        audit.verify_original_trace(&original).unwrap();
+        let (foreign_original, _foreign_original_writer) = original_continuation_source();
+        assert!(audit.verify_original_trace(&foreign_original).is_err());
+        audit.verify_recorder(&trace).unwrap();
+        audit.clone().verify_recorder(&trace.clone()).unwrap();
+        let (foreign, _foreign_writer, _foreign_backend, _, _) =
+            actual_child_journal(original.source());
+        cut(&foreign);
+        let error = audit.verify_recorder(&foreign).unwrap_err();
+        assert!(error.to_string().contains("different owned recorder"));
+        // A failed owner cannot reuse a formerly valid private durable acknowledgment.
+        trace.fail("actual failed continuation owner");
+        assert!(halt.is_halted());
+        assert!(audit.verify_recorder(&trace).is_err());
+    }
+
+    #[rstest]
     fn native_historical_continuation_refuses_missing_foreign_or_changed_child_and_latches_failure()
     {
         let (original, _original_writer) = original_continuation_source();

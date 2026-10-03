@@ -437,6 +437,17 @@ impl LiveNode {
             .as_mut()
             .context("native engine source lost")?["watermark"] =
             serde_json::to_value(&final_watermark)?;
+        if let Some(audit) = &trace_continuation {
+            let recorder = self
+                .dispatch_observer
+                .as_ref()
+                .and_then(|observer| observer.native_trace())
+                .context("native timer continuation lost its owned child recorder")?;
+            self.recovery_timers
+                .as_mut()
+                .context("native timer continuation lost original owner timers")?
+                .bind_native_continuation(trace, &final_watermark, recorder, audit)?;
+        }
         Ok(NativeTailReplayReceipt {
             source: trace.source().clone(),
             target_instance: self.kernel.instance_id(),
@@ -1235,6 +1246,19 @@ mod tests {
                         &watermark,
                     )
                     .unwrap();
+                let legacy_error = target
+                    .recovery_timers
+                    .as_ref()
+                    .unwrap()
+                    .verify_native_continuation(
+                        &child_trace,
+                        &watermark,
+                        target.instance_id(),
+                        true,
+                        &[],
+                    )
+                    .unwrap_err();
+                assert!(legacy_error.to_string().contains("legacy retained timers"));
                 let result = target.replay_native_tail(
                     &verified,
                     &watermark,
@@ -1266,6 +1290,42 @@ mod tests {
                     assert_eq!(audit.child(), &child_source);
                     assert_eq!(audit.original(), verified.source());
                     assert!(audit.acknowledgment().sequence() > 0);
+                    let timers = target.recovery_timers.as_ref().unwrap();
+                    // Original owner clocks remain restored; only this actual reader/child
+                    // audit admits their causal inventory to a subsequent native cut.
+                    timers
+                        .verify_native_continuation(
+                            &child_trace,
+                            receipt.final_watermark(),
+                            target.instance_id(),
+                            true,
+                            receipt.retained_inputs(),
+                        )
+                        .unwrap();
+                    let mut wrong_frontier = receipt.final_watermark().clone();
+                    wrong_frontier.dispatch_watermark += 1;
+                    assert!(
+                        timers
+                            .verify_native_continuation(
+                                &child_trace,
+                                &wrong_frontier,
+                                target.instance_id(),
+                                true,
+                                receipt.retained_inputs(),
+                            )
+                            .is_err()
+                    );
+                    assert!(
+                        timers
+                            .verify_native_continuation(
+                                &child_trace,
+                                receipt.final_watermark(),
+                                nautilus_core::UUID4::new(),
+                                true,
+                                receipt.retained_inputs(),
+                            )
+                            .is_err()
+                    );
                     // Continue through the actual original receiver and native DataEngine.
                     target
                         .runner
@@ -1305,6 +1365,18 @@ mod tests {
                             .values()
                             .all(|count| *count == 0)
                     );
+                    target
+                        .recovery_timers
+                        .as_ref()
+                        .unwrap()
+                        .verify_native_continuation(
+                            &child_trace,
+                            receipt.final_watermark(),
+                            target.instance_id(),
+                            true,
+                            &[],
+                        )
+                        .unwrap();
                     let fresh_cut = child_trace
                         .checkpoint_cut(
                             completion.root_sequence(),

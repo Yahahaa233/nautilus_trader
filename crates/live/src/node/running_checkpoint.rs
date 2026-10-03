@@ -2013,15 +2013,24 @@ impl LiveNode {
                             verify()?;
                             #[cfg(feature = "native-tail-replay")]
                             let native_trace_cut = observer.native_trace().map(|trace| {
-                                ensure!(self.recovery_timers.is_none(),
-                                    "legacy retained timers lack original causal receipts");
                                 let receipts = receivers.native_pending_receipts()?;
+                                let original_inputs = receivers.native_pending_inputs(&|source, input| {
+                                    Ok(observer.encode_historical_source(crate::node::dispatch::source_dispatch(source)?, "native_enqueue", input)?.payload)
+                                })?;
+                                if let Some(timers) = &self.recovery_timers {
+                                    timers.verify_native_continuation(
+                                        trace,
+                                        self.recovery_native_frontier.as_ref()
+                                            .context("native timer checkpoint frontier absent")?,
+                                        self.kernel.instance_id(),
+                                        self.recovery_requires_release,
+                                        &original_inputs,
+                                    )?;
+                                }
                                 let value = serde_json::to_value(&inventory)?;
                                 let digest = nautilus_event_store::native_trace::native_inventory_digest(&value)?;
                                 let mut cut = trace.checkpoint_cut_at(proof.root_sequence(), proof.input_sequence(), digest, receipts, now, inventory.captured_at_ns)?;
-                                cut.pending_inputs = receivers.native_pending_inputs(&|source, input| {
-                                    Ok(observer.encode_historical_source(crate::node::dispatch::source_dispatch(source)?, "native_enqueue", input)?.payload)
-                                })?;
+                                cut.pending_inputs = original_inputs;
                                 cut.registered_timers = inventory.timers.clone();
                                 cut.native_effects["registered_timers"] = serde_json::to_value(&inventory.timers)?;
                                 cut.native_effects["execution_manager"] = self.exec_manager.trace_effects_inventory(now)?;
