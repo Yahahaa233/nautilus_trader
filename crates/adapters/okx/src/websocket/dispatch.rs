@@ -179,6 +179,7 @@ where
 /// and business WebSocket dispatch loops.
 #[derive(Debug)]
 pub struct WsDispatchState {
+    pub(crate) protection_sources: crate::protection::ProtectionSourceEmitter,
     pub order_identities: DashMap<ClientOrderId, OrderIdentity>,
     order_contexts: DashMap<ClientOrderId, OrderContext>,
     pub(crate) pending_orders: Arc<DashMap<String, PendingOrderInfo>>,
@@ -200,6 +201,7 @@ pub struct WsDispatchState {
 impl Default for WsDispatchState {
     fn default() -> Self {
         Self {
+            protection_sources: crate::protection::ProtectionSourceEmitter::default(),
             order_identities: DashMap::new(),
             order_contexts: DashMap::new(),
             pending_orders: Arc::new(DashMap::new()),
@@ -805,7 +807,27 @@ pub fn dispatch_ws_message(
     let guard = instruments.load();
     let instruments: &AHashMap<Ustr, InstrumentAny> = &guard;
 
+    let message = if let OKXWsMessage::OriginalOrderData {
+        payload_json,
+        message,
+    } = message
+    {
+        let now = clock.get_time_ns();
+        if state
+            .protection_sources
+            .wire(emitter.trader_id(), account_id, payload_json, now)
+            .is_err()
+        {
+            log::warn!("Original protective stream source could not be retained");
+        }
+        *message
+    } else {
+        message
+    };
     match message {
+        OKXWsMessage::OriginalOrderData { .. } => {
+            log::error!("Nested protective stream envelope refused");
+        }
         OKXWsMessage::Orders(order_msgs) => {
             let ts_init = clock.get_time_ns();
             let pending_order_msgs = state.take_routable_linked_children();
@@ -1689,6 +1711,15 @@ fn dispatch_tracked_algo_order_message(
 }
 
 fn algo_child_venue_order_id(msg: &OKXAlgoOrderMsg) -> Option<VenueOrderId> {
+    if msg.ord_id_list.len() > 1
+        || msg
+            .ord_id_list
+            .first()
+            .is_some_and(|id| !msg.ord_id.is_empty() && id != &msg.ord_id)
+    {
+        log::warn!("Ambiguous actual algo child list refused: {}", msg.algo_id);
+        return None;
+    }
     if !msg.ord_id.is_empty() {
         return Some(VenueOrderId::new(msg.ord_id.as_str()));
     }
@@ -4249,5 +4280,28 @@ mod tests {
                 "pending state mismatch for {client_order_id}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod protective_child_tests {
+    use super::*;
+    #[test]
+    fn original_multiple_algo_children_do_not_bind_latest_as_single_protection() {
+        let value: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_data/ws_orders_algo_states.json"))
+                .unwrap();
+        let mut message: OKXAlgoOrderMsg =
+            serde_json::from_value(value["data"][0].clone()).unwrap();
+        message.ord_id = "latest-child".into();
+        message.ord_id_list = vec!["first-child".into(), "latest-child".into()];
+        assert_eq!(algo_child_venue_order_id(&message), None);
+        message.ord_id_list = vec!["foreign-child".into()];
+        assert_eq!(algo_child_venue_order_id(&message), None);
+        message.ord_id_list = vec!["latest-child".into()];
+        assert_eq!(
+            algo_child_venue_order_id(&message),
+            Some("latest-child".into())
+        );
     }
 }

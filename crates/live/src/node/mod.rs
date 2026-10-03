@@ -83,6 +83,8 @@
 //! When maintenance and runner inputs are both ready, one maintenance root
 //! alternates with one actual runner input. This bounds priority in both
 //! directions even when synchronous checkpoint persistence exceeds 100ms.
+//! Ready runner channels also rotate in bounded cyclic order; a permanent
+//! timer backlog cannot prevent original execution/data FIFO progress.
 
 use std::{any::Any, fmt::Debug, time::Duration};
 
@@ -2908,6 +2910,7 @@ impl LiveNode {
             .map(|config| QueueMonitor::new(config, metrics.snapshot()));
         let mut dispatches_since_yield = 0usize;
         let mut last_dispatch_was_maintenance = false;
+        let mut next_runner_channel = 0usize;
         #[cfg(feature = "dispatch-observer")]
         let mut checkpoint_error = None;
 
@@ -2923,13 +2926,26 @@ impl LiveNode {
             // tick ready. Preserve its priority, but never select it twice in
             // succession while an actual runner input is already queued.
             // Reading queue length neither dequeues nor changes FIFO/receipts.
-            let runner_input_ready = !time_evt_rx.is_empty()
-                || !system_evt_rx.is_empty()
-                || !system_cmd_rx.is_empty()
-                || !exec_evt_rx.is_empty()
-                || !exec_cmd_rx.is_empty()
-                || !data_evt_rx.is_empty()
-                || !data_cmd_rx.is_empty();
+            // Snapshot only readiness; each selected receiver still dequeues
+            // its own original FIFO message/receipt in the normal branch.
+            // A continuously ready fast timer must not starve native command,
+            // report/data input or another channel. Empty snapshots leave all
+            // receivers armed so a newly arriving message wakes the loop.
+            let runner_channels_ready = [
+                !time_evt_rx.is_empty(),
+                !system_evt_rx.is_empty(),
+                !system_cmd_rx.is_empty(),
+                !exec_evt_rx.is_empty(),
+                !exec_cmd_rx.is_empty(),
+                external_msgbus_rx
+                    .as_ref()
+                    .is_some_and(|rx| !rx.is_empty() || rx.is_closed()),
+                !data_evt_rx.is_empty(),
+                !data_cmd_rx.is_empty(),
+            ];
+            let selected_runner_channel =
+                next_ready_runner_channel(&runner_channels_ready, next_runner_channel);
+            let runner_input_ready = selected_runner_channel.is_some();
             let maintenance_can_dispatch = !last_dispatch_was_maintenance || !runner_input_ready;
 
             tokio::select! {
@@ -3142,7 +3158,8 @@ impl LiveNode {
                 // ordered ahead of data events so a strategy action (cancel,
                 // submit, etc.) is not delayed behind a market data backlog
                 // when the biased select polls receivers each iteration.
-                Some(handler) = time_evt_rx.recv() => {
+                Some(handler) = time_evt_rx.recv(), if selected_runner_channel.is_none_or(|selected| selected == 0) => {
+                    next_runner_channel = (0 + 1) % runner_channels_ready.len();
                     last_dispatch_was_maintenance = false;
                     let dispatch_start = dst::time::Instant::now();
                     let dispatched = self.process_time_event(handler);
@@ -3161,7 +3178,8 @@ impl LiveNode {
                         );
                     }
                 }
-                Some(event) = system_evt_rx.recv() => {
+                Some(event) = system_evt_rx.recv(), if selected_runner_channel.is_none_or(|selected| selected == 1) => {
+                    next_runner_channel = (1 + 1) % runner_channels_ready.len();
                     last_dispatch_was_maintenance = false;
                     if is_shutting_down {
                         log::debug!("Residual system event: {event}");
@@ -3169,7 +3187,8 @@ impl LiveNode {
                     }
                     self.process_system_event(event);
                 }
-                Some(command) = system_cmd_rx.recv() => {
+                Some(command) = system_cmd_rx.recv(), if selected_runner_channel.is_none_or(|selected| selected == 2) => {
+                    next_runner_channel = (2 + 1) % runner_channels_ready.len();
                     last_dispatch_was_maintenance = false;
                     if is_shutting_down {
                         log::debug!("Residual system command: {command}");
@@ -3177,7 +3196,8 @@ impl LiveNode {
                     }
                     self.process_system_command(command);
                 }
-                Some(evt) = exec_evt_rx.recv() => {
+                Some(evt) = exec_evt_rx.recv(), if selected_runner_channel.is_none_or(|selected| selected == 3) => {
+                    next_runner_channel = (3 + 1) % runner_channels_ready.len();
                     last_dispatch_was_maintenance = false;
                     let dispatch_start = dst::time::Instant::now();
 
@@ -3194,7 +3214,8 @@ impl LiveNode {
                         metrics_start,
                     );
                 }
-                Some(cmd) = exec_cmd_rx.recv() => {
+                Some(cmd) = exec_cmd_rx.recv(), if selected_runner_channel.is_none_or(|selected| selected == 4) => {
+                    next_runner_channel = (4 + 1) % runner_channels_ready.len();
                     last_dispatch_was_maintenance = false;
                     let dispatch_start = dst::time::Instant::now();
 
@@ -3211,7 +3232,9 @@ impl LiveNode {
                         metrics_start,
                     );
                 }
-                message = recv_external_msgbus_message(&mut external_msgbus_rx) => {
+                message = recv_external_msgbus_message(&mut external_msgbus_rx), if selected_runner_channel.is_none_or(|selected| selected == 5) => {
+                    next_runner_channel = (5 + 1) % runner_channels_ready.len();
+                    last_dispatch_was_maintenance = false;
                     let external_msgbus_start = dst::time::Instant::now();
 
                     match message {
@@ -3238,7 +3261,8 @@ impl LiveNode {
                         metrics_start,
                     );
                 }
-                Some(evt) = data_evt_rx.recv() => {
+                Some(evt) = data_evt_rx.recv(), if selected_runner_channel.is_none_or(|selected| selected == 6) => {
+                    next_runner_channel = (6 + 1) % runner_channels_ready.len();
                     last_dispatch_was_maintenance = false;
                     let dispatch_start = dst::time::Instant::now();
 
@@ -3254,7 +3278,8 @@ impl LiveNode {
                         metrics_start,
                     );
                 }
-                Some(cmd) = data_cmd_rx.recv() => {
+                Some(cmd) = data_cmd_rx.recv(), if selected_runner_channel.is_none_or(|selected| selected == 7) => {
+                    next_runner_channel = (7 + 1) % runner_channels_ready.len();
                     last_dispatch_was_maintenance = false;
                     let dispatch_start = dst::time::Instant::now();
 
@@ -4644,6 +4669,18 @@ fn record_runner_external_msgbus(
         work_end.duration_since(work_start),
         work_end.duration_since(metrics_start),
     );
+}
+
+/// Select one ready channel in bounded cyclic order without receiving,
+/// moving, sorting or discarding any original input. Signals/deadlines remain
+/// ahead of this selection, and maintenance retains its existing alternation.
+fn next_ready_runner_channel<const N: usize>(ready: &[bool; N], next: usize) -> Option<usize> {
+    ready
+        .iter()
+        .enumerate()
+        .skip(next)
+        .chain(ready.iter().enumerate().take(next))
+        .find_map(|(index, ready)| ready.then_some(index))
 }
 
 async fn recv_external_msgbus_message(

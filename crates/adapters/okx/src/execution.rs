@@ -230,6 +230,7 @@ impl OKXExecutionClient {
         dispatch.retained_submit_contexts = ws_private.retained_submit_contexts.clone();
         let dispatch =
             dispatch.with_retained_cancel_contexts(ws_private.retained_cancel_contexts.clone());
+        crate::protection::register_source_type()?;
         let ws_dispatch_state = Arc::new(dispatch);
 
         Ok(Self {
@@ -944,10 +945,11 @@ impl OKXExecutionClient {
 
         self.ws_dispatch_state.track_order_context(context);
         let dispatch_state = Arc::clone(&self.ws_dispatch_state);
+        let original_command = serde_json::to_string(cmd)?;
 
         self.spawn_task("submit_algo_order", async move {
             let result = http_client
-                .place_algo_order_with_domain_types(
+                .place_algo_order_with_domain_types_and_source(
                     instrument_id,
                     trade_mode,
                     client_order_id,
@@ -966,7 +968,56 @@ impl OKXExecutionClient {
                 .await;
 
             match result {
-                Ok(response) => {
+                Ok((responses, original_http)) => {
+                    let raw_response: serde_json::Value =
+                        serde_json::from_str(&original_http.response_body_json)?;
+                    if dispatch_state
+                        .protection_sources
+                        .http(
+                            emitter.trader_id(),
+                            emitter.account_id(),
+                            original_command,
+                            original_http,
+                        )
+                        .is_err()
+                    {
+                        log::warn!("Original protective HTTP source could not be retained");
+                    }
+                    let response = responses.into_iter().next();
+                    let failure_code = raw_response["code"]
+                        .as_str()
+                        .filter(|code| *code != "0")
+                        .or_else(|| {
+                            response
+                                .as_ref()
+                                .and_then(|r| r.s_code.as_deref())
+                                .filter(|code| *code != "0")
+                        });
+                    if let Some(code) = failure_code {
+                        let error = OKXHttpError::from_venue_response(
+                            code.to_string(),
+                            response
+                                .as_ref()
+                                .and_then(|r| r.s_msg.clone())
+                                .unwrap_or_default(),
+                            None,
+                        );
+                        let failure = classify_okx_http_failure(&error);
+                        dispatch_state.resolve_algo_submit_failure(client_order_id, &failure);
+                        emit_submit_failure(
+                            failure,
+                            &emitter,
+                            clock,
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                        );
+                        return Err(anyhow::Error::new(error));
+                    }
+                    let response = response.ok_or(OKXHttpError::EmptyResponse)?;
+                    if response.algo_id.is_empty() {
+                        return Err(anyhow::Error::new(OKXHttpError::EmptyResponse));
+                    }
                     dispatch_state.bind_algo_parent(
                         client_order_id,
                         VenueOrderId::new(response.algo_id.as_str()),
@@ -1031,6 +1082,7 @@ impl OKXExecutionClient {
         let http = self.http_client.clone();
         let emitter = self.emitter.clone();
         let clock = self.clock;
+        let sources = self.ws_dispatch_state.protection_sources.clone();
         self.spawn_task("modify_algo_order", async move {
             // 查询负责识别实际交易所类型；查询失败时尚未发送修改，可明确拒绝。
             let request = match http
@@ -1052,7 +1104,37 @@ impl OKXExecutionClient {
                 Ok(request) => {
                     let req_id = request.req_id.clone();
                     let algo_id = request.algo_id.clone();
-                    match http.amend_algo_order(request).await {
+                    let result = match http.amend_algo_order_with_source(request).await {
+                        Ok((items, raw)) => {
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&raw.response_body_json)?;
+                            if sources
+                                .http(
+                                    emitter.trader_id(),
+                                    emitter.account_id(),
+                                    serde_json::to_string(&command)?,
+                                    raw,
+                                )
+                                .is_err()
+                            {
+                                log::warn!(
+                                    "Original protective amend HTTP source could not be retained"
+                                );
+                            }
+                            if let Some(code) = parsed["code"].as_str().filter(|code| *code != "0")
+                            {
+                                Err(OKXHttpError::from_venue_response(
+                                    code.to_string(),
+                                    parsed["msg"].as_str().unwrap_or_default().into(),
+                                    None,
+                                ))
+                            } else {
+                                items.into_iter().next().ok_or(OKXHttpError::EmptyResponse)
+                            }
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match result {
                         Ok(response)
                             if response.req_id == req_id && response.algo_id == algo_id =>
                         {
@@ -1180,11 +1262,12 @@ impl OKXExecutionClient {
         });
     }
 
-    fn cancel_algo_order(&self, cmd: &CancelOrder) {
+    fn cancel_algo_order(&self, cmd: &CancelOrder, original_command: String) {
         let http_client = self.http_client.clone();
         let command = cmd.clone();
         let emitter = self.emitter.clone();
         let clock = self.clock;
+        let sources = self.ws_dispatch_state.protection_sources.clone();
 
         let cache = self.core.cache();
         let is_advance = cache
@@ -1207,7 +1290,38 @@ impl OKXExecutionClient {
             let responses = if is_advance {
                 http_client.cancel_advance_algo_orders(vec![request]).await
             } else {
-                http_client.cancel_algo_orders(vec![request]).await
+                match http_client
+                    .cancel_algo_orders_with_source(vec![request])
+                    .await
+                {
+                    Ok((items, raw)) => {
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&raw.response_body_json)?;
+                        if sources
+                            .http(
+                                emitter.trader_id(),
+                                emitter.account_id(),
+                                original_command,
+                                raw,
+                            )
+                            .is_err()
+                        {
+                            log::warn!(
+                                "Original protective cancel HTTP source could not be retained"
+                            );
+                        }
+                        if let Some(code) = parsed["code"].as_str().filter(|code| *code != "0") {
+                            Err(OKXHttpError::from_venue_response(
+                                code.to_string(),
+                                parsed["msg"].as_str().unwrap_or_default().into(),
+                                None,
+                            ))
+                        } else {
+                            Ok(items)
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
             };
 
             match responses {
@@ -2204,6 +2318,9 @@ impl ExecutionClient for OKXExecutionClient {
 
         let sender = get_exec_event_sender();
         self.emitter.set_sender(sender);
+        if let Some(sender) = nautilus_common::live::runner::try_get_data_event_sender() {
+            self.ws_dispatch_state.protection_sources.bind(sender);
+        }
         self.core.set_started();
 
         log::info!(
@@ -2791,6 +2908,7 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn cancel_order(&self, mut cmd: CancelOrder) -> anyhow::Result<()> {
+        let original = cmd.clone();
         self.recovery_pristine
             .store(false, std::sync::atomic::Ordering::Release);
         let venue_binding = self
@@ -2814,7 +2932,9 @@ impl ExecutionClient for OKXExecutionClient {
 
         match route {
             OrderCommandRoute::RegularWs => self.cancel_ws_order(&cmd),
-            OrderCommandRoute::AlgoHttp => self.cancel_algo_order(&cmd),
+            OrderCommandRoute::AlgoHttp => {
+                self.cancel_algo_order(&cmd, serde_json::to_string(&original)?)
+            }
             OrderCommandRoute::SpreadHttp => self.cancel_order_http(&cmd),
         }
         Ok(())
@@ -4802,3 +4922,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "protective_source_tests.rs"]
+mod protective_source_tests;

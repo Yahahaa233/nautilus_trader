@@ -114,6 +114,7 @@ pub mod data;
 pub mod execution;
 pub mod factories;
 pub mod http;
+pub mod protection;
 pub mod websocket;
 
 mod book_sync;

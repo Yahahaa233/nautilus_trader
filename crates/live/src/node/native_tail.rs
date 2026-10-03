@@ -50,8 +50,16 @@ pub struct NativeTailReplayReceipt {
     pending_report_contexts: serde_json::Value,
     final_watermark: RunnerRecoveryWatermark,
     retained_inputs: Vec<NativePendingInput>,
+    trace_continuation: Option<nautilus_event_store::native_trace::NativeReplayContinuationReceipt>,
 }
 impl NativeTailReplayReceipt {
+    /// Same actual child writer audit after verified replay. Never current execution authority.
+    #[must_use]
+    pub const fn trace_continuation(
+        &self,
+    ) -> Option<&nautilus_event_store::native_trace::NativeReplayContinuationReceipt> {
+        self.trace_continuation.as_ref()
+    }
     #[must_use]
     pub const fn source(&self) -> &NativeTraceSource {
         &self.source
@@ -313,6 +321,8 @@ impl LiveNode {
         Trader::prepare_native_recovery(&self.kernel.trader, trace)?;
         self.verify_native_cut_business_state(trace, mapped_cut)?;
 
+        let mut historical_receipts = Vec::new();
+        historical_receipts.try_reserve(trace.roots().len())?;
         let mut reports = HistoricalReports::default();
         let mut final_root = trace.cut().completed_root;
         let mut final_input = trace.cut().last_input_sequence;
@@ -346,6 +356,7 @@ impl LiveNode {
             let receipt = replay.finish()?;
             final_root = receipt.root_sequence();
             final_input = receipt.final_input_sequence();
+            historical_receipts.push(receipt);
             self.historical_replay = None;
             frozen.verify()?;
         }
@@ -397,6 +408,27 @@ impl LiveNode {
                 .context("final original FIFO receiver missing")?
                 .install_native_retained_input(&frozen, event, original.receipt.clone())?;
         }
+        frozen.verify()?;
+        let trace_continuation = if let Some(observer) = &self.dispatch_observer
+            && let Some(recorder) = observer.native_trace()
+        {
+            let prepared = recorder.prepare_historical_continuation(trace, &historical_receipts)?;
+            let completed = observer
+                .completed_root_boundary_proof()?
+                .context("historical replay child observer has no completed boundary")?;
+            completed.verify()?;
+            ensure!(
+                prepared.completed_dispatch()
+                    == Some((completed.root_sequence(), completed.input_sequence())),
+                "verified historical continuation differs from actual child dispatch"
+            );
+            let acknowledgment = prepared.commit()?;
+            completed.verify()?;
+            frozen.verify()?;
+            Some(acknowledgment)
+        } else {
+            None
+        };
         frozen.finish()?;
         let mut final_watermark = cut.clone();
         final_watermark.dispatch_watermark = final_input;
@@ -415,6 +447,7 @@ impl LiveNode {
             pending_report_contexts,
             final_watermark,
             retained_inputs: trace.final_pending()?.to_vec(),
+            trace_continuation,
         })
     }
 
@@ -1080,131 +1113,231 @@ mod tests {
         );
         source.dispose();
         drop(source);
-        let reader = EventStoreReader::new(
-            RedbBackend::open_sealed(
-                root.join("source"),
-                &source_instance.to_string(),
-                &source_identity.journal_run,
-            )
-            .unwrap(),
-        );
-        let verified = reader
-            .verify_native_tail(&source_identity, &first.0, reader.high_watermark().unwrap())
-            .unwrap();
-        assert!(
-            verified
-                .roots()
-                .iter()
-                .any(|root| root.inputs().iter().any(|row| matches!(
-                    row,
-                    NativeTraceRecord::Begin {
-                        input_source: NativeInputSource::DataEvent,
-                        ..
-                    }
-                )))
-        );
-        assert!(verified.final_pending().unwrap().is_empty());
-        let source_high = reader.high_watermark().unwrap();
-        let fingerprint = EventStoreLifecycle::sealed_run_fingerprint(
-            &root.join("source"),
-            source_instance,
-            &source_identity.journal_run,
-            source_high,
-        )
-        .unwrap();
-        let mut target = actual_node(
-            "native-target",
-            root.join("target"),
-            Some((
-                root.join("source"),
-                source_instance,
-                source_identity.journal_run.clone(),
-                source_high,
-                fingerprint,
-            )),
-        );
-        target.restore_native_cache(Cache::default()).unwrap();
-        target.restore_component_state(&first.2).unwrap();
-        target
-            .kernel
-            .risk_engine
-            .borrow_mut()
-            .set_trading_state(nautilus_model::enums::TradingState::Halted);
-        target
-            .kernel
-            .open_event_store_for_paused_recovery()
-            .unwrap();
-        let watermark = RunnerRecoveryWatermark {
-            recovery_id: "actual-source-cut".into(),
-            checkpoint_sequence: first.0.prefix.sequence,
-            dispatch_watermark: first.0.last_input_sequence,
-        };
-        target
-            .replay_recovery_events(&watermark, &[], &registry(), |_, _| Ok(()))
-            .unwrap();
-        target
-            .restore_registered_engine_checkpoint(
-                &first.1["execution_manager"],
-                &first.1["data_engine"],
-                first.0.captured_at_ns,
-                &watermark,
-            )
-            .unwrap();
-        target
-            .restore_registered_portfolio_checkpoint(
-                &first.0.native_effects["portfolio"],
-                &watermark,
-            )
-            .unwrap();
-        target
-            .restore_registered_timer_checkpoint(
-                first.0.registered_timers.clone(),
-                Vec::new(),
-                &watermark,
-            )
-            .unwrap();
-        let result = target.replay_native_tail(
-            &verified,
-            &watermark,
-            |_, begin| {
-                let NativeTraceRecord::Begin { payload, .. } = begin else {
-                    unreachable!()
+        // Receipt/callback scopes belong to one actual node owner thread and
+        // cannot be reset or reused by a second source installation. The child
+        // reads and verifies the original sealed Journal on its own owner.
+        let child_root = root.clone();
+        std::thread::spawn(move || {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            executor.block_on(async move {
+                let root = child_root;
+                let reader = EventStoreReader::new(
+                    RedbBackend::open_sealed(
+                        root.join("source"),
+                        &source_instance.to_string(),
+                        &source_identity.journal_run,
+                    )
+                    .unwrap(),
+                );
+                let verified = reader
+                    .verify_native_tail(
+                        &source_identity,
+                        &first.0,
+                        reader.high_watermark().unwrap(),
+                    )
+                    .unwrap();
+                assert!(verified.roots().iter().any(|root| root.inputs().iter().any(
+                    |row| matches!(
+                        row,
+                        NativeTraceRecord::Begin {
+                            input_source: NativeInputSource::DataEvent,
+                            ..
+                        }
+                    )
+                )));
+                assert!(verified.final_pending().unwrap().is_empty());
+                let source_high = reader.high_watermark().unwrap();
+                let fingerprint = EventStoreLifecycle::sealed_run_fingerprint(
+                    &root.join("source"),
+                    source_instance,
+                    &source_identity.journal_run,
+                    source_high,
+                )
+                .unwrap();
+                let mut target = actual_node(
+                    "native-target",
+                    root.join("target"),
+                    Some((
+                        root.join("source"),
+                        source_instance,
+                        source_identity.journal_run.clone(),
+                        source_high,
+                        fingerprint,
+                    )),
+                );
+                target.restore_native_cache(Cache::default()).unwrap();
+                target.restore_component_state(&first.2).unwrap();
+                target
+                    .kernel
+                    .risk_engine
+                    .borrow_mut()
+                    .set_trading_state(nautilus_model::enums::TradingState::Halted);
+                target
+                    .kernel
+                    .open_event_store_for_paused_recovery()
+                    .unwrap();
+                let child_source = NativeTraceSource {
+                    node_instance: target.kernel.instance_id(),
+                    process_incarnation: nautilus_core::UUID4::new(),
+                    journal_run: target
+                        .kernel
+                        .event_store()
+                        .unwrap()
+                        .run_id()
+                        .unwrap()
+                        .to_owned(),
+                    ..source_identity.clone()
                 };
-                let mut original: InstrumentAny = serde_json::from_value(payload.clone())?;
+                let child_trace = target
+                    .kernel
+                    .event_store()
+                    .unwrap()
+                    .native_trace_handle(child_source.clone())
+                    .unwrap()
+                    .downcast::<nautilus_event_store::native_trace::NativeTraceRecorder>()
+                    .unwrap();
+                target
+                    .set_native_recovery_trace(
+                        child_trace.as_ref().clone(),
+                        |_, _, _| Ok(vec![]),
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+                let watermark = RunnerRecoveryWatermark {
+                    recovery_id: "actual-source-cut".into(),
+                    checkpoint_sequence: first.0.prefix.sequence,
+                    dispatch_watermark: first.0.last_input_sequence,
+                };
+                target
+                    .replay_recovery_events(&watermark, &[], &registry(), |_, _| Ok(()))
+                    .unwrap();
+                target
+                    .restore_registered_engine_checkpoint(
+                        &first.1["execution_manager"],
+                        &first.1["data_engine"],
+                        first.0.captured_at_ns,
+                        &watermark,
+                    )
+                    .unwrap();
+                target
+                    .restore_registered_portfolio_checkpoint(
+                        &first.0.native_effects["portfolio"],
+                        &watermark,
+                    )
+                    .unwrap();
+                target
+                    .restore_registered_timer_checkpoint(
+                        first.0.registered_timers.clone(),
+                        Vec::new(),
+                        &watermark,
+                    )
+                    .unwrap();
+                let result = target.replay_native_tail(
+                    &verified,
+                    &watermark,
+                    |_, begin| {
+                        let NativeTraceRecord::Begin { payload, .. } = begin else {
+                            unreachable!()
+                        };
+                        let mut original: InstrumentAny = serde_json::from_value(payload.clone())?;
+                        if changed {
+                            original = InstrumentAny::CryptoPerpetual(
+                                nautilus_model::instruments::stubs::xbtusd_bitmex(),
+                            );
+                        }
+                        Ok(RunnerRecoveryEvent::DataEvent(DataEvent::Instrument(
+                            original,
+                        )))
+                    },
+                    |_, _| anyhow::bail!("no original pending input expected"),
+                );
                 if changed {
-                    original = InstrumentAny::CryptoPerpetual(
-                        nautilus_model::instruments::stubs::xbtusd_bitmex(),
+                    assert!(result.is_err());
+                    assert!(target.kernel.exec_engine.borrow().submissions_fenced());
+                    assert!(target.event_store_halted());
+                } else {
+                    let receipt = result.unwrap();
+                    let audit = receipt
+                        .trace_continuation()
+                        .expect("actual child trace continuation absent");
+                    assert_eq!(audit.child(), &child_source);
+                    assert_eq!(audit.original(), verified.source());
+                    assert!(audit.acknowledgment().sequence() > 0);
+                    // Continue through the actual original receiver and native DataEngine.
+                    target
+                        .runner
+                        .as_ref()
+                        .unwrap()
+                        .data_event_sender_clone()
+                        .send(DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
+                            nautilus_model::instruments::stubs::xbtusd_bitmex(),
+                        )))
+                        .unwrap();
+                    let fresh = target
+                        .runner
+                        .as_mut()
+                        .unwrap()
+                        .startup_channels_mut()
+                        .data_evt_rx
+                        .try_recv()
+                        .unwrap();
+                    target.process_data_event(fresh);
+                    assert!(!target.dispatch_failure.get());
+                    let completion = target
+                        .dispatch_observer
+                        .as_ref()
+                        .unwrap()
+                        .completed_root_boundary_proof()
+                        .unwrap()
+                        .unwrap();
+                    completion.verify().unwrap();
+                    assert!(completion.input_sequence() > audit.last_dispatch_input());
+                    let frozen = target.runner.as_ref().unwrap().freeze_ingress().unwrap();
+                    assert!(
+                        target
+                            .runner
+                            .as_ref()
+                            .unwrap()
+                            .pending_queue_counts()
+                            .values()
+                            .all(|count| *count == 0)
                     );
+                    let fresh_cut = child_trace
+                        .checkpoint_cut(
+                            completion.root_sequence(),
+                            completion.input_sequence(),
+                            "actual-child-fresh-native-inventory".into(),
+                            vec![],
+                        )
+                        .unwrap();
+                    child_trace
+                        .persist_checkpoint(&fresh_cut, serde_json::Value::Null)
+                        .unwrap();
+                    frozen.finish().unwrap();
+                    assert!(receipt.final_input() > watermark.dispatch_watermark);
+                    assert!(receipt.retained_inputs().is_empty());
+                    assert!(target.kernel.cache.borrow().instrument(&id).is_some());
+                    assert_eq!(target.state(), NodeState::Idle);
+                    assert_eq!(
+                        target.kernel.risk_engine.borrow().trading_state(),
+                        nautilus_model::enums::TradingState::Halted
+                    );
+                    assert!(target.recovery_requires_release);
                 }
-                Ok(RunnerRecoveryEvent::DataEvent(DataEvent::Instrument(
-                    original,
-                )))
-            },
-            |_, _| anyhow::bail!("no original pending input expected"),
-        );
-        if changed {
-            assert!(result.is_err());
-            assert!(target.kernel.exec_engine.borrow().submissions_fenced());
-            assert!(target.event_store_halted());
-        } else {
-            let receipt = result.unwrap();
-            assert!(receipt.final_input() > watermark.dispatch_watermark);
-            assert!(receipt.retained_inputs().is_empty());
-            assert!(target.kernel.cache.borrow().instrument(&id).is_some());
-            assert_eq!(target.state(), NodeState::Idle);
-            assert_eq!(
-                target.kernel.risk_engine.borrow().trading_state(),
-                nautilus_model::enums::TradingState::Halted
-            );
-            assert!(target.recovery_requires_release);
-        }
-        target
-            .kernel
-            .prohibit_event_store_seal("test retains child until authenticated observation")
-            .unwrap();
-        target.dispose();
-        drop(target);
-        drop(reader);
+                target
+                    .kernel
+                    .prohibit_event_store_seal("test retains child until authenticated observation")
+                    .unwrap();
+                target.dispose();
+                drop(target);
+                drop(reader);
+            });
+        })
+        .join()
+        .expect("actual native child owner worker failed");
         drop(trace);
         std::fs::remove_dir_all(root).unwrap();
     }

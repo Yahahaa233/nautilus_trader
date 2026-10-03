@@ -106,6 +106,11 @@ pub enum ExecutionReport {
 /// (using the system Cache for order lookups).
 #[derive(Debug)]
 pub enum OKXWsMessage {
+    /// The original private frame and the same parsed message it produced.
+    OriginalOrderData {
+        payload_json: String,
+        message: Box<OKXWsMessage>,
+    },
     /// Order book snapshot or update.
     BookData {
         arg: OKXWebSocketArg,

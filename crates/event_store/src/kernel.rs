@@ -934,6 +934,7 @@ impl EventStoreLifecycle {
             source,
             session.writer.as_ref().ok_or(EventStoreError::Closed)?,
             self.halt.clone(),
+            session.parent_run_id().map(str::to_owned),
         )
     }
 

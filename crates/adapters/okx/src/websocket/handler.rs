@@ -349,6 +349,7 @@ impl OKXWsFeedHandler {
                 }
 
                 msg = self.raw_rx.recv() => {
+                    let mut original_order_payload = None;
                     let event = match msg {
                         Some(msg) => {
                             let msg = if let Some(recovery) = &self.recovery_raw {
@@ -363,6 +364,13 @@ impl OKXWsFeedHandler {
                                     }
                                 }
                             } else { msg };
+                            if let Message::Text(text) = &msg {
+                                let raw: Result<Value, _> = serde_json::from_str(text);
+                                if raw.as_ref().is_ok_and(|v| matches!(v["arg"]["channel"].as_str(),
+                                    Some("orders" | "orders-algo" | "algo-advance"))) {
+                                    original_order_payload = Some(text.to_string());
+                                }
+                            }
                             match Self::parse_raw_message(msg) {
                             Some(event) => event,
                             None => continue,
@@ -414,7 +422,9 @@ impl OKXWsFeedHandler {
                         }
                         OKXWsFrame::Data { arg, data } => {
                             if let Some(output) = self.route_data_message(arg, data) {
-                                return Some(output);
+                                return Some(if let Some(payload_json) = original_order_payload {
+                                    OKXWsMessage::OriginalOrderData { payload_json, message: Box::new(output) }
+                                } else { output });
                             }
                         }
                         OKXWsFrame::Error { arg, code, msg } => {
@@ -1185,4 +1195,27 @@ mod tests {
             other => panic!("Expected LiquidationWarnings, was {other:?}"),
         }
     }
+}
+
+/// Test drives the production raw inbox and decoder rather than constructing a
+/// parsed message or an OriginalOrderData wrapper as a substitute for capture.
+#[cfg(test)]
+pub(crate) async fn read_protection_test_frame(payload: String) -> OKXWsMessage {
+    let (_command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut handler = OKXWsFeedHandler::new(
+        Arc::new(AtomicBool::new(false)),
+        command_rx,
+        raw_rx,
+        out_tx,
+        AuthTracker::new(),
+        SubscriptionState::new(crate::common::consts::OKX_WS_TOPIC_DELIMITER),
+        nautilus_core::time::get_atomic_clock_realtime(),
+    );
+    raw_tx.send(Message::Text(payload.into())).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), handler.next())
+        .await
+        .unwrap()
+        .expect("actual raw frame did not produce data")
 }

@@ -51,6 +51,13 @@ use crate::{
 pub const NATIVE_TRACE_PAYLOAD_TYPE: &str = "NativeRecoveryTrace.v1";
 pub const NATIVE_CHECKPOINT_PAYLOAD_TYPE: &str = "NativeRecoveryCheckpoint.v1";
 
+#[path = "native_replay_continuation.rs"]
+mod continuation;
+pub use continuation::{
+    NATIVE_REPLAY_CONTINUATION_PAYLOAD_TYPE, NativeReplayContinuationReceipt,
+    PreparedNativeReplayContinuation,
+};
+
 /// Explicit non-economic checkpoint metadata in the source Journal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,6 +82,8 @@ struct State {
     writer: Weak<EventStoreWriter>,
     halt: HaltSignal,
     process_start: dst::time::Instant,
+    parent_run: Option<String>,
+    replay_continued: bool,
     next_input: u64,
     next_root: u64,
     stack: Vec<(u64, u64)>,
@@ -93,6 +102,7 @@ impl NativeTraceRecorder {
         source: NativeTraceSource,
         writer: &Arc<EventStoreWriter>,
         halt: HaltSignal,
+        parent_run: Option<String>,
     ) -> Result<Self> {
         source.validate()?;
         ensure!(!halt.is_halted(), "native trace Journal halted");
@@ -101,6 +111,8 @@ impl NativeTraceRecorder {
             writer: Arc::downgrade(writer),
             halt,
             process_start: dst::time::Instant::now(),
+            parent_run,
+            replay_continued: false,
             next_input: 1,
             next_root: 1,
             stack: Vec::new(),
@@ -659,6 +671,7 @@ pub struct VerifiedNativeTrace {
     roots: Vec<VerifiedNativeRoot>,
     incomplete_suffix: Vec<EventStoreEntry>,
     end_sequence: u64,
+    end_prefix: DurableJournalPrefix,
     final_cut: Option<NativeTraceCheckpointCut>,
     initial_cut_sealed: bool,
 }
@@ -938,6 +951,7 @@ impl NativeHistoricalRootReplay {
         Ok(NativeHistoricalRootReceipt {
             source: state.root.source.clone(),
             root: state.root.root_sequence,
+            verified_root: state.root.clone(),
             final_input: state
                 .root
                 .inputs
@@ -955,6 +969,7 @@ impl NativeHistoricalRootReplay {
 /// It is not Deserialize and has no current execution capability.
 #[derive(Debug)]
 pub struct NativeHistoricalRootReceipt {
+    verified_root: Rc<VerifiedNativeRoot>,
     source: NativeTraceSource,
     root: u64,
     final_input: u64,
@@ -1160,6 +1175,7 @@ impl<B: EventStore> EventStoreReader<B> {
         prefix_hash.update(&(expected.journal_run.len() as u64).to_be_bytes());
         prefix_hash.update(expected.journal_run.as_bytes());
         prefix_hash.update(&cut.prefix.sequence.to_be_bytes());
+        let mut prefix_continuation = continuation::PrefixContinuations::new();
         let mut known_inputs = BTreeMap::new();
         let mut prefix_channel_ordinals = BTreeMap::<String, u64>::new();
         let mut derived_outputs =
@@ -1173,8 +1189,23 @@ impl<B: EventStore> EventStoreReader<B> {
                 "native prefix hash mismatch"
             );
             prefix_hash.update(entry.entry_hash.as_bytes());
+            if entry.payload_type.as_str() == NATIVE_REPLAY_CONTINUATION_PAYLOAD_TYPE {
+                let before = self.verified_native_prefix(
+                    expected,
+                    sequence
+                        .checked_sub(1)
+                        .context("native replay audit sequence absent")?,
+                )?;
+                prefix_continuation.observe_audit(
+                    &entry,
+                    expected,
+                    manifest.parent_run_id.as_deref(),
+                    before,
+                )?;
+            }
             if entry.payload_type.as_str() == NATIVE_TRACE_PAYLOAD_TYPE {
                 let record: NativeTraceRecord = rmp_serde::from_slice(&entry.payload)?;
+                prefix_continuation.observe_trace(&record)?;
                 if let NativeTraceRecord::Complete {
                     source,
                     root_sequence,
@@ -1209,10 +1240,21 @@ impl<B: EventStore> EventStoreReader<B> {
                     root_sequence,
                     input_sequence,
                     receipt,
+                    payload,
                     ..
                 } = record
                 {
                     if let Some(ingress) = &receipt.ingress {
+                        let resumed = prefix_continuation.consume_retained(ingress, &payload)?;
+                        if let Some(cause) = &ingress.caused_by {
+                            ensure!(
+                                resumed
+                                    || (cause.journal_run == expected.journal_run
+                                        && cause.process_incarnation
+                                            == expected.process_incarnation),
+                                "native prefix retained parent cause lacks verified continuation"
+                            );
+                        }
                         if let Some(previous) = prefix_channel_ordinals
                             .insert(ingress.channel_id.to_string(), ingress.channel_ordinal)
                         {
@@ -1289,6 +1331,10 @@ impl<B: EventStore> EventStoreReader<B> {
                 entry.seq == sequence && entry.recompute_hash() == entry.entry_hash,
                 "native tail hash mismatch"
             );
+            ensure!(
+                entry.payload_type.as_str() != NATIVE_REPLAY_CONTINUATION_PAYLOAD_TYPE,
+                "native recovery source cut must follow its verified historical continuation"
+            );
             if entry.payload_type.as_str() == "RunEnded" {
                 ensure!(
                     stack.is_empty() && sequence == end && entry.headers.native_origin.is_none(),
@@ -1326,6 +1372,7 @@ impl<B: EventStore> EventStoreReader<B> {
                     metadata.cut.pending_inputs.len() == metadata.cut.pending.len(),
                     "native checkpoint pending payload coverage absent"
                 );
+                prefix_continuation.verify_retained_inventory(&metadata.cut.pending_inputs)?;
                 let mut final_ids = BTreeSet::new();
                 for (input, receipt) in metadata
                     .cut
@@ -1392,6 +1439,7 @@ impl<B: EventStore> EventStoreReader<B> {
                         );
                         last_processing_ns = receipt.process_elapsed_ns;
                         if let Some(ingress) = &receipt.ingress {
+                            let resumed = prefix_continuation.consume_retained(ingress, payload)?;
                             if let Some(original) =
                                 pending_cut.remove(&ingress.message_id.to_string())
                             {
@@ -1400,7 +1448,9 @@ impl<B: EventStore> EventStoreReader<B> {
                                     "native cut pending receipt was substituted"
                                 );
                             }
-                            if let Some(cause) = &ingress.caused_by {
+                            if let Some(cause) = &ingress.caused_by
+                                && !resumed
+                            {
                                 let admitted = derived_outputs
                                     .get(&ingress.message_id.to_string())
                                     .context(
@@ -1432,7 +1482,9 @@ impl<B: EventStore> EventStoreReader<B> {
                                     "native channel FIFO gap"
                                 );
                             }
-                            if let Some(cause) = &ingress.caused_by {
+                            if let Some(cause) = &ingress.caused_by
+                                && !resumed
+                            {
                                 ensure!(
                                     cause.process_incarnation == expected.process_incarnation
                                         && cause.journal_run == expected.journal_run
@@ -1558,6 +1610,7 @@ impl<B: EventStore> EventStoreReader<B> {
                 });
             }
         }
+        let end_prefix = self.verified_native_prefix(expected, end)?;
         ensure!(
             self.high_watermark()? == watermark,
             "native source changed during tail verification"
@@ -1568,6 +1621,7 @@ impl<B: EventStore> EventStoreReader<B> {
             roots,
             incomplete_suffix: root_entries,
             end_sequence: end,
+            end_prefix,
             final_cut,
             initial_cut_sealed,
         })
@@ -1699,7 +1753,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let trace = NativeTraceRecorder::new(source.clone(), &writer, halt.clone()).unwrap();
+        let trace = NativeTraceRecorder::new(source.clone(), &writer, halt.clone(), None).unwrap();
         (trace, writer, backend, source, halt)
     }
     fn cut(trace: &NativeTraceRecorder) -> NativeTraceCheckpointCut {
@@ -2168,5 +2222,457 @@ mod tests {
             "historical read view cannot roll back actual time"
         );
         drop(writer);
+    }
+    fn actual_child_journal(
+        parent: &NativeTraceSource,
+    ) -> (
+        NativeTraceRecorder,
+        Arc<EventStoreWriter>,
+        SharedTraceMemory,
+        NativeTraceSource,
+        HaltSignal,
+    ) {
+        let source = NativeTraceSource {
+            node_instance: UUID4::new(),
+            process_incarnation: UUID4::new(),
+            journal_run: "actual-child-native-trace".into(),
+            ..parent.clone()
+        };
+        let mut backend = SharedTraceMemory(Arc::new(Mutex::new(MemoryBackend::new())));
+        backend
+            .open_run(RunManifest {
+                run_id: source.journal_run.clone(),
+                parent_run_id: Some(parent.journal_run.clone()),
+                instance_id: source.node_instance.to_string(),
+                binary_hash: "actual-child-writer".into(),
+                schema_version: 1,
+                crate_versions: "test".into(),
+                feature_flags: vec!["live".into()],
+                adapter_versions: IndexMap::new(),
+                config_hash: "config".into(),
+                registered_components: RegisteredComponents::default(),
+                seed: None,
+                start_ts_init: UnixNanos::from(1),
+                end_ts_init: None,
+                high_watermark: 0,
+                status: RunStatus::Running,
+            })
+            .unwrap();
+        let halt = HaltSignal::new();
+        let writer = Arc::new(
+            EventStoreWriter::spawn(
+                Box::new(backend.clone()),
+                get_atomic_clock_realtime(),
+                halt.callback(),
+                WriterConfig {
+                    max_batch_entries: 1,
+                    max_batch_latency: Duration::from_millis(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let trace = NativeTraceRecorder::new(
+            source.clone(),
+            &writer,
+            halt.clone(),
+            Some(parent.journal_run.clone()),
+        )
+        .unwrap();
+        (trace, writer, backend, source, halt)
+    }
+
+    fn original_continuation_source() -> (VerifiedNativeTrace, Arc<EventStoreWriter>) {
+        let (trace, writer, backend, source, _) = actual_journal();
+        let first = cut(&trace);
+        trace.persist_checkpoint(&first, Value::Null).unwrap();
+        let parent = trace
+            .begin_native(
+                2,
+                2,
+                None,
+                NativeInputSource::Maintenance,
+                "running",
+                serde_json::json!({"actual_parent":true}),
+                vec![],
+            )
+            .unwrap();
+        let child = trace
+            .begin_native(
+                2,
+                3,
+                Some(2),
+                NativeInputSource::QueryResult,
+                "running",
+                serde_json::json!({"actual_child":true}),
+                vec![],
+            )
+            .unwrap();
+        child
+            .complete(serde_json::json!({"child_effect":17}))
+            .unwrap();
+        parent
+            .complete(serde_json::json!({"parent_effect":true}))
+            .unwrap();
+        let final_cut = trace
+            .checkpoint_cut(2, 2, "actual-final-inventory".into(), vec![])
+            .unwrap();
+        trace.persist_checkpoint(&final_cut, Value::Null).unwrap();
+        let reader = EventStoreReader::new(backend);
+        let verified = reader
+            .verify_native_tail(&source, &first, writer.high_watermark())
+            .unwrap();
+        (verified, writer)
+    }
+
+    fn replay_original_continuation_root(
+        trace: &VerifiedNativeTrace,
+    ) -> NativeHistoricalRootReceipt {
+        let replay = NativeHistoricalRootReplay::new(&trace.roots()[0]);
+        let parent = replay
+            .begin(
+                NativeInputSource::Maintenance,
+                &serde_json::json!({"actual_parent":true}),
+            )
+            .unwrap();
+        let child = replay
+            .begin(
+                NativeInputSource::QueryResult,
+                &serde_json::json!({"actual_child":true}),
+            )
+            .unwrap();
+        child
+            .complete(serde_json::json!({"child_effect":17}))
+            .unwrap();
+        parent
+            .complete(serde_json::json!({"parent_effect":true}))
+            .unwrap();
+        replay.finish().unwrap()
+    }
+
+    #[rstest]
+    fn native_historical_continuation_actual_child_writer_preserves_fresh_source_and_reader_cut() {
+        let (original, _original_writer) = original_continuation_source();
+        let (trace, _writer, backend, source, _) = actual_child_journal(original.source());
+        let child_install = cut(&trace);
+        let receipt = replay_original_continuation_root(&original);
+        let prepared = trace
+            .prepare_historical_continuation(&original, &[receipt])
+            .unwrap();
+        assert_eq!(prepared.completed_dispatch(), Some((2, 2)));
+        let audit = prepared.commit().unwrap();
+        assert_eq!(audit.original(), original.source());
+        assert_eq!(audit.child(), &source);
+        assert_eq!(audit.last_dispatch_input(), 3);
+        let audit_row = backend
+            .scan_seq(audit.acknowledgment().sequence())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            audit_row.payload_type.as_str(),
+            NATIVE_REPLAY_CONTINUATION_PAYLOAD_TYPE
+        );
+        assert!(audit_row.headers.native_origin.is_none());
+        // A verified replay audit is not a fabricated child native Complete.
+        assert!(
+            trace
+                .checkpoint_cut(2, 2, "not-a-source-cut".into(), vec![])
+                .is_err()
+        );
+        trace
+            .begin_native(
+                3,
+                4,
+                None,
+                NativeInputSource::Lifecycle,
+                "actual-fresh",
+                serde_json::json!({"action":"fresh"}),
+                vec![],
+            )
+            .unwrap()
+            .complete(serde_json::json!({"actual_child_physical_state":"paused"}))
+            .unwrap();
+        let first = trace
+            .checkpoint_cut(3, 4, "actual-child-inventory".into(), vec![])
+            .unwrap();
+        assert!(first.prefix.sequence > child_install.prefix.sequence);
+        trace.persist_checkpoint(&first, Value::Null).unwrap();
+        trace
+            .begin_native(
+                4,
+                5,
+                None,
+                NativeInputSource::Lifecycle,
+                "actual-fresh-tail",
+                serde_json::json!({"action":"next"}),
+                vec![],
+            )
+            .unwrap()
+            .complete(serde_json::json!({"actual_child_physical_state":"paused"}))
+            .unwrap();
+        let final_cut = trace
+            .checkpoint_cut(4, 5, "actual-child-final-inventory".into(), vec![])
+            .unwrap();
+        trace.persist_checkpoint(&final_cut, Value::Null).unwrap();
+        let reader = EventStoreReader::new(backend);
+        let child_verified = reader
+            .verify_native_tail(&source, &first, reader.high_watermark().unwrap())
+            .unwrap();
+        assert_eq!(child_verified.roots().len(), 1);
+        assert_eq!(child_verified.roots()[0].root_sequence(), 4);
+        assert!(child_verified.final_pending().unwrap().is_empty());
+        let repeated = replay_original_continuation_root(&original);
+        assert!(
+            trace
+                .prepare_historical_continuation(&original, &[repeated])
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    fn native_historical_continuation_refuses_missing_foreign_or_changed_child_and_latches_failure()
+    {
+        let (original, _original_writer) = original_continuation_source();
+        let (trace, _writer, _backend, _, halt) = actual_child_journal(original.source());
+        cut(&trace);
+        assert!(
+            trace
+                .prepare_historical_continuation(&original, &[])
+                .is_err()
+        );
+        let (unbound, _unbound_writer, _, _, _) = actual_journal();
+        let original_receipt = replay_original_continuation_root(&original);
+        assert!(
+            unbound
+                .prepare_historical_continuation(&original, &[original_receipt])
+                .is_err()
+        );
+        let actual = replay_original_continuation_root(&original);
+        let prepared = trace
+            .prepare_historical_continuation(&original, &[actual])
+            .unwrap();
+        // A real intervening source mutation invalidates the prepared exact cursor;
+        // no public counter/JSON or replacement source can renew the continuation.
+        trace
+            .begin_native(
+                2,
+                2,
+                None,
+                NativeInputSource::Lifecycle,
+                "intervening",
+                serde_json::json!({"action":"changed"}),
+                vec![],
+            )
+            .unwrap()
+            .complete(serde_json::json!({"actual_mutation":true}))
+            .unwrap();
+        assert!(prepared.commit().is_err());
+        assert!(halt.is_halted());
+        assert!(trace.source().is_err());
+    }
+
+    #[rstest]
+    #[case(false, false)]
+    #[case(true, false)]
+    #[case(false, true)]
+    fn native_historical_continuation_retained_parent_fifo_matches_original_or_rejects_substitution(
+        #[case] substitute_payload: bool,
+        #[case] substitute_inventory: bool,
+    ) {
+        use nautilus_common::{
+            live::ingress::IngressGate,
+            messages::DataEvent,
+            recovery_trace::{NativePendingInput, set_native_ingress_encoder},
+        };
+        use nautilus_model::instruments::{InstrumentAny, stubs::xbtusd_bitmex};
+
+        fn encode(input: &DataEvent) -> Value {
+            match input {
+                DataEvent::Instrument(instrument) => {
+                    serde_json::json!({"instrument": instrument})
+                }
+                _ => panic!("unsupported actual native input"),
+            }
+        }
+        set_native_ingress_encoder(|source, input| {
+            ensure!(
+                source == NativeInputSource::DataEvent,
+                "actual channel differs"
+            );
+            Ok(encode(
+                input
+                    .downcast_ref::<DataEvent>()
+                    .context("actual DataEvent absent")?,
+            ))
+        });
+        let gate = IngressGate::new();
+        let (sender, mut receiver) = gate.native_channel(NativeInputSource::DataEvent);
+        let (original_recorder, original_writer, original_backend, original_source, _) =
+            actual_journal();
+        let original_cut = cut(&original_recorder);
+        original_recorder
+            .persist_checkpoint(&original_cut, Value::Null)
+            .unwrap();
+        let original_root = original_recorder
+            .begin_native(
+                2,
+                2,
+                None,
+                NativeInputSource::Maintenance,
+                "running",
+                serde_json::json!({"actual_parent":true}),
+                vec![],
+            )
+            .unwrap();
+        // The ordinary owned channel generates both admission and original parent cause.
+        sender
+            .send(DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
+                xbtusd_bitmex(),
+            )))
+            .unwrap();
+        original_root
+            .complete(serde_json::json!({"queued_instrument":true}))
+            .unwrap();
+        let (message, original_receipt) = receiver.try_recv().unwrap().into_parts();
+        let retained = NativePendingInput {
+            receipt: original_receipt.clone(),
+            payload: encode(&message),
+            callback_binding: None,
+            timer_event: None,
+        };
+        let frozen = gate.freeze().unwrap();
+        let mut final_cut = original_recorder
+            .checkpoint_cut(
+                2,
+                2,
+                "actual-retained-inventory".into(),
+                vec![original_receipt.clone()],
+            )
+            .unwrap();
+        final_cut.pending_inputs = vec![retained.clone()];
+        original_recorder
+            .persist_checkpoint(&final_cut, Value::Null)
+            .unwrap();
+        frozen.finish().unwrap();
+        let original = EventStoreReader::new(original_backend)
+            .verify_native_tail(
+                &original_source,
+                &original_cut,
+                original_writer.high_watermark(),
+            )
+            .unwrap();
+        assert_eq!(
+            original.final_pending().unwrap(),
+            std::slice::from_ref(&retained)
+        );
+        let replay = NativeHistoricalRootReplay::new(&original.roots()[0]);
+        let replay_scope = replay
+            .begin(
+                NativeInputSource::Maintenance,
+                &serde_json::json!({"actual_parent":true}),
+            )
+            .unwrap();
+        // Consumes the exact original queued output without physically sending it again.
+        sender
+            .send(DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
+                xbtusd_bitmex(),
+            )))
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
+        replay_scope
+            .complete(serde_json::json!({"queued_instrument":true}))
+            .unwrap();
+        let receipt = replay.finish().unwrap();
+        let (child, child_writer, child_backend, child_source, _) =
+            actual_child_journal(&original_source);
+        cut(&child);
+        child
+            .prepare_historical_continuation(&original, &[receipt])
+            .unwrap()
+            .commit()
+            .unwrap();
+        child
+            .begin_native(
+                3,
+                3,
+                None,
+                NativeInputSource::Lifecycle,
+                "fresh",
+                serde_json::json!({"action":"fresh"}),
+                vec![],
+            )
+            .unwrap()
+            .complete(serde_json::json!({"physical":"paused"}))
+            .unwrap();
+        let mut child_cut = child
+            .checkpoint_cut(
+                3,
+                3,
+                "same-retained-child-inventory".into(),
+                vec![original_receipt.clone()],
+            )
+            .unwrap();
+        child_cut.pending_inputs = vec![retained.clone()];
+        if substitute_inventory {
+            child_cut.pending_inputs[0].payload["instrument"]["id"] =
+                Value::String("foreign-inventory-input".into());
+        }
+        child.persist_checkpoint(&child_cut, Value::Null).unwrap();
+        scope::enable_ingress_receipts().unwrap();
+        scope::received_ingress(Some(original_receipt.clone()));
+        let mut consumed_payload = encode(&message);
+        if substitute_payload {
+            consumed_payload["instrument"]["id"] = Value::String("foreign-original-input".into());
+        }
+        child
+            .begin_native(
+                4,
+                4,
+                None,
+                NativeInputSource::DataEvent,
+                "fresh",
+                consumed_payload,
+                vec![],
+            )
+            .unwrap()
+            .complete(serde_json::json!({"physical":"paused","retained_processed":true}))
+            .unwrap();
+        let child_final_cut = child
+            .checkpoint_cut(4, 4, "child-after-actual-dequeue".into(), vec![])
+            .unwrap();
+        child
+            .persist_checkpoint(&child_final_cut, Value::Null)
+            .unwrap();
+        let verified = EventStoreReader::new(child_backend).verify_native_tail(
+            &child_source,
+            &child_cut,
+            child_writer.high_watermark(),
+        );
+        if substitute_payload || substitute_inventory {
+            let error = verified.unwrap_err();
+            assert!(error.to_string().contains(if substitute_inventory {
+                "retained inventory was lost or substituted"
+            } else {
+                "retained input was substituted"
+            }));
+        } else {
+            let verified = verified.unwrap();
+            assert!(verified.final_pending().unwrap().is_empty());
+            let NativeTraceRecord::Begin { receipt, .. } = &verified.roots()[0].inputs()[0] else {
+                panic!("original retained Begin absent");
+            };
+            assert_eq!(receipt.ingress.as_ref(), Some(&original_receipt));
+            assert_eq!(
+                receipt
+                    .ingress
+                    .as_ref()
+                    .unwrap()
+                    .caused_by
+                    .as_ref()
+                    .unwrap()
+                    .journal_run,
+                original_source.journal_run
+            );
+        }
     }
 }

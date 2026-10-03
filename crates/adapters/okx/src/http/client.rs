@@ -1218,6 +1218,20 @@ impl OKXRawHttpClient {
         body: Option<Vec<u8>>,
         authenticate: bool,
     ) -> Result<Vec<T>, OKXHttpError> {
+        self.send_request_capture(method, path, params, body, authenticate, false)
+            .await
+            .map(|(data, _)| data)
+    }
+
+    async fn send_request_capture<T: DeserializeOwned, P: Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        params: Option<&P>,
+        body: Option<Vec<u8>>,
+        authenticate: bool,
+        capture_source: bool,
+    ) -> Result<(Vec<T>, Option<crate::protection::ProtectionHttpSource>), OKXHttpError> {
         let _checkpoint_request = self
             .checkpoint_gate
             .enter_request()
@@ -1256,8 +1270,14 @@ impl OKXRawHttpClient {
             let full_path = full_path.clone();
 
             async move {
+                let request_ns = if authenticate || capture_source {
+                    self.clock.get_time_ns()
+                } else {
+                    UnixNanos::default()
+                };
+                let original_body = body.clone();
                 let mut headers = if authenticate {
-                    let now = self.clock.get_time_ns().to_datetime_utc();
+                    let now = request_ns.to_datetime_utc();
                     self.sign_request(&method, &full_path, body.as_deref(), now)?
                 } else {
                     HashMap::new()
@@ -1282,7 +1302,8 @@ impl OKXRawHttpClient {
                     .await?;
 
                 log::trace!("Response: {resp:?}");
-                let now = self.clock.get_time_ns().to_datetime_utc();
+                let received_ns = self.clock.get_time_ns();
+                let now = received_ns.to_datetime_utc();
                 let retry_after = retry_after(&resp.headers, now);
 
                 if resp.status.is_success() {
@@ -1292,7 +1313,8 @@ impl OKXRawHttpClient {
                             e
                         })?;
 
-                    if okx_response.code != OKX_SUCCESS_CODE
+                    if !capture_source
+                        && okx_response.code != OKX_SUCCESS_CODE
                         && !(accepts_partial_success
                             && okx_response.code == OKX_PARTIAL_SUCCESS_CODE)
                     {
@@ -1305,7 +1327,31 @@ impl OKXRawHttpClient {
                         ));
                     }
 
-                    Ok(okx_response.data)
+                    let source = if capture_source {
+                        Some(crate::protection::ProtectionHttpSource {
+                            method: method.to_string(),
+                            path: full_path,
+                            request_body_json: String::from_utf8(original_body.unwrap_or_default())
+                                .map_err(|_| {
+                                    OKXHttpError::ValidationError(
+                                        "protective request is not UTF-8".into(),
+                                    )
+                                })?,
+                            response_body_json: String::from_utf8(resp.body.to_vec()).map_err(
+                                |_| {
+                                    OKXHttpError::ValidationError(
+                                        "protective response is not UTF-8".into(),
+                                    )
+                                },
+                            )?,
+                            status: resp.status.as_u16(),
+                            request_ns: request_ns.as_u64(),
+                            received_ns: received_ns.as_u64(),
+                        })
+                    } else {
+                        None
+                    };
+                    Ok((okx_response.data, source))
                 } else {
                     let status = StatusCode::from_u16(resp.status.as_u16())
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -6422,6 +6468,37 @@ impl OKXHttpClient {
         Ok(item)
     }
 
+    /// Retains the actual HTTP body; item/top-level failures remain source facts.
+    pub async fn place_algo_order_with_source(
+        &self,
+        request: OKXPlaceAlgoOrderRequest,
+    ) -> Result<
+        (
+            Vec<OKXPlaceAlgoOrderResponse>,
+            crate::protection::ProtectionHttpSource,
+        ),
+        OKXHttpError,
+    > {
+        let body = serde_json::to_vec(&request)?;
+        let (items, source) = self
+            .inner
+            .send_request_capture::<_, ()>(
+                Method::POST,
+                "/api/v5/trade/order-algo",
+                None,
+                Some(body),
+                true,
+                true,
+            )
+            .await?;
+        Ok((
+            items,
+            source.ok_or_else(|| {
+                OKXHttpError::ValidationError("missing original HTTP source".into())
+            })?,
+        ))
+    }
+
     /// Cancels an algo order via HTTP.
     ///
     /// # Errors
@@ -6473,6 +6550,37 @@ impl OKXHttpClient {
     ///
     /// # References
     ///
+    /// Returns the original signed body and received response, without declaring terminal state.
+    pub async fn cancel_algo_orders_with_source(
+        &self,
+        request: Vec<OKXCancelAlgoOrderRequest>,
+    ) -> Result<
+        (
+            Vec<OKXCancelAlgoOrderResponse>,
+            crate::protection::ProtectionHttpSource,
+        ),
+        OKXHttpError,
+    > {
+        let body = serde_json::to_vec(&request)?;
+        let (items, source) = self
+            .inner
+            .send_request_capture::<_, ()>(
+                Method::POST,
+                "/api/v5/trade/cancel-algos",
+                None,
+                Some(body),
+                true,
+                true,
+            )
+            .await?;
+        Ok((
+            items,
+            source.ok_or_else(|| {
+                OKXHttpError::ValidationError("missing original HTTP source".into())
+            })?,
+        ))
+    }
+
     /// <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-post-cancel-algo-order>
     pub async fn cancel_algo_orders(
         &self,
@@ -6566,6 +6674,37 @@ impl OKXHttpClient {
     ///
     /// # References
     ///
+    /// Returns the original signed body and received response, without declaring terminal state.
+    pub async fn amend_algo_order_with_source(
+        &self,
+        request: OKXAmendAlgoOrderRequest,
+    ) -> Result<
+        (
+            Vec<OKXAmendAlgoOrderResponse>,
+            crate::protection::ProtectionHttpSource,
+        ),
+        OKXHttpError,
+    > {
+        let body = serde_json::to_vec(&request)?;
+        let (items, source) = self
+            .inner
+            .send_request_capture::<_, ()>(
+                Method::POST,
+                "/api/v5/trade/amend-algos",
+                None,
+                Some(body),
+                true,
+                true,
+            )
+            .await?;
+        Ok((
+            items,
+            source.ok_or_else(|| {
+                OKXHttpError::ValidationError("missing original HTTP source".into())
+            })?,
+        ))
+    }
+
     /// <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-post-amend-algo-order>
     pub async fn amend_algo_order(
         &self,
@@ -6967,6 +7106,45 @@ impl OKXHttpClient {
         callback_spread: Option<String>,
         activation_price: Option<Price>,
     ) -> Result<OKXPlaceAlgoOrderResponse, OKXHttpError> {
+        let request = self
+            .build_algo_order_request(
+                instrument_id,
+                td_mode,
+                client_order_id,
+                order_side,
+                order_type,
+                quantity,
+                trigger_price,
+                trigger_type,
+                limit_price,
+                reduce_only,
+                close_fraction,
+                callback_ratio,
+                callback_spread,
+                activation_price,
+            )
+            .await?;
+        self.place_algo_order(request).await
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn build_algo_order_request(
+        &self,
+        instrument_id: InstrumentId,
+        td_mode: OKXTradeMode,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        trigger_price: Option<Price>,
+        trigger_type: Option<TriggerType>,
+        limit_price: Option<Price>,
+        reduce_only: Option<bool>,
+        close_fraction: Option<String>,
+        callback_ratio: Option<String>,
+        callback_spread: Option<String>,
+        activation_price: Option<Price>,
+    ) -> Result<OKXPlaceAlgoOrderRequest, OKXHttpError> {
         if !matches!(order_side, OrderSide::Buy | OrderSide::Sell) {
             return Err(OKXHttpError::ValidationError(
                 "Invalid order side".to_string(),
@@ -7136,7 +7314,54 @@ impl OKXHttpClient {
             active_px: activation_price.map(|p| p.to_string()),
         };
 
-        self.place_algo_order(request).await
+        Ok(request)
+    }
+
+    /// Uses the same signed body as the ordinary conditional producer, retaining
+    /// the complete received body even for an explicit venue rejection.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn place_algo_order_with_domain_types_and_source(
+        &self,
+        instrument_id: InstrumentId,
+        td_mode: OKXTradeMode,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        trigger_price: Option<Price>,
+        trigger_type: Option<TriggerType>,
+        limit_price: Option<Price>,
+        reduce_only: Option<bool>,
+        close_fraction: Option<String>,
+        callback_ratio: Option<String>,
+        callback_spread: Option<String>,
+        activation_price: Option<Price>,
+    ) -> Result<
+        (
+            Vec<OKXPlaceAlgoOrderResponse>,
+            crate::protection::ProtectionHttpSource,
+        ),
+        OKXHttpError,
+    > {
+        let request = self
+            .build_algo_order_request(
+                instrument_id,
+                td_mode,
+                client_order_id,
+                order_side,
+                order_type,
+                quantity,
+                trigger_price,
+                trigger_type,
+                limit_price,
+                reduce_only,
+                close_fraction,
+                callback_ratio,
+                callback_spread,
+                activation_price,
+            )
+            .await?;
+        self.place_algo_order_with_source(request).await
     }
 
     /// Cancels an algo order using domain types.

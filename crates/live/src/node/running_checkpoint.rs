@@ -318,6 +318,300 @@ mod tests {
         assert!(!node.kernel.exec_engine.borrow().submissions_fenced());
     }
 
+    #[derive(Debug)]
+    struct CrossChannelHeartbeatActor {
+        core: nautilus_common::actor::DataActorCore,
+        emitted: bool,
+        ticks: Rc<Cell<usize>>,
+        heartbeats: Rc<Cell<usize>>,
+        commands: Rc<std::cell::RefCell<Vec<String>>>,
+    }
+    impl nautilus_common::actor::DataActor for CrossChannelHeartbeatActor {
+        fn on_start(&mut self) -> Result<()> {
+            use nautilus_common::{
+                actor::registry::get_actor_unchecked,
+                messages::execution::TradingCommand,
+                msgbus::{self, TypedIntoHandler},
+            };
+            let owner = self.actor_id().inner();
+            msgbus::register_trading_command_endpoint(
+                "checkpoint.fairness.execute".into(),
+                TypedIntoHandler::from_with_id(
+                    "CHECKPOINT-CROSS-CHANNEL",
+                    move |command: TradingCommand| {
+                        let actor = get_actor_unchecked::<Self>(&owner);
+                        let TradingCommand::CancelOrder(command) = command else {
+                            panic!("original cancel command changed");
+                        };
+                        actor
+                            .commands
+                            .borrow_mut()
+                            .push(command.client_order_id.to_string());
+                    },
+                ),
+            );
+            self.clock().set_timer(
+                "CHECKPOINT-FAST-EXIT",
+                Duration::from_millis(100),
+                None,
+                None,
+                None,
+                Some(false),
+                Some(false),
+            )?;
+            self.clock().set_timer(
+                "CHECKPOINT-GUARDIAN-HEARTBEAT",
+                Duration::from_secs(1),
+                None,
+                None,
+                None,
+                Some(false),
+                Some(false),
+            )?;
+            Ok(())
+        }
+        fn on_time_event(&mut self, event: &nautilus_common::timer::TimeEvent) -> Result<()> {
+            use nautilus_common::{
+                messages::execution::{CancelOrder, TradingCommand},
+                runner::{TradingCommandMessage, get_trading_cmd_sender},
+            };
+            match event.name.as_str() {
+                "CHECKPOINT-FAST-EXIT" => {
+                    self.ticks.set(self.ticks.get() + 1);
+                    if !self.emitted {
+                        self.emitted = true;
+                        for ordinal in 1..=4 {
+                            let command = CancelOrder::new(
+                                "CHECKPOINT-CHANNELS".into(),
+                                None,
+                                "FAIRNESS-001".into(),
+                                "ETHUSDT.BINANCE".into(),
+                                format!("O-FAIRNESS-{ordinal}").as_str().into(),
+                                None,
+                                nautilus_common::recovery_trace::native_event_uuid(),
+                                self.clock().timestamp_ns(),
+                                None,
+                                None,
+                            );
+                            get_trading_cmd_sender().execute(TradingCommandMessage::new(
+                                "checkpoint.fairness.execute".into(),
+                                TradingCommand::CancelOrder(command),
+                            ));
+                        }
+                    }
+                }
+                "CHECKPOINT-GUARDIAN-HEARTBEAT" => {
+                    self.heartbeats.set(self.heartbeats.get() + 1);
+                }
+                _ => anyhow::bail!("original registered timer changed"),
+            }
+            Ok(())
+        }
+    }
+    nautilus_common::nautilus_actor!(CrossChannelHeartbeatActor);
+
+    #[derive(Debug)]
+    struct ActualExecutionCommandQueueCodec;
+    impl crate::runner_recovery::RunnerRecoveryCodec for ActualExecutionCommandQueueCodec {
+        fn channel(&self) -> crate::runner_recovery::RunnerRecoveryChannel {
+            crate::runner_recovery::RunnerRecoveryChannel::ExecutionCommand
+        }
+        fn codec_id(&self) -> &str {
+            "actual-fairness-command-capture.v1"
+        }
+        fn encode(
+            &self,
+            event: crate::runner_recovery::RunnerRecoveryEventRef<'_>,
+        ) -> Result<serde_json::Value> {
+            let crate::runner_recovery::RunnerRecoveryEventRef::ExecutionCommand(message) = event
+            else {
+                anyhow::bail!("expected original command message");
+            };
+            Ok(
+                serde_json::json!({"endpoint":message.endpoint().as_ref(),"command":message.command()}),
+            )
+        }
+        fn decode(
+            &self,
+            _: &crate::runner_recovery::RunnerRecoveryEnvelope,
+        ) -> Result<crate::runner_recovery::RunnerRecoveryEvent> {
+            anyhow::bail!("actual source fairness codec is capture-only")
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn checkpoint_fast_timer_backlog_preserves_exec_fifo_and_registered_heartbeat() {
+        use crate::dispatch::{DispatchRecord, DispatchSource};
+        use nautilus_common::{
+            actor::{DataActorConfig, DataActorCore},
+            messages::execution::TradingCommand,
+            runner::TradingCommandMessage,
+        };
+        let trace = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let retained = Rc::new(Cell::new(false));
+        let ticks = Rc::new(Cell::new(0));
+        let heartbeats = Rc::new(Cell::new(0));
+        let commands = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut node = LiveNode::builder("CHECKPOINT-CHANNELS".into(), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .with_delay_post_stop_secs(0)
+            .with_delay_shutdown_secs(1)
+            .with_event_store({
+                let trace = trace.clone();
+                let retained = retained.clone();
+                move |_, _| Ok(Box::new(TerminalStore { trace, retained }))
+            })
+            .build()
+            .unwrap();
+        let handle = node.handle();
+        node.add_actor(CrossChannelHeartbeatActor {
+            core: DataActorCore::new(DataActorConfig {
+                actor_id: Some("CHECKPOINT-CROSS-CHANNEL".into()),
+                ..Default::default()
+            }),
+            emitted: false,
+            ticks: ticks.clone(),
+            heartbeats: heartbeats.clone(),
+            commands: commands.clone(),
+        })
+        .unwrap();
+        let dispatches = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let original = dispatches.clone();
+        let source_handle = handle.clone();
+        node.set_dispatch_observer(NodeDispatchObserver::new(
+            DispatchObserver::new("cross-channel-checkpoint".into(),move|record|{
+                if let DispatchRecord::Begin{root_sequence,parent_input_sequence:None,input,..}=record
+                    && source_handle.state()==NodeState::Running && !source_handle.should_stop()
+                    && matches!(input.source,DispatchSource::Time|DispatchSource::ExecutionCommand|DispatchSource::Maintenance) {
+                    original.borrow_mut().push((*root_sequence,input.source,input.payload.clone()));
+                }
+                Ok(())
+            }).unwrap(),
+            |source,phase,input| {
+                let payload=if let Some(native)=input.downcast_ref::<super::super::NativeMutationInput>() { native.canonical_payload()? }
+                    else if let Some(message)=input.downcast_ref::<nautilus_common::runner::TimeEventMessage>() {
+                        let event=message.event(); serde_json::json!({"name":event.name.to_string(),"event_id":event.event_id,"ts_event":event.ts_event,"ts_init":event.ts_init,"callback":message.native_input_callback_binding()})
+                    } else if let Some(message)=input.downcast_ref::<TradingCommandMessage>() {
+                        let TradingCommand::CancelOrder(command)=message.command() else {anyhow::bail!("original command variant changed");};
+                        serde_json::json!({"endpoint":message.endpoint().as_ref(),"command":message.command(),"client_order_id":command.client_order_id})
+                    } else {anyhow::bail!("uncovered cross-channel input");};
+                Ok(DispatchInput{source,phase:phase.into(),payload,batch_index:None})
+            },
+        )).unwrap();
+        let mut registry = RunnerRecoveryCodecRegistry::new([
+            crate::runner_recovery::RunnerRecoveryChannel::TimeEvent,
+            crate::runner_recovery::RunnerRecoveryChannel::ExecutionCommand,
+        ]);
+        registry
+            .register_owner_bound_timer_codec(ActualHeartbeatQueueCodec)
+            .unwrap();
+        registry.register(ActualExecutionCommandQueueCodec).unwrap();
+        let captures = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let persisted = captures.clone();
+        let failure = retained.clone();
+        let completed_commands = commands.clone();
+        let completed_heartbeats = heartbeats.clone();
+        let stop_cut_persisted = Rc::new(Cell::new(false));
+        let completed_cut = stop_cut_persisted.clone();
+        node.set_running_checkpoint_handler(
+            Rc::new(registry.seal().unwrap()),
+            RunningCheckpointSchedule::EveryCompletedRoot,
+            |boundary| {
+                boundary.verify()?;
+                Ok((
+                    boundary.completion_proof().root_sequence(),
+                    boundary.inventory().is_terminal_cut(),
+                ))
+            },
+            move |cut| {
+                std::thread::sleep(Duration::from_millis(130));
+                persisted.borrow_mut().push(cut);
+                // Request Stop only after this actual root has its durable cut.
+                // A callback-requested Stop intentionally bypasses a nonterminal cut.
+                if !cut.1
+                    && completed_heartbeats.get() > 0
+                    && completed_commands.borrow().len() == 4
+                {
+                    completed_cut.set(true);
+                }
+                Ok(())
+            },
+            move |_| failure.set(true),
+        )
+        .unwrap();
+        let stop_after_persistence = async {
+            while !stop_cut_persisted.get() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            // This future is polled only after the synchronous capture releases its guards.
+            handle.stop();
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut running = std::pin::pin!(node.run_with_mode(NodeRunMode::Hosted));
+            let mut stopped = std::pin::pin!(stop_after_persistence);
+            tokio::select! {
+                result = &mut running => result,
+                () = &mut stopped => running.await,
+            }
+        })
+        .await
+        .expect("real timer/command/heartbeat source did not progress")
+        .unwrap();
+        assert!(
+            ticks.get() > 1,
+            "source did not produce a real timer backlog"
+        );
+        assert!(
+            heartbeats.get() > 0,
+            "registered one-second heartbeat was starved"
+        );
+        assert_eq!(
+            commands.borrow().as_slice(),
+            [
+                "O-FAIRNESS-1",
+                "O-FAIRNESS-2",
+                "O-FAIRNESS-3",
+                "O-FAIRNESS-4"
+            ]
+        );
+        let dispatches = dispatches.borrow();
+        let first_command = dispatches
+            .iter()
+            .position(|(_, source, _)| *source == DispatchSource::ExecutionCommand)
+            .expect("actual command dequeue absent");
+        assert!(
+            dispatches[..first_command]
+                .iter()
+                .any(|(_, source, _)| *source == DispatchSource::Time)
+        );
+        assert!(
+            dispatches[first_command + 1..]
+                .iter()
+                .any(|(_, source, _)| *source == DispatchSource::Time)
+        );
+        let observed_commands = dispatches
+            .iter()
+            .filter(|(_, source, _)| *source == DispatchSource::ExecutionCommand)
+            .map(|(_, _, value)| value["client_order_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(observed_commands, *commands.borrow());
+        let captures = captures.borrow();
+        for (root, _, _) in dispatches.iter() {
+            assert!(
+                captures
+                    .iter()
+                    .any(|(captured, terminal)| captured == root && !terminal),
+                "original root {root} lost its real synchronous checkpoint"
+            );
+        }
+        assert!(captures.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(captures.last().is_some_and(|(_, terminal)| *terminal));
+        assert!(!retained.get());
+        assert!(!node.kernel.exec_engine.borrow().submissions_fenced());
+        assert!(trace.borrow().contains(&"seal"));
+    }
+
     #[rstest]
     #[case::actual_response(false, false, false, false)]
     #[case::deadline_without_another_input(true, false, false, false)]
