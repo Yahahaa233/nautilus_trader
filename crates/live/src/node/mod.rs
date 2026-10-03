@@ -1843,18 +1843,6 @@ impl LiveNode {
         }
     }
 
-    fn process_system_events(&self, events: Vec<SystemEvent>) {
-        for event in events {
-            self.process_system_event(event);
-        }
-    }
-
-    fn process_system_commands(&self, commands: Vec<SystemCommand>) {
-        for command in commands {
-            self.process_system_command(command);
-        }
-    }
-
     #[allow(clippy::unused_unit)]
     fn process_system_command(&self, command: SystemCommand) {
         let guard = begin_node_dispatch!(self, SystemCommand, &command, ());
