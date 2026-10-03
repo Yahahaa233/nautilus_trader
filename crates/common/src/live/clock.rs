@@ -114,11 +114,130 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
         // lease count. Only this known change becomes the next retained state.
         *self.restored.try_borrow_mut()? =
             running_timer_inventory(&self.inspectors, self.clock_id)?;
-        Ok(if cleanup {
+        Ok((if cleanup {
             crate::runner::TimeEventMessage::cleanup(event, lease)
         } else {
             crate::runner::TimeEventMessage::registered(event, lease)
         })
+        .with_native_source_callback_binding(source_binding_id))
+    }
+    fn admit_historical_messages(
+        &self,
+        desired: &serde_json::Value,
+        inputs: &[(crate::timer::TimeEvent, u64, bool)],
+    ) -> anyhow::Result<Vec<crate::runner::TimeEventMessage>> {
+        self.verify()?;
+        let actual = self.historical_inventory()?;
+        let rows = desired["timers"]
+            .as_array()
+            .context("source timer inventory absent")?;
+        let mut counts = BTreeMap::<u64, u64>::new();
+        let mut events = std::collections::HashSet::new();
+        // Validate every original input before acquiring any lease or moving a
+        // schedule. UUIDs, owner binding, nominal deadline and cleanup kind are
+        // the source facts; target wall time never supplies a missing input.
+        for (event, binding, cleanup) in inputs {
+            anyhow::ensure!(
+                events.insert(event.event_id),
+                "duplicate original timer admission"
+            );
+            let (name, interval, _, _) = self
+                .tokens
+                .get(binding)
+                .context("historical queued callback binding changed")?;
+            let row = rows
+                .iter()
+                .find(|row| row["binding"]["binding_id"].as_u64() == Some(*binding))
+                .context("original queued callback has no owner schedule")?;
+            let next = row["next_time_ns"]
+                .as_u64()
+                .context("original timer frontier absent")?;
+            anyhow::ensure!(
+                event.name.as_str() == name
+                    && event.ts_event.as_u64() <= next
+                    && (next - event.ts_event.as_u64()) % interval == 0,
+                "original queued timer headers or schedule changed"
+            );
+            anyhow::ensure!(
+                !cleanup,
+                "historical terminal cleanup admission unsupported"
+            );
+            *counts.entry(*binding).or_default() += 1;
+        }
+        let mut before_admission = desired.clone();
+        let closed = 1u64 << 63;
+        let mut closing = Vec::new();
+        for row in before_admission["timers"]
+            .as_array_mut()
+            .context("source schedules absent")?
+        {
+            let id = row["binding"]["binding_id"]
+                .as_u64()
+                .context("source timer binding absent")?;
+            let current = actual["timers"]
+                .as_array()
+                .context("actual schedules absent")?
+                .iter()
+                .find(|row| row["binding"]["binding_id"].as_u64() == Some(id))
+                .context("original timer registration changed")?;
+            let current_state = current["binding"]["state"]
+                .as_u64()
+                .context("actual timer count absent")?;
+            let source_state = row["binding"]["state"]
+                .as_u64()
+                .context("source timer count absent")?;
+            let added = counts.remove(&id).unwrap_or(0);
+            anyhow::ensure!(
+                (current_state & !closed).checked_add(added) == Some(source_state & !closed),
+                "original timer queued lease count missing or changed"
+            );
+            anyhow::ensure!(
+                current_state & closed == 0 || (source_state & closed != 0 && added == 0),
+                "historical callback cannot acquire or revive a closed token"
+            );
+            if source_state & closed != 0 && current_state & closed == 0 {
+                anyhow::ensure!(
+                    row["status"] == "exhausted",
+                    "original callback closure has no retained terminal lease"
+                );
+                let next = row["next_time_ns"]
+                    .as_u64()
+                    .context("terminal frontier absent")?;
+                let interval = row["interval_ns"]
+                    .as_u64()
+                    .context("terminal interval absent")?;
+                let terminal = match row["stop_time_ns"].as_u64() {
+                    Some(stop) => next == stop,
+                    None => next.checked_add(interval).is_none(),
+                };
+                anyhow::ensure!(
+                    terminal,
+                    "original closed timer has an invalid terminal successor"
+                );
+                closing.push(id);
+            }
+            // Only the known incoming leases and terminal close are deferred.
+            // Existing strict advancement still validates all other bytes.
+            row["binding"]["state"] = current_state.into();
+        }
+        anyhow::ensure!(counts.is_empty(), "original timer admission owner changed");
+        self.apply_historical_inventory(&before_admission)?;
+        let messages = inputs
+            .iter()
+            .map(|(event, binding, cleanup)| {
+                self.restore_message(event.clone(), *binding, *cleanup)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for id in closing {
+            self.tokens[&id].3.close();
+        }
+        *self.restored.try_borrow_mut()? =
+            running_timer_inventory(&self.inspectors, self.clock_id)?;
+        anyhow::ensure!(
+            self.historical_inventory()? == *desired,
+            "original owner timer inventory disagrees after queued admission"
+        );
+        Ok(messages)
     }
     fn historical_inventory(&self) -> anyhow::Result<serde_json::Value> {
         self.pause.verify()?;
@@ -641,6 +760,7 @@ impl Clock for LiveClock {
             )
             .with_callback_source(callback_source)
             .with_callback_profile(spec.callback_profile)
+            .with_owner_clock_id(restored_clock_id.unwrap_or(self.native_clock_id))
             .with_checkpoint_gate(self.checkpoint_gate.clone());
             timer.start_restored(
                 UnixNanos::from(spec.next_time_ns),
@@ -842,6 +962,7 @@ impl Clock for LiveClock {
             fire_immediately,
             sender,
         )
+        .with_owner_clock_id(self.restored_clock_id.unwrap_or(self.native_clock_id))
         .with_checkpoint_gate(self.checkpoint_gate.clone())
         .with_callback_source(callback_source)
         .with_callback_profile(callback_profile);
@@ -914,6 +1035,7 @@ impl Clock for LiveClock {
             fire_immediately,
             sender,
         )
+        .with_owner_clock_id(self.restored_clock_id.unwrap_or(self.native_clock_id))
         .with_checkpoint_gate(self.checkpoint_gate.clone())
         .with_callback_source(callback_source)
         .with_callback_profile(callback_profile);
@@ -1276,6 +1398,11 @@ mod tests {
                 .unwrap(),
             source_binding
         );
+        assert_eq!(
+            pending.native_input_callback_binding(),
+            source_message.checkpoint_callback_binding(),
+            "canonical source identity must not change the actual callback lease"
+        );
         restored_tx.send(pending).unwrap();
         let expected_next = if advance_history {
             let mut advanced = receipt.historical_inventory().unwrap();
@@ -1298,6 +1425,159 @@ mod tests {
         assert_eq!(count.get(), 2);
         restored.cancel_timers();
         drop(source_message);
+    }
+
+    #[rstest]
+    #[case("valid")]
+    #[case("missing_lease")]
+    #[case("changed_binding")]
+    #[case("changed_event")]
+    #[case("active_closed")]
+    #[case("wrong_successor")]
+    fn actual_checkpoint_terminal_timer_admits_original_closed_queued_lease(#[case] fault: &str) {
+        let (source_tx, source_rx) = mpsc::channel();
+        let mut source = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(source_tx))));
+        source.register_default_handler(TimeEventCallback::RustLocal(std::rc::Rc::new(|_| {})));
+        let due = source.timestamp_ns() + DurationNanos::from_millis(20);
+        source
+            .set_time_alert_ns("terminal-owner", due, None, Some(false))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let original = source_rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap();
+        // Send makes the message visible before the real producer drops its
+        // active admission lease. Freeze correctly refuses only that transient
+        // gate state; wait for actual quiescence inside the same original budget.
+        let frozen = loop {
+            match source.freeze_running_timer_checkpoint() {
+                Ok(frozen) => break frozen,
+                Err(error)
+                    if error.to_string() == "adapter requests or callbacks remain in flight" =>
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "actual terminal timer producer did not become quiescent: {error:#}"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("actual terminal timer checkpoint failed: {error:#}"),
+            }
+        };
+        let source_inventory = frozen.inventory().clone();
+        let closed = 1u64 << 63;
+        assert_eq!(source_inventory["timers"][0]["status"], "exhausted");
+        assert_eq!(
+            source_inventory["timers"][0]["next_time_ns"].as_u64(),
+            Some(due.as_u64())
+        );
+        assert!(!source.timer_exists(&Ustr::from("terminal-owner")));
+        assert_eq!(
+            original.native_input_callback_binding(),
+            original.checkpoint_callback_binding()
+        );
+        assert_eq!(
+            source_inventory["timers"][0]["binding"]["state"].as_u64(),
+            Some(closed | 1)
+        );
+        frozen.finish().unwrap();
+
+        let (target_tx, target_rx) = mpsc::channel();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let actual_calls = calls.clone();
+        let mut target = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(target_tx))));
+        target.register_default_handler(TimeEventCallback::RustLocal(std::rc::Rc::new(
+            move |_| {
+                actual_calls.set(actual_calls.get() + 1);
+            },
+        )));
+        let receipt = target
+            .restore_running_timer_checkpoint(&source_inventory)
+            .unwrap();
+        let before = receipt.historical_inventory().unwrap();
+        let binding = original.checkpoint_callback_binding()["binding_id"]
+            .as_u64()
+            .unwrap();
+        let mut desired = source_inventory.clone();
+        let mut event = original.event().clone();
+        let input_binding = if fault == "changed_binding" {
+            binding + 9999
+        } else {
+            binding
+        };
+        if fault == "missing_lease" {
+            desired["timers"][0]["binding"]["state"] = closed.into();
+        }
+        if fault == "changed_event" {
+            event.ts_event += DurationNanos::new(1);
+        }
+        if fault == "active_closed" {
+            desired["timers"][0]["status"] = "active".into();
+        }
+        if fault == "wrong_successor" {
+            desired["timers"][0]["next_time_ns"] =
+                (desired["timers"][0]["next_time_ns"].as_u64().unwrap()
+                    + desired["timers"][0]["interval_ns"].as_u64().unwrap())
+                .into();
+        }
+        let result = receipt.admit_historical_messages(&desired, &[(event, input_binding, false)]);
+        if fault != "valid" {
+            assert!(result.is_err());
+            assert_eq!(
+                receipt.historical_inventory().unwrap(),
+                before,
+                "missing or changed original leases must fail before mutation"
+            );
+            assert_eq!(calls.get(), 0);
+        } else {
+            let mut messages = result.unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(receipt.historical_inventory().unwrap(), source_inventory);
+            assert!(
+                !target.timer_exists(&Ustr::from("terminal-owner")),
+                "paused terminal schedule must expose the original expired lifecycle"
+            );
+            assert_eq!(target.next_time_ns("terminal-owner"), None);
+            let message = messages.remove(0);
+            assert_eq!(message.event(), original.event());
+            assert_eq!(
+                message.native_input_callback_binding(),
+                original.checkpoint_callback_binding()
+            );
+            assert_ne!(
+                message.checkpoint_callback_binding()["binding_id"],
+                original.checkpoint_callback_binding()["binding_id"]
+            );
+            assert!(
+                receipt
+                    .restore_message(original.event().clone(), binding, false)
+                    .is_err(),
+                "ordinary acquisition must still refuse the closed actual token"
+            );
+            assert!(
+                message.dispatch(),
+                "the existing queued lease still runs the original owner callback"
+            );
+            assert_eq!(calls.get(), 1);
+            receipt.refresh_after_historical_dispatch().unwrap();
+            let exhausted = receipt.historical_inventory().unwrap();
+            assert_eq!(
+                exhausted["timers"][0]["binding"]["state"].as_u64(),
+                Some(closed)
+            );
+            assert!(
+                receipt
+                    .restore_message(original.event().clone(), binding, false)
+                    .is_err()
+            );
+            assert!(
+                target_rx.try_recv().is_err(),
+                "no timer event may be regenerated"
+            );
+        }
+        source.cancel_timers();
+        target.cancel_timers();
+        drop(original);
     }
 
     #[rstest]

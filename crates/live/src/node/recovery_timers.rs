@@ -184,49 +184,88 @@ impl RetainedNodeTimers {
         admissions: &[(String, u64, bool, TimeEvent, u64)],
         captured_at_ns: u64,
     ) -> Result<()> {
-        let mut adjusted = before.clone();
         let mut pending = self.pending.try_borrow_mut()?;
         let mut admitted = self.historical_admitted.try_borrow_mut()?;
-        let mut incoming = Vec::new();
+        let mut incoming = BTreeMap::<String, Vec<(TimeEvent, u64, bool)>>::new();
+        let mut incoming_order = Vec::new();
+        let mut incoming_ids = HashSet::new();
         for (owner, binding, cleanup, event, accepted_at) in admissions {
             if *accepted_at > captured_at_ns || admitted.contains(&event.event_id) {
                 continue;
             }
-            if pending
+            if let Some(message) = pending
                 .iter()
-                .any(|message| message.event().event_id == event.event_id)
+                .find(|message| message.event().event_id == event.event_id)
             {
+                ensure!(
+                    message.event() == event
+                        && message.native_input_callback_binding()["binding_id"].as_u64()
+                            == Some(*binding)
+                        && (message.native_input_callback_binding()["kind"]
+                            == "registered_cleanup")
+                            == *cleanup,
+                    "retained original timer admission changed headers or binding"
+                );
                 admitted.insert(event.event_id);
                 continue;
             }
-            let timer = adjusted
-                .get_mut(owner)
-                .context("historical timer admission has unknown owner")?["timers"]
-                .as_array_mut()
-                .context("historical timer schedules absent")?
-                .iter_mut()
-                .find(|timer| timer["binding"]["binding_id"].as_u64() == Some(*binding))
-                .context("historical timer admission changed binding")?;
-            let count = timer["binding"]["state"]
-                .as_u64()
-                .context("historical timer lease count absent")?;
             ensure!(
-                count > 0 && count < (1u64 << 63),
-                "historical native callback closed or count missing"
+                incoming_ids.insert(event.event_id),
+                "duplicate original timer admission UUID"
             );
-            timer["binding"]["state"] = (count - 1).into();
-            incoming.push((owner, binding, cleanup, event));
+            incoming_order.push((event.clone(), *binding, *cleanup));
+            incoming
+                .entry(owner.clone())
+                .or_default()
+                .push((event.clone(), *binding, *cleanup));
         }
-        self.apply_historical_inventory(&adjusted)?;
-        for (owner, binding, cleanup, event) in incoming {
-            let message = self.clocks[owner]
+        ensure!(
+            incoming.keys().all(|owner| before.contains_key(owner)),
+            "historical timer admission has unknown owner"
+        );
+        let mut materialized = std::collections::HashMap::new();
+        for (owner, inventory) in before {
+            let receipt = self
+                .clocks
+                .get(owner)
+                .context("historical timer owner changed")?
                 .as_ref()
                 .context("historical timer owner resumed")?
-                .try_borrow()?
-                .restore_message(event.clone(), *binding, *cleanup)?;
-            pending.push_back(message);
-            admitted.insert(event.event_id);
+                .try_borrow()?;
+            let messages = receipt.admit_historical_messages(
+                inventory,
+                &incoming.remove(owner).unwrap_or_default(),
+            )?;
+            for message in messages {
+                ensure!(
+                    materialized
+                        .insert(message.event().event_id, message)
+                        .is_none(),
+                    "duplicate actual owner timer admission UUID"
+                );
+            }
         }
+        // Owner grouping is only a paused lease-acquisition detail. The actual
+        // retained Time channel must keep the original cross-owner input FIFO.
+        for (event, binding, cleanup) in incoming_order {
+            let message = materialized
+                .remove(&event.event_id)
+                .context("original owner timer message was not materialized")?;
+            ensure!(
+                message.event() == &event
+                    && message.native_input_callback_binding()["binding_id"].as_u64()
+                        == Some(binding)
+                    && (message.native_input_callback_binding()["kind"] == "registered_cleanup")
+                        == cleanup,
+                "actual owner timer admission changed original input headers or binding"
+            );
+            admitted.insert(event.event_id);
+            pending.push_back(message);
+        }
+        ensure!(
+            materialized.is_empty(),
+            "unarchived actual owner timer admission"
+        );
         ensure!(
             self.historical_inventory()? == *before,
             "historical native timer inventory contains an unarchived callback admission"
@@ -236,12 +275,14 @@ impl RetainedNodeTimers {
     #[cfg(feature = "native-tail-replay")]
     pub(super) fn take_historical_retained(&self, id: UUID4) -> Result<TimeEventMessage> {
         let mut pending = self.pending.try_borrow_mut()?;
-        let index = pending
-            .iter()
-            .position(|message| message.event().event_id == id)
-            .context("sealed original timer message was not actually materialized")?;
+        ensure!(
+            pending
+                .front()
+                .is_some_and(|message| message.event().event_id == id),
+            "sealed original timer input is not the next retained FIFO message"
+        );
         let message = pending
-            .remove(index)
+            .pop_front()
             .context("original retained timer disappeared")?;
         self.progress
             .0
@@ -281,7 +322,7 @@ impl RetainedNodeTimers {
             serde_json::from_value(input["event"]["ts_event"].clone())?,
             serde_json::from_value(input["event"]["ts_init"].clone())?,
         );
-        let mut before: BTreeMap<String, serde_json::Value> =
+        let before: BTreeMap<String, serde_json::Value> =
             serde_json::from_value(witness.payload["inventory"].clone())?;
         self.historical_admitted
             .try_borrow_mut()?
@@ -291,10 +332,18 @@ impl RetainedNodeTimers {
             .iter()
             .position(|message| message.event().event_id == event.event_id);
         if let Some(index) = retained {
+            ensure!(
+                index == 0,
+                "historical timer input changed original retained FIFO"
+            );
             let message = pending
                 .remove(index)
                 .context("retained source event disappeared")?;
-            ensure!(message.event() == &event, "retained timer headers changed");
+            ensure!(
+                message.event() == &event
+                    && message.native_input_callback_binding() == input["binding"],
+                "retained timer headers or original owner binding changed"
+            );
             self.apply_historical_inventory(&before)?;
             self.progress
                 .0
@@ -303,36 +352,21 @@ impl RetainedNodeTimers {
                 .remove(&event.event_id.to_string());
             return Ok(message);
         }
-        // The incoming lease is added by the actual installed callback token, not by a counter setter.
-        let timer = before
-            .get_mut(owner)
-            .context("historical timer owner not installed")?["timers"]
-            .as_array_mut()
-            .context("historical timer inventory absent")?
-            .iter_mut()
-            .find(|timer| timer["binding"]["binding_id"].as_u64() == Some(binding))
-            .context("historical timer callback not in its owner clock")?;
-        let count = timer["binding"]["state"]
-            .as_u64()
-            .context("historical timer lease count absent")?;
-        ensure!(
-            count > 0 && count < (1u64 << 63),
-            "historical timer binding closed or unleased"
-        );
-        timer["binding"]["state"] = (count - 1).into();
-        self.apply_historical_inventory(&before)?;
-        let message = self.clocks[owner]
+        // Preserve an actual queued lease even if the source producer closed
+        // after reserving its terminal fire. Closure is never undone.
+        let mut messages = self
+            .clocks
+            .get(owner)
+            .context("historical timer owner absent")?
             .as_ref()
             .context("historical timer receipt absent")?
             .try_borrow()?
-            .restore_message(event, binding, cleanup)?;
-        let original: BTreeMap<String, serde_json::Value> =
-            serde_json::from_value(witness.payload["inventory"].clone())?;
+            .admit_historical_messages(&before[owner], &[(event, binding, cleanup)])?;
         ensure!(
-            self.historical_inventory()? == original,
-            "historical timer has unknown queued callback leases"
+            messages.len() == 1,
+            "original timer admission count differs"
         );
-        Ok(message)
+        Ok(messages.remove(0))
     }
     pub(super) fn resume_observers(
         &mut self,
@@ -486,6 +520,16 @@ impl LiveNode {
                         .restore_message(event, input.source_binding_id, input.cleanup)?,
                 );
             }
+            // Keep the original global FIFO above. Only after every actual
+            // queued lease is acquired may a source terminal token close.
+            // The complete source counts reject any missing/unarchived lease.
+            for (owner, receipt) in &restored {
+                receipt
+                    .as_ref()
+                    .context("native clock receipt missing")?
+                    .try_borrow()?
+                    .admit_historical_messages(&source[owner], &[])?;
+            }
             let progress = RetainedRecoveryTimerHandoff(Rc::new(RefCell::new(TimerProgress {
                 watermark: watermark.clone(),
                 node_instance_id: self.kernel.instance_id,
@@ -545,6 +589,199 @@ impl LiveNode {
 mod tests {
     use super::*;
     use nautilus_common::timer::TimeEventCallback;
+    #[cfg(feature = "native-tail-replay")]
+    #[rstest::rstest]
+    #[case("valid")]
+    #[case("wrong_front")]
+    #[case("changed_binding")]
+    #[case("missing_lease")]
+    fn checkpoint_actual_cross_owner_timer_admission_keeps_original_fifo(#[case] fault: &str) {
+        use crate::runner_recovery::{
+            RunnerRecoveryChannel, RunnerRecoveryCodec, RunnerRecoveryEnvelope, RunnerRecoveryEvent,
+        };
+        use nautilus_common::{clock::Clock, live::clock::LiveClock, runner::TimeEventSender};
+        use nautilus_core::DurationNanos;
+        use std::{
+            sync::{Arc, mpsc},
+            time::Duration,
+        };
+
+        #[derive(Debug)]
+        struct SourceSender(mpsc::Sender<(TimeEventMessage, u64)>);
+        impl TimeEventSender for SourceSender {
+            fn send(&self, message: TimeEventMessage) {
+                let accepted = nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64;
+                self.0.send((message, accepted)).unwrap();
+            }
+        }
+        #[derive(Debug)]
+        struct ActualTimerCodec;
+        impl RunnerRecoveryCodec for ActualTimerCodec {
+            fn channel(&self) -> RunnerRecoveryChannel {
+                RunnerRecoveryChannel::TimeEvent
+            }
+            fn codec_id(&self) -> &str {
+                "actual_cross_owner_retained_timer.v1"
+            }
+            fn encode(&self, input: RunnerRecoveryEventRef<'_>) -> Result<serde_json::Value> {
+                let RunnerRecoveryEventRef::TimeEvent(message) = input else {
+                    anyhow::bail!("only actual owner timer messages supported")
+                };
+                Ok(serde_json::json!({"event":event_identity(message),
+                    "binding":message.native_input_callback_binding()}))
+            }
+            fn decode(&self, _: &RunnerRecoveryEnvelope) -> Result<RunnerRecoveryEvent> {
+                anyhow::bail!("borrowed actual owner capture is not an executable JSON callback")
+            }
+        }
+        let mut registry = RunnerRecoveryCodecRegistry::new([RunnerRecoveryChannel::TimeEvent]);
+        registry
+            .register_owner_bound_timer_codec(ActualTimerCodec)
+            .unwrap();
+        let registry = registry.seal().unwrap();
+        let (source_tx, source_rx) = mpsc::channel();
+        let mut source_clocks = Vec::new();
+        let mut source_messages = Vec::new();
+        let mut before = BTreeMap::new();
+        let mut admissions = Vec::new();
+        // Actual Source producers deliver Z then A. Sorting owner IDs would
+        // reverse this single Time channel's real FIFO.
+        for owner in ["owner-Z", "owner-A"] {
+            let mut clock = LiveClock::new(Some(Arc::new(SourceSender(source_tx.clone()))));
+            clock.register_default_handler(TimeEventCallback::RustLocal(Rc::new(|_| {})));
+            let due = clock.timestamp_ns() + DurationNanos::from_millis(20);
+            clock
+                .set_time_alert_ns(owner, due, None, Some(false))
+                .unwrap();
+            let (message, accepted) = source_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let freeze = clock.freeze_running_timer_checkpoint().unwrap();
+            before.insert(owner.to_owned(), freeze.inventory().clone());
+            freeze.finish().unwrap();
+            let binding = message.checkpoint_callback_binding()["binding_id"]
+                .as_u64()
+                .unwrap();
+            admissions.push((
+                owner.to_owned(),
+                binding,
+                false,
+                message.event().clone(),
+                accepted,
+            ));
+            source_messages.push(message);
+            source_clocks.push(clock);
+        }
+        let original_ids = source_messages
+            .iter()
+            .map(|m| m.event().event_id)
+            .collect::<Vec<_>>();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut actual_clocks = BTreeMap::new();
+        let mut receipts = BTreeMap::new();
+        let (target_tx, target_rx) = mpsc::channel();
+        for owner in ["owner-Z", "owner-A"] {
+            let mut clock = LiveClock::new(Some(Arc::new(SourceSender(target_tx.clone()))));
+            let actual_calls = calls.clone();
+            clock.register_default_handler(TimeEventCallback::RustLocal(Rc::new(move |event| {
+                actual_calls
+                    .borrow_mut()
+                    .push((owner.to_owned(), event.event_id));
+            })));
+            let receipt = clock
+                .restore_running_timer_checkpoint(&before[owner])
+                .unwrap();
+            receipts.insert(owner.to_owned(), Some(RefCell::new(receipt)));
+            let actual: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(clock));
+            actual_clocks.insert(owner.to_owned(), actual);
+        }
+        let progress = RetainedRecoveryTimerHandoff(Rc::new(RefCell::new(TimerProgress {
+            watermark: RunnerRecoveryWatermark {
+                recovery_id: "actual-cross-owner".into(),
+                checkpoint_sequence: 1,
+                dispatch_watermark: 1,
+            },
+            node_instance_id: UUID4::new(),
+            events: BTreeMap::new(),
+        })));
+        let mut timers = RetainedNodeTimers {
+            clocks: receipts,
+            actual_clocks,
+            source: before.clone(),
+            source_pending: Vec::new(),
+            pending: RefCell::new(VecDeque::new()),
+            historical_admitted: RefCell::new(HashSet::new()),
+            progress,
+        };
+        let captured = nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64;
+        if fault == "changed_binding" {
+            admissions[1].1 += 9999;
+        }
+        if fault == "missing_lease" {
+            before.get_mut("owner-A").unwrap()["timers"][0]["binding"]["state"] =
+                (1u64 << 63).into();
+        }
+        let result = timers.admit_historical_timers(&before, &admissions, captured);
+        if matches!(fault, "changed_binding" | "missing_lease") {
+            assert!(result.is_err());
+            assert!(
+                timers.pending.borrow().is_empty(),
+                "a partial owner batch cannot publish a queue prefix"
+            );
+            assert!(calls.borrow().is_empty());
+            return;
+        }
+        result.unwrap();
+        let entries = timers.pending_entries(&registry).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| e.channel_ordinal)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                entry.payload["event"],
+                event_identity(&source_messages[index])
+            );
+            assert_eq!(
+                entry.payload["binding"],
+                source_messages[index].checkpoint_callback_binding()
+            );
+        }
+        if fault == "wrong_front" {
+            assert!(timers.take_historical_retained(original_ids[1]).is_err());
+            assert_eq!(
+                timers.pending_entries(&registry).unwrap(),
+                entries,
+                "wrong original UUID cannot remove a later owner's input"
+            );
+        }
+        let (_current_tx, current_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut receiver = SnapshotReceiver::from(current_rx);
+        timers.handoff_after_start(&mut receiver).unwrap();
+        for original in &source_messages {
+            let message = receiver.try_recv().unwrap();
+            assert_eq!(message.event(), original.event());
+            assert_eq!(
+                message.native_input_callback_binding(),
+                original.checkpoint_callback_binding()
+            );
+            assert!(message.dispatch());
+        }
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                ("owner-Z".to_owned(), original_ids[0]),
+                ("owner-A".to_owned(), original_ids[1])
+            ]
+        );
+        assert!(receiver.try_recv().is_err());
+        assert!(
+            target_rx.try_recv().is_err(),
+            "source terminal messages must not regenerate"
+        );
+    }
+
     #[test]
     fn checkpoint_retained_callback_fifo_cannot_ack_a_different_actual_callback() {
         let actual_now = nautilus_core::time::get_atomic_clock_realtime().get_time_ns();

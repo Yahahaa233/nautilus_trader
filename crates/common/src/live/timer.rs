@@ -87,6 +87,7 @@ pub struct LiveTimer {
     checkpoint_gate: super::checkpoint::CheckpointGate,
     callback_source: &'static str,
     callback_profile: Option<serde_json::Value>,
+    owner_clock_id: Option<UUID4>,
     /// The name of the timer.
     pub name: Ustr,
     /// The interval between timer events in nanoseconds.
@@ -107,6 +108,13 @@ pub struct LiveTimer {
 }
 
 impl LiveTimer {
+    /// The actual registered clock supplies this identity synchronously before
+    /// start. Async tasks never infer a dispatch owner from ambient context.
+    pub(crate) fn with_owner_clock_id(mut self, clock_id: UUID4) -> Self {
+        self.owner_clock_id = Some(clock_id);
+        self
+    }
+
     pub(crate) fn with_callback_source(mut self, source: &'static str) -> Self {
         self.callback_source = source;
         self
@@ -272,6 +280,7 @@ impl LiveTimer {
             checkpoint_gate: Default::default(),
             callback_source: "named_or_explicit_unsupported",
             callback_profile: None,
+            owner_clock_id: None,
             name,
             interval_ns,
             start_time_ns,
@@ -303,6 +312,11 @@ impl LiveTimer {
     #[must_use]
     pub fn is_expired(&self) -> bool {
         self.canceled
+            || self.exhausted
+            || self
+                .task_state
+                .as_ref()
+                .is_some_and(|state| state.status.load(atomic::Ordering::SeqCst) == TASK_EXHAUSTED)
             || self
                 .task_handle
                 .as_ref()
@@ -401,7 +415,20 @@ impl LiveTimer {
 
         // Get current time
         let clock = get_atomic_clock_realtime();
-        let now_ns = clock.get_time_ns();
+        let actual_now_ns = clock.get_time_ns();
+        let now_ns = if restored_next.is_none() {
+            self.owner_clock_id.map_or(actual_now_ns, |owner| {
+                UnixNanos::from(crate::recovery_trace::native_clock_read(
+                    owner,
+                    &format!("live_timer.start:{event_name}"),
+                    actual_now_ns.as_u64(),
+                ))
+            })
+        } else {
+            // Source-cut restoration already carries a sealed exact frontier;
+            // it must not consume a creation draw or clamp that frontier to now.
+            actual_now_ns
+        };
 
         // Check if the timer's alert time is in the past and adjust if needed
         let now_raw = now_ns.as_u64();
@@ -439,110 +466,140 @@ impl LiveTimer {
             let mut timer = dst::time::interval_at(start, Duration::from(interval_ns));
 
             loop {
-                // Never fire an event scheduled past the stop time. The event's
-                // `ts_event` is the scheduled `next_time_ns`, so the bound is
-                // enforced on the scheduled time (matching `TestTimer`), not on
-                // the wall-clock read used only for `ts_init`.
-                if !should_fire_scheduled_time(next_time_ns, stop_time_ns) {
-                    let (_, _checkpoint_callback) =
-                        checkpoint_gate.callback(std::future::ready(())).await;
-                    if let (Some(sender), WorkerDispatch::Registered(token)) =
-                        (sender.as_ref(), &worker_dispatch)
-                        && let Some(lease) = token.acquire()
-                    {
-                        token.close();
-                        let now_ns = clock.get_time_ns();
-                        let event = TimeEvent::new(event_name, UUID4::new(), next_time_ns, now_ns);
-                        sender.send(TimeEventMessage::cleanup(event, lease));
-                    }
-                    break; // Timer expired before this event
-                }
-
-                // `timer.tick` is cancellation safe, if the cancel branch completes
-                // first then no tick has been consumed (no event was ready).
-                let (_, checkpoint_callback) = checkpoint_gate.callback(timer.tick()).await;
-                // A retained producer's real task schedule can advance while paused
-                // during historical replay. Consume that same schedule after the
-                // gate opens, rather than firing the old captured local deadline.
-                if task_state.status.load(atomic::Ordering::SeqCst) != TASK_ACTIVE {
-                    break;
-                }
-                let retained_next = task_state.next_time_ns.load(atomic::Ordering::SeqCst);
-                if retained_next != next_time_ns.as_u64() {
-                    next_time_ns = UnixNanos::from(retained_next);
-                    timer.reset_at(
-                        Instant::now() + timer_start_delay(next_time_ns, clock.get_time_ns()),
-                    );
-                    drop(checkpoint_callback);
-                    continue;
-                }
-                let now_ns = clock.get_time_ns();
-
-                let event = TimeEvent::new(event_name, UUID4::new(), next_time_ns, now_ns);
-
-                // An event at the inclusive stop boundary or without a representable successor
-                // is terminal.
-                let following_next_time_ns = next_time_ns.checked_add(interval_ns);
-                let expires_after_fire = expires_after_scheduled_time(next_time_ns, stop_time_ns)
-                    || following_next_time_ns.is_none();
-
-                // Reserve this fire with its following schedule or terminal exhaustion. A restart
-                // observes that outcome or retires the task before it can dispatch. Registered
-                // callbacks acquire their lease first so token closure cannot suppress a reserved
-                // event.
-                let registered_lease = if let WorkerDispatch::Registered(token) = &worker_dispatch {
-                    match task_state.reserve_registered_fire(
-                        token,
-                        following_next_time_ns.map(|time| time.as_u64()),
-                    ) {
-                        Some(lease) => Some(lease),
-                        None => break,
-                    }
-                } else {
-                    if !task_state.reserve_fire(following_next_time_ns.map(|time| time.as_u64())) {
-                        break;
-                    }
-                    None
-                };
-
-                if sender.is_some()
-                    && let Some(following_next_time_ns) = following_next_time_ns
-                {
-                    next_time_atomic
-                        .store(following_next_time_ns.as_u64(), atomic::Ordering::SeqCst);
-                }
-
-                match (&sender, &worker_dispatch) {
-                    (Some(sender), WorkerDispatch::Direct(factory)) => {
-                        sender.send(factory.message(event));
-                    }
-                    (Some(sender), WorkerDispatch::Registered(token)) => {
-                        let lease =
-                            registered_lease.expect("registered callback lease was not acquired");
-
-                        if expires_after_fire {
+                let mut publish = |cx: &mut std::task::Context<'_>| {
+                    // Never fire an event scheduled past the stop time. The event's
+                    // `ts_event` is the scheduled `next_time_ns`, so the bound is
+                    // enforced on the scheduled time (matching `TestTimer`), not on
+                    // the wall-clock read used only for `ts_init`.
+                    if !should_fire_scheduled_time(next_time_ns, stop_time_ns) {
+                        if let (Some(sender), WorkerDispatch::Registered(token)) =
+                            (sender.as_ref(), &worker_dispatch)
+                            && let Some(lease) = token.acquire()
+                        {
                             token.close();
+                            let now_ns = clock.get_time_ns();
+                            let event =
+                                TimeEvent::new(event_name, UUID4::new(), next_time_ns, now_ns);
+                            sender.send(TimeEventMessage::cleanup(event, lease));
                         }
-                        sender.send(TimeEventMessage::registered(event, lease));
+                        return std::task::Poll::Ready(false); // Timer expired before this event
                     }
-                    #[cfg(feature = "python")]
-                    (None, WorkerDispatch::SenderlessPython(callback)) => callback.call(event),
-                    _ => unreachable!("timer callback dispatch did not match its sender"),
-                }
 
-                if sender.is_none()
-                    && let Some(following_next_time_ns) = following_next_time_ns
-                {
-                    next_time_atomic
-                        .store(following_next_time_ns.as_u64(), atomic::Ordering::SeqCst);
-                }
+                    // `timer.tick` is cancellation safe, if the cancel branch completes
+                    // first then no tick has been consumed (no event was ready).
+                    if timer.poll_tick(cx).is_pending() {
+                        return std::task::Poll::Pending;
+                    }
+                    // A retained producer's real task schedule can advance while paused
+                    // during historical replay. Consume that same schedule after the
+                    // gate opens, rather than firing the old captured local deadline.
+                    if task_state.status.load(atomic::Ordering::SeqCst) != TASK_ACTIVE {
+                        return std::task::Poll::Ready(false);
+                    }
+                    let retained_next = task_state.next_time_ns.load(atomic::Ordering::SeqCst);
+                    if retained_next != next_time_ns.as_u64() {
+                        next_time_ns = UnixNanos::from(retained_next);
+                        timer.reset_at(
+                            Instant::now() + timer_start_delay(next_time_ns, clock.get_time_ns()),
+                        );
+                        return std::task::Poll::Ready(true);
+                    }
+                    let now_ns = clock.get_time_ns();
 
-                if let Some(following_next_time_ns) = following_next_time_ns {
-                    next_time_ns = following_next_time_ns;
-                }
+                    let event = TimeEvent::new(event_name, UUID4::new(), next_time_ns, now_ns);
 
-                if expires_after_fire {
-                    break; // Stop boundary reached, or no representable successor
+                    // An event at the inclusive stop boundary or without a representable successor
+                    // is terminal.
+                    let following_next_time_ns = next_time_ns.checked_add(interval_ns);
+                    let expires_after_fire =
+                        expires_after_scheduled_time(next_time_ns, stop_time_ns)
+                            || following_next_time_ns.is_none();
+                    // A terminal fire has no successor. Publish exhaustion at the
+                    // final nominal event before closing its already reserved lease,
+                    // rather than advancing an active schedule past the stop bound.
+                    let following_next_time_ns = if expires_after_fire {
+                        None
+                    } else {
+                        following_next_time_ns
+                    };
+
+                    // Reserve this fire with its following schedule or terminal exhaustion. A restart
+                    // observes that outcome or retires the task before it can dispatch. Registered
+                    // callbacks acquire their lease first so token closure cannot suppress a reserved
+                    // event.
+                    let registered_lease =
+                        if let WorkerDispatch::Registered(token) = &worker_dispatch {
+                            match task_state.reserve_registered_fire(
+                                token,
+                                following_next_time_ns.map(|time| time.as_u64()),
+                            ) {
+                                Some(lease) => Some(lease),
+                                None => return std::task::Poll::Ready(false),
+                            }
+                        } else {
+                            if !task_state
+                                .reserve_fire(following_next_time_ns.map(|time| time.as_u64()))
+                            {
+                                return std::task::Poll::Ready(false);
+                            }
+                            None
+                        };
+
+                    if sender.is_some()
+                        && let Some(following_next_time_ns) = following_next_time_ns
+                    {
+                        next_time_atomic
+                            .store(following_next_time_ns.as_u64(), atomic::Ordering::SeqCst);
+                    }
+
+                    match (&sender, &worker_dispatch) {
+                        (Some(sender), WorkerDispatch::Direct(factory)) => {
+                            sender.send(factory.message(event));
+                        }
+                        (Some(sender), WorkerDispatch::Registered(token)) => {
+                            let lease = registered_lease
+                                .expect("registered callback lease was not acquired");
+
+                            if expires_after_fire {
+                                token.close();
+                            }
+                            sender.send(TimeEventMessage::registered(event, lease));
+                        }
+                        #[cfg(feature = "python")]
+                        (None, WorkerDispatch::SenderlessPython(callback)) => callback.call(event),
+                        _ => unreachable!("timer callback dispatch did not match its sender"),
+                    }
+
+                    if sender.is_none()
+                        && let Some(following_next_time_ns) = following_next_time_ns
+                    {
+                        next_time_atomic
+                            .store(following_next_time_ns.as_u64(), atomic::Ordering::SeqCst);
+                    }
+
+                    if let Some(following_next_time_ns) = following_next_time_ns {
+                        next_time_ns = following_next_time_ns;
+                    }
+
+                    if expires_after_fire {
+                        return std::task::Poll::Ready(false); // Stop boundary reached, or no representable successor
+                    }
+                    std::task::Poll::Ready(true)
+                };
+                let keep_running = if matches!(&worker_dispatch, WorkerDispatch::Registered(_)) {
+                    checkpoint_gate
+                        .registered_timer_publication(&mut publish)
+                        .await
+                } else {
+                    // Thread-safe and senderless callbacks retain the original
+                    // active lease contract; they are not declared atomic sends.
+                    let (keep_running, _lease) = checkpoint_gate
+                        .callback(std::future::poll_fn(&mut publish))
+                        .await;
+                    keep_running
+                };
+                if !keep_running {
+                    break;
                 }
             }
         };
@@ -1139,6 +1196,68 @@ mod tests {
 
         assert!(message.dispatch());
         assert_eq!(count.get(), 1);
+    }
+
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    #[rstest]
+    fn actual_registered_timer_checkpoint_linearizes_publication_and_keeps_terminal_lease() {
+        let gate = crate::live::checkpoint::CheckpointGate::default();
+        let (tx, rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sender = Arc::new(PausingChannelSender {
+            tx,
+            release_rx: Mutex::new(release_rx),
+        });
+        let called = Rc::new(std::cell::Cell::new(0));
+        let callback_called = called.clone();
+        let now =
+            UnixNanos::from(get_atomic_clock_realtime().get_time_ns().as_u64() / 1_000 * 1_000);
+        let due = UnixNanos::from(now.as_u64() + 100_000_000);
+        let mut timer = LiveTimer::new(
+            Ustr::from("ATOMIC_TERMINAL_PUBLICATION"),
+            NonZeroU64::new(100_000_000).unwrap(),
+            now,
+            Some(due),
+            TimeEventCallback::RustLocal(Rc::new(move |_| {
+                callback_called.set(callback_called.get() + 1);
+            })),
+            false,
+            Some(sender),
+        )
+        .with_checkpoint_gate(gate.clone());
+        timer.start();
+        // This real sender has emitted the terminal registered lease but has
+        // not yet returned to complete the producer's publication section.
+        let message = rx.recv_timeout(StdDuration::from_secs(2)).unwrap();
+        let (freeze_tx, freeze_rx) = mpsc::channel();
+        let capture = std::thread::spawn(move || {
+            freeze_tx.send(gate.freeze()).unwrap();
+        });
+        let premature = freeze_rx.recv_timeout(StdDuration::from_millis(20));
+        release_tx.send(()).unwrap();
+        assert!(
+            matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)),
+            "freeze must linearize after actual publication instead of rejecting a short tick lease"
+        );
+        let frozen = freeze_rx
+            .recv_timeout(StdDuration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        capture.join().unwrap();
+        frozen.verify().unwrap();
+        let inventory = timer.checkpoint_inspector().unwrap()().unwrap();
+        assert_eq!(inventory["status"], "exhausted");
+        let closed = (1usize << (usize::BITS - 1)) as u64;
+        assert_eq!(inventory["binding"]["state"].as_u64(), Some(closed + 1));
+        assert_eq!(called.get(), 0);
+        frozen.finish().unwrap();
+        assert_eq!(message.event().ts_event, due);
+        assert!(message.dispatch());
+        assert_eq!(called.get(), 1);
+        assert_eq!(
+            timer.checkpoint_inspector().unwrap()().unwrap()["binding"]["state"].as_u64(),
+            Some(closed)
+        );
     }
 
     #[cfg(not(all(feature = "simulation", madsim)))]

@@ -583,7 +583,7 @@ impl Trader {
                 #[cfg(feature = "live")]
                 historical_prepare: Self::prepare_historical_component::<T>,
                 #[cfg(feature = "live")]
-                historical_lifecycle: Self::dispatch_historical_lifecycle::<T>,
+                historical_lifecycle: Self::dispatch_historical_strategy_lifecycle::<T>,
             },
         );
         self.strategy_handler_ids
@@ -709,6 +709,13 @@ impl Trader {
                         &component_id,
                         "strategy.handle_time_event",
                         |boundary| {
+                            if !boundary.original_callback_admitted()? {
+                                return Ok(());
+                            }
+                            route_time_event(&mut *strategy, &event);
+                            // Framework nested failure must precede any later
+                            // user callback, even though the legacy prelude is void.
+                            nautilus_common::recovery_trace::historical::pending_callback_route()?;
                             DataActor::on_native_recovery_input(&mut *strategy, boundary, &event)
                         },
                     ) {
@@ -801,7 +808,7 @@ impl Trader {
                 #[cfg(feature = "live")]
                 historical_prepare: Self::prepare_historical_component::<T>,
                 #[cfg(feature = "live")]
-                historical_lifecycle: Self::dispatch_historical_lifecycle::<T>,
+                historical_lifecycle: Self::dispatch_historical_strategy_lifecycle::<T>,
             },
         );
         self.strategy_handler_ids
@@ -2119,10 +2126,14 @@ impl Trader {
     where
         T: DataActor + DataActorNative + Debug + 'static,
     {
+        anyhow::ensure!(
+            kind == "lifecycle.stop",
+            "unsupported original actor lifecycle: {kind}"
+        );
         let mut component = try_get_actor_unchecked::<T>(&id)
             .ok_or_else(|| anyhow::anyhow!("historical lifecycle owner absent: {id}"))?;
         let input = nautilus_common::recovery_trace::NativeComponentLifecycle {
-            action: kind.into(),
+            action: "stop".into(),
             component_id: id.as_str().into(),
         };
         anyhow::ensure!(
@@ -2132,6 +2143,58 @@ impl Trader {
                 |boundary| component.on_native_recovery_input(boundary, &input)
             ),
             "historical lifecycle scope missing"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "live")]
+    fn dispatch_historical_strategy_lifecycle<T>(id: Ustr, kind: &str) -> anyhow::Result<()>
+    where
+        T: Strategy + StrategyNative + DataActorNative + Debug + 'static,
+    {
+        if kind == "lifecycle.stop" {
+            return Self::dispatch_historical_lifecycle::<T>(id, kind);
+        }
+        anyhow::ensure!(
+            kind == "lifecycle.strategy_stop",
+            "unsupported original strategy lifecycle: {kind}"
+        );
+        let mut strategy = try_get_actor_unchecked::<T>(&id)
+            .ok_or_else(|| anyhow::anyhow!("historical strategy lifecycle owner absent: {id}"))?;
+        anyhow::ensure!(
+            nautilus_common::recovery_trace::historical::dispatch_if_active(
+                id.as_str(),
+                kind,
+                |boundary| {
+                    let next =
+                        nautilus_common::recovery_trace::historical::pending_callback_route()?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("original default strategy stop profile absent")
+                            })?;
+                    anyhow::ensure!(
+                        next.component_id == id.as_str()
+                            && next.kind == "lifecycle.strategy_stop.default"
+                            && next.component_state == boundary.route().component_state,
+                        "original custom strategy stop profile unsupported"
+                    );
+                    let should_proceed = Strategy::stop(&mut *strategy);
+                    let next =
+                        nautilus_common::recovery_trace::historical::pending_callback_route()?;
+                    let next_is_stop = next.as_ref().is_some_and(|next| {
+                        next.component_id == id.as_str() && next.kind == "lifecycle.stop"
+                    });
+                    let original_active = matches!(
+                        boundary.original_component_state()?,
+                        ComponentState::Starting | ComponentState::Running
+                    );
+                    anyhow::ensure!(
+                        next_is_stop == (should_proceed && original_active),
+                        "original strategy stop disposition differs"
+                    );
+                    Ok(())
+                }
+            ),
+            "historical strategy lifecycle scope missing"
         );
         Ok(())
     }
@@ -2414,6 +2477,273 @@ mod tests {
     }
 
     nautilus_actor!(TestDataActor);
+
+    #[cfg(feature = "live")]
+    fn lifecycle_history_input(
+        instance_id: UUID4,
+    ) -> nautilus_common::recovery_trace::NativeTraceRecord {
+        use nautilus_common::recovery_trace::{
+            NativeInputSource, NativeProcessingReceipt, NativeTraceRecord, NativeTraceSource,
+        };
+        NativeTraceRecord::Begin {
+            source: NativeTraceSource {
+                schema_version: 1,
+                node_instance: instance_id,
+                process_incarnation: instance_id,
+                journal_run: "original-lifecycle".into(),
+                logical_run: "original-logical".into(),
+                configuration_digest: "original-config".into(),
+                codec_profile: "original-lifecycle".into(),
+                registered_profile_digest: "actual-registered-owner".into(),
+            },
+            root_sequence: 1,
+            input_sequence: 1,
+            stack_parent: None,
+            input_source: NativeInputSource::Lifecycle,
+            phase: "lifecycle".into(),
+            receipt: NativeProcessingReceipt {
+                wall_ns: 1,
+                process_elapsed_ns: 1,
+                ingress: None,
+            },
+            payload: serde_json::json!({"action":"stop.trader"}),
+            read_witnesses: Vec::new(),
+        }
+    }
+
+    #[rstest]
+    #[case(
+        "lifecycle.strategy_stop",
+        "original custom strategy stop profile unsupported"
+    )]
+    #[case("lifecycle.reset", "unexpected original lifecycle callback")]
+    #[cfg(feature = "live")]
+    fn historical_lifecycle_rejects_unknown_route_and_unmarked_strategy_stop(
+        #[case] kind: &str,
+        #[case] expected_error: &str,
+    ) {
+        use nautilus_common::recovery_trace::{
+            NativeCallbackRoute,
+            historical::{HistoricalInputScope, pending_callback_route},
+        };
+        let (bus, cache, portfolio, _data, _risk, _execution, clocks) = create_trader_components();
+        set_message_bus(bus);
+        let instance_id = UUID4::new();
+        let mut trader = Trader::new(
+            TraderId::test_default(),
+            instance_id,
+            Environment::Live,
+            clocks,
+            cache,
+            portfolio,
+        );
+        let strategy_id = StrategyId::from("UnmarkedLifecycle-001");
+        trader
+            .add_strategy(TestStrategy::new(StrategyConfig {
+                strategy_id: Some(strategy_id),
+                manage_stop: false,
+                ..Default::default()
+            }))
+            .unwrap();
+        let trader = Rc::new(RefCell::new(trader));
+        let routes = vec![
+            NativeCallbackRoute {
+                component_id: strategy_id.to_string(),
+                kind: kind.into(),
+                component_state: "Running".into(),
+            },
+            NativeCallbackRoute {
+                component_id: strategy_id.to_string(),
+                kind: "lifecycle.stop".into(),
+                component_state: "Running".into(),
+            },
+        ];
+        // Negative metadata does not manufacture a reader-issued default profile.
+        let scope = HistoricalInputScope::enter(
+            Rc::new(()),
+            lifecycle_history_input(instance_id),
+            routes,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let error = Trader::replay_native_lifecycle(&trader).unwrap_err();
+        assert!(error.to_string().contains(expected_error), "{error:#}");
+        assert_eq!(
+            get_actor_unchecked::<TestStrategy>(&strategy_id.inner()).state(),
+            ComponentState::Ready
+        );
+        assert!(trader.borrow().ts_stopped.is_none());
+        if kind == "lifecycle.strategy_stop" {
+            assert!(pending_callback_route().is_err());
+        }
+        assert!(scope.finish().is_err());
+    }
+
+    #[cfg(feature = "live")]
+    #[derive(Debug)]
+    struct FailingHistoricalLifecycleActor {
+        core: DataActorCore,
+        fail: bool,
+        historical_calls: Rc<Cell<usize>>,
+        ordinary_stops: Rc<Cell<usize>>,
+    }
+
+    #[cfg(feature = "live")]
+    impl DataActor for FailingHistoricalLifecycleActor {
+        fn on_stop(&mut self) -> anyhow::Result<()> {
+            self.ordinary_stops.set(self.ordinary_stops.get() + 1);
+            Ok(())
+        }
+
+        fn on_native_recovery_input(
+            &mut self,
+            boundary: &nautilus_common::recovery_trace::historical::HistoricalInputBoundary<'_>,
+            input: &dyn std::any::Any,
+        ) -> anyhow::Result<()> {
+            let lifecycle = input
+                .downcast_ref::<nautilus_common::recovery_trace::NativeComponentLifecycle>()
+                .ok_or_else(|| anyhow::anyhow!("original lifecycle input absent"))?;
+            anyhow::ensure!(
+                lifecycle.component_id == self.actor_id().as_str()
+                    && lifecycle.action == "stop"
+                    && boundary.route().component_id == lifecycle.component_id,
+                "original lifecycle owner changed"
+            );
+            self.historical_calls.set(self.historical_calls.get() + 1);
+            if self.fail {
+                return Err(anyhow::anyhow!("original first lifecycle callback failure")
+                    .context("registered lifecycle owner refused source"));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "live")]
+    nautilus_actor!(FailingHistoricalLifecycleActor);
+
+    #[test]
+    #[cfg(feature = "live")]
+    fn historical_lifecycle_first_owner_failure_returns_original_error_with_pending_routes() {
+        use nautilus_common::recovery_trace::{
+            NativeCallbackRoute, NativeInputSource, NativeProcessingReceipt, NativeTraceRecord,
+            NativeTraceSource,
+            historical::{self, HistoricalInputScope},
+        };
+        let (bus, cache, portfolio, _data, _risk, _execution, clocks) = create_trader_components();
+        set_message_bus(bus);
+        let instance_id = UUID4::new();
+        let mut trader = Trader::new(
+            TraderId::test_default(),
+            instance_id,
+            Environment::Live,
+            clocks,
+            cache,
+            portfolio,
+        );
+        let first = ActorId::from("HistoricalLifecycleFirst");
+        let later = ActorId::from("HistoricalLifecycleUnconsumed");
+        let first_calls = Rc::new(Cell::new(0));
+        let later_calls = Rc::new(Cell::new(0));
+        let stops = Rc::new(Cell::new(0));
+        for (id, fail, calls) in [
+            (first, true, first_calls.clone()),
+            (later, false, later_calls.clone()),
+        ] {
+            trader
+                .add_actor(FailingHistoricalLifecycleActor {
+                    core: DataActorCore::new(DataActorConfig {
+                        actor_id: Some(id),
+                        ..Default::default()
+                    }),
+                    fail,
+                    historical_calls: calls,
+                    ordinary_stops: stops.clone(),
+                })
+                .expect("actual registered lifecycle owner");
+        }
+        let trader = Rc::new(RefCell::new(trader));
+        let routes = [first, later]
+            .into_iter()
+            .map(|id| NativeCallbackRoute {
+                component_id: id.to_string(),
+                kind: "lifecycle.stop".into(),
+                component_state: "Running".into(),
+            })
+            .collect();
+        // This failure test routes callbacks only. It creates no reader-issued
+        // proof, phase release, grant or venue command from the source metadata.
+        let scope = HistoricalInputScope::enter(
+            Rc::new(()),
+            NativeTraceRecord::Begin {
+                source: NativeTraceSource {
+                    schema_version: 1,
+                    node_instance: instance_id,
+                    process_incarnation: instance_id,
+                    journal_run: "original-failed-lifecycle".into(),
+                    logical_run: "original-logical".into(),
+                    configuration_digest: "original-config".into(),
+                    codec_profile: "original-lifecycle".into(),
+                    registered_profile_digest: "two-registered-owners".into(),
+                },
+                root_sequence: 1,
+                input_sequence: 1,
+                stack_parent: None,
+                input_source: NativeInputSource::Lifecycle,
+                phase: "lifecycle".into(),
+                receipt: NativeProcessingReceipt {
+                    wall_ns: 1,
+                    process_elapsed_ns: 1,
+                    ingress: None,
+                },
+                payload: serde_json::json!({"action":"stop.trader"}),
+                read_witnesses: Vec::new(),
+            },
+            routes,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("historical callback scope");
+        let error = Trader::replay_native_lifecycle(&trader)
+            .expect_err("first owner must stop the actual drain loop");
+        assert_eq!(
+            error.to_string(),
+            "registered lifecycle owner refused source: original first lifecycle callback failure"
+        );
+        assert_eq!(first_calls.get(), 1);
+        assert_eq!(
+            later_calls.get(),
+            0,
+            "later source callback must remain unconsumed"
+        );
+        assert_eq!(stops.get(), 0, "ordinary physical stop is never a fallback");
+        assert!(
+            trader.borrow().ts_stopped().is_none(),
+            "failed lifecycle cannot finish trader bookkeeping"
+        );
+        assert_eq!(
+            get_actor_unchecked::<FailingHistoricalLifecycleActor>(&first.inner()).state(),
+            ComponentState::Ready
+        );
+        assert_eq!(
+            get_actor_unchecked::<FailingHistoricalLifecycleActor>(&later.inner()).state(),
+            ComponentState::Ready
+        );
+        assert_eq!(
+            historical::pending_callback_route()
+                .expect_err("original failure remains latched")
+                .to_string(),
+            error.to_string()
+        );
+        assert!(
+            scope.finish().is_err(),
+            "unfinished original route cannot be acknowledged"
+        );
+        assert!(
+            !historical::active(),
+            "failed scope drop must release only its own routing frame"
+        );
+    }
 
     // Simple ExecutionAlgorithm wrapper for testing
     #[derive(Debug)]

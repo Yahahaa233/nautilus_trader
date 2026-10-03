@@ -162,6 +162,34 @@ impl CheckpointGate {
         }
     }
 
+    /// Linearizes a registered timer's synchronous poll, schedule publication and
+    /// queue send against freeze. Only native registered timer workers use this
+    /// section: network requests and arbitrary callbacks keep their full active
+    /// leases and continue to refuse a concurrent freeze.
+    pub(crate) async fn registered_timer_publication<R>(
+        &self,
+        mut publish: impl FnMut(&mut Context<'_>) -> Poll<R>,
+    ) -> R {
+        std::future::poll_fn(|cx| {
+            let mut state = self.0.lock().expect("checkpoint gate mutex poisoned");
+            if state.frozen || state.paused || state.poisoned || state.terminal {
+                if !state
+                    .waiters
+                    .iter()
+                    .any(|waker| waker.will_wake(cx.waker()))
+                {
+                    state.waiters.push(cx.waker().clone());
+                }
+                return Poll::Pending;
+            }
+            // Freeze obtains this same mutex after the actual poll/publication
+            // has returned. No lease is exposed across a worker scheduling gap.
+            // A panic poisons the mutex and leaves admission permanently closed.
+            publish(cx)
+        })
+        .await
+    }
+
     /// Returns a lease with a ready input. The caller retains it through all
     /// derived state changes and output emission, not just the receiver poll.
     pub async fn callback<F: Future>(&self, future: F) -> (F::Output, CallbackLease) {

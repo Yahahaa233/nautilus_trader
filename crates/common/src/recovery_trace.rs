@@ -1275,8 +1275,11 @@ pub mod historical {
         })
     }
 
-    /// Returns whether a historical scope is present, regardless of success.
-    #[must_use]
+    /// Returns the next recorded route only while the historical input is healthy.
+    /// A callback failure must terminate an owner's drain loop even when later
+    /// routes remain unconsumed; it must never look like another pending callback.
+    /// # Errors
+    /// Returns the original callback failure without advancing or discarding routes.
     pub fn pending_callback_route() -> Result<Option<NativeCallbackRoute>> {
         CURRENT.with(|current| {
             let frames = current
@@ -1286,6 +1289,9 @@ pub mod historical {
                 return Ok(None);
             };
             let frame = frame.try_borrow().context("historical route input busy")?;
+            if let Some(failure) = &frame.failure {
+                anyhow::bail!("{failure}");
+            }
             Ok(frame.routes.get(frame.next).cloned())
         })
     }

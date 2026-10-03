@@ -172,6 +172,487 @@ fn native_order_event_framework<S: Strategy + StrategyNative + ?Sized>(
     true
 }
 
+// The physical normal callback and its original historical route share the same
+// framework implementation. The supplied state never mutates physical admission.
+fn native_market_exit_framework<S: Strategy + StrategyNative + ?Sized>(
+    strategy: &mut S,
+    state: ComponentState,
+) -> anyhow::Result<()> {
+    let core = StrategyNative::strategy_core_mut(strategy);
+    let strategy_id = registered_strategy_id(core)?;
+
+    if state != ComponentState::Running {
+        log::warn!("{strategy_id} Cannot market exit: strategy is not running");
+        return Ok(());
+    }
+
+    if core.is_exiting {
+        log::warn!("{strategy_id} Market exit called when already in progress");
+        return Ok(());
+    }
+
+    core.is_exiting = true;
+    core.market_exit_attempts = 0;
+    let time_in_force = core.config.market_exit_time_in_force;
+    let reduce_only = core.config.market_exit_reduce_only;
+
+    log::info!("{strategy_id} Initiating market exit...");
+
+    strategy.on_market_exit();
+
+    let core = StrategyNative::strategy_core_mut(strategy);
+    let cache = core.cache_ref();
+
+    let mut instruments: AHashSet<InstrumentId> = AHashSet::new();
+
+    for client_order_id in cache.iter_client_order_ids_open(None, None, Some(&strategy_id), None) {
+        if let Some(order) = cache.order(&client_order_id) {
+            instruments.insert(order.instrument_id());
+        }
+    }
+
+    for client_order_id in
+        cache.iter_client_order_ids_inflight(None, None, Some(&strategy_id), None)
+    {
+        if let Some(order) = cache.order(&client_order_id) {
+            instruments.insert(order.instrument_id());
+        }
+    }
+
+    for position_id in cache.iter_position_open_ids(None, None, Some(&strategy_id), None) {
+        if let Some(position) = cache.position(&position_id) {
+            instruments.insert(position.instrument_id);
+        }
+    }
+
+    let market_exit_tag = core.market_exit_tag;
+    // Sort so the per-instrument cancel_all_orders/close_all_positions
+    // cascade fires msgbus commands in a deterministic sequence; the
+    // upstream dedup is AHash-backed.
+    let mut instruments: Vec<_> = instruments.into_iter().collect();
+    instruments.sort();
+    drop(cache);
+
+    for instrument_id in instruments {
+        if let Err(e) = strategy.cancel_all_orders(instrument_id, None, None, true, None) {
+            log::error!("Error canceling orders for {instrument_id}: {e}");
+        }
+
+        if let Err(e) = strategy.close_all_positions(
+            instrument_id,
+            None,
+            None,
+            Some(vec![market_exit_tag]),
+            Some(time_in_force),
+            Some(reduce_only),
+            None,
+            None,
+        ) {
+            log::error!("Error closing positions for {instrument_id}: {e}");
+        }
+    }
+
+    let core = StrategyNative::strategy_core_mut(strategy);
+    let interval_ms = core.config.market_exit_interval_ms;
+    let timer_name = core.market_exit_timer_name;
+
+    log::info!("{strategy_id} Setting market exit timer at {interval_ms}ms intervals");
+
+    let Ok(interval_ns) = DurationNanos::try_from_millis(interval_ms) else {
+        core.is_exiting = false;
+        core.market_exit_attempts = 0;
+        anyhow::bail!("Market exit timer interval exceeds the nanosecond range");
+    };
+    let result = core.clock_mut().set_timer_ns(
+        timer_name.as_str(),
+        interval_ns,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    if let Err(e) = result {
+        // Reset exit state on timer failure (caller handles pending_stop)
+        core.is_exiting = false;
+        core.market_exit_attempts = 0;
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+fn native_strategy_stop_framework<S: Strategy + StrategyNative + ?Sized>(
+    strategy: &mut S,
+    state: ComponentState,
+) -> bool {
+    let (manage_stop, is_exiting, should_initiate_exit) = {
+        let core = StrategyNative::strategy_core_mut(strategy);
+        let actor_id = core.actor_id();
+        let manage_stop = core.config.manage_stop;
+        let pending_stop = core.pending_stop;
+        let is_exiting = core.is_exiting;
+
+        if manage_stop {
+            if state != ComponentState::Running {
+                return true; // Proceed with stop
+            }
+
+            if pending_stop && !is_exiting {
+                return false; // A previous exit initiation did not complete
+            }
+
+            core.pending_stop = true;
+            let should_initiate_exit = !is_exiting;
+
+            if should_initiate_exit {
+                log::info!("{actor_id} Initiating market exit before stop");
+            }
+
+            (manage_stop, is_exiting, should_initiate_exit)
+        } else {
+            (manage_stop, is_exiting, false)
+        }
+    };
+
+    if manage_stop {
+        if should_initiate_exit && let Err(e) = strategy.market_exit() {
+            log::error!("Market exit failed during stop: {e}");
+            return false;
+        }
+        // Recheck the actual settled exposure, including emulated orders, without
+        // advancing time. Normal and source-state historical stop use the same
+        // framework; the target's physical component admission stays closed.
+        let core = StrategyNative::strategy_core_mut(strategy);
+        let strategy_id = core.strategy_id();
+        let cache = core.cache_ref();
+        let flat = strategy_id.is_some_and(|id| {
+            cache.orders_open_count(None, None, Some(&id), None, None) == 0
+                && cache.orders_inflight_count(None, None, Some(&id), None, None) == 0
+                && cache.orders_emulated_count(None, None, Some(&id), None, None) == 0
+                && cache.positions_open_count(None, None, Some(&id), None, None) == 0
+        });
+        drop(cache);
+        if flat {
+            if let Err(error) =
+                native_require_default_route(strategy, "strategy.cancel_market_exit.default")
+            {
+                nautilus_common::recovery_trace::historical_failure(&format!("{error:#}"));
+                return false;
+            }
+            strategy.cancel_market_exit();
+            if let Err(error) = native_historical_route_health() {
+                nautilus_common::recovery_trace::historical_failure(&format!("{error:#}"));
+                return false;
+            }
+            if let Err(error) = catch_unwind(AssertUnwindSafe(|| strategy.post_market_exit())) {
+                log::error!("Error in post_market_exit during stop: {error:?}");
+                StrategyNative::strategy_core_mut(strategy).pending_stop = true;
+                if nautilus_common::recovery_trace::historical_active() {
+                    nautilus_common::recovery_trace::historical_failure(&format!(
+                        "original post_market_exit during stop panicked: {error:?}"
+                    ));
+                }
+                return false;
+            }
+            return true;
+        }
+        debug_assert!(
+            strategy.is_exiting(),
+            "INVARIANT: deferring stop but not exiting"
+        );
+        return false; // Defer stop until market exit completes
+    }
+
+    // manage_stop is false - clean up any active market exit
+    if is_exiting {
+        if let Err(error) =
+            native_require_default_route(strategy, "strategy.cancel_market_exit.default")
+        {
+            nautilus_common::recovery_trace::historical_failure(&format!("{error:#}"));
+            return false;
+        }
+        strategy.cancel_market_exit();
+    }
+
+    true // Proceed with stop
+}
+
+// Only a producer-recorded default route admits framework replay. Calling an
+// overridden method without this route would invent a default implementation.
+fn native_require_default_route<S: StrategyNative + ?Sized>(
+    strategy: &S,
+    kind: &str,
+) -> anyhow::Result<()> {
+    #[cfg(feature = "live")]
+    if nautilus_common::recovery_trace::historical::active() {
+        let owner = StrategyNative::strategy_core(strategy)
+            .actor
+            .actor_id
+            .to_string();
+        let next = nautilus_common::recovery_trace::historical::pending_callback_route()?
+            .ok_or_else(|| {
+                anyhow::anyhow!("original default timer framework profile absent: {kind}")
+            })?;
+        anyhow::ensure!(
+            next.component_id == owner && next.kind == kind,
+            "original custom timer framework unsupported: {kind}"
+        );
+    }
+    #[cfg(not(feature = "live"))]
+    let _ = (strategy, kind);
+    Ok(())
+}
+
+fn native_historical_route_health() -> anyhow::Result<()> {
+    #[cfg(feature = "live")]
+    if nautilus_common::recovery_trace::historical::active() {
+        nautilus_common::recovery_trace::historical::pending_callback_route()?;
+    }
+    Ok(())
+}
+
+fn native_finalize_market_exit_framework<S: Strategy + StrategyNative + Component + ?Sized>(
+    strategy: &mut S,
+    state: ComponentState,
+) -> anyhow::Result<()> {
+    let (actor_id, should_stop) = {
+        let core = StrategyNative::strategy_core_mut(strategy);
+        (core.actor_id(), core.pending_stop)
+    };
+    native_require_default_route(strategy, "strategy.cancel_market_exit.default")?;
+    strategy.cancel_market_exit();
+    native_historical_route_health()?;
+    if let Err(error) = catch_unwind(AssertUnwindSafe(|| strategy.post_market_exit())) {
+        log::error!("{actor_id} Error in post_market_exit: {error:?}");
+        StrategyNative::strategy_core_mut(strategy).pending_stop = should_stop;
+        if nautilus_common::recovery_trace::historical_active() {
+            anyhow::bail!("original post_market_exit callback panicked: {error:?}");
+        }
+        // Preserve the newer normal contract: a failed hook cannot complete stop.
+        return Ok(());
+    }
+    if should_stop {
+        log::info!("{actor_id} Market exit complete, stopping strategy");
+        #[cfg(feature = "live")]
+        {
+            let owner = actor_id.to_string();
+            if nautilus_common::recovery_trace::historical::active() {
+                anyhow::ensure!(
+                    state == ComponentState::Running,
+                    "original managed stop was not Running"
+                );
+                native_require_default_route(strategy, "lifecycle.stop")?;
+                let input = nautilus_common::recovery_trace::NativeComponentLifecycle {
+                    action: "stop".into(),
+                    component_id: owner.clone(),
+                };
+                anyhow::ensure!(
+                    nautilus_common::recovery_trace::historical::dispatch_if_active(
+                        &owner,
+                        "lifecycle.stop",
+                        |boundary| {
+                            anyhow::ensure!(
+                                boundary.original_component_state()? == state,
+                                "original managed business stop state changed"
+                            );
+                            strategy.on_native_recovery_input(boundary, &input)
+                        }
+                    ),
+                    "original managed business stop scope absent"
+                );
+                native_historical_route_health()?;
+                return Ok(());
+            }
+            // This is the actual managed timer's Component::stop call, not
+            // Trader's separate stop-components route. Seal this business hook
+            // before its normal physical state-machine transition.
+            if state == ComponentState::Running {
+                nautilus_common::recovery_trace::scope::note_callback(
+                    nautilus_common::recovery_trace::NativeCallbackRoute {
+                        component_id: owner,
+                        kind: "lifecycle.stop".into(),
+                        component_state: format!("{state:?}"),
+                    },
+                )?;
+            }
+        }
+        if let Err(error) = Component::stop(strategy) {
+            log::error!("{actor_id} Failed to stop: {error:#}");
+            if nautilus_common::recovery_trace::historical_active() {
+                return Err(error);
+            }
+        }
+    }
+    let core = StrategyNative::strategy_core_mut(strategy);
+    debug_assert!(
+        !(core.pending_stop && !core.is_exiting && state == ComponentState::Running),
+        "INVARIANT: stuck state after finalize_market_exit"
+    );
+    Ok(())
+}
+
+fn native_check_market_exit_framework<S: Strategy + StrategyNative + Component + ?Sized>(
+    strategy: &mut S,
+) -> anyhow::Result<()> {
+    // Guard against stale timer events after cancel_market_exit
+    if !strategy.is_exiting() {
+        return Ok(());
+    }
+
+    let core = StrategyNative::strategy_core_mut(strategy);
+    let Some(strategy_id) = core.strategy_id() else {
+        log::error!("Cannot check market exit: strategy_id is not set");
+        return Ok(());
+    };
+
+    core.market_exit_attempts += 1;
+    let attempts = core.market_exit_attempts;
+    let max_attempts = core.config.market_exit_max_attempts;
+
+    log::debug!("{strategy_id} Market exit check triggered (attempt {attempts}/{max_attempts})");
+
+    if attempts >= max_attempts {
+        let cache = core.cache_ref();
+        let open_orders_count = cache.orders_open_count(None, None, Some(&strategy_id), None, None);
+        let inflight_orders_count =
+            cache.orders_inflight_count(None, None, Some(&strategy_id), None, None);
+        let open_positions_count =
+            cache.positions_open_count(None, None, Some(&strategy_id), None, None);
+
+        drop(cache);
+
+        log::warn!(
+            "{strategy_id} Market exit max attempts ({max_attempts}) reached, \
+                completing with open orders: {open_orders_count}, \
+                inflight orders: {inflight_orders_count}, \
+                open positions: {open_positions_count}"
+        );
+
+        native_require_default_route(strategy, "lifecycle.finalize_market_exit.default")?;
+        strategy.finalize_market_exit();
+        native_historical_route_health()?;
+        return Ok(());
+    }
+
+    let cache = core.cache_ref();
+    let has_open_orders = !cache
+        .orders_open(None, None, Some(&strategy_id), None, None)
+        .is_empty();
+    let has_inflight_orders = !cache
+        .orders_inflight(None, None, Some(&strategy_id), None, None)
+        .is_empty();
+
+    if has_open_orders || has_inflight_orders {
+        return Ok(());
+    }
+
+    let positions_data: Vec<_> = cache
+        .positions_open(None, None, Some(&strategy_id), None, None)
+        .iter()
+        .map(|p| (p.id, p.instrument_id, p.side, p.quantity, p.is_closed()))
+        .collect();
+
+    if !positions_data.is_empty() {
+        // If there are open positions but no orders, re-send close orders
+        drop(cache);
+
+        for (pos_id, instrument_id, side, quantity, is_closed) in positions_data {
+            if is_closed {
+                continue;
+            }
+
+            let core = StrategyNative::strategy_core_mut(strategy);
+            let time_in_force = core.config.market_exit_time_in_force;
+            let reduce_only = core.config.market_exit_reduce_only;
+            let market_exit_tag = core.market_exit_tag;
+            let Some(closing_side) = OrderCore::closing_side(side) else {
+                continue;
+            };
+            let order = core.order_factory().market(
+                instrument_id,
+                closing_side,
+                quantity,
+                Some(time_in_force),
+                Some(reduce_only),
+                None,
+                None,
+                None,
+                Some(vec![market_exit_tag]),
+                None,
+            );
+
+            if let Err(e) = strategy.submit_order(order, Some(pos_id), None, None) {
+                log::error!("Error re-submitting close order for position {pos_id}: {e}");
+            }
+        }
+        return Ok(());
+    }
+
+    drop(cache);
+    native_require_default_route(strategy, "lifecycle.finalize_market_exit.default")?;
+    strategy.finalize_market_exit();
+    native_historical_route_health()?;
+    Ok(())
+}
+
+fn native_cancel_market_exit_framework<S: Strategy + StrategyNative + ?Sized>(
+    strategy: &mut S,
+) -> anyhow::Result<()> {
+    let core = StrategyNative::strategy_core_mut(strategy);
+    let timer_name = core.market_exit_timer_name;
+
+    if core
+        .clock_mut()
+        .timer_names()
+        .contains(&timer_name.as_str())
+    {
+        core.clock_mut().cancel_timer(timer_name.as_str());
+    }
+
+    core.is_exiting = false;
+    core.pending_stop = false;
+    core.market_exit_attempts = 0;
+    native_historical_route_health()
+}
+
+fn native_expire_gtd_framework<S: Strategy + StrategyNative + ?Sized>(
+    strategy: &mut S,
+    event: TimeEvent,
+) -> anyhow::Result<()> {
+    let timer_name = event.name;
+    let Some(client_order_id) = timer_name
+        .strip_prefix("GTD-EXPIRY:")
+        .and_then(|value| ClientOrderId::new_checked(value).ok())
+    else {
+        log::error!("Invalid GTD timer name format: {timer_name}");
+        return Ok(());
+    };
+
+    let core = StrategyNative::strategy_core_mut(strategy);
+    if core.gtd_timers.get(&client_order_id) != Some(&timer_name) {
+        return Ok(());
+    }
+    core.gtd_timers.remove(&client_order_id);
+
+    let order = core.cache_ref().order(&client_order_id).map(|o| o.clone());
+    let Some(order) = order else {
+        log::warn!("GTD order {client_order_id} not found in cache");
+        return Ok(());
+    };
+
+    log::info!("GTD order {client_order_id} expired");
+
+    if let Err(e) = strategy.cancel_order(order.client_order_id(), None, None) {
+        log::error!("Failed to cancel expired GTD order {client_order_id}: {e}");
+        if nautilus_common::recovery_trace::historical_active() {
+            return Err(e);
+        }
+    }
+    native_historical_route_health()
+}
+
 /// Core trait for implementing trading strategies in NautilusTrader.
 ///
 /// Strategies are specialized [`DataActor`]s that combine data ingestion capabilities with
@@ -1843,111 +2324,38 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
-        let core = StrategyNative::strategy_core_mut(self);
-        let strategy_id = registered_strategy_id(core)?;
-
-        if core.actor.state() != ComponentState::Running {
-            log::warn!("{strategy_id} Cannot market exit: strategy is not running");
-            return Ok(());
-        }
-
-        if core.is_exiting {
-            log::warn!("{strategy_id} Market exit called when already in progress");
-            return Ok(());
-        }
-
-        core.is_exiting = true;
-        core.market_exit_attempts = 0;
-        let time_in_force = core.config.market_exit_time_in_force;
-        let reduce_only = core.config.market_exit_reduce_only;
-
-        log::info!("{strategy_id} Initiating market exit...");
-
-        self.on_market_exit();
-
-        let core = StrategyNative::strategy_core_mut(self);
-        let cache = core.cache_ref();
-
-        let mut instruments: AHashSet<InstrumentId> = AHashSet::new();
-
-        for client_order_id in
-            cache.iter_client_order_ids_open(None, None, Some(&strategy_id), None)
+        #[cfg(feature = "live")]
         {
-            if let Some(order) = cache.order(&client_order_id) {
-                instruments.insert(order.instrument_id());
-            }
-        }
-
-        for client_order_id in
-            cache.iter_client_order_ids_inflight(None, None, Some(&strategy_id), None)
-        {
-            if let Some(order) = cache.order(&client_order_id) {
-                instruments.insert(order.instrument_id());
-            }
-        }
-
-        for position_id in cache.iter_position_open_ids(None, None, Some(&strategy_id), None) {
-            if let Some(position) = cache.position(&position_id) {
-                instruments.insert(position.instrument_id);
-            }
-        }
-
-        let market_exit_tag = core.market_exit_tag;
-        // Sort so the per-instrument cancel_all_orders/close_all_positions
-        // cascade fires msgbus commands in a deterministic sequence; the
-        // upstream dedup is AHash-backed.
-        let mut instruments: Vec<_> = instruments.into_iter().collect();
-        instruments.sort();
-        drop(cache);
-
-        for instrument_id in instruments {
-            if let Err(e) = self.cancel_all_orders(instrument_id, None, None, true, None) {
-                log::error!("Error canceling orders for {instrument_id}: {e}");
-            }
-
-            if let Err(e) = self.close_all_positions(
-                instrument_id,
-                None,
-                None,
-                Some(vec![market_exit_tag]),
-                Some(time_in_force),
-                Some(reduce_only),
-                None,
-                None,
+            let component_id = StrategyNative::strategy_core(self)
+                .actor
+                .actor_id
+                .to_string();
+            let mut outcome = None;
+            if nautilus_common::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "lifecycle.market_exit.default",
+                |boundary| {
+                    native_market_exit_framework(self, boundary.original_component_state()?)?;
+                    outcome = Some(Ok(()));
+                    Ok(())
+                },
             ) {
-                log::error!("Error closing positions for {instrument_id}: {e}");
+                return outcome
+                    .unwrap_or_else(|| anyhow::bail!("historical default market exit failed"));
             }
+            nautilus_common::recovery_trace::scope::note_callback(
+                nautilus_common::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "lifecycle.market_exit.default".into(),
+                    component_state: format!(
+                        "{:?}",
+                        StrategyNative::strategy_core(self).actor.state()
+                    ),
+                },
+            )?;
         }
-
-        let core = StrategyNative::strategy_core_mut(self);
-        let interval_ms = core.config.market_exit_interval_ms;
-        let timer_name = core.market_exit_timer_name;
-
-        log::info!("{strategy_id} Setting market exit timer at {interval_ms}ms intervals");
-
-        let Ok(interval_ns) = DurationNanos::try_from_millis(interval_ms) else {
-            core.is_exiting = false;
-            core.market_exit_attempts = 0;
-            anyhow::bail!("Market exit timer interval exceeds the nanosecond range");
-        };
-        let result = core.clock_mut().set_timer_ns(
-            timer_name.as_str(),
-            interval_ns,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-
-        if let Err(e) = result {
-            // Reset exit state on timer failure (caller handles pending_stop)
-            core.is_exiting = false;
-            core.market_exit_attempts = 0;
-            return Err(e);
-        }
-
-        Ok(())
+        let state = StrategyNative::strategy_core(self).actor.state();
+        native_market_exit_framework(self, state)
     }
 
     /// Checks if the market exit is complete and finalizes if so.
@@ -1957,103 +2365,38 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative + Component,
     {
-        // Guard against stale timer events after cancel_market_exit
-        if !self.is_exiting() {
-            return;
-        }
-
-        let core = StrategyNative::strategy_core_mut(self);
-        let Some(strategy_id) = core.strategy_id() else {
-            log::error!("Cannot check market exit: strategy_id is not set");
-            return;
-        };
-
-        core.market_exit_attempts += 1;
-        let attempts = core.market_exit_attempts;
-        let max_attempts = core.config.market_exit_max_attempts;
-
-        log::debug!(
-            "{strategy_id} Market exit check triggered (attempt {attempts}/{max_attempts})"
-        );
-
-        if attempts >= max_attempts {
-            let cache = core.cache_ref();
-            let open_orders_count =
-                cache.orders_open_count(None, None, Some(&strategy_id), None, None);
-            let inflight_orders_count =
-                cache.orders_inflight_count(None, None, Some(&strategy_id), None, None);
-            let open_positions_count =
-                cache.positions_open_count(None, None, Some(&strategy_id), None, None);
-
-            drop(cache);
-
-            log::warn!(
-                "{strategy_id} Market exit max attempts ({max_attempts}) reached, \
-                completing with open orders: {open_orders_count}, \
-                inflight orders: {inflight_orders_count}, \
-                open positions: {open_positions_count}"
-            );
-
-            self.finalize_market_exit();
-            return;
-        }
-
-        let cache = core.cache_ref();
-        let has_open_orders = !cache
-            .orders_open(None, None, Some(&strategy_id), None, None)
-            .is_empty();
-        let has_inflight_orders = !cache
-            .orders_inflight(None, None, Some(&strategy_id), None, None)
-            .is_empty();
-
-        if has_open_orders || has_inflight_orders {
-            return;
-        }
-
-        let positions_data: Vec<_> = cache
-            .positions_open(None, None, Some(&strategy_id), None, None)
-            .iter()
-            .map(|p| (p.id, p.instrument_id, p.side, p.quantity, p.is_closed()))
-            .collect();
-
-        if !positions_data.is_empty() {
-            // If there are open positions but no orders, re-send close orders
-            drop(cache);
-
-            for (pos_id, instrument_id, side, quantity, is_closed) in positions_data {
-                if is_closed {
-                    continue;
-                }
-
-                let core = StrategyNative::strategy_core_mut(self);
-                let time_in_force = core.config.market_exit_time_in_force;
-                let reduce_only = core.config.market_exit_reduce_only;
-                let market_exit_tag = core.market_exit_tag;
-                let Some(closing_side) = OrderCore::closing_side(side) else {
-                    continue;
-                };
-                let order = core.order_factory().market(
-                    instrument_id,
-                    closing_side,
-                    quantity,
-                    Some(time_in_force),
-                    Some(reduce_only),
-                    None,
-                    None,
-                    None,
-                    Some(vec![market_exit_tag]),
-                    None,
-                );
-
-                if let Err(e) = self.submit_order(order, Some(pos_id), None, None) {
-                    log::error!("Error re-submitting close order for position {pos_id}: {e}");
-                }
+        #[cfg(feature = "live")]
+        {
+            let component_id = StrategyNative::strategy_core(self)
+                .actor
+                .actor_id
+                .to_string();
+            if nautilus_common::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "strategy.check_market_exit.default",
+                |_boundary| native_check_market_exit_framework(self),
+            ) {
+                return;
             }
-            return;
+            if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
+                nautilus_common::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "strategy.check_market_exit.default".into(),
+                    component_state: format!(
+                        "{:?}",
+                        StrategyNative::strategy_core(self).actor.state()
+                    ),
+                },
+            ) {
+                log::error!("Native default check_market_exit source refused: {error:#}");
+                nautilus_common::recovery_trace::historical_failure(&format!("{error:#}"));
+                return;
+            }
         }
-
-        drop(cache);
-        self.finalize_market_exit();
+        if let Err(error) = native_check_market_exit_framework(self) {
+            log::error!("Native default check_market_exit failed: {error:#}");
+            nautilus_common::recovery_trace::historical_failure(&format!("{error:#}"));
+        }
     }
 
     /// Finalizes the market exit process.
@@ -2064,40 +2407,44 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative + Component,
     {
-        let (actor_id, should_stop) = {
-            let core = StrategyNative::strategy_core_mut(self);
-            let actor_id = core.actor_id();
-            let should_stop = core.pending_stop;
-            (actor_id, should_stop)
-        };
-
-        self.cancel_market_exit();
-
-        let hook_result = catch_unwind(AssertUnwindSafe(|| {
-            self.post_market_exit();
-        }));
-
-        if let Err(e) = hook_result {
-            log::error!("{actor_id} Error in post_market_exit: {e:?}");
-            StrategyNative::strategy_core_mut(self).pending_stop = should_stop;
-            return;
-        }
-
-        if should_stop {
-            log::info!("{actor_id} Market exit complete, stopping strategy");
-
-            if let Err(e) = Component::stop(self) {
-                log::error!("{actor_id} Failed to stop: {e}");
+        #[cfg(feature = "live")]
+        {
+            let component_id = StrategyNative::strategy_core(self)
+                .actor
+                .actor_id
+                .to_string();
+            if nautilus_common::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "lifecycle.finalize_market_exit.default",
+                |boundary| {
+                    native_finalize_market_exit_framework(
+                        self,
+                        boundary.original_component_state()?,
+                    )
+                },
+            ) {
+                return;
+            }
+            if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
+                nautilus_common::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "lifecycle.finalize_market_exit.default".into(),
+                    component_state: format!(
+                        "{:?}",
+                        StrategyNative::strategy_core(self).actor.state()
+                    ),
+                },
+            ) {
+                log::error!("Native default finalize_market_exit source refused: {error:#}");
+                nautilus_common::recovery_trace::historical_failure(&format!("{error:#}"));
+                return;
             }
         }
-
-        let core = StrategyNative::strategy_core_mut(self);
-        debug_assert!(
-            !(core.pending_stop
-                && !core.is_exiting
-                && core.actor.state() == ComponentState::Running),
-            "INVARIANT: stuck state after finalize_market_exit"
-        );
+        let state = StrategyNative::strategy_core(self).actor.state();
+        if let Err(error) = { native_finalize_market_exit_framework(self, state) } {
+            log::error!("Native default finalize_market_exit failed: {error:#}");
+            nautilus_common::recovery_trace::historical_failure(&format!("{error:#}"));
+        }
     }
 
     /// Cancels an active market exit without calling hooks.
@@ -2107,20 +2454,38 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
-        let core = StrategyNative::strategy_core_mut(self);
-        let timer_name = core.market_exit_timer_name;
-
-        if core
-            .clock_mut()
-            .timer_names()
-            .contains(&timer_name.as_str())
+        #[cfg(feature = "live")]
         {
-            core.clock_mut().cancel_timer(timer_name.as_str());
+            let component_id = StrategyNative::strategy_core(self)
+                .actor
+                .actor_id
+                .to_string();
+            if nautilus_common::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "strategy.cancel_market_exit.default",
+                |_boundary| native_cancel_market_exit_framework(self),
+            ) {
+                return;
+            }
+            if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
+                nautilus_common::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "strategy.cancel_market_exit.default".into(),
+                    component_state: format!(
+                        "{:?}",
+                        StrategyNative::strategy_core(self).actor.state()
+                    ),
+                },
+            ) {
+                log::error!("Native default cancel_market_exit source refused: {error:#}");
+                nautilus_common::recovery_trace::historical_failure(&format!("{error:#}"));
+                return;
+            }
         }
-
-        core.is_exiting = false;
-        core.pending_stop = false;
-        core.market_exit_attempts = 0;
+        if let Err(error) = native_cancel_market_exit_framework(self) {
+            log::error!("Native default cancel_market_exit failed: {error:#}");
+            nautilus_common::recovery_trace::historical_failure(&format!("{error:#}"));
+        }
     }
 
     /// Stops the strategy with optional managed stop behavior.
@@ -2138,76 +2503,59 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
-        let (manage_stop, is_exiting, should_initiate_exit) = {
-            let core = StrategyNative::strategy_core_mut(self);
-            let actor_id = core.actor_id();
-            let manage_stop = core.config.manage_stop;
-            let state = core.actor.state();
-            let pending_stop = core.pending_stop;
-            let is_exiting = core.is_exiting;
-
-            if manage_stop {
-                if state != ComponentState::Running {
-                    return true; // Proceed with stop
-                }
-
-                if pending_stop && !is_exiting {
-                    return false; // A previous exit initiation did not complete
-                }
-
-                core.pending_stop = true;
-                let should_initiate_exit = !is_exiting;
-
-                if should_initiate_exit {
-                    log::info!("{actor_id} Initiating market exit before stop");
-                }
-
-                (manage_stop, is_exiting, should_initiate_exit)
-            } else {
-                (manage_stop, is_exiting, false)
+        #[cfg(feature = "live")]
+        {
+            let component_id = StrategyNative::strategy_core(self)
+                .actor
+                .actor_id
+                .to_string();
+            let mut should_proceed = None;
+            if nautilus_common::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "lifecycle.strategy_stop.default",
+                |boundary| {
+                    let state = boundary.original_component_state()?;
+                    let core = StrategyNative::strategy_core(self);
+                    if core.config.manage_stop
+                        && state == ComponentState::Running
+                        && !core.pending_stop
+                        && !core.is_exiting
+                    {
+                        // A custom market_exit implementation has no default marker.
+                        // Do not substitute a guessed framework for that source.
+                        let next =
+                            nautilus_common::recovery_trace::historical::pending_callback_route()?
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("original default market exit profile absent")
+                                })?;
+                        anyhow::ensure!(
+                            next.component_id == component_id
+                                && next.kind == "lifecycle.market_exit.default",
+                            "original custom market exit profile unsupported"
+                        );
+                    }
+                    should_proceed = Some(native_strategy_stop_framework(self, state));
+                    Ok(())
+                },
+            ) {
+                return should_proceed.unwrap_or(false);
             }
-        };
-
-        if manage_stop {
-            if should_initiate_exit && let Err(e) = self.market_exit() {
-                log::error!("Market exit failed during stop: {e}");
+            if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
+                nautilus_common::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "lifecycle.strategy_stop.default".into(),
+                    component_state: format!(
+                        "{:?}",
+                        StrategyNative::strategy_core(self).actor.state()
+                    ),
+                },
+            ) {
+                log::error!("Native default strategy stop refused: {error:#}");
                 return false;
             }
-            // Settlement can complete before the next timer callback, especially
-            // at the backtest boundary, so repeated stop requests check actual exposure.
-            let core = StrategyNative::strategy_core_mut(self);
-            let strategy_id = core.strategy_id();
-            let cache = core.cache_ref();
-            let flat = strategy_id.is_some_and(|id| {
-                cache.orders_open_count(None, None, Some(&id), None, None) == 0
-                    && cache.orders_inflight_count(None, None, Some(&id), None, None) == 0
-                    && cache.orders_emulated_count(None, None, Some(&id), None, None) == 0
-                    && cache.positions_open_count(None, None, Some(&id), None, None) == 0
-            });
-            drop(cache);
-            if flat {
-                self.cancel_market_exit();
-                if let Err(e) = catch_unwind(AssertUnwindSafe(|| self.post_market_exit())) {
-                    log::error!("Error in post_market_exit during stop: {e:?}");
-                    let core = StrategyNative::strategy_core_mut(self);
-                    core.pending_stop = true;
-                    return false;
-                }
-                return true;
-            }
-            debug_assert!(
-                self.is_exiting(),
-                "INVARIANT: deferring stop but not exiting"
-            );
-            return false; // Defer stop until market exit completes
         }
-
-        // manage_stop is false - clean up any active market exit
-        if is_exiting {
-            self.cancel_market_exit();
-        }
-
-        true // Proceed with stop
+        let state = StrategyNative::strategy_core(self).actor.state();
+        native_strategy_stop_framework(self, state)
     }
 
     /// Denies an order by generating an `OrderDenied` event.
@@ -2380,31 +2728,37 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
-        let timer_name = event.name;
-        let Some(client_order_id) = timer_name
-            .strip_prefix("GTD-EXPIRY:")
-            .and_then(|value| ClientOrderId::new_checked(value).ok())
-        else {
-            log::error!("Invalid GTD timer name format: {timer_name}");
-            return;
-        };
-
-        let core = StrategyNative::strategy_core_mut(self);
-        if core.gtd_timers.get(&client_order_id) != Some(&timer_name) {
-            return;
+        #[cfg(feature = "live")]
+        {
+            let component_id = StrategyNative::strategy_core(self)
+                .actor
+                .actor_id
+                .to_string();
+            if nautilus_common::recovery_trace::historical::dispatch_if_active(
+                &component_id,
+                "strategy.expire_gtd_order.default",
+                |_boundary| native_expire_gtd_framework(self, event.clone()),
+            ) {
+                return;
+            }
+            if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
+                nautilus_common::recovery_trace::NativeCallbackRoute {
+                    component_id,
+                    kind: "strategy.expire_gtd_order.default".into(),
+                    component_state: format!(
+                        "{:?}",
+                        StrategyNative::strategy_core(self).actor.state()
+                    ),
+                },
+            ) {
+                log::error!("Native default expire_gtd_order source refused: {error:#}");
+                nautilus_common::recovery_trace::historical_failure(&format!("{error:#}"));
+                return;
+            }
         }
-        core.gtd_timers.remove(&client_order_id);
-
-        let order = core.cache_ref().order(&client_order_id).map(|o| o.clone());
-        let Some(order) = order else {
-            log::warn!("GTD order {client_order_id} not found in cache");
-            return;
-        };
-
-        log::info!("GTD order {client_order_id} expired");
-
-        if let Err(e) = self.cancel_order(order.client_order_id(), None, None) {
-            log::error!("Failed to cancel expired GTD order {client_order_id}: {e}");
+        if let Err(error) = native_expire_gtd_framework(self, event) {
+            log::error!("Native default expire_gtd_order failed: {error:#}");
+            nautilus_common::recovery_trace::historical_failure(&format!("{error:#}"));
         }
     }
 
@@ -2479,7 +2833,16 @@ where
     if core.managed_time_event_last_id == Some(event.event_id) {
         return;
     }
-    core.managed_time_event_last_id = Some(event.event_id);
+    let kind = if gtd_order_id.is_some() {
+        "strategy.expire_gtd_order.default"
+    } else {
+        "strategy.check_market_exit.default"
+    };
+    if let Err(error) = native_require_default_route(strategy, kind) {
+        nautilus_common::recovery_trace::historical_failure(&format!("{error:#}"));
+        return;
+    }
+    StrategyNative::strategy_core_mut(strategy).managed_time_event_last_id = Some(event.event_id);
 
     if gtd_order_id.is_some() {
         strategy.expire_gtd_order(event.clone());
@@ -6568,6 +6931,91 @@ mod tests {
         // The attempt WAS incremented to 1 during the check, then reset on finalize.
         assert!(!strategy.core.is_exiting);
         assert_eq!(strategy.core.market_exit_attempts, 0);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[cfg(feature = "live")]
+    fn historical_default_timer_rejects_unmarked_framework_before_mutation(#[case] gtd: bool) {
+        use nautilus_common::recovery_trace::{
+            NativeCallbackRoute, NativeInputSource, NativeProcessingReceipt, NativeTraceRecord,
+            NativeTraceSource,
+            historical::{HistoricalInputScope, pending_callback_route},
+        };
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        let owner = strategy.core.actor.actor_id.to_string();
+        let event_id = UUID4::new();
+        let name = if gtd {
+            let order_id = ClientOrderId::from("O-UNMARKED-GTD");
+            let name = Ustr::from("GTD-EXPIRY:O-UNMARKED-GTD");
+            strategy.core.gtd_timers.insert(order_id, name);
+            name
+        } else {
+            strategy.core.is_exiting = true;
+            strategy.core.market_exit_timer_name
+        };
+        let event = TimeEvent::new(name, event_id, 1.into(), 1.into());
+        let instance = UUID4::new();
+        // Refusal metadata creates no verified root, no source clock capability
+        // and no positive callback/lifecycle/venue admission.
+        let scope = HistoricalInputScope::enter(
+            Rc::new(()),
+            NativeTraceRecord::Begin {
+                source: NativeTraceSource {
+                    schema_version: 1,
+                    node_instance: instance,
+                    process_incarnation: instance,
+                    journal_run: "unmarked-timer".into(),
+                    logical_run: "unmarked".into(),
+                    configuration_digest: "config".into(),
+                    codec_profile: "timer".into(),
+                    registered_profile_digest: "registered".into(),
+                },
+                root_sequence: 1,
+                input_sequence: 1,
+                stack_parent: None,
+                input_source: NativeInputSource::Time,
+                phase: "running".into(),
+                receipt: NativeProcessingReceipt {
+                    wall_ns: 1,
+                    process_elapsed_ns: 1,
+                    ingress: None,
+                },
+                payload: serde_json::json!({"event_id":event_id}),
+                read_witnesses: Vec::new(),
+            },
+            vec![NativeCallbackRoute {
+                component_id: owner,
+                kind: "custom.timer.override".into(),
+                component_state: "Running".into(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        route_time_event(&mut strategy, &event);
+        assert!(
+            pending_callback_route()
+                .unwrap_err()
+                .to_string()
+                .contains("original custom timer framework unsupported")
+        );
+        assert_eq!(strategy.state(), ComponentState::Ready);
+        assert_eq!(strategy.core.managed_time_event_last_id, None);
+        if gtd {
+            assert!(
+                strategy
+                    .core
+                    .gtd_timers
+                    .contains_key(&ClientOrderId::from("O-UNMARKED-GTD"))
+            );
+        } else {
+            assert!(strategy.core.is_exiting);
+            assert_eq!(strategy.core.market_exit_attempts, 0);
+        }
+        assert!(scope.finish().is_err());
     }
 
     #[rstest]

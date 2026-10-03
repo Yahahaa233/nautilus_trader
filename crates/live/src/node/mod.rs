@@ -516,6 +516,11 @@ impl LiveNode {
     fn finish_node_dispatch(&self, guard: dispatch::NodeDispatchGuard) -> anyhow::Result<()> {
         #[cfg(feature = "native-tail-replay")]
         if guard.requires_native_effects() {
+            // A failed historical business hook must be returned before reading
+            // another Clock or sampling effects. Sampling is not error recovery.
+            if self.historical_replay.is_some() {
+                nautilus_common::recovery_trace::historical::pending_callback_route()?;
+            }
             if let Some(replay) = &self.historical_replay {
                 let expected = replay.expected_effects()?;
                 let scheduled = serde_json::from_value(expected["registered_timers"].clone())?;
@@ -927,8 +932,20 @@ impl LiveNode {
         complete_node_dispatch!(self, guard);
     }
 
-    #[allow(clippy::unused_unit)]
     fn process_time_event(&self, message: TimeEventMessage) -> bool {
+        match self.process_time_event_result(message) {
+            Ok(dispatched) => dispatched,
+            Err(error) => {
+                log::error!("Timer dispatch completion failed: {error:#}");
+                #[cfg(feature = "dispatch-observer")]
+                self.fail_native_dispatch(&format!("timer completion failed: {error:#}"));
+                false
+            }
+        }
+    }
+
+    #[allow(clippy::unused_unit)]
+    fn process_time_event_result(&self, message: TimeEventMessage) -> anyhow::Result<bool> {
         #[cfg(feature = "dispatch-observer")]
         let retained_event_id = message.event().event_id;
         #[cfg(feature = "dispatch-observer")]
@@ -937,7 +954,7 @@ impl LiveNode {
         if self.state() == NodeState::Observing {
             if let Err(error) = self.verify_observation_timer_admission(&message) {
                 self.fail_recovery_observation(&format!("{error:#}"));
-                return false;
+                return Ok(false);
             }
         }
         #[cfg(feature = "dispatch-observer")]
@@ -946,10 +963,10 @@ impl LiveNode {
         {
             if let Err(error) = timers.received(&message) {
                 self.fail_recovery_observation(&format!("{error:#}"));
-                return false;
+                return Ok(false);
             }
         }
-        let guard = begin_node_dispatch!(self, Time, &message, false);
+        let guard = begin_node_dispatch!(self, Time, &message, Ok(false));
         let dispatched = AsyncRunner::handle_time_event(message);
         #[cfg(feature = "dispatch-observer")]
         if !dispatched && !cleanup {
@@ -957,28 +974,24 @@ impl LiveNode {
                 let _ = guard.rejected();
                 self.fail_native_dispatch("registered timer dispatch was rejected");
             }
-            return false;
+            return Ok(false);
         }
         #[cfg(feature = "dispatch-observer")]
         {
-            if let Some(guard) = guard
-                && let Err(error) = self.finish_node_dispatch(guard)
-            {
-                log::error!("Timer dispatch completion failed: {error:#}");
-                self.fail_native_dispatch(&format!("timer completion failed: {error:#}"));
-                return false;
+            if let Some(guard) = guard {
+                self.finish_node_dispatch(guard)?;
             }
             if let Some(timers) = &self.recovery_timers
                 && !self.is_native_historical_dispatch()
                 && let Err(error) = timers.processed(retained_event_id)
             {
                 self.fail_recovery_observation(&format!("{error:#}"));
-                return false;
+                return Ok(false);
             }
         }
         #[cfg(not(feature = "dispatch-observer"))]
         complete_node_dispatch!(self, guard);
-        dispatched
+        Ok(dispatched)
     }
     #[allow(clippy::unused_unit)]
     fn process_data_event(&self, event: DataEvent) {

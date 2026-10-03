@@ -2307,7 +2307,7 @@ pub(crate) mod serial_tests {
     )]
     #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_stop_fails_when_disconnect_readiness_poll_times_out() {
-        let (mut node, data_state, _exec_state) = live_node_with_lifecycle_clients(
+        let (mut node, data_state, exec_state) = live_node_with_lifecycle_clients(
             "DisconnectReadinessPollNode",
             LifecycleClientBehavior::DisconnectKeepsConnected,
             LifecycleClientBehavior::Connects,
@@ -2324,8 +2324,14 @@ pub(crate) mod serial_tests {
             err.to_string().contains("disconnect readiness"),
             "unexpected error: {err:#}"
         );
-        assert_eq!(handle.state(), NodeState::Stopped);
+        // A client is still connected, so finalization has not reached the
+        // successful stop/seal boundary. Preserve the actual failed shutdown.
+        assert_eq!(handle.state(), NodeState::ShuttingDown);
+        assert!(!handle.is_running());
         assert!(data_state.disconnect_attempted.load(Ordering::Relaxed));
+        assert!(data_state.connected.load(Ordering::Relaxed));
+        assert!(exec_state.disconnect_attempted.load(Ordering::Relaxed));
+        assert!(!exec_state.connected.load(Ordering::Relaxed));
     }
 
     #[rstest]

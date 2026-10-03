@@ -167,6 +167,16 @@ pub trait RestoredTimerCheckpoint: Debug {
         source_binding_id: u64,
         cleanup: bool,
     ) -> anyhow::Result<crate::runner::TimeEventMessage>;
+    /// Materializes only the exact original queued leases before applying the
+    /// original terminal closure. The producer remains paused throughout;
+    /// counts/configuration/schedules must match the supplied source inventory.
+    fn admit_historical_messages(
+        &self,
+        _inventory: &serde_json::Value,
+        _inputs: &[(TimeEvent, u64, bool)],
+    ) -> anyhow::Result<Vec<crate::runner::TimeEventMessage>> {
+        anyhow::bail!("historical owner queued callback admission unsupported")
+    }
     /// Advances only the already installed owner schedules under their producer pause.
     /// The native reader supplies the original inventory; callback bindings cannot change.
     fn apply_historical_inventory(&self, _inventory: &serde_json::Value) -> anyhow::Result<()> {

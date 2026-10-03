@@ -126,7 +126,14 @@ impl LiveNode {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             self.replay_native_tail_inner(trace, cut, &mut decode, &mut decode_pending)
         }))
-        .map_err(|_| anyhow::anyhow!("native tail replay panicked"))
+        .map_err(|panic| {
+            let reason = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            anyhow::anyhow!("native tail replay panicked: {reason}")
+        })
         .and_then(|result| result);
         self.historical_replay = None;
         self.historical_timer_admissions.clear();
@@ -445,7 +452,7 @@ impl LiveNode {
                     .context("original owner timers not installed")?
                     .historical_time_message(witnesses[0])?;
                 ensure!(
-                    self.process_time_event(message),
+                    self.process_time_event_result(message)?,
                     "original owner callback rejected historical event"
                 );
             }
@@ -922,6 +929,19 @@ mod tests {
                     }
                 } else if let Some(command) = input.downcast_ref::<nautilus_common::runner::TradingCommandMessage>() {
                     serde_json::json!({"endpoint":command.endpoint().to_string(),"command":command.command()})
+                } else if let Some(message) = input.downcast_ref::<nautilus_common::runner::TimeEventMessage>() {
+                    let actual = message.checkpoint_callback_binding();
+                    anyhow::ensure!(
+                        actual["owner_thread_matches"].as_bool() == Some(true)
+                            && matches!(actual["kind"].as_str(),
+                                Some("registered_owner_thread" | "registered_cleanup"))
+                            && actual["binding_id"].as_u64().is_some_and(|id| id > 0),
+                        "actual observer timer has no owner-bound dispatch lease"
+                    );
+                    let event = message.event();
+                    serde_json::json!({"name":event.name.to_string(),"event_id":event.event_id,
+                        "ts_event":event.ts_event,"ts_init":event.ts_init,
+                        "callback":message.native_input_callback_binding()})
                 } else if let Some(events) =
                     input.downcast_ref::<Vec<nautilus_model::events::OrderEventAny>>()
                 {

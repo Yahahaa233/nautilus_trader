@@ -258,6 +258,7 @@ impl TimeEventMessageFactory {
         TimeEventMessage {
             event,
             dispatch: TimeEventDispatch::Direct(self.0.clone()),
+            native_source_binding_id: None,
         }
     }
 }
@@ -278,6 +279,8 @@ enum TimeEventDispatch {
 pub struct TimeEventMessage {
     event: TimeEvent,
     dispatch: TimeEventDispatch,
+    // Only the actual paused owner-clock receipt can project its source binding.
+    native_source_binding_id: Option<u64>,
 }
 
 impl TimeEventMessage {
@@ -293,10 +296,12 @@ impl TimeEventMessage {
             TimeEventCallback::Python(callback) => Self {
                 event,
                 dispatch: TimeEventDispatch::Direct(SendTimeEventCallback::Python(callback)),
+                native_source_binding_id: None,
             },
             TimeEventCallback::Rust(callback) => Self {
                 event,
                 dispatch: TimeEventDispatch::Direct(SendTimeEventCallback::Rust(callback)),
+                native_source_binding_id: None,
             },
             callback @ TimeEventCallback::RustLocal(_) => {
                 let token = TimeEventCallbackToken::register(callback);
@@ -331,10 +336,30 @@ impl TimeEventMessage {
         }
     }
 
+    /// Canonical callback identity carried by the original native input. A
+    /// restored message projects only its privately installed source binding;
+    /// dispatch and `checkpoint_callback_binding` retain the actual local lease.
+    /// This is input evidence, never callback or execution authority.
+    #[must_use]
+    pub fn native_input_callback_binding(&self) -> serde_json::Value {
+        let mut binding = self.checkpoint_callback_binding();
+        if let Some(source) = self.native_source_binding_id {
+            binding["binding_id"] = source.into();
+        }
+        binding
+    }
+
+    #[cfg(feature = "live")]
+    pub(crate) fn with_native_source_callback_binding(mut self, source: u64) -> Self {
+        self.native_source_binding_id = Some(source);
+        self
+    }
+
     pub(crate) const fn registered(event: TimeEvent, lease: TimeEventCallbackLease) -> Self {
         Self {
             event,
             dispatch: TimeEventDispatch::Registered(lease),
+            native_source_binding_id: None,
         }
     }
 
@@ -343,6 +368,7 @@ impl TimeEventMessage {
         Self {
             event,
             dispatch: TimeEventDispatch::Cleanup(lease),
+            native_source_binding_id: None,
         }
     }
 
@@ -355,7 +381,9 @@ impl TimeEventMessage {
     /// Returns `true` when a callback was dispatched. Cleanup messages and
     /// wrong-thread registered messages return `false`.
     pub fn dispatch(self) -> bool {
-        let Self { event, dispatch } = self;
+        let Self {
+            event, dispatch, ..
+        } = self;
         match dispatch {
             TimeEventDispatch::Direct(callback) => {
                 TimeEventHandler::new(event, callback.into_callback()).run();
