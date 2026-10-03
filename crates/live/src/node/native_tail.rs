@@ -594,6 +594,7 @@ impl LiveNode {
             "market_cache",
             "market_cache_config",
             "components",
+            "strategy_framework",
             "data_engine",
             "report_contexts",
             "portfolio",
@@ -603,6 +604,16 @@ impl LiveNode {
                 "installed native source cut business state differs: {name}"
             );
         }
+        let owner_timers = self
+            .recovery_timers
+            .as_ref()
+            .context("source native timer installation missing")?
+            .historical_inventory()?;
+        nautilus_system::trader::Trader::verify_native_strategy_framework_timers(
+            &self.kernel.trader,
+            &expected["strategy_framework"],
+            &owner_timers,
+        )?;
         let mut manager = self.exec_manager.trace_effects_inventory(source_at)?;
         manager["captured_at_ns"] = trace.cut().captured_at_ns.into();
         ensure!(

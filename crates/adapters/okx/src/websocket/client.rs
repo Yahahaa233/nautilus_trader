@@ -266,6 +266,198 @@ impl PendingOrderInfo {
     }
 }
 
+/// One original ordinary submit. Operation ACK is retained separately from
+/// the venue orders-channel state, which may arrive before that ACK.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PendingSubmitInfo {
+    pub command_id: nautilus_core::UUID4,
+    pub command_payload_json: Ustr,
+    pub request_id: String,
+    pub trader_id: TraderId,
+    pub account_id: AccountId,
+    pub identity: nautilus_live::execution::context::OrderIdentity,
+    pub acknowledged_response: Option<serde_json::Value>,
+}
+impl PendingSubmitInfo {
+    pub(crate) fn new(
+        command: &nautilus_common::messages::execution::SubmitOrder,
+        account_id: AccountId,
+        identity: nautilus_live::execution::context::OrderIdentity,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            command.strategy_id == identity.strategy_id
+                && command.instrument_id == identity.instrument_id
+                && command.client_order_id == identity.client_order_id
+                && command.order_init.trader_id == command.trader_id
+                && command.order_init.strategy_id == command.strategy_id
+                && command.order_init.instrument_id == command.instrument_id
+                && command.order_init.client_order_id == command.client_order_id
+                && command.order_init.order_side == identity.order_side
+                && command.order_init.order_type == identity.order_type,
+            "ordinary original submission differs from the captured order identity"
+        );
+        Ok(Self {
+            command_id: command.command_id,
+            command_payload_json: serde_json::to_string(command)?.as_str().into(),
+            request_id: command.command_id.to_string().replace('-', ""),
+            trader_id: command.trader_id,
+            account_id,
+            identity,
+            acknowledged_response: None,
+        })
+    }
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        let command: nautilus_common::messages::execution::SubmitOrder =
+            serde_json::from_str(self.command_payload_json.as_str())?;
+        let actual = Self::new(&command, self.account_id, self.identity)?;
+        anyhow::ensure!(
+            actual.command_id == self.command_id && actual.trader_id == self.trader_id,
+            "retained ordinary submit differs from its complete original command"
+        );
+        anyhow::ensure!(
+            self.request_id == self.command_id.to_string().replace('-', ""),
+            "ordinary submission request differs from original command UUID"
+        );
+        Ok(())
+    }
+    pub(crate) fn matches(
+        &self,
+        request_id: Option<&str>,
+        client_order_id: &str,
+        account_id: AccountId,
+        identity: &nautilus_live::execution::context::OrderIdentity,
+    ) -> bool {
+        self.request_id == request_id.unwrap_or("")
+            && self.identity.client_order_id.as_str() == client_order_id
+            && self.account_id == account_id
+            && &self.identity == identity
+    }
+}
+
+/// Exact ordinary single-cancel context; an operation ACK is never a terminal event.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PendingCancelInfo {
+    pub trader_id: TraderId,
+    pub strategy_id: StrategyId,
+    pub instrument_id: InstrumentId,
+    pub account_id: AccountId,
+    pub client_order_id: ClientOrderId,
+    pub venue_order_id: Option<VenueOrderId>,
+    pub command_id: nautilus_core::UUID4,
+    pub request_id: String,
+    pub command_payload_json: String,
+    pub acknowledgement: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "cancel_association_is_certain")]
+    pub association_uncertain: bool,
+}
+fn cancel_association_is_certain(value: &bool) -> bool {
+    !*value
+}
+impl PendingCancelInfo {
+    pub(crate) fn matches_response(
+        &self,
+        request_id: Option<&str>,
+        client: ClientOrderId,
+        venue: Option<VenueOrderId>,
+    ) -> bool {
+        request_id == Some(self.request_id.as_str())
+            && client == self.client_order_id
+            && venue.is_some()
+            && self
+                .venue_order_id
+                .is_none_or(|expected| Some(expected) == venue)
+    }
+    pub(crate) fn terminal_causation(
+        &self,
+        event: &nautilus_model::events::OrderCanceled,
+    ) -> Option<nautilus_core::UUID4> {
+        if self.association_uncertain {
+            return None;
+        }
+        let ack = self.acknowledgement.as_ref()?;
+        (event.trader_id == self.trader_id
+            && event.strategy_id == self.strategy_id
+            && event.instrument_id == self.instrument_id
+            && event.account_id == Some(self.account_id)
+            && event.client_order_id == self.client_order_id
+            && ack["request_id"].as_str() == Some(self.request_id.as_str())
+            && ack["code"] == "0"
+            && ack["matched_item"]["sCode"] == "0"
+            && ack["matched_item"]["ordId"].as_str() == event.venue_order_id.as_ref().map(|id| id.as_str())
+            && ack["matched_item"]["clOrdId"].as_str() == Some(self.client_order_id.as_str()))
+        .then_some(self.command_id)
+    }
+    pub(crate) fn terminal_basis(
+        &self,
+        event: &nautilus_model::events::OrderCanceled,
+    ) -> Option<nautilus_model::events::OrderCommandCausationBasis> {
+        self.terminal_causation(event)?;
+        let terminal = serde_json::to_string(event).ok()?;
+        let acknowledgement = serde_json::to_string(self.acknowledgement.as_ref()?).ok()?;
+        if terminal.len() > 16_384
+            || acknowledgement.len() > 65_536
+            || self.command_payload_json.len() > 16_384
+        {
+            return None;
+        }
+        Some(nautilus_model::events::OrderCommandCausationBasis {
+            kind: "local_unique_cancel_ack_terminal_identity".into(),
+            command_id: self.command_id,
+            command_payload_json: self.command_payload_json.as_str().into(),
+            request_id: Some(self.request_id.as_str().into()),
+            acknowledgement_payload_json: Some(acknowledgement.as_str().into()),
+            original_terminal_payload_json: terminal.as_str().into(),
+            venue_command_causation_available: false,
+        })
+    }
+    pub(crate) fn rejection(
+        &self,
+        venue: Option<VenueOrderId>,
+        reason: &str,
+        now: nautilus_core::UnixNanos,
+        acknowledgement: &serde_json::Value,
+    ) -> nautilus_model::events::OrderEventAny {
+        let mut event = nautilus_model::events::OrderCancelRejected::new(
+            self.trader_id,
+            self.strategy_id,
+            self.instrument_id,
+            self.client_order_id,
+            reason.into(),
+            nautilus_common::recovery_trace::native_event_uuid(),
+            now,
+            now,
+            false,
+            venue,
+            Some(self.account_id),
+        );
+        // The response is a request rejection, not an order-canceled terminal.
+        if let (Ok(original), Ok(ack)) = (
+            serde_json::to_string(&event),
+            serde_json::to_string(acknowledgement),
+        ) {
+            if original.len() <= 16_384
+                && ack.len() <= 65_536
+                && self.command_payload_json.len() <= 16_384
+            {
+                event.command_causation_basis =
+                    Some(nautilus_model::events::OrderCommandCausationBasis {
+                        kind: "venue_cancel_req_id_rejection".into(),
+                        command_id: self.command_id,
+                        command_payload_json: self.command_payload_json.as_str().into(),
+                        request_id: Some(self.request_id.as_str().into()),
+                        acknowledgement_payload_json: Some(ack.as_str().into()),
+                        original_terminal_payload_json: original.as_str().into(),
+                        venue_command_causation_available: true,
+                    });
+                event.causation_id = Some(self.command_id);
+            }
+        }
+        nautilus_model::events::OrderEventAny::CancelRejected(event)
+    }
+}
+
 /// Provides a WebSocket client for connecting to [OKX](https://okx.com).
 #[derive(Clone)]
 pub struct OKXWebSocketClient {
@@ -301,7 +493,9 @@ pub struct OKXWebSocketClient {
     trade_quote_ccy_lists: Arc<AtomicMap<Ustr, Vec<Ustr>>>,
     spot_trade_quote_ccy: Arc<Mutex<Option<Ustr>>>,
     pub(crate) pending_orders: Arc<DashMap<String, PendingOrderInfo>>,
+    pub(crate) retained_submit_contexts: Arc<DashMap<String, PendingSubmitInfo>>,
     pub(crate) pending_cancels: Arc<DashMap<String, PendingOrderInfo>>,
+    pub(crate) retained_cancel_contexts: Arc<DashMap<String, PendingCancelInfo>>,
     pub(crate) pending_amends: Arc<DashMap<String, PendingOrderInfo>>,
     option_greeks_subs: Arc<AtomicMap<InstrumentId, AHashSet<OKXGreeksType>>>,
     /// Per-base-pair refcount for the `index-tickers` channel. Multiple
@@ -455,7 +649,9 @@ impl OKXWebSocketClient {
             trade_quote_ccy_lists: Arc::new(AtomicMap::new()),
             spot_trade_quote_ccy: Arc::new(Mutex::new(None)),
             pending_orders: Arc::new(DashMap::new()),
+            retained_submit_contexts: Arc::new(DashMap::new()),
             pending_cancels: Arc::new(DashMap::new()),
+            retained_cancel_contexts: Arc::new(DashMap::new()),
             pending_amends: Arc::new(DashMap::new()),
             option_greeks_subs: Arc::new(AtomicMap::new()),
             index_pair_subscribers: Arc::new(DashMap::new()),
@@ -707,6 +903,7 @@ impl OKXWebSocketClient {
                 && self.pending_orders.is_empty()
                 && self.pending_cancels.is_empty()
                 && self.pending_amends.is_empty()
+                && self.retained_submit_contexts.is_empty()
                 && self.subscriptions_state.is_empty()
                 && self.subscriptions_inst_type.is_empty()
                 && self.subscriptions_inst_family.is_empty()
@@ -2921,6 +3118,63 @@ impl OKXWebSocketClient {
         rpi_taker_access: Option<bool>,
         rpi_px_round: Option<bool>,
     ) -> Result<(), OKXWsError> {
+        self.submit_order_with_context(
+            None,
+            trader_id,
+            strategy_id,
+            instrument_id,
+            td_mode,
+            client_order_id,
+            order_side,
+            order_type,
+            quantity,
+            time_in_force,
+            price,
+            trigger_price,
+            post_only,
+            reduce_only,
+            quote_quantity,
+            position_side,
+            attach_algo_ords,
+            px_usd,
+            px_vol,
+            outcome,
+            slippage_pct,
+            rpi,
+            rpi_taker_access,
+            rpi_px_round,
+        )
+        .await
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn submit_order_with_context(
+        &self,
+        original: Option<PendingSubmitInfo>,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        td_mode: OKXTradeMode,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        time_in_force: Option<TimeInForce>,
+        price: Option<Price>,
+        trigger_price: Option<Price>,
+        post_only: Option<bool>,
+        reduce_only: Option<bool>,
+        quote_quantity: Option<bool>,
+        position_side: Option<PositionSide>,
+        attach_algo_ords: Option<Vec<WsAttachAlgoOrdParams>>,
+        px_usd: Option<String>,
+        px_vol: Option<String>,
+        outcome: Option<String>,
+        slippage_pct: Option<String>,
+        rpi: Option<bool>,
+        rpi_taker_access: Option<bool>,
+        rpi_px_round: Option<bool>,
+    ) -> Result<(), OKXWsError> {
         let _checkpoint_request = self
             .checkpoint_gate
             .enter_request()
@@ -3151,7 +3405,37 @@ impl OKXWebSocketClient {
             .build()
             .map_err(|e| OKXWsError::ClientError(format!("Build order params error: {e}")))?;
 
-        let request_id = self.generate_unique_request_id();
+        if let Some(context) = &original {
+            context
+                .validate()
+                .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
+            let command: nautilus_common::messages::execution::SubmitOrder =
+                serde_json::from_str(context.command_payload_json.as_str())
+                    .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
+            if command.order_init.quantity != quantity
+                || command.order_init.price != price
+                || command.order_init.trigger_price != trigger_price
+            {
+                return Err(OKXWsError::ClientError(
+                    "ordinary wire terms differ from the original SubmitOrder".into(),
+                ));
+            }
+            if context.trader_id != trader_id
+                || context.identity.strategy_id != strategy_id
+                || context.identity.instrument_id != instrument_id
+                || context.identity.client_order_id != client_order_id
+                || context.identity.order_side != order_side
+                || context.identity.order_type != order_type
+            {
+                return Err(OKXWsError::ClientError(
+                    "ordinary submit command identity differs".into(),
+                ));
+            }
+        }
+        let request_id = original.as_ref().map_or_else(
+            || self.generate_unique_request_id(),
+            |context| context.request_id.clone(),
+        );
         let request = OKXWsRequest {
             id: Some(request_id.clone()),
             op: super::enums::OKXWsOperation::Order,
@@ -3163,13 +3447,30 @@ impl OKXWebSocketClient {
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize order: {e}")))?;
 
         let cl_ord_key = client_order_id.to_string();
+        if original.is_none() && self.retained_submit_contexts.contains_key(&cl_ord_key) {
+            return Err(OKXWsError::ClientError(
+                "ordinary order already has an original submit context".into(),
+            ));
+        }
+        if let Some(context) = original.as_ref() {
+            match self.retained_submit_contexts.entry(cl_ord_key.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    return Err(OKXWsError::ClientError(
+                        "ordinary order has an original submit context".into(),
+                    ));
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    entry.insert(context.clone());
+                }
+            }
+        }
         self.pending_orders.insert(
             cl_ord_key.clone(),
             PendingOrderInfo {
                 trader_id,
                 strategy_id,
                 instrument_id,
-                command_id: None,
+                command_id: original.as_ref().map(|context| context.command_id),
             },
         );
 
@@ -3185,6 +3486,9 @@ impl OKXWebSocketClient {
 
         if result.is_err() {
             self.pending_orders.remove(&cl_ord_key);
+            // A transport error can occur after the wire was sent. Keep the
+            // unique original context for a later actual venue update; only a
+            // structured outcome or terminal order state can retire it.
         }
 
         result
@@ -3334,6 +3638,45 @@ impl OKXWebSocketClient {
         client_order_id: Option<ClientOrderId>,
         venue_order_id: Option<VenueOrderId>,
     ) -> Result<(), OKXWsError> {
+        self.cancel_order_inner(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            venue_order_id,
+            None,
+        )
+        .await
+    }
+    pub(crate) async fn cancel_order_with_command(
+        &self,
+        command: &nautilus_common::messages::execution::CancelOrder,
+        account_id: AccountId,
+    ) -> Result<(), OKXWsError> {
+        self.cancel_order_inner(
+            command.trader_id,
+            command.strategy_id,
+            command.instrument_id,
+            Some(command.client_order_id),
+            command.venue_order_id,
+            Some((
+                command.command_id,
+                account_id,
+                serde_json::to_string(command)
+                    .map_err(|error| OKXWsError::JsonError(error.to_string()))?,
+            )),
+        )
+        .await
+    }
+    async fn cancel_order_inner(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+        original: Option<(nautilus_core::UUID4, AccountId, String)>,
+    ) -> Result<(), OKXWsError> {
         let _checkpoint_request = self
             .checkpoint_gate
             .enter_request()
@@ -3357,22 +3700,46 @@ impl OKXWebSocketClient {
 
         if let Some(client_order_id) = client_order_id {
             builder.cl_ord_id(client_order_id.as_str());
-            self.pending_cancels.insert(
-                client_order_id.to_string(),
-                PendingOrderInfo {
-                    trader_id,
-                    strategy_id,
-                    instrument_id,
-                    command_id: None,
-                },
-            );
         }
 
         let params = builder
             .build()
             .map_err(|e| OKXWsError::ClientError(format!("Build cancel params error: {e}")))?;
 
-        let request_id = self.generate_unique_request_id();
+        let request_id = original.as_ref().map_or_else(
+            || self.generate_unique_request_id(),
+            |(id, _, _)| id.to_string().replace('-', ""),
+        );
+        if let (Some((command_id, account_id, command_payload_json)), Some(client_order_id)) =
+            (original.as_ref(), client_order_id)
+        {
+            match self
+                .retained_cancel_contexts
+                .entry(client_order_id.to_string())
+            {
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    return Err(OKXWsError::ClientError(
+                        "original cancel remains unresolved; reconcile, never replace its context"
+                            .into(),
+                    ));
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    entry.insert(PendingCancelInfo {
+                        trader_id,
+                        strategy_id,
+                        instrument_id,
+                        account_id: *account_id,
+                        client_order_id,
+                        venue_order_id,
+                        command_id: *command_id,
+                        request_id: request_id.clone(),
+                        command_payload_json: command_payload_json.clone(),
+                        acknowledgement: None,
+                        association_uncertain: false,
+                    });
+                }
+            }
+        }
         let request = OKXWsRequest {
             id: Some(request_id.clone()),
             op: super::enums::OKXWsOperation::CancelOrder,
@@ -3383,6 +3750,17 @@ impl OKXWebSocketClient {
         let payload = serde_json::to_string(&request)
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize cancel: {e}")))?;
 
+        if let Some(client_order_id) = client_order_id {
+            self.pending_cancels.insert(
+                client_order_id.to_string(),
+                PendingOrderInfo {
+                    trader_id,
+                    strategy_id,
+                    instrument_id,
+                    command_id: original.as_ref().map(|(id, _, _)| *id),
+                },
+            );
+        }
         let cmd = HandlerCommand::Send {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_CANCEL.to_vec()),
@@ -3394,7 +3772,9 @@ impl OKXWebSocketClient {
         let result = self.send_cmd(cmd).await;
 
         if let (Err(_), Some(key)) = (&result, &cl_ord_key) {
-            self.pending_cancels.remove(key);
+            if original.is_none() {
+                self.pending_cancels.remove(key);
+            }
         }
 
         result
@@ -5576,3 +5956,11 @@ mod tests {
         assert_eq!(all[0], topic);
     }
 }
+
+#[cfg(test)]
+#[path = "submission_caller_tests.rs"]
+mod submission_caller_tests;
+
+#[cfg(test)]
+#[path = "cancel_causation_tests.rs"]
+mod cancel_causation_tests;

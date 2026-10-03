@@ -222,11 +222,15 @@ impl OKXExecutionClient {
         );
 
         let ws_business = ws_business.with_checkpoint_gate(checkpoint_gate.clone());
-        let ws_dispatch_state = Arc::new(WsDispatchState::with_pending_maps(
+        let mut dispatch = WsDispatchState::with_pending_maps(
             ws_private.pending_orders.clone(),
             ws_private.pending_cancels.clone(),
             ws_private.pending_amends.clone(),
-        ));
+        );
+        dispatch.retained_submit_contexts = ws_private.retained_submit_contexts.clone();
+        let dispatch =
+            dispatch.with_retained_cancel_contexts(ws_private.retained_cancel_contexts.clone());
+        let ws_dispatch_state = Arc::new(dispatch);
 
         Ok(Self {
             recovery_pristine: std::sync::atomic::AtomicBool::new(true),
@@ -731,6 +735,12 @@ impl OKXExecutionClient {
         let clock = self.clock;
         let trader_id = self.core.trader_id;
         let context = OrderContext::from(&order);
+        let command_id = cmd.command_id;
+        let original = crate::websocket::client::PendingSubmitInfo::new(
+            cmd,
+            self.core.account_id,
+            context.identity,
+        )?;
 
         self.ws_dispatch_state
             .order_identities
@@ -758,7 +768,8 @@ impl OKXExecutionClient {
 
         self.spawn_task("submit_order", async move {
             let result = ws_private
-                .submit_order(
+                .submit_order_with_context(
+                    Some(original),
                     trader_id,
                     strategy_id,
                     instrument_id,
@@ -786,13 +797,12 @@ impl OKXExecutionClient {
                 .await;
 
             if let Err(e) = result {
-                emit_submit_failure(
+                emit_submit_failure_with_causation(
                     classify_okx_ws_failure(&e),
                     &emitter,
                     clock,
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
+                    (strategy_id, instrument_id, client_order_id),
+                    Some(command_id),
                 );
                 return Err(anyhow::Error::new(e).context("submit order failed"));
             }
@@ -1115,15 +1125,10 @@ impl OKXExecutionClient {
             .map(|(venue_order_id, _)| venue_order_id)
             .or(cmd.venue_order_id);
 
+        let account_id = self.emitter.account_id();
         self.spawn_task("cancel_order", async move {
             let result = ws_private
-                .cancel_order(
-                    command.trader_id,
-                    command.strategy_id,
-                    command.instrument_id,
-                    Some(command.client_order_id),
-                    command.venue_order_id,
-                )
+                .cancel_order_with_command(&command, account_id)
                 .await;
 
             if let Err(e) = result {
@@ -2528,7 +2533,11 @@ impl ExecutionClient for OKXExecutionClient {
 
             let trade_mode = self.trade_mode_for_order(cmd.instrument_id, cmd.params.as_ref());
             if let Err(reason) = validate_order(&*order, trade_mode, OrderSubmission::Single) {
-                self.emitter.emit_order_denied(&order, &reason.to_string());
+                self.emitter.emit_order_denied_with_causation(
+                    &order,
+                    &reason.to_string(),
+                    cmd.command_id,
+                );
                 return Ok(());
             }
 
@@ -2536,7 +2545,8 @@ impl ExecutionClient for OKXExecutionClient {
             let route = self.submit_order_route(cmd.instrument_id, order_type)?;
 
             log::debug!("OrderSubmitted client_order_id={}", order.client_order_id());
-            self.emitter.emit_order_submitted(&order);
+            self.emitter
+                .emit_order_submitted_with_causation(&order, cmd.command_id);
 
             route
         };
@@ -3494,12 +3504,28 @@ fn emit_submit_failure(
     instrument_id: InstrumentId,
     client_order_id: ClientOrderId,
 ) {
+    emit_submit_failure_with_causation(
+        failure,
+        emitter,
+        clock,
+        (strategy_id, instrument_id, client_order_id),
+        None,
+    );
+}
+
+fn emit_submit_failure_with_causation(
+    failure: CommandFailure,
+    emitter: &ExecutionEventEmitter,
+    clock: &'static AtomicTime,
+    identity: (StrategyId, InstrumentId, ClientOrderId),
+    command_id: Option<nautilus_core::UUID4>,
+) {
+    let (strategy_id, instrument_id, client_order_id) = identity;
     match failure {
         CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
-            emitter.emit_order_rejected_event(
-                strategy_id,
-                instrument_id,
-                client_order_id,
+            emitter.emit_order_rejected_event_with_causation(
+                (strategy_id, instrument_id, client_order_id),
+                command_id,
                 &reason,
                 clock.get_time_ns(),
                 false,

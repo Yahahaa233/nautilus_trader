@@ -152,6 +152,21 @@ impl ShareableMessageHandler {
         TypedHandler(Rc::new(DowncastingHandler::new(f)))
     }
 
+    /// Creates a typed downcasting handler with an explicit stable identifier.
+    /// Local historical bindings use this constructor without drawing a UUID.
+    pub fn from_typed_with_id<T, S, F>(id: S, callback: F) -> Self
+    where
+        T: 'static,
+        S: AsRef<str>,
+        F: Fn(&T) + 'static,
+    {
+        TypedHandler(Rc::new(DowncastingHandler {
+            id: Ustr::from(id.as_ref()),
+            callback,
+            _marker: PhantomData,
+        }))
+    }
+
     /// Creates a handler from an Any-typed closure.
     pub fn from_any<F>(f: F) -> Self
     where

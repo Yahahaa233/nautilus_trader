@@ -37,7 +37,7 @@ use nautilus_common::{
     live::ingress::IngressSender,
     messages::{ExecutionEvent, ExecutionReport},
 };
-use nautilus_core::{Params, UnixNanos, time::AtomicTime};
+use nautilus_core::{Params, UUID4, UnixNanos, time::AtomicTime};
 use nautilus_model::{
     enums::{AccountType, LiquiditySide},
     events::{
@@ -180,6 +180,32 @@ impl ExecutionEventEmitter {
     /// Generates and emits an order submitted event.
     pub fn emit_order_submitted(&self, order: &OrderAny) {
         let event = self.factory.generate_order_submitted(order, self.ts_init());
+        self.send_order_event(event);
+    }
+
+    /// Retains the actual submitting command, rather than reconstructing it
+    /// from an order ID or callback timing.
+    pub fn emit_order_submitted_with_causation(&self, order: &OrderAny, command_id: UUID4) {
+        let mut event = self.factory.generate_order_submitted(order, self.ts_init());
+        if let OrderEventAny::Submitted(value) = &mut event {
+            value.causation_id = Some(command_id);
+        }
+        self.send_order_event(event);
+    }
+
+    /// Preserves a local command rejection without implying a venue ACK.
+    pub fn emit_order_denied_with_causation(
+        &self,
+        order: &OrderAny,
+        reason: &str,
+        command_id: UUID4,
+    ) {
+        let mut event = self
+            .factory
+            .generate_order_denied(order, reason, self.ts_init());
+        if let OrderEventAny::Denied(value) = &mut event {
+            value.causation_id = Some(command_id);
+        }
         self.send_order_event(event);
     }
 
@@ -355,7 +381,26 @@ impl ExecutionEventEmitter {
         ts_event: UnixNanos,
         due_post_only: bool,
     ) {
-        let event = OrderRejected::new(
+        self.emit_order_rejected_event_with_causation(
+            (strategy_id, instrument_id, client_order_id),
+            None,
+            reason,
+            ts_event,
+            due_post_only,
+        );
+    }
+
+    /// Emits a structured rejection bound only to a verified original command.
+    pub fn emit_order_rejected_event_with_causation(
+        &self,
+        identity: (StrategyId, InstrumentId, ClientOrderId),
+        command_id: Option<UUID4>,
+        reason: &str,
+        ts_event: UnixNanos,
+        due_post_only: bool,
+    ) {
+        let (strategy_id, instrument_id, client_order_id) = identity;
+        let mut event = OrderRejected::new(
             self.factory.trader_id(),
             strategy_id,
             instrument_id,
@@ -368,6 +413,7 @@ impl ExecutionEventEmitter {
             false,
             due_post_only,
         );
+        event.causation_id = command_id;
         self.send_order_event(OrderEventAny::Rejected(event));
     }
 

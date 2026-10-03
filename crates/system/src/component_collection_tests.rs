@@ -61,6 +61,12 @@ fn register(
             load,
             save: save_actor,
             #[cfg(feature = "live")]
+            native_save: None,
+            #[cfg(feature = "live")]
+            native_framework: None,
+            #[cfg(feature = "live")]
+            native_load: None,
+            #[cfg(feature = "live")]
             historical_save: save_actor,
             #[cfg(feature = "live")]
             historical_prepare: |_, _| {
@@ -77,6 +83,12 @@ fn register(
         ComponentStateCallbacks {
             load,
             save: save_strategy,
+            #[cfg(feature = "live")]
+            native_save: None,
+            #[cfg(feature = "live")]
+            native_framework: None,
+            #[cfg(feature = "live")]
+            native_load: None,
             #[cfg(feature = "live")]
             historical_save: save_strategy,
             #[cfg(feature = "live")]

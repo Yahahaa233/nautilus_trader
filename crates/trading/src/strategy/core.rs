@@ -38,6 +38,19 @@ use nautilus_model::identifiers::{
 use nautilus_portfolio::portfolio::Portfolio;
 use ustr::Ustr;
 
+#[cfg(feature = "live")]
+mod framework_checkpoint;
+#[cfg(feature = "live")]
+pub use framework_checkpoint::NativeStrategyFrameworkCheckpoint;
+#[cfg(feature = "live")]
+#[doc(hidden)]
+pub fn validate_native_framework_timers(
+    value: &serde_json::Value,
+    inventory: &serde_json::Value,
+) -> anyhow::Result<()> {
+    framework_checkpoint::validate_native_framework_timers(value, inventory)
+}
+
 use super::{
     api::{OrderApi, PortfolioApi},
     config::StrategyConfig,
@@ -69,6 +82,8 @@ pub struct StrategyCore {
     pub(crate) market_exit_attempts: u64,
     pub(crate) market_exit_timer_name: Ustr,
     pub(crate) market_exit_tag: Ustr,
+    #[cfg(feature = "live")]
+    native_framework_restore: Option<NativeStrategyFrameworkCheckpoint>,
 }
 
 impl Debug for StrategyCore {
@@ -206,6 +221,8 @@ impl StrategyCore {
             market_exit_attempts: 0,
             market_exit_timer_name,
             market_exit_tag: Ustr::from("MARKET_EXIT"),
+            #[cfg(feature = "live")]
+            native_framework_restore: None,
         })
     }
 

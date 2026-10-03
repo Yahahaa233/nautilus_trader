@@ -22,6 +22,8 @@
 use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use ahash::AHashMap;
+#[cfg(feature = "live")]
+use anyhow::Context;
 use indexmap::IndexMap;
 #[cfg(feature = "python")]
 use nautilus_common::python::wrappers::release_python_wrapper;
@@ -85,6 +87,19 @@ type ComponentStateSaveFn = fn(Ustr) -> anyhow::Result<PersistedComponentState>;
 struct ComponentStateCallbacks {
     load: ComponentStateLoadFn,
     save: ComponentStateSaveFn,
+    #[cfg(feature = "live")]
+    native_save: Option<ComponentStateSaveFn>,
+    #[cfg(feature = "live")]
+    native_framework: Option<fn(Ustr) -> anyhow::Result<serde_json::Value>>,
+    #[cfg(feature = "live")]
+    native_load: Option<
+        fn(
+            Ustr,
+            PersistedComponentState,
+            &serde_json::Value,
+            &serde_json::Value,
+        ) -> anyhow::Result<()>,
+    >,
     #[cfg(feature = "live")]
     historical_save: ComponentStateSaveFn,
     #[cfg(feature = "live")]
@@ -417,6 +432,12 @@ impl Trader {
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
                 #[cfg(feature = "live")]
+                native_save: None,
+                #[cfg(feature = "live")]
+                native_framework: None,
+                #[cfg(feature = "live")]
+                native_load: None,
+                #[cfg(feature = "live")]
                 historical_save: Self::save_historical_component_state::<T>,
                 #[cfg(feature = "live")]
                 historical_prepare: Self::prepare_historical_component::<T>,
@@ -455,6 +476,12 @@ impl Trader {
             ComponentStateCallbacks {
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
+                #[cfg(feature = "live")]
+                native_save: None,
+                #[cfg(feature = "live")]
+                native_framework: None,
+                #[cfg(feature = "live")]
+                native_load: None,
                 #[cfg(feature = "live")]
                 historical_save: Self::save_historical_component_state::<T>,
                 #[cfg(feature = "live")]
@@ -578,6 +605,12 @@ impl Trader {
             ComponentStateCallbacks {
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
+                #[cfg(feature = "live")]
+                native_save: Some(Self::save_native_strategy_state::<T>),
+                #[cfg(feature = "live")]
+                native_framework: Some(Self::save_native_strategy_framework::<T>),
+                #[cfg(feature = "live")]
+                native_load: Some(Self::load_native_strategy_state::<T>),
                 #[cfg(feature = "live")]
                 historical_save: Self::save_historical_component_state::<T>,
                 #[cfg(feature = "live")]
@@ -803,6 +836,12 @@ impl Trader {
             ComponentStateCallbacks {
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
+                #[cfg(feature = "live")]
+                native_save: Some(Self::save_native_strategy_state::<T>),
+                #[cfg(feature = "live")]
+                native_framework: Some(Self::save_native_strategy_framework::<T>),
+                #[cfg(feature = "live")]
+                native_load: Some(Self::load_native_strategy_state::<T>),
                 #[cfg(feature = "live")]
                 historical_save: Self::save_historical_component_state::<T>,
                 #[cfg(feature = "live")]
@@ -1820,6 +1859,248 @@ impl Trader {
             errors.join("; ")
         );
         Ok(result)
+    }
+
+    /// Actual framework-aware strategy business capture. The enclosing node
+    /// supplies its completed-root/cache/owner-timer freeze; ordinary component
+    /// save/export paths remain unchanged.
+    #[cfg(feature = "live")]
+    pub fn collect_native_component_state(
+        trader: &Rc<RefCell<Self>>,
+    ) -> anyhow::Result<CollectedComponentState> {
+        let (actor_callbacks, strategy_callbacks) = {
+            let trader = trader
+                .try_borrow()
+                .map_err(|_| anyhow::anyhow!("Trader is active during state collection"))?;
+            anyhow::ensure!(
+                trader
+                    .actor_ids
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    == trader.actor_ids.len()
+                    && trader
+                        .strategy_ids
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == trader.strategy_ids.len(),
+                "Duplicate component registration during state collection"
+            );
+            (
+                trader.actor_state_callbacks()?,
+                trader.strategy_state_callbacks()?,
+            )
+        };
+        let mut result = CollectedComponentState {
+            actors: IndexMap::new(),
+            strategies: IndexMap::new(),
+        };
+        let mut errors = Vec::new();
+        for (id, callbacks) in &actor_callbacks {
+            match (callbacks.save)(id.inner()) {
+                Ok(state) => {
+                    result.actors.insert(*id, state);
+                }
+                Err(error) => errors.push(format!("actor {id} callback: {error:#}")),
+            }
+        }
+        for (id, callbacks) in &strategy_callbacks {
+            let save = callbacks
+                .native_save
+                .context("native strategy save callback absent")?;
+            match save(id.inner()) {
+                Ok(state) => {
+                    result.strategies.insert(*id, state);
+                }
+                Err(error) => errors.push(format!("strategy {id} callback: {error:#}")),
+            }
+        }
+        {
+            let current = trader
+                .try_borrow()
+                .map_err(|_| anyhow::anyhow!("Trader remained active after state collection"))?;
+            anyhow::ensure!(
+                current
+                    .actor_ids
+                    .iter()
+                    .copied()
+                    .eq(actor_callbacks.iter().map(|(id, _)| *id))
+                    && current
+                        .strategy_ids
+                        .iter()
+                        .copied()
+                        .eq(strategy_callbacks.iter().map(|(id, _)| *id)),
+                "Component registration changed during state collection"
+            );
+        }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "Failed to collect component state: {}",
+            errors.join("; ")
+        );
+        Ok(result)
+    }
+
+    /// Complete limited framework facts from actual registered strategies.
+    /// This performs no Clock reads or random draws.
+    #[cfg(feature = "live")]
+    pub fn collect_native_strategy_framework(
+        trader: &Rc<RefCell<Self>>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let callbacks = trader.try_borrow()?.strategy_state_callbacks()?;
+        let mut values = std::collections::BTreeMap::new();
+        for (id, callback) in &callbacks {
+            let save = callback
+                .native_framework
+                .context("native framework callback absent")?;
+            values.insert(id.to_string(), save(id.inner())?);
+        }
+        anyhow::ensure!(
+            trader
+                .try_borrow()?
+                .strategy_ids
+                .iter()
+                .copied()
+                .eq(callbacks.iter().map(|(id, _)| *id)),
+            "strategy registration changed during framework capture"
+        );
+        Ok(serde_json::to_value(values)?)
+    }
+
+    /// Exact source/current framework plus the already restored/frozen owner
+    /// schedules. Native cache/configuration checks occur in the same callback.
+    #[cfg(feature = "live")]
+    pub fn verify_native_strategy_framework_timers(
+        trader: &Rc<RefCell<Self>>,
+        expected: &serde_json::Value,
+        timers: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let callbacks = trader.try_borrow()?.strategy_state_callbacks()?;
+        let actual = Self::collect_native_strategy_framework(trader)?;
+        anyhow::ensure!(
+            actual == *expected,
+            "actual native strategy framework differs"
+        );
+        for (id, _) in callbacks {
+            let inventory = timers
+                .get(&format!("component:{id}"))
+                .context("strategy owner timer inventory absent")?;
+            nautilus_trading::strategy::core::validate_native_framework_timers(
+                &actual[&id.to_string()],
+                inventory,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Internal typed kernel handoff. LiveNode's reader-issued native trace
+    /// entry is the public recovery admission; this routine never starts trader.
+    #[cfg(feature = "live")]
+    pub fn restore_native_component_state(
+        trader: &Rc<RefCell<Self>>,
+        state: &CollectedComponentState,
+        frameworks: &serde_json::Value,
+        timers: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let (actors, strategies, actor_ids, strategy_ids) = {
+            let current = trader.try_borrow()?;
+            anyhow::ensure!(
+                matches!(
+                    current.state,
+                    ComponentState::PreInitialized | ComponentState::Ready
+                ),
+                "native trader restore requires an unused idle lifecycle"
+            );
+            (
+                current.actor_state_callbacks()?,
+                current.strategy_state_callbacks()?,
+                current.actor_ids.clone(),
+                current.strategy_ids.clone(),
+            )
+        };
+        anyhow::ensure!(
+            state.actors.keys().copied().eq(actor_ids.iter().copied())
+                && state
+                    .strategies
+                    .keys()
+                    .copied()
+                    .eq(strategy_ids.iter().copied()),
+            "native component identity/order differs"
+        );
+        let source_ids = frameworks
+            .as_object()
+            .context("reader native framework map absent")?;
+        anyhow::ensure!(
+            source_ids.len() == strategy_ids.len()
+                && strategy_ids
+                    .iter()
+                    .all(|id| source_ids.contains_key(&id.to_string())),
+            "reader native framework owners differ"
+        );
+        for (id, callbacks) in actors {
+            (callbacks.load)(id.inner(), state.actors[&id].clone())?;
+        }
+        for (id, callbacks) in strategies {
+            let load = callbacks
+                .native_load
+                .context("native strategy restore callback absent")?;
+            load(
+                id.inner(),
+                state.strategies[&id].clone(),
+                &frameworks[&id.to_string()],
+                timers
+                    .get(&format!("component:{id}"))
+                    .context("reader strategy timer owner absent")?,
+            )?;
+        }
+        anyhow::ensure!(
+            trader.try_borrow()?.actor_ids == actor_ids
+                && trader.try_borrow()?.strategy_ids == strategy_ids,
+            "native component registration changed during restore"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "live")]
+    fn save_native_strategy_framework<T>(id: Ustr) -> anyhow::Result<serde_json::Value>
+    where
+        T: Strategy + StrategyNative + DataActorNative + Debug + 'static,
+    {
+        let strategy = try_get_actor_unchecked::<T>(&id).context("native strategy absent")?;
+        strategy
+            .strategy_core()
+            .native_framework_checkpoint()?
+            .value()
+    }
+    #[cfg(feature = "live")]
+    fn save_native_strategy_state<T>(id: Ustr) -> anyhow::Result<PersistedComponentState>
+    where
+        T: Strategy + StrategyNative + DataActorNative + Debug + 'static,
+    {
+        let strategy = try_get_actor_unchecked::<T>(&id).context("native strategy absent")?;
+        let framework = strategy.strategy_core().native_framework_checkpoint()?;
+        let value = Strategy::on_native_framework_checkpoint(&*strategy, &framework)?;
+        framework.verify_current(strategy.strategy_core())?;
+        Ok(value)
+    }
+    #[cfg(feature = "live")]
+    fn load_native_strategy_state<T>(
+        id: Ustr,
+        state: PersistedComponentState,
+        framework: &serde_json::Value,
+        timers: &serde_json::Value,
+    ) -> anyhow::Result<()>
+    where
+        T: Strategy + StrategyNative + DataActorNative + Debug + 'static,
+    {
+        let mut strategy =
+            try_get_actor_unchecked::<T>(&id).context("native strategy target absent")?;
+        let receipt = strategy
+            .strategy_core_mut()
+            .restore_native_framework_checkpoint(framework, timers)?;
+        Strategy::on_native_framework_checkpoint_load(&mut *strategy, state, &receipt)?;
+        receipt.verify_current(strategy.strategy_core())
     }
 
     /// Restores actor and strategy callback state into an already registered,

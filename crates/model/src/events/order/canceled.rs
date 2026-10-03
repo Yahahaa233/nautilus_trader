@@ -33,6 +33,21 @@ use crate::{
     types::{Currency, Money, Price, Quantity},
 };
 
+/// Explicit producer association with original command and response values.
+/// This records the stated proof strength; it grants no execution authority.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderCommandCausationBasis {
+    pub kind: Ustr,
+    pub command_id: UUID4,
+    pub command_payload_json: Ustr,
+    pub request_id: Option<Ustr>,
+    pub acknowledgement_payload_json: Option<Ustr>,
+    pub original_terminal_payload_json: Ustr,
+    pub venue_command_causation_available: bool,
+}
+
 /// Represents an event where an order has been canceled at the trading venue.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +87,9 @@ pub struct OrderCanceled {
     /// The causation ID associated with the event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub causation_id: Option<UUID4>,
+    /// Local association is distinct from a request ID echoed by the terminal event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_causation_basis: Option<OrderCommandCausationBasis>,
 }
 
 impl OrderCanceled {
@@ -104,6 +122,7 @@ impl OrderCanceled {
             account_id,
             reason,
             causation_id: None,
+            command_causation_basis: None,
         }
     }
 }

@@ -580,8 +580,7 @@ impl LiveNode {
                             .context("release account disappeared")
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let components =
-                    nautilus_system::trader::Trader::collect_component_state(&self.kernel.trader)?;
+                let components = self.collect_recovery_checkpoint_components()?;
                 let boundary = RecoveryReleaseBoundary {
                     cache: &cache,
                     components: &components,
@@ -596,8 +595,7 @@ impl LiveNode {
                 verify_timers()?;
                 generation.verify()?;
                 ensure!(
-                    nautilus_system::trader::Trader::collect_component_state(&self.kernel.trader)?
-                        == components,
+                    self.collect_recovery_checkpoint_components()? == components,
                     "final release validation mutated native component history"
                 );
                 registration

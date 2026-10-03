@@ -121,7 +121,6 @@ use nautilus_model::{
     orders::Order,
 };
 use nautilus_network::mode::ReconnectRequestOutcome;
-#[cfg(any(feature = "python", feature = "native-tail-replay"))]
 use nautilus_system::trader::Trader;
 use nautilus_system::{config::NautilusKernelConfig, kernel::NautilusKernel};
 use nautilus_trading::{
@@ -541,6 +540,56 @@ impl LiveNode {
         guard.complete()
     }
 
+    fn collect_recovery_checkpoint_components(
+        &self,
+    ) -> anyhow::Result<nautilus_system::trader::CollectedComponentState> {
+        #[cfg(feature = "native-tail-replay")]
+        {
+            return Trader::collect_native_component_state(&self.kernel.trader);
+        }
+        #[cfg(not(feature = "native-tail-replay"))]
+        {
+            Trader::collect_component_state(&self.kernel.trader)
+        }
+    }
+
+    /// Restores only Reader-verified framework state into this actual Idle node.
+    /// All source data remain untrusted until actual registered configuration,
+    /// native cache and same-owner source schedules have been checked. The
+    /// physical lifecycle and submission gates remain paused.
+    #[cfg(feature = "native-tail-replay")]
+    pub fn restore_native_component_state(
+        &mut self,
+        state: &nautilus_system::trader::CollectedComponentState,
+        trace: &nautilus_event_store::native_trace::VerifiedNativeTrace,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.state() == NodeState::Idle,
+            "native component restore requires Idle"
+        );
+        anyhow::ensure!(
+            self.recovery_restored_components.is_none() && self.recovery_empty_bootstrap.is_none(),
+            "native component source already installed"
+        );
+        let framework = trace
+            .cut()
+            .native_effects
+            .get("strategy_framework")
+            .context("reader source cut lacks native strategy framework")?;
+        self.recovery_requires_release = true;
+        Trader::restore_native_component_state(
+            self.kernel.trader(),
+            state,
+            framework,
+            &trace.cut().registered_timers,
+        )?;
+        self.recovery_restored_components = Some((
+            state.actors.keys().map(ToString::to_string).collect(),
+            state.strategies.keys().map(ToString::to_string).collect(),
+        ));
+        Ok(())
+    }
+
     #[cfg(feature = "native-tail-replay")]
     fn collect_native_trace_effects(&self) -> anyhow::Result<serde_json::Value> {
         recovery_quiescence::with_registered_timer_inventory_mode(
@@ -586,6 +635,8 @@ impl LiveNode {
                 let market = cache.native_market_checkpoint()?;
                 let market_config = cache.native_market_checkpoint_config();
                 let components = Trader::collect_native_recovery_state(&self.kernel.trader)?;
+                let strategy_framework =
+                    Trader::collect_native_strategy_framework(&self.kernel.trader)?;
                 let data = self
                     .kernel
                     .data_engine
@@ -600,7 +651,7 @@ impl LiveNode {
                 verify()?;
                 let mut effects = serde_json::json!({"schema":"NautilusNativeTraceEffects.v1","timer_capture_ns":timer_capture_ns,
                     "orders":orders, "positions":positions, "accounts":accounts,"market_cache":market,"market_cache_config":market_config,
-                    "components":components, "data_engine":data, "execution_manager":manager, "portfolio":portfolio,
+                    "components":components, "strategy_framework":strategy_framework, "data_engine":data, "execution_manager":manager, "portfolio":portfolio,
                     "registered_timers":if self.historical_replay.is_some() {
                         self.recovery_timers.as_ref().context("historical owner timer installation missing")?.historical_inventory()?
                     } else { timers.clone() }, "report_contexts": &*self.native_report_contexts.try_borrow()?,

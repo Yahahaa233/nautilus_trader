@@ -1111,6 +1111,23 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(
     drop(actual);
     let identity = trace.source().unwrap();
     let first = cuts.borrow()[0].clone();
+    if complete_market_exit {
+        let observed = cuts.borrow();
+        let exiting = observed
+            .iter()
+            .find(|cut| cut.0.native_effects["strategy_framework"][STRATEGY]["is_exiting"] == true)
+            .expect("real market_exit never reached a completed native Core cut");
+        let framework = &exiting.0.native_effects["strategy_framework"][STRATEGY];
+        assert_eq!(framework["pending_stop"], true);
+        assert_eq!(framework["market_exit_attempts"], 0);
+        assert_eq!(
+            framework["market_exit_timer_name"],
+            format!("MARKET_EXIT_CHECK:{STRATEGY}")
+        );
+        assert_eq!(framework["market_exit_tag"], "MARKET_EXIT");
+        assert_eq!(framework["order_manager"]["submit_order_commands"], 0);
+        assert_eq!(framework["order_manager"]["oto_target_quantities"], 0);
+    }
     if historical_responses {
         assert_eq!(
             first.0.native_effects["market_cache"][0]["quotes"]
@@ -1303,7 +1320,9 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(
             .unwrap();
     }
     target.restore_native_cache(restored).unwrap();
-    target.restore_component_state(&first.2).unwrap();
+    target
+        .restore_native_component_state(&first.2, &verified)
+        .unwrap();
     target
         .kernel
         .risk_engine
@@ -1490,6 +1509,13 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(
             assert_eq!(actual.gtd_order_events, original_business_order_events);
         }
         drop(actual);
+        assert_eq!(
+            nautilus_system::trader::Trader::collect_native_strategy_framework(
+                &target.kernel.trader
+            )
+            .unwrap(),
+            verified.final_cut().unwrap().native_effects["strategy_framework"]
+        );
         assert_eq!(target.state(), NodeState::Idle);
         assert_eq!(
             target.kernel.risk_engine.borrow().trading_state(),

@@ -65,7 +65,7 @@ use crate::{
     },
     http::models::{OKXAccount, OKXCancelAlgoOrderResponse, OKXPosition, OKXSpreadOrder},
     websocket::{
-        client::PendingOrderInfo,
+        client::{PendingCancelInfo, PendingOrderInfo, PendingSubmitInfo},
         enums::OKXWsOperation,
         handler::{is_post_only_auto_cancel, is_unfilled_rpi_cancel},
         messages::{ExecutionReport, OKXAlgoOrderMsg, OKXOrderMsg, OKXWsMessage},
@@ -182,7 +182,9 @@ pub struct WsDispatchState {
     pub order_identities: DashMap<ClientOrderId, OrderIdentity>,
     order_contexts: DashMap<ClientOrderId, OrderContext>,
     pub(crate) pending_orders: Arc<DashMap<String, PendingOrderInfo>>,
+    pub(crate) retained_submit_contexts: Arc<DashMap<String, PendingSubmitInfo>>,
     pub(crate) pending_cancels: Arc<DashMap<String, PendingOrderInfo>>,
+    pub(crate) retained_cancel_contexts: Arc<DashMap<String, PendingCancelInfo>>,
     pub(crate) pending_amends: Arc<DashMap<String, PendingOrderInfo>>,
     accepted_venue_order_ids: Mutex<FifoCacheMap<ClientOrderId, VenueOrderId, DEDUP_CAPACITY>>,
     triggered_orders: DedupCache<ClientOrderId>,
@@ -201,7 +203,9 @@ impl Default for WsDispatchState {
             order_identities: DashMap::new(),
             order_contexts: DashMap::new(),
             pending_orders: Arc::new(DashMap::new()),
+            retained_submit_contexts: Arc::new(DashMap::new()),
             pending_cancels: Arc::new(DashMap::new()),
+            retained_cancel_contexts: Arc::new(DashMap::new()),
             pending_amends: Arc::new(DashMap::new()),
             accepted_venue_order_ids: Mutex::new(FifoCacheMap::new()),
             triggered_orders: DedupCache::new(),
@@ -233,6 +237,10 @@ impl WsDispatchState {
             venue_by_client: AHashMap<ClientOrderId, OrderVenueBinding>,
             terminal_client_by_parent: Vec<(VenueOrderId, ClientOrderId)>,
             pending_linked_children: u64,
+            #[serde(default)]
+            retained_submit_contexts: std::collections::BTreeMap<String, PendingSubmitInfo>,
+            #[serde(default)]
+            retained_cancel_contexts: std::collections::BTreeMap<String, PendingCancelInfo>,
         }
         fn distinct<K: Eq + Hash>(values: impl IntoIterator<Item = K>) -> anyhow::Result<()> {
             let mut keys = std::collections::HashSet::new();
@@ -250,6 +258,47 @@ impl WsDispatchState {
                 && source.pending_linked_children == 0,
             "execution dispatch recovery requires fresh resolved source"
         );
+        anyhow::ensure!(
+            source.retained_cancel_contexts.len() <= DEDUP_CAPACITY,
+            "cancel retained source exceeds bounded inventory"
+        );
+        for (key, info) in &source.retained_cancel_contexts {
+            let original: nautilus_common::messages::execution::CancelOrder =
+                serde_json::from_str(&info.command_payload_json)?;
+            anyhow::ensure!(
+                original.command_id == info.command_id
+                    && original.trader_id == info.trader_id
+                    && original.strategy_id == info.strategy_id
+                    && original.instrument_id == info.instrument_id
+                    && original.client_order_id == info.client_order_id
+                    && original.venue_order_id == info.venue_order_id,
+                "cancel original command changed in adapter source"
+            );
+            anyhow::ensure!(
+                !info.association_uncertain
+                    && key == info.client_order_id.as_str()
+                    && info.request_id == info.command_id.to_string().replace('-', "")
+                    && info
+                        .acknowledgement
+                        .as_ref()
+                        .is_some_and(|ack| ack["request_id"].as_str()
+                            == Some(info.request_id.as_str())
+                            && ack["code"] == "0"
+                            && ack["matched_item"]["sCode"] == "0"
+                            && ack["matched_item"]["clOrdId"].as_str() == Some(key.as_str())
+                            && ack["matched_item"]["ordId"]
+                                .as_str()
+                                .is_some_and(|venue| info
+                                    .venue_order_id
+                                    .is_none_or(|expected| expected.as_str() == venue)))
+                    && source
+                        .order_identities
+                        .get(&info.client_order_id)
+                        .is_some_and(|identity| identity.strategy_id == info.strategy_id
+                            && identity.instrument_id == info.instrument_id),
+                "cancel retained original acknowledgement or identity changed"
+            );
+        }
         for (key, identity) in &source.order_identities {
             anyhow::ensure!(
                 *key == identity.client_order_id,
@@ -265,6 +314,33 @@ impl WsDispatchState {
                         .is_none_or(|identity| *identity == context.identity),
                 "source order context differs"
             );
+        }
+        for (key, context) in &source.retained_submit_contexts {
+            context.validate()?;
+            anyhow::ensure!(
+                key == context.identity.client_order_id.as_str()
+                    && source
+                        .order_identities
+                        .get(&context.identity.client_order_id)
+                        == Some(&context.identity),
+                "source original submission differs from retained order identity"
+            );
+            if let Some(response) = &context.acknowledged_response {
+                anyhow::ensure!(
+                    response["id"] == context.request_id
+                        && response["code"] == "0"
+                        && response["op"] == "order"
+                        && response["data"]
+                            .as_array()
+                            .is_some_and(|data| data.len() == 1)
+                        && response["data"][0]["clOrdId"] == key.as_str()
+                        && response["data"][0]["sCode"] == "0"
+                        && response["data"][0]["ordId"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty()),
+                    "source original submission ACK differs from actual request"
+                );
+            }
         }
         for (client, binding) in &source.venue_by_client {
             anyhow::ensure!(
@@ -291,6 +367,9 @@ impl WsDispatchState {
         for (key, value) in source.order_identities {
             self.order_identities.insert(key, value);
         }
+        for (key, context) in source.retained_submit_contexts {
+            self.retained_submit_contexts.insert(key, context);
+        }
         for (key, value) in source.order_contexts {
             self.order_contexts.insert(key, value);
         }
@@ -312,6 +391,9 @@ impl WsDispatchState {
         for key in source.post_only_rejections {
             self.post_only_rejections.insert(key);
         }
+        for (key, info) in source.retained_cancel_contexts {
+            self.retained_cancel_contexts.insert(key, info);
+        }
         let mut bindings = self.lifecycle_bindings.lock();
         bindings.client_by_parent = source.client_by_parent;
         bindings.venue_by_client = source.venue_by_client;
@@ -331,8 +413,16 @@ impl WsDispatchState {
             self.pending_linked_children.lock().is_empty(),
             "OKX linked child routing is unresolved"
         );
+        anyhow::ensure!(
+            self.retained_cancel_contexts.len() <= DEDUP_CAPACITY
+                && self
+                    .retained_cancel_contexts
+                    .iter()
+                    .all(|entry| entry.acknowledgement.is_some() && !entry.association_uncertain),
+            "cancel original acknowledgement remains unresolved"
+        );
         let bindings = self.lifecycle_bindings.lock();
-        Ok(serde_json::json!({
+        let mut inventory = serde_json::json!({
             "order_identities":self.order_identities.iter().map(|entry| (*entry.key(), *entry.value()))
                 .collect::<std::collections::BTreeMap<_,_>>(),
             "order_contexts":self.order_contexts.iter().map(|entry| (*entry.key(), *entry.value()))
@@ -350,7 +440,24 @@ impl WsDispatchState {
                 .collect::<std::collections::BTreeMap<_,_>>(),
             "terminal_client_by_parent":bindings.terminal_client_by_parent.checkpoint_entries(),
             "pending_linked_children":0,
-        }))
+        });
+        if !self.retained_submit_contexts.is_empty() {
+            inventory["retained_submit_contexts"] = serde_json::to_value(
+                self.retained_submit_contexts
+                    .iter()
+                    .map(|entry| (entry.key().clone(), entry.value().clone()))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )?;
+        }
+        if !self.retained_cancel_contexts.is_empty() {
+            inventory["retained_cancel_contexts"] = serde_json::to_value(
+                self.retained_cancel_contexts
+                    .iter()
+                    .map(|entry| (entry.key().clone(), entry.value().clone()))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )?;
+        }
+        Ok(inventory)
     }
 
     // Creates a dispatch state sharing the pending operation maps
@@ -366,6 +473,14 @@ impl WsDispatchState {
             pending_amends,
             ..Default::default()
         }
+    }
+
+    pub(crate) fn with_retained_cancel_contexts(
+        mut self,
+        contexts: Arc<DashMap<String, PendingCancelInfo>>,
+    ) -> Self {
+        self.retained_cancel_contexts = contexts;
+        self
     }
 
     pub(crate) fn track_order_context(&self, context: OrderContext) {
@@ -428,10 +543,63 @@ impl WsDispatchState {
             })
     }
 
+    fn attach_original_submit_causation(
+        &self,
+        event: &mut OrderAccepted,
+        identity: &OrderIdentity,
+    ) {
+        let Some(original) = self
+            .retained_submit_contexts
+            .get(event.client_order_id.as_str())
+        else {
+            return;
+        };
+        let ack_venue_matches = original
+            .acknowledged_response
+            .as_ref()
+            .is_none_or(|response| {
+                response["data"][0]["ordId"].as_str() == Some(event.venue_order_id.as_str())
+            });
+        if original.trader_id != event.trader_id
+            || original.account_id != event.account_id
+            || &original.identity != identity
+            || !ack_venue_matches
+        {
+            return;
+        }
+        // Preserve the actual native event before attaching local association.
+        // Serialization cannot grant trading or supply an operation ACK.
+        let Ok(original_event) = serde_json::to_string(event) else {
+            return;
+        };
+        let acknowledgement = original
+            .acknowledged_response
+            .as_ref()
+            .and_then(|response| serde_json::to_string(response).ok());
+        event.causation_id = Some(original.command_id);
+        event.command_causation_basis = Some(nautilus_model::events::OrderCommandCausationBasis {
+            kind: "local_original_submit_identity".into(),
+            command_id: original.command_id,
+            command_payload_json: original.command_payload_json,
+            request_id: acknowledgement
+                .as_ref()
+                .map(|_| original.request_id.as_str().into()),
+            acknowledgement_payload_json: acknowledgement
+                .as_ref()
+                .map(|value| value.as_str().into()),
+            original_terminal_payload_json: original_event.as_str().into(),
+            venue_command_causation_available: false,
+        });
+    }
+
     pub(crate) fn remove_order_tracking(&self, client_order_id: ClientOrderId) {
         let pending = self.pending_linked_children.lock();
         let removed_context = self.order_contexts.remove(&client_order_id).is_some();
         self.order_identities.remove(&client_order_id);
+        self.retained_submit_contexts
+            .remove(client_order_id.as_str());
+        self.retained_cancel_contexts
+            .remove(client_order_id.as_str());
         drop(pending);
 
         if removed_context {
@@ -761,13 +929,88 @@ pub fn dispatch_ws_message(
                 if s_code == OKX_SUCCESS_CODE {
                     log::debug!("Order response ok: op={op:?} cl_ord_id={cl_ord_id}");
                     match op {
-                        OKXWsOperation::Order
-                        | OKXWsOperation::BatchOrders
-                        | OKXWsOperation::OrderAlgo => {
+                        OKXWsOperation::Order => {
+                            if let Some(mut original) =
+                                state.retained_submit_contexts.get_mut(cl_ord_id)
+                            {
+                                let Some(identity) =
+                                    state.order_identity(original.identity.client_order_id)
+                                else {
+                                    continue;
+                                };
+                                let venue = item
+                                    .get("ordId")
+                                    .and_then(|id| id.as_str())
+                                    .filter(|id| !id.is_empty());
+                                if code != "0"
+                                    || venue.is_none()
+                                    || data.len() != 1
+                                    || !original.matches(
+                                        id.as_deref(),
+                                        cl_ord_id,
+                                        account_id,
+                                        &identity,
+                                    )
+                                    || original.trader_id != emitter.trader_id()
+                                    || state
+                                        .accepted_venue_order_id(&original.identity.client_order_id)
+                                        .is_some_and(|accepted| Some(accepted.as_str()) != venue)
+                                {
+                                    log::warn!(
+                                        "Ordinary submit ACK does not match its retained original request"
+                                    );
+                                    continue;
+                                }
+                                if original.acknowledged_response.is_none() {
+                                    original.acknowledged_response = Some(serde_json::json!({
+                                        "id":id,"op":op,"code":code,"msg":msg,"data":data,"received_ns":ts_init.as_u64()}));
+                                }
+                                state.pending_orders.remove(cl_ord_id);
+                            } else {
+                                state.pending_orders.remove(cl_ord_id);
+                            }
+                        }
+                        OKXWsOperation::BatchOrders | OKXWsOperation::OrderAlgo => {
                             state.pending_orders.remove(cl_ord_id);
                         }
-                        OKXWsOperation::CancelOrder
-                        | OKXWsOperation::BatchCancelOrders
+                        OKXWsOperation::CancelOrder => {
+                            if let Some(mut context) =
+                                state.retained_cancel_contexts.get_mut(cl_ord_id)
+                            {
+                                let client = parse_client_order_id(cl_ord_id);
+                                let venue = item
+                                    .get("ordId")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|v| !v.is_empty())
+                                    .map(VenueOrderId::new);
+                                if client.is_some_and(|client| {
+                                    context.matches_response(id.as_deref(), client, venue)
+                                }) && code == OKX_SUCCESS_CODE
+                                {
+                                    let original_ack = serde_json::json!({"request_id":id,"operation":op,"code":code,"message":msg,"data":data,"matched_item":item});
+                                    if context
+                                        .acknowledgement
+                                        .as_ref()
+                                        .is_some_and(|first| first != &original_ack)
+                                    {
+                                        context.association_uncertain = true;
+                                        log::warn!(
+                                            "Conflicting original cancel acknowledgement; association remains uncertain"
+                                        );
+                                    } else if !context.association_uncertain {
+                                        context.acknowledgement.get_or_insert(original_ack);
+                                        state.pending_cancels.remove(cl_ord_id);
+                                    }
+                                } else {
+                                    log::warn!(
+                                        "Cancel acknowledgement differs from original context; awaiting reconciliation"
+                                    );
+                                }
+                            } else {
+                                state.pending_cancels.remove(cl_ord_id);
+                            }
+                        }
+                        OKXWsOperation::BatchCancelOrders
                         | OKXWsOperation::MassCancel
                         | OKXWsOperation::CancelAlgos => {
                             state.pending_cancels.remove(cl_ord_id);
@@ -822,20 +1065,113 @@ pub fn dispatch_ws_message(
 
                 match op {
                     OKXWsOperation::Order | OKXWsOperation::BatchOrders => {
+                        let original = state
+                            .retained_submit_contexts
+                            .get(cl_ord_id)
+                            .map(|entry| entry.clone());
+                        if let Some(original) = &original {
+                            if op != OKXWsOperation::Order
+                                || data.len() != 1
+                                || !original.matches(id.as_deref(), cl_ord_id, account_id, &ident)
+                                || original.trader_id != emitter.trader_id()
+                            {
+                                log::warn!(
+                                    "Ordinary submit rejection does not match its retained original request"
+                                );
+                                continue;
+                            }
+                        }
                         state.remove_order_tracking(client_order_id);
                         state.pending_orders.remove(cl_ord_id);
-                        emitter.emit_order_rejected_event(
-                            ident.strategy_id,
-                            ident.instrument_id,
-                            client_order_id,
-                            &reason,
-                            ts_init,
-                            false,
-                        );
+                        if let Some(original) = original {
+                            let mut event = OrderRejected::new(
+                                emitter.trader_id(),
+                                ident.strategy_id,
+                                ident.instrument_id,
+                                client_order_id,
+                                account_id,
+                                reason.as_str().into(),
+                                nautilus_common::recovery_trace::native_event_uuid(),
+                                ts_init,
+                                ts_init,
+                                false,
+                                false,
+                            );
+                            let original_event = serde_json::to_string(&event);
+                            let acknowledgement = serde_json::to_string(&serde_json::json!({
+                                "id":id,"op":op,"code":code,"msg":msg,"data":data,"received_ns":ts_init.as_u64()
+                            }));
+                            if let (Ok(original_event), Ok(acknowledgement)) =
+                                (original_event, acknowledgement)
+                            {
+                                event.causation_id = Some(original.command_id);
+                                event.command_causation_basis =
+                                    Some(nautilus_model::events::OrderCommandCausationBasis {
+                                        kind: "venue_submit_req_id_rejection".into(),
+                                        command_id: original.command_id,
+                                        command_payload_json: original.command_payload_json,
+                                        request_id: Some(original.request_id.as_str().into()),
+                                        acknowledgement_payload_json: Some(
+                                            acknowledgement.as_str().into(),
+                                        ),
+                                        original_terminal_payload_json: original_event
+                                            .as_str()
+                                            .into(),
+                                        venue_command_causation_available: true,
+                                    });
+                                emitter.send_order_event(OrderEventAny::Rejected(event));
+                            } else {
+                                log::error!(
+                                    "Failed to preserve the original submit rejection source"
+                                );
+                            }
+                        } else {
+                            emitter.emit_order_rejected_event(
+                                ident.strategy_id,
+                                ident.instrument_id,
+                                client_order_id,
+                                &reason,
+                                ts_init,
+                                false,
+                            );
+                        }
                     }
-                    OKXWsOperation::CancelOrder
-                    | OKXWsOperation::BatchCancelOrders
-                    | OKXWsOperation::MassCancel => {
+                    OKXWsOperation::CancelOrder => {
+                        let retained =
+                            state
+                                .retained_cancel_contexts
+                                .remove_if(cl_ord_id, |_, context| {
+                                    context.matches_response(
+                                        id.as_deref(),
+                                        client_order_id,
+                                        venue_order_id,
+                                    )
+                                });
+                        if let Some((_, context)) = retained {
+                            state.pending_cancels.remove(cl_ord_id);
+                            emitter.send_order_event(context.rejection(
+                                venue_order_id,
+                                &reason,
+                                ts_init,
+                                &serde_json::json!({"request_id":id,"operation":op,"code":code,"message":msg,"data":data,"matched_item":item}),
+                            ));
+                        } else if !state.retained_cancel_contexts.contains_key(cl_ord_id) {
+                            state.pending_cancels.remove(cl_ord_id);
+                            emitter.emit_order_cancel_rejected_event(
+                                ident.strategy_id,
+                                ident.instrument_id,
+                                client_order_id,
+                                venue_order_id,
+                                &reason,
+                                ts_init,
+                            );
+                        } else {
+                            log::warn!(
+                                "Cancel rejection differs from original request; awaiting reconciliation"
+                            );
+                        }
+                    }
+                    OKXWsOperation::BatchCancelOrders | OKXWsOperation::MassCancel => {
                         state.pending_cancels.remove(cl_ord_id);
                         emitter.emit_order_cancel_rejected_event(
                             ident.strategy_id,
@@ -915,10 +1251,17 @@ pub fn dispatch_ws_message(
                         }
                     }
                     Some(OKXWsOperation::AmendOrder | OKXWsOperation::BatchAmendOrders) => {
+                        emit_send_failed_modify(
+                            &failure,
+                            state,
+                            emitter,
+                            clock,
+                            client_order_id,
+                            &request_id,
+                        );
                         if !is_ambiguous {
                             state.pending_amends.remove(key);
                         }
-                        emit_send_failed_modify(&failure, state, emitter, clock, client_order_id);
                     }
                     _ => {}
                 }
@@ -1768,6 +2111,7 @@ fn dispatch_order_messages(
                     false,
                     true, // due_post_only
                 );
+
                 state.remove_order_tracking(client_order_id);
                 if let Some(bindings) = lifecycle_bindings.as_mut() {
                     state.insert_terminal(client_order_id);
@@ -2061,7 +2405,7 @@ fn dispatch_parsed_order_event(
     let is_terminal;
 
     match event {
-        ParsedOrderEvent::Accepted(e) => {
+        ParsedOrderEvent::Accepted(mut e) => {
             if state.contains_filled(&client_order_id) || state.contains_terminal(&client_order_id)
             {
                 log::debug!("Skipping duplicate Accepted for {client_order_id}");
@@ -2090,6 +2434,7 @@ fn dispatch_parsed_order_event(
 
             state.insert_accepted(client_order_id, venue_order_id);
             is_terminal = false;
+            state.attach_original_submit_causation(&mut e, identity);
             emitter.send_order_event(OrderEventAny::Accepted(e));
         }
         ParsedOrderEvent::Triggered(e) => {
@@ -2121,7 +2466,13 @@ fn dispatch_parsed_order_event(
             is_terminal = false;
             emitter.send_order_event(OrderEventAny::Triggered(e));
         }
-        ParsedOrderEvent::Canceled(e) => {
+        ParsedOrderEvent::Canceled(mut e) => {
+            if let Some(context) = state.retained_cancel_contexts.get(client_order_id.as_str()) {
+                if let Some(basis) = context.terminal_basis(&e) {
+                    e.causation_id = Some(basis.command_id);
+                    e.command_causation_basis = Some(basis);
+                }
+            }
             ensure_accepted_emitted(
                 client_order_id,
                 account_id,
@@ -2253,7 +2604,7 @@ fn ensure_accepted_emitted(
     }
 
     state.insert_accepted(client_order_id, venue_order_id);
-    let accepted = OrderAccepted::new(
+    let mut accepted = OrderAccepted::new(
         emitter.trader_id(),
         identity.strategy_id,
         identity.instrument_id,
@@ -2265,6 +2616,7 @@ fn ensure_accepted_emitted(
         ts_init,
         false,
     );
+    state.attach_original_submit_causation(&mut accepted, identity);
     emitter.send_order_event(OrderEventAny::Accepted(accepted));
 }
 
@@ -2608,6 +2960,7 @@ fn emit_send_failed_modify(
     emitter: &ExecutionEventEmitter,
     clock: &AtomicTime,
     client_order_id: ClientOrderId,
+    request_id: &str,
 ) {
     let (CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason)) = failure else {
         return;
@@ -2616,14 +2969,23 @@ fn emit_send_failed_modify(
         return;
     };
 
-    emitter.emit_order_modify_rejected_event(
-        ident.strategy_id,
-        ident.instrument_id,
-        client_order_id,
-        None,
-        reason,
-        clock.get_time_ns(),
-    );
+    if let Some(original) = state.pending_amends.get(client_order_id.as_str()) {
+        if original.matches_amendment(Some(request_id))
+            && original.trader_id == emitter.trader_id()
+            && original.strategy_id == ident.strategy_id
+            && original.instrument_id == ident.instrument_id
+        {
+            let now = clock.get_time_ns();
+            emitter.send_order_event(original.rejection(
+                emitter.account_id(),
+                client_order_id,
+                None,
+                reason,
+                now,
+                now,
+            ));
+        }
+    }
 }
 
 fn format_order_response_reason(s_code: &str, s_msg: &str, sub_code: &str) -> String {

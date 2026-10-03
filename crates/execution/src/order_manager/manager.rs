@@ -89,6 +89,19 @@ impl OrderManager {
         self.submit_order_commands.remove(&client_order_id)
     }
 
+    /// Exact limited framework profile. Contingent/local pending commands are
+    /// not reconstructible from the cache alone and remain explicitly refused.
+    pub fn empty_native_framework_checkpoint(&self) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(
+            self.submit_order_commands.is_empty() && self.oto_target_quantities.is_empty(),
+            "strategy native framework cannot capture nonempty local order manager"
+        );
+        Ok(
+            serde_json::json!({"profile":"actual_empty_order_manager.v1",
+            "active_local":self.active_local,"submit_order_commands":0,"oto_target_quantities":0}),
+        )
+    }
+
     /// Resets the order manager by clearing all stateful values.
     pub fn reset(&mut self) {
         self.submit_order_commands.clear();

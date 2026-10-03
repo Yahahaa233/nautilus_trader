@@ -34,7 +34,7 @@ pub use crate::events::{
         accepted_batch::OrderAcceptedBatch,
         any::OrderEventAny,
         cancel_rejected::OrderCancelRejected,
-        canceled::OrderCanceled,
+        canceled::{OrderCanceled, OrderCommandCausationBasis},
         canceled_batch::OrderCanceledBatch,
         denied::OrderDenied,
         denied_reason::{OrderDeniedCode, OrderDeniedReason, OrderPriceField},

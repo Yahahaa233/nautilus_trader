@@ -72,6 +72,9 @@ pub struct OrderRejected {
     /// The causation ID associated with the event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub causation_id: Option<UUID4>,
+    /// Original request and rejection response association, when retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_causation_basis: Option<crate::events::OrderCommandCausationBasis>,
 }
 
 impl OrderRejected {
@@ -104,6 +107,7 @@ impl OrderRejected {
             reconciliation,
             due_post_only,
             causation_id: None,
+            command_causation_basis: None,
         }
     }
 }

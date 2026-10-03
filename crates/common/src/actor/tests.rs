@@ -24,6 +24,8 @@ use std::{
 };
 
 use ahash::AHashSet;
+#[cfg(feature = "live")]
+use crate::live::dst;
 use bytes::Bytes;
 use indexmap::IndexMap;
 use log::LevelFilter;
@@ -7004,4 +7006,314 @@ fn test_update_synthetic_replaces_existing(
     let guard = cache.borrow();
     let stored = guard.synthetic(&synthetic_id).unwrap();
     assert_eq!(stored.formula, new_formula);
+}
+
+#[cfg(feature = "live")]
+fn native_local_binding_test_source() -> crate::recovery_trace::NativeTraceSource {
+    crate::recovery_trace::NativeTraceSource {
+        schema_version: 1,
+        node_instance: UUID4::new(),
+        process_incarnation: UUID4::new(),
+        journal_run: "local-handler-source".into(),
+        logical_run: "original-local-handler-run".into(),
+        configuration_digest: "local-handler-config".into(),
+        codec_profile: "native-local-handler-test-v1".into(),
+        registered_profile_digest: "registered-test-data-actor".into(),
+    }
+}
+
+#[cfg(feature = "live")]
+#[rstest]
+fn test_native_local_quote_bar_prepare_has_no_effects_and_startup_reuses_handlers(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    use crate::recovery_trace::{
+        historical::HistoricalReplayPreparation, scope::NativeCaptureScope,
+    };
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+    actor.stop().unwrap();
+    assert_eq!(actor.state(), crate::enums::ComponentState::Stopped);
+    let (handler, saver) = get_typed_into_message_saving_handler::<DataCommand>(None);
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        handler,
+    );
+    let bar_type = BarType::from_str(&format!("{}-1-MINUTE-LAST-INTERNAL", audusd_sim.id)).unwrap();
+    let source = native_local_binding_test_source();
+    // This is a common-layer mechanism test, not a reader-issued source proof.
+    // ADX's actual preparation hook separately requires VerifiedNativeTrace.
+    let preparation = HistoricalReplayPreparation::new(&(), actor_id.as_str());
+    let scope = NativeCaptureScope::enter(&source, 1, 1, None, dst::time::Instant::now()).unwrap();
+    for _ in 0..2 {
+        actor
+            .restore_native_local_quotes(audusd_sim.id, &preparation)
+            .unwrap();
+        actor
+            .restore_native_local_bars(bar_type, &preparation)
+            .unwrap();
+        actor
+            .restore_native_local_signal("RISK_EMERGENCY", None, &preparation)
+            .unwrap();
+    }
+    assert_eq!(actor.core.quote_handler_count(), 1);
+    assert_eq!(actor.core.bar_handler_count(), 1);
+    assert_eq!(actor.state(), crate::enums::ComponentState::Stopped);
+    assert!(saver.get_messages().is_empty());
+    assert!(scope.clock_reads().unwrap().is_empty());
+    assert!(scope.uuid_draws().unwrap().is_empty());
+    assert!(scope.callbacks().unwrap().is_empty());
+    assert!(scope.transports().unwrap().is_empty());
+    assert!(scope.queued_outputs().unwrap().is_empty());
+    assert_eq!(scope.output_count().unwrap(), 0);
+    scope.finish().unwrap();
+    drop(actor);
+
+    // Stopped source components still have their original framework callbacks.
+    // They do not enter the running business hook or change lifecycle state.
+    let scope = NativeCaptureScope::enter(&source, 2, 2, None, dst::time::Instant::now()).unwrap();
+    msgbus::publish_quote(get_quotes_topic(audusd_sim.id), &QuoteTick::default());
+    msgbus::publish_bar(get_bars_topic(bar_type.standard()), &Bar::default());
+    let callbacks = scope.callbacks().unwrap();
+    assert_eq!(callbacks.len(), 2);
+    assert!(
+        callbacks
+            .iter()
+            .all(|route| route.component_id == actor_id.as_str()
+                && route.component_state == "Stopped")
+    );
+    assert_eq!(callbacks[0].kind, "handle_quote");
+    assert_eq!(callbacks[1].kind, "handle_bar");
+    scope.finish().unwrap();
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    assert!(actor.received_quotes.is_empty());
+    assert!(actor.received_bars.is_empty());
+    actor.resume().unwrap();
+    for _ in 0..2 {
+        actor.subscribe_quotes(audusd_sim.id, None, None);
+        actor.subscribe_bars(bar_type, None, None);
+        actor.subscribe_signal("RISK_EMERGENCY", None);
+    }
+    let commands = saver.get_messages();
+    assert_eq!(commands.len(), 2);
+    assert!(
+        matches!(&commands[0], DataCommand::Subscribe(SubscribeCommand::Quotes(q)) if q.instrument_id == audusd_sim.id)
+    );
+    assert!(
+        matches!(&commands[1], DataCommand::Subscribe(SubscribeCommand::Bars(b)) if b.bar_type == bar_type)
+    );
+    assert_eq!(actor.core.quote_handler_count(), 1);
+    assert_eq!(actor.core.bar_handler_count(), 1);
+    assert_eq!(
+        msgbus::subscriptions_count_any(crate::msgbus::switchboard::get_signal_topic(
+            "RISK_EMERGENCY"
+        ))
+        .unwrap(),
+        1
+    );
+    drop(actor);
+    msgbus::publish_quote(get_quotes_topic(audusd_sim.id), &QuoteTick::default());
+    msgbus::publish_bar(get_bars_topic(bar_type.standard()), &Bar::default());
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    assert_eq!(actor.received_quotes.len(), 1);
+    assert_eq!(actor.received_bars.len(), 1);
+    actor.unsubscribe_quotes(audusd_sim.id, None, None);
+    actor.unsubscribe_bars(bar_type, None, None);
+    assert_eq!(actor.core.quote_handler_count(), 0);
+    assert_eq!(actor.core.bar_handler_count(), 0);
+    let commands = saver.get_messages();
+    assert_eq!(commands.len(), 4);
+    assert!(
+        matches!(&commands[2], DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(q)) if q.instrument_id == audusd_sim.id)
+    );
+    assert!(
+        matches!(&commands[3], DataCommand::Unsubscribe(UnsubscribeCommand::Bars(b)) if b.bar_type == bar_type)
+    );
+}
+
+#[cfg(feature = "live")]
+#[rstest]
+fn test_native_local_binding_rejects_foreign_running_and_remote_downgrade(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    use crate::recovery_trace::{
+        historical::HistoricalReplayPreparation, scope::NativeCaptureScope,
+    };
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+    actor.stop().unwrap();
+    let bar_type = BarType::from_str(&format!("{}-1-MINUTE-LAST-INTERNAL", audusd_sim.id)).unwrap();
+    let (handler, saver) = get_typed_into_message_saving_handler::<DataCommand>(None);
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        handler,
+    );
+    let source = native_local_binding_test_source();
+    let foreign = HistoricalReplayPreparation::new(&(), "different-original-owner");
+    let scope = NativeCaptureScope::enter(&source, 1, 1, None, dst::time::Instant::now()).unwrap();
+    assert!(
+        actor
+            .restore_native_local_quotes(audusd_sim.id, &foreign)
+            .is_err()
+    );
+    assert!(actor.restore_native_local_bars(bar_type, &foreign).is_err());
+    assert!(
+        actor
+            .restore_native_local_signal("RISK_EMERGENCY", None, &foreign)
+            .is_err()
+    );
+    assert_eq!(actor.core.quote_handler_count(), 0);
+    assert_eq!(actor.core.bar_handler_count(), 0);
+    assert!(scope.clock_reads().unwrap().is_empty());
+    assert!(scope.uuid_draws().unwrap().is_empty());
+    assert!(scope.transports().unwrap().is_empty());
+    assert_eq!(scope.output_count().unwrap(), 0);
+    scope.finish().unwrap();
+    assert!(saver.get_messages().is_empty());
+    let preparation = HistoricalReplayPreparation::new(&(), actor_id.as_str());
+    actor.resume().unwrap();
+    assert!(
+        actor
+            .restore_native_local_quotes(audusd_sim.id, &preparation)
+            .is_err()
+    );
+    assert!(
+        actor
+            .restore_native_local_bars(bar_type, &preparation)
+            .is_err()
+    );
+    actor.subscribe_quotes(audusd_sim.id, None, None);
+    actor.subscribe_bars(bar_type, None, None);
+    actor.subscribe_signal("RISK_EMERGENCY", None);
+    actor.stop().unwrap();
+    let scope = NativeCaptureScope::enter(&source, 2, 2, None, dst::time::Instant::now()).unwrap();
+    assert!(
+        actor
+            .restore_native_local_quotes(audusd_sim.id, &preparation)
+            .is_err()
+    );
+    assert!(
+        actor
+            .restore_native_local_bars(bar_type, &preparation)
+            .is_err()
+    );
+    assert!(
+        actor
+            .restore_native_local_signal("RISK_EMERGENCY", None, &preparation)
+            .is_err()
+    );
+    assert!(scope.clock_reads().unwrap().is_empty());
+    assert!(scope.uuid_draws().unwrap().is_empty());
+    assert!(scope.transports().unwrap().is_empty());
+    assert_eq!(scope.output_count().unwrap(), 0);
+    scope.finish().unwrap();
+    assert_eq!(actor.core.quote_handler_count(), 1);
+    assert_eq!(actor.core.bar_handler_count(), 1);
+    assert_eq!(saver.get_messages().len(), 2);
+    let mut unregistered = TestDataActor::new(DataActorConfig::default());
+    assert!(
+        unregistered
+            .restore_native_local_quotes(audusd_sim.id, &preparation)
+            .is_err()
+    );
+    assert!(
+        unregistered
+            .restore_native_local_bars(bar_type, &preparation)
+            .is_err()
+    );
+}
+
+#[cfg(feature = "live")]
+#[rstest]
+fn test_native_local_mark_prepare_has_no_effects_and_startup_reuses_actual_handler(
+    clock: Rc<RefCell<TestClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    audusd_sim: CurrencyPair,
+) {
+    use crate::recovery_trace::{
+        historical::HistoricalReplayPreparation, scope::NativeCaptureScope,
+    };
+    let actor_id = register_data_actor(clock, cache, trader_id);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    actor.start().unwrap();
+    actor.stop().unwrap();
+    let (handler, saver) = get_typed_into_message_saving_handler::<DataCommand>(None);
+    msgbus::register_data_command_endpoint(
+        MessagingSwitchboard::data_engine_queue_execute(),
+        handler,
+    );
+    let source = native_local_binding_test_source();
+    let preparation = HistoricalReplayPreparation::new(&(), actor_id.as_str());
+    let foreign = HistoricalReplayPreparation::new(&(), "FOREIGN-CAPITAL");
+    assert!(
+        actor
+            .restore_native_local_mark_prices(audusd_sim.id, &foreign)
+            .is_err()
+    );
+    let scope = NativeCaptureScope::enter(&source, 1, 1, None, dst::time::Instant::now()).unwrap();
+    for _ in 0..2 {
+        actor
+            .restore_native_local_mark_prices(audusd_sim.id, &preparation)
+            .unwrap();
+    }
+    assert!(saver.get_messages().is_empty());
+    assert!(scope.clock_reads().unwrap().is_empty());
+    assert!(scope.uuid_draws().unwrap().is_empty());
+    assert!(scope.callbacks().unwrap().is_empty());
+    assert!(scope.transports().unwrap().is_empty());
+    assert!(scope.queued_outputs().unwrap().is_empty());
+    assert_eq!(scope.output_count().unwrap(), 0);
+    scope.finish().unwrap();
+    drop(actor);
+    let mark = MarkPriceUpdate::new(
+        audusd_sim.id,
+        Price::from("1.00000"),
+        1u64.into(),
+        2u64.into(),
+    );
+    let scope = NativeCaptureScope::enter(&source, 2, 2, None, dst::time::Instant::now()).unwrap();
+    msgbus::publish_mark_price(get_mark_price_topic(audusd_sim.id), &mark);
+    let callbacks = scope.callbacks().unwrap();
+    assert_eq!(callbacks.len(), 1);
+    assert_eq!(callbacks[0].component_id, actor_id.as_str());
+    assert_eq!(callbacks[0].kind, "handle_mark_price");
+    assert_eq!(callbacks[0].component_state, "Stopped");
+    scope.finish().unwrap();
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    assert!(actor.received_mark_prices.is_empty());
+    actor.resume().unwrap();
+    assert!(
+        actor
+            .restore_native_local_mark_prices(audusd_sim.id, &preparation)
+            .is_err()
+    );
+    for _ in 0..2 {
+        actor.subscribe_mark_prices(audusd_sim.id, None, None);
+    }
+    let commands = saver.get_messages();
+    assert_eq!(commands.len(), 1);
+    assert!(
+        matches!(&commands[0],DataCommand::Subscribe(SubscribeCommand::MarkPrices(m)) if m.instrument_id==audusd_sim.id)
+    );
+    drop(actor);
+    msgbus::publish_mark_price(get_mark_price_topic(audusd_sim.id), &mark);
+    let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
+    assert_eq!(actor.received_mark_prices, vec![mark]);
+    actor.stop().unwrap();
+    assert!(
+        actor
+            .restore_native_local_mark_prices(audusd_sim.id, &preparation)
+            .is_err()
+    );
+    actor.unsubscribe_mark_prices(audusd_sim.id, None, None);
+    assert_eq!(saver.get_messages().len(), 2);
 }

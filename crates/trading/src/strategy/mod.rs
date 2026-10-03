@@ -19,6 +19,8 @@ pub mod binding;
 pub mod config;
 pub mod core;
 
+#[cfg(feature = "live")]
+pub use core::NativeStrategyFrameworkCheckpoint;
 pub use core::{StrategyCore, StrategyNative};
 mod submission;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -40,7 +42,6 @@ use nautilus_common::{
     msgbus::{self, MessagingSwitchboard},
     timer::TimeEvent,
 };
-#[cfg(test)]
 use nautilus_core::UUID4;
 use nautilus_core::{DurationNanos, Params};
 use nautilus_execution::order_manager::OrderManagerAction;
@@ -689,6 +690,28 @@ fn native_expire_gtd_framework<S: Strategy + StrategyNative + ?Sized>(
 /// [`StrategyNative`] and [`Component`] bounds. Implementations that only need
 /// behavioral callbacks do not own or implement native runtime state.
 pub trait Strategy: DataActor {
+    /// Explicit native framework-aware business checkpoint callback. The SDK
+    /// captures this opaque value from the same actual registered object; it is
+    /// not execution authority and never reads a Clock or generates a UUID.
+    #[cfg(feature = "live")]
+    fn on_native_framework_checkpoint(
+        &self,
+        _framework: &NativeStrategyFrameworkCheckpoint,
+    ) -> anyhow::Result<indexmap::IndexMap<String, Vec<u8>>> {
+        self.on_save()
+    }
+
+    /// SDK native restore callback after exact source framework installation.
+    /// Ordinary on_load remains independent and cannot mint this opaque value.
+    #[cfg(feature = "live")]
+    fn on_native_framework_checkpoint_load(
+        &mut self,
+        state: indexmap::IndexMap<String, Vec<u8>>,
+        _framework: &NativeStrategyFrameworkCheckpoint,
+    ) -> anyhow::Result<()> {
+        self.on_load(state)
+    }
+
     /// Returns the instrument IDs this strategy intends to claim for external order routing.
     ///
     /// Live strategy registration materializes this configuration intent as active cache claims.
@@ -1038,7 +1061,7 @@ pub trait Strategy: DataActor {
             .as_ref()
             .map(|interceptor| interceptor.prepare(&TradingCommand::ModifyOrder(command.clone())))
             .transpose()?;
-        if !self.mark_order_pending_update(&order)? {
+        if !self.mark_order_pending_update_with_causation(&order, Some(command.command_id))? {
             return Ok(());
         }
         if let Some(prepared) = prepared {
@@ -1180,11 +1203,7 @@ pub trait Strategy: DataActor {
         let mut modifies = Vec::with_capacity(orders.len());
 
         for (order, (_, quantity, price, trigger_price)) in orders.into_iter().zip(updates) {
-            if !self.mark_order_pending_update(&order)? {
-                continue;
-            }
-
-            modifies.push(ModifyOrder::new(
+            let command = ModifyOrder::new(
                 trader_id,
                 client_id,
                 strategy_id,
@@ -1198,7 +1217,11 @@ pub trait Strategy: DataActor {
                 ts_init,
                 params.clone(),
                 None, // correlation_id
-            ));
+            );
+            if !self.mark_order_pending_update_with_causation(&order, Some(command.command_id))? {
+                continue;
+            }
+            modifies.push(command);
         }
 
         if modifies.is_empty() {
@@ -1256,7 +1279,8 @@ pub trait Strategy: DataActor {
             .try_order_owned(&client_order_id)
             .map_err(|e| anyhow::anyhow!("Cannot cancel order: {e}"))?;
 
-        if !self.mark_order_pending_cancel(&order)? {
+        let command_id = nautilus_common::recovery_trace::native_event_uuid();
+        if !self.mark_order_pending_cancel_with_command(&order, Some(command_id))? {
             return Ok(());
         }
 
@@ -1267,7 +1291,7 @@ pub trait Strategy: DataActor {
             order.instrument_id(),
             order.client_order_id(),
             order.venue_order_id(),
-            nautilus_common::recovery_trace::native_event_uuid(),
+            command_id,
             ts_init,
             params,
             None, // correlation_id
@@ -1404,13 +1428,27 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        self.mark_order_pending_update_with_causation(order, None)
+    }
+
+    /// Preserves the UUID minted before the local PendingUpdate transition.
+    fn mark_order_pending_update_with_causation(
+        &mut self,
+        order: &OrderAny,
+        command_id: Option<UUID4>,
+    ) -> anyhow::Result<bool>
+    where
+        Self: StrategyNative,
+    {
         if order.is_active_local() || order.is_pending_update() {
             return Ok(true);
         }
 
         let strategy_id = order.strategy_id();
         required_account_id(order, "pending update")?;
-        let event = OrderEventAny::PendingUpdate(self.generate_order_pending_update(order));
+        let event = OrderEventAny::PendingUpdate(
+            self.generate_order_pending_update_with_causation(order, command_id),
+        );
 
         {
             let cache_rc = StrategyNative::strategy_core_mut(self).cache_rc();
@@ -1449,6 +1487,16 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        self.mark_order_pending_cancel_with_command(order, None)
+    }
+    fn mark_order_pending_cancel_with_command(
+        &mut self,
+        order: &OrderAny,
+        command_id: Option<nautilus_core::UUID4>,
+    ) -> anyhow::Result<bool>
+    where
+        Self: StrategyNative,
+    {
         if order.is_closed() || order.is_pending_cancel() {
             log::warn!(
                 "Cannot cancel order: state is {:?}, {order:?}",
@@ -1463,7 +1511,9 @@ pub trait Strategy: DataActor {
 
         let strategy_id = order.strategy_id();
         required_account_id(order, "pending cancel")?;
-        let event = OrderEventAny::PendingCancel(self.generate_order_pending_cancel(order));
+        let mut pending = self.generate_order_pending_cancel(order);
+        pending.causation_id = command_id;
+        let event = OrderEventAny::PendingCancel(pending);
 
         {
             let cache_rc = StrategyNative::strategy_core_mut(self).cache_rc();
@@ -1499,11 +1549,22 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        self.generate_order_pending_update_with_causation(order, None)
+    }
+
+    fn generate_order_pending_update_with_causation(
+        &mut self,
+        order: &OrderAny,
+        command_id: Option<UUID4>,
+    ) -> OrderPendingUpdate
+    where
+        Self: StrategyNative,
+    {
         let ts_now = StrategyNative::strategy_core_mut(self)
             .clock_mut()
             .timestamp_ns();
 
-        OrderPendingUpdate::new(
+        let mut event = OrderPendingUpdate::new(
             order.trader_id(),
             order.strategy_id(),
             order.instrument_id(),
@@ -1514,7 +1575,9 @@ pub trait Strategy: DataActor {
             ts_now,
             false,
             order.venue_order_id(),
-        )
+        );
+        event.causation_id = command_id;
+        event
     }
 
     /// Generates an `OrderPendingCancel` event for an order.
@@ -3232,6 +3295,225 @@ mod tests {
             self.on_position_closed_called = true;
         }
     });
+
+    #[cfg(feature = "live")]
+    #[derive(Debug)]
+    struct NativeFrameworkTimerSender(
+        std::sync::mpsc::Sender<nautilus_common::runner::TimeEventMessage>,
+    );
+    #[cfg(feature = "live")]
+    impl nautilus_common::runner::TimeEventSender for NativeFrameworkTimerSender {
+        fn send(&self, message: nautilus_common::runner::TimeEventMessage) {
+            self.0
+                .send(message)
+                .expect("actual framework timer receiver remains retained");
+        }
+    }
+
+    #[cfg(feature = "live")]
+    fn native_registered_framework_fixture(
+        config: StrategyConfig,
+        cache: Rc<RefCell<Cache>>,
+    ) -> (
+        TestStrategy,
+        Rc<RefCell<nautilus_common::live::clock::LiveClock>>,
+        std::sync::mpsc::Receiver<nautilus_common::runner::TimeEventMessage>,
+    ) {
+        let mut strategy = TestStrategy::new(config);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let clock = Rc::new(RefCell::new(nautilus_common::live::clock::LiveClock::new(
+            Some(std::sync::Arc::new(NativeFrameworkTimerSender(sender))),
+        )));
+        clock
+            .borrow_mut()
+            .register_default_handler(TimeEventCallback::RustLocal(Rc::new(|_: TimeEvent| {})));
+        let portfolio = Rc::new(RefCell::new(Portfolio::new(
+            clock.clone(),
+            cache.clone(),
+            None,
+        )));
+        strategy
+            .core
+            .register(
+                TraderId::from("TRADER-001"),
+                clock.clone(),
+                cache,
+                portfolio,
+            )
+            .unwrap();
+        strategy.initialize().unwrap();
+        (strategy, clock, receiver)
+    }
+
+    #[cfg(feature = "live")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_framework_actual_exit_cut_preserves_core_and_rejects_changed_config_or_timer() {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let config = StrategyConfig {
+            strategy_id: Some(StrategyId::from("TEST-001")),
+            market_exit_interval_ms: 3_600_000,
+            ..Default::default()
+        };
+        let (mut source, clock, _source_receiver) =
+            native_registered_framework_fixture(config.clone(), cache.clone());
+        source.start().unwrap();
+        source.market_exit().unwrap(); // Original shared framework, no manually set exit flag.
+        let cut = source.core.native_framework_checkpoint().unwrap();
+        let before = cut.value().unwrap();
+        assert_eq!(before["is_exiting"], true);
+        assert_eq!(
+            before["market_exit_timer_name"],
+            "MARKET_EXIT_CHECK:TEST-001"
+        );
+        let guard = clock.borrow().freeze_running_timer_checkpoint().unwrap();
+        let original = guard.inventory().clone();
+        cut.verify_timer_inventory(&original).unwrap();
+        for fault in ["configuration", "timer_interval", "missing_timer"] {
+            let (mut rejected, _, _rejected_receiver) =
+                native_registered_framework_fixture(config.clone(), cache.clone());
+            let mut value = before.clone();
+            let mut timers = original.clone();
+            match fault {
+                "configuration" => {
+                    value["configuration"]["market_exit_interval_ms"] = serde_json::json!(1)
+                }
+                "timer_interval" => timers["timers"][0]["interval_ns"] = serde_json::json!(1),
+                _ => timers["timers"] = serde_json::json!([]),
+            }
+            assert!(
+                rejected
+                    .core
+                    .restore_native_framework_checkpoint(&value, &timers)
+                    .is_err(),
+                "{fault}"
+            );
+            assert!(!rejected.is_exiting());
+            assert_eq!(rejected.state(), ComponentState::Ready);
+        }
+        let (mut target, _, _target_receiver) = native_registered_framework_fixture(config, cache);
+        let receipt = target
+            .core
+            .restore_native_framework_checkpoint(&before, &original)
+            .unwrap();
+        receipt.verify_current(&target.core).unwrap();
+        assert!(target.is_exiting());
+        assert_eq!(target.state(), ComponentState::Ready);
+        assert!(
+            target
+                .core
+                .restore_native_framework_checkpoint(&before, &original)
+                .is_err()
+        );
+        assert_eq!(
+            source
+                .core
+                .native_framework_checkpoint()
+                .unwrap()
+                .value()
+                .unwrap(),
+            before
+        );
+        guard.verify().unwrap();
+        drop(guard);
+        source.cancel_market_exit();
+        Component::stop(&mut source).unwrap();
+    }
+
+    #[cfg(feature = "live")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_framework_actual_gtd_cut_requires_same_cached_expiry_and_owner_schedule() {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let config = StrategyConfig {
+            strategy_id: Some(StrategyId::from("TEST-001")),
+            manage_gtd_expiry: true,
+            ..Default::default()
+        };
+        let (mut source, clock, _source_receiver) =
+            native_registered_framework_fixture(config.clone(), cache.clone());
+        source.start().unwrap();
+        let expiry = UnixNanos::from(clock.borrow().timestamp_ns().as_u64() + 3_600_000_000_000);
+        let order = make_submitted_gtd_limit_order("O-NATIVE-CUT", expiry);
+        add_order_to_cache(&source, &order);
+        source.set_gtd_expiry(&order).unwrap();
+        let cut = source.core.native_framework_checkpoint().unwrap();
+        let before = cut.value().unwrap();
+        let guard = clock.borrow().freeze_running_timer_checkpoint().unwrap();
+        let original = guard.inventory().clone();
+        cut.verify_timer_inventory(&original).unwrap();
+        let (mut target, _, _target_receiver) =
+            native_registered_framework_fixture(config.clone(), cache.clone());
+        let receipt = target
+            .core
+            .restore_native_framework_checkpoint(&before, &original)
+            .unwrap();
+        receipt.verify_current(&target.core).unwrap();
+        assert!(target.has_gtd_expiry_timer(&order.client_order_id()));
+        let (mut rejected, _, _rejected_receiver) =
+            native_registered_framework_fixture(config.clone(), cache.clone());
+        let mut changed = original.clone();
+        changed["timers"][0]["stop_time_ns"] = serde_json::json!(expiry.as_u64() + 1);
+        assert!(
+            rejected
+                .core
+                .restore_native_framework_checkpoint(&before, &changed)
+                .is_err()
+        );
+        assert!(!rejected.has_gtd_expiry_timer(&order.client_order_id()));
+        let absent = Rc::new(RefCell::new(Cache::default()));
+        let (mut rejected, _, _rejected_receiver) =
+            native_registered_framework_fixture(config, absent);
+        assert!(
+            rejected
+                .core
+                .restore_native_framework_checkpoint(&before, &original)
+                .is_err()
+        );
+        assert_eq!(
+            source
+                .core
+                .native_framework_checkpoint()
+                .unwrap()
+                .value()
+                .unwrap(),
+            before
+        );
+        drop(guard);
+        source.cancel_gtd_expiry(&order.client_order_id());
+        Component::stop(&mut source).unwrap();
+    }
+
+    #[cfg(feature = "live")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_framework_actual_local_manager_command_is_explicitly_unsupported() {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let config = StrategyConfig {
+            strategy_id: Some(StrategyId::from("TEST-001")),
+            ..Default::default()
+        };
+        let (mut source, _, _source_receiver) = native_registered_framework_fixture(config, cache);
+        source.core.native_framework_checkpoint().unwrap();
+        let order = make_accepted_limit_order("O-MANAGER-NATIVE-CUT");
+        source
+            .core
+            .order_manager
+            .as_mut()
+            .unwrap()
+            .create_new_submit_order(&order, None, None, None)
+            .unwrap();
+        let error = source.core.native_framework_checkpoint().unwrap_err();
+        assert!(error.to_string().contains("nonempty local order manager"));
+        assert_eq!(
+            source
+                .core
+                .order_manager
+                .as_ref()
+                .unwrap()
+                .get_submit_order_commands()
+                .len(),
+            1
+        );
+        assert_eq!(source.state(), ComponentState::Ready);
+    }
 
     fn create_test_strategy() -> TestStrategy {
         let config = StrategyConfig {
@@ -5109,12 +5391,16 @@ mod tests {
             Some(TradingCommand::ModifyOrder(_))
         ));
 
+        let Some(TradingCommand::ModifyOrder(original)) = risk_messages.first() else {
+            panic!("expected original ModifyOrder command");
+        };
         let event_messages = event_messages.get_messages();
         assert_eq!(event_messages.len(), 1);
-        assert!(matches!(
-            event_messages.first(),
-            Some(OrderEventAny::PendingUpdate(_))
-        ));
+        let Some(OrderEventAny::PendingUpdate(pending)) = event_messages.first() else {
+            panic!("expected original PendingUpdate");
+        };
+        assert_eq!(pending.causation_id, Some(original.command_id));
+        assert_eq!(pending.client_order_id, original.client_order_id);
     }
 
     #[rstest]
@@ -5184,6 +5470,20 @@ mod tests {
 
         let event_messages = event_messages.get_messages();
         assert_eq!(event_messages.len(), 2);
+        for original in &command.modifies {
+            let pending = event_messages
+                .iter()
+                .find_map(|event| match event {
+                    OrderEventAny::PendingUpdate(pending)
+                        if pending.client_order_id == original.client_order_id =>
+                    {
+                        Some(pending)
+                    }
+                    _ => None,
+                })
+                .expect("original child PendingUpdate missing");
+            assert_eq!(pending.causation_id, Some(original.command_id));
+        }
         assert!(
             event_messages
                 .iter()

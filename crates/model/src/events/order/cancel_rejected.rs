@@ -25,7 +25,7 @@ use crate::{
         ContingencyType, LiquiditySide, OrderSide, OrderType, TimeInForce, TrailingOffsetType,
         TriggerType,
     },
-    events::OrderEvent,
+    events::{OrderCommandCausationBasis, OrderEvent},
     identifiers::{
         AccountId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId, PositionId,
         StrategyId, TradeId, TraderId, VenueOrderId,
@@ -72,6 +72,9 @@ pub struct OrderCancelRejected {
     /// The causation ID associated with the event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub causation_id: Option<UUID4>,
+    /// The exact original request acknowledgement, distinct from order terminal causation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_causation_basis: Option<OrderCommandCausationBasis>,
 }
 
 impl OrderCancelRejected {
@@ -104,6 +107,7 @@ impl OrderCancelRejected {
             venue_order_id,
             account_id,
             causation_id: None,
+            command_causation_basis: None,
         }
     }
 }

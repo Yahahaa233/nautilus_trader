@@ -71,6 +71,10 @@ pub struct OrderAccepted {
     /// The causation ID associated with the event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub causation_id: Option<UUID4>,
+    /// Explicit association evidence; an adapter-local link is never a venue
+    /// echo of the native command UUID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_causation_basis: Option<crate::events::OrderCommandCausationBasis>,
 }
 
 impl OrderAccepted {
@@ -101,6 +105,7 @@ impl OrderAccepted {
             ts_init,
             reconciliation,
             causation_id: None,
+            command_causation_basis: None,
         }
     }
 }

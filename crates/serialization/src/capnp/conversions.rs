@@ -2801,6 +2801,7 @@ impl<'a> FromCapnp<'a> for OrderAccepted {
             ts_init: ts_init.into(),
             reconciliation,
             causation_id: None,
+            command_causation_basis: None,
         })
     }
 }
@@ -2887,6 +2888,7 @@ impl<'a> FromCapnp<'a> for OrderRejected {
             reconciliation,
             due_post_only,
             causation_id: None,
+            command_causation_basis: None,
         })
     }
 }
@@ -2985,6 +2987,7 @@ impl<'a> FromCapnp<'a> for OrderCanceled {
             reconciliation,
             reason,
             causation_id: None,
+            command_causation_basis: None,
         })
     }
 }
@@ -3513,6 +3516,7 @@ impl<'a> FromCapnp<'a> for OrderCancelRejected {
             ts_init: ts_init.into(),
             reconciliation,
             causation_id: None,
+            command_causation_basis: None,
         })
     }
 }

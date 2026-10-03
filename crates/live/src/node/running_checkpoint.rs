@@ -19,7 +19,9 @@ use std::{any::Any, collections::BTreeMap, fmt::Debug, rc::Rc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use nautilus_common::{cache::Cache, live::dst};
-use nautilus_system::trader::{CollectedComponentState, Trader};
+use nautilus_system::trader::CollectedComponentState;
+#[cfg(feature = "native-tail-replay")]
+use nautilus_system::trader::Trader;
 
 use super::{LiveNode, NodeState, recovery_quiescence};
 use crate::{
@@ -894,6 +896,8 @@ pub struct RunningCheckpointInventory {
     data_client_state: BTreeMap<String, serde_json::Value>,
     data_engine: serde_json::Value,
     portfolio: serde_json::Value,
+    #[cfg(feature = "native-tail-replay")]
+    strategy_framework: serde_json::Value,
     message_bus_mode: &'static str,
     execution_authorized: bool,
 }
@@ -1480,7 +1484,16 @@ impl LiveNode {
                                 .context("account disappeared during checkpoint")
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    let components = Trader::collect_component_state(&self.kernel.trader)?;
+                    let components = self.collect_recovery_checkpoint_components()?;
+                    #[cfg(feature = "native-tail-replay")]
+                    let strategy_framework =
+                        Trader::collect_native_strategy_framework(&self.kernel.trader)?;
+                    #[cfg(feature = "native-tail-replay")]
+                    Trader::verify_native_strategy_framework_timers(
+                        &self.kernel.trader,
+                        &strategy_framework,
+                        &timer_state,
+                    )?;
                     let manager = self.exec_manager.checkpoint_inventory(now)?;
                     let engine_counts = (
                         execution.command_count(),
@@ -1573,6 +1586,8 @@ impl LiveNode {
                                 data_client_state: data_client_state.clone(),
                                 data_engine: data_engine_state.clone(),
                                 portfolio: portfolio_state.clone(),
+                                #[cfg(feature = "native-tail-replay")]
+                                strategy_framework: strategy_framework.clone(),
                                 message_bus_mode: "local_only",
                                 execution_authorized: false,
                             };
@@ -1600,10 +1615,15 @@ impl LiveNode {
                                     "dispatch inventory changed during checkpoint"
                                 );
                                 ensure!(
-                                    Trader::collect_component_state(&self.kernel.trader)?
-                                        == components,
+                                    self.collect_recovery_checkpoint_components()? == components,
                                     "component state changed during checkpoint"
                                 );
+                                #[cfg(feature = "native-tail-replay")]
+                                Trader::verify_native_strategy_framework_timers(
+                                    &self.kernel.trader,
+                                    &strategy_framework,
+                                    &timer_state,
+                                )?;
                                 ensure!(
                                     data.running_checkpoint_state()? == data_engine_state,
                                     "actual native DataEngine internal inventory changed"

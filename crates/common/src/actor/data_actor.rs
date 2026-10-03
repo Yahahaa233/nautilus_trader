@@ -2415,6 +2415,148 @@ pub trait DataActor {
         );
     }
 
+    /// Restores only the registered component's local historical signal handler.
+    /// The component's preparation hook must first verify its opaque source and
+    /// configured subscription set. This method grants no runtime admission.
+    ///
+    /// # Errors
+    /// Refuses a foreign registration or an active/disposed component.
+    #[cfg(feature = "live")]
+    fn restore_native_local_signal(
+        &mut self,
+        name: &str,
+        priority: Option<u32>,
+        preparation: &crate::recovery_trace::historical::HistoricalReplayPreparation<'_>,
+    ) -> anyhow::Result<()>
+    where
+        Self: DataActorNative + 'static + Debug + Sized,
+    {
+        self.core().check_native_local_preparation(preparation)?;
+        let actor_id = self.core().actor_id().inner();
+        let pattern = get_signal_pattern(name);
+        let handler = ShareableMessageHandler::from_typed_with_id(
+            format!("native.local.signal:{actor_id}:{pattern}"),
+            move |data: &CustomData| {
+                if let Some(signal) = data.data.as_any().downcast_ref::<Signal>() {
+                    if !super::recovery_observation::callback_admitted(&actor_id) {
+                        return;
+                    }
+                    if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                        actor.handle_signal(signal);
+                    } else {
+                        log::error!(
+                            "Actor {actor_id} not found for local historical signal handling"
+                        );
+                    }
+                }
+            },
+        );
+        self.core_mut()
+            .add_native_local_signal_subscription(pattern, handler, priority)
+    }
+
+    /// Restores a local quote callback without a venue subscription command.
+    /// The original source/configuration is verified by the component hook;
+    /// normal startup later upgrades this same handler to a remote subscription.
+    ///
+    /// # Errors
+    /// Refuses a foreign registration, an active component or remote downgrade.
+    #[cfg(feature = "live")]
+    fn restore_native_local_quotes(
+        &mut self,
+        instrument_id: InstrumentId,
+        preparation: &crate::recovery_trace::historical::HistoricalReplayPreparation<'_>,
+    ) -> anyhow::Result<()>
+    where
+        Self: DataActorNative + 'static + Debug + Sized,
+    {
+        self.core().check_native_local_preparation(preparation)?;
+        let actor_id = self.core().actor_id().inner();
+        let topic = get_quotes_topic(instrument_id);
+        let handler = TypedHandler::from_with_id(
+            format!("native.local.quote:{actor_id}:{topic}"),
+            move |quote: &QuoteTick| {
+                if !super::recovery_observation::callback_admitted(&actor_id) {
+                    return;
+                }
+                if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                    actor.handle_quote(quote);
+                } else {
+                    log::error!("Actor {actor_id} not found for local historical quote handling");
+                }
+            },
+        );
+        self.core_mut()
+            .add_native_local_quote_subscription(topic, handler)
+    }
+
+    /// Restores the same registered actor's local mark callback only. Normal
+    /// startup upgrades this exact handler to its first real data command.
+    /// # Errors
+    /// Refuses foreign/active registration and remote handler replacement.
+    #[cfg(feature = "live")]
+    fn restore_native_local_mark_prices(
+        &mut self,
+        instrument_id: InstrumentId,
+        preparation: &crate::recovery_trace::historical::HistoricalReplayPreparation<'_>,
+    ) -> anyhow::Result<()>
+    where
+        Self: DataActorNative + 'static + Debug + Sized,
+    {
+        self.core().check_native_local_preparation(preparation)?;
+        let actor_id = self.core().actor_id().inner();
+        let topic = get_mark_price_topic(instrument_id);
+        let handler = TypedHandler::from_with_id(
+            format!("native.local.mark:{actor_id}:{topic}"),
+            move |mark_price: &MarkPriceUpdate| {
+                if !super::recovery_observation::callback_admitted(&actor_id) {
+                    return;
+                }
+                if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                    actor.handle_mark_price(mark_price);
+                } else {
+                    log::error!("Actor {actor_id} not found for local historical mark handling");
+                }
+            },
+        );
+        self.core_mut()
+            .add_native_local_mark_subscription(topic, handler)
+    }
+
+    /// Restores a local bar callback without reading a clock, drawing a UUID
+    /// or issuing a data command. Normal startup retains this exact handler.
+    ///
+    /// # Errors
+    /// Refuses a foreign registration, an active component or remote downgrade.
+    #[cfg(feature = "live")]
+    fn restore_native_local_bars(
+        &mut self,
+        bar_type: BarType,
+        preparation: &crate::recovery_trace::historical::HistoricalReplayPreparation<'_>,
+    ) -> anyhow::Result<()>
+    where
+        Self: DataActorNative + 'static + Debug + Sized,
+    {
+        self.core().check_native_local_preparation(preparation)?;
+        let actor_id = self.core().actor_id().inner();
+        let topic = get_bars_topic(bar_type.standard());
+        let handler = TypedHandler::from_with_id(
+            format!("native.local.bar:{actor_id}:{topic}"),
+            move |bar: &Bar| {
+                if !super::recovery_observation::callback_admitted(&actor_id) {
+                    return;
+                }
+                if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                    actor.handle_bar(bar);
+                } else {
+                    log::error!("Actor {actor_id} not found for local historical bar handling");
+                }
+            },
+        );
+        self.core_mut()
+            .add_native_local_bar_subscription(topic, handler)
+    }
+
     /// Subscribe to streaming [`QuoteTick`] data for the `instrument_id`.
     fn subscribe_quotes(
         &mut self,
@@ -4176,13 +4318,85 @@ impl DataActorCore {
         }
     }
 
+    #[cfg(feature = "live")]
+    fn add_native_local_signal_subscription(
+        &mut self,
+        pattern: MStr<Pattern>,
+        handler: ShareableMessageHandler,
+        priority: Option<u32>,
+    ) -> anyhow::Result<()> {
+        if let Some(existing) = self.topic_handlers.get(&pattern) {
+            anyhow::ensure!(
+                existing.command.is_none() && existing.handler.id() == handler.id(),
+                "native local signal subscription cannot replace an existing foreign handler"
+            );
+            return Ok(());
+        }
+        self.add_subscription_any(pattern, handler, priority, None);
+        Ok(())
+    }
+
+    #[cfg(feature = "live")]
+    fn add_native_local_quote_subscription(
+        &mut self,
+        topic: MStr<Topic>,
+        handler: TypedHandler<QuoteTick>,
+    ) -> anyhow::Result<()> {
+        if let Some(existing) = self.quote_handlers.get(&topic) {
+            anyhow::ensure!(
+                existing.command.is_none() && existing.handler.id() == handler.id(),
+                "native local quote subscription cannot replace an existing remote or foreign handler"
+            );
+            return Ok(());
+        }
+        self.quote_handlers.insert(
+            topic,
+            Subscription {
+                handler: handler.clone(),
+                command: None,
+            },
+        );
+        msgbus::subscribe_quotes(topic.into(), handler, None);
+        Ok(())
+    }
+
+    #[cfg(feature = "live")]
+    fn add_native_local_bar_subscription(
+        &mut self,
+        topic: MStr<Topic>,
+        handler: TypedHandler<Bar>,
+    ) -> anyhow::Result<()> {
+        if let Some(existing) = self.bar_handlers.get(&topic) {
+            anyhow::ensure!(
+                existing.command.is_none() && existing.handler.id() == handler.id(),
+                "native local bar subscription cannot replace an existing remote or foreign handler"
+            );
+            return Ok(());
+        }
+        self.bar_handlers.insert(
+            topic,
+            Subscription {
+                handler: handler.clone(),
+                command: None,
+            },
+        );
+        msgbus::subscribe_bars(topic.into(), handler, None);
+        Ok(())
+    }
+
     pub(crate) fn add_quote_subscription(
         &mut self,
         topic: MStr<Topic>,
         handler: TypedHandler<QuoteTick>,
         command: DataCommand,
     ) -> bool {
-        if self.quote_handlers.contains_key(&topic) {
+        if let Some(subscription) = self.quote_handlers.get_mut(&topic) {
+            // Historical preparation installs a local handler with no command.
+            // Real startup adds its first remote command without another handler.
+            if subscription.command.is_none() {
+                subscription.command = Some(command);
+                return true;
+            }
             log::warn!(
                 "Actor {} attempted duplicate quote subscription to '{topic}'",
                 self.actor_id
@@ -4244,7 +4458,13 @@ impl DataActorCore {
         handler: TypedHandler<Bar>,
         command: DataCommand,
     ) -> bool {
-        if self.bar_handlers.contains_key(&topic) {
+        if let Some(subscription) = self.bar_handlers.get_mut(&topic) {
+            // Historical preparation installs a local handler with no command.
+            // Real startup adds its first remote command without another handler.
+            if subscription.command.is_none() {
+                subscription.command = Some(command);
+                return true;
+            }
             log::warn!(
                 "Actor {} attempted duplicate bar subscription to '{topic}'",
                 self.actor_id
@@ -4440,13 +4660,41 @@ impl DataActorCore {
         subscription.command
     }
 
+    #[cfg(feature = "live")]
+    fn add_native_local_mark_subscription(
+        &mut self,
+        topic: MStr<Topic>,
+        handler: TypedHandler<MarkPriceUpdate>,
+    ) -> anyhow::Result<()> {
+        if let Some(existing) = self.mark_price_handlers.get(&topic) {
+            anyhow::ensure!(
+                existing.command.is_none() && existing.handler.id() == handler.id(),
+                "native local mark subscription cannot replace an existing remote or foreign handler"
+            );
+            return Ok(());
+        }
+        self.mark_price_handlers.insert(
+            topic,
+            Subscription {
+                handler: handler.clone(),
+                command: None,
+            },
+        );
+        msgbus::subscribe_mark_prices(topic.into(), handler, None);
+        Ok(())
+    }
+
     pub(crate) fn add_mark_price_subscription(
         &mut self,
         topic: MStr<Topic>,
         handler: TypedHandler<MarkPriceUpdate>,
         command: DataCommand,
     ) -> bool {
-        if self.mark_price_handlers.contains_key(&topic) {
+        if let Some(subscription) = self.mark_price_handlers.get_mut(&topic) {
+            if subscription.command.is_none() {
+                subscription.command = Some(command);
+                return true;
+            }
             log::warn!(
                 "Actor {} attempted duplicate mark price subscription to '{topic}'",
                 self.actor_id
@@ -5205,6 +5453,20 @@ impl DataActorCore {
             self.is_registered(),
             "Actor has not been registered with a Trader"
         );
+    }
+
+    #[cfg(feature = "live")]
+    fn check_native_local_preparation(
+        &self,
+        preparation: &crate::recovery_trace::historical::HistoricalReplayPreparation<'_>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_properly_registered()
+                && preparation.component_id() == self.actor_id.as_str()
+                && matches!(self.state, ComponentState::Ready | ComponentState::Stopped),
+            "native local subscription differs from paused original registration"
+        );
+        Ok(())
     }
 
     /// Validates registration state without panicking.
