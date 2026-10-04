@@ -1626,6 +1626,19 @@ pub fn historical_active() -> bool {
     }
 }
 
+/// Checks only the active historical input's original first-failure state.
+/// This does not consume a callback/Clock or provide current execution authority.
+///
+/// # Errors
+/// Returns an existing historical input failure or a busy scoped frame.
+pub fn check_historical_input_health() -> Result<()> {
+    #[cfg(feature = "live")]
+    if historical::active() {
+        historical::pending_callback_route()?;
+    }
+    Ok(())
+}
+
 /// Records an unsupported historical effect; a logged callback error cannot become completion.
 pub fn historical_failure(reason: &str) {
     #[cfg(feature = "live")]

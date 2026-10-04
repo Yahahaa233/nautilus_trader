@@ -1531,6 +1531,470 @@ mod tests {
         drop(trace);
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[derive(Debug)]
+    struct GuardCommandCodec;
+    impl RunnerRecoveryCodec for GuardCommandCodec {
+        fn channel(&self) -> RunnerRecoveryChannel {
+            RunnerRecoveryChannel::ExecutionCommand
+        }
+        fn codec_id(&self) -> &str {
+            "actual_registered_submission_guard_tail.v1"
+        }
+        fn encode(&self, event: RunnerRecoveryEventRef<'_>) -> Result<serde_json::Value> {
+            let RunnerRecoveryEventRef::ExecutionCommand(command) = event else {
+                anyhow::bail!("registered guard source has a different channel");
+            };
+            Ok(
+                serde_json::json!({"endpoint":command.endpoint().to_string(),
+                "command":command.command()}),
+            )
+        }
+        fn decode(&self, input: &RunnerRecoveryEnvelope) -> Result<RunnerRecoveryEvent> {
+            Ok(RunnerRecoveryEvent::ExecutionCommand(
+                nautilus_common::runner::TradingCommandMessage::new(
+                    input.payload["endpoint"]
+                        .as_str()
+                        .context("guard command endpoint absent")?
+                        .into(),
+                    serde_json::from_value(input.payload["command"].clone())?,
+                ),
+            ))
+        }
+    }
+
+    fn guard_command_registry() -> Rc<RunnerRecoveryCodecRegistry> {
+        let mut registry =
+            RunnerRecoveryCodecRegistry::new([RunnerRecoveryChannel::ExecutionCommand]);
+        registry.register(GuardCommandCodec).unwrap();
+        Rc::new(registry.seal().unwrap())
+    }
+
+    // The guard is invoked through the real registered ExecutionEngine path.
+    // Only its actual native_transport outcome is replayed. The source's local
+    // approval branch is not a CQS grant; target phase gates remain closed.
+    fn install_original_guard(
+        node: &mut LiveNode,
+        approved: bool,
+    ) -> (Rc<std::cell::Cell<usize>>, Rc<std::cell::Cell<usize>>) {
+        let guard_calls = Rc::new(std::cell::Cell::new(0));
+        let current_calls = Rc::new(std::cell::Cell::new(0));
+        let calls = guard_calls.clone();
+        let current = current_calls.clone();
+        node.kernel
+            .exec_engine
+            .borrow_mut()
+            .set_submission_guard(Some(Rc::new(move |command| {
+                calls.set(calls.get() + 1);
+                nautilus_common::recovery_trace::native_transport(
+                    "ACTUAL-REGISTERED-GUARD",
+                    "execution.root_guard",
+                    command,
+                    || {
+                        current.set(current.get() + 1);
+                        anyhow::ensure!(approved, "node execution not activated");
+                        Ok(())
+                    },
+                )
+            })));
+        (guard_calls, current_calls)
+    }
+
+    async fn run_actual_original_guard_tail(approved: bool) {
+        use nautilus_common::{
+            messages::execution::{SubmitOrder, TradingCommand},
+            msgbus::MessagingSwitchboard,
+            runner::TradingCommandMessage,
+        };
+        use nautilus_core::UUID4;
+        use nautilus_model::{
+            enums::{OrderStatus, OrderType},
+            identifiers::{ClientOrderId, StrategyId},
+            orders::{Order, OrderTestBuilder},
+            types::Quantity,
+        };
+        let directory = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("original-guard-tail-{}", UUID4::new()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(TraderId::from("NATIVE-TAIL-001"))
+            .strategy_id(StrategyId::from("GUARD-TAIL-001"))
+            .instrument_id(crypto_perpetual_ethusdt().id())
+            .client_order_id(ClientOrderId::from("O-ORIGINAL-GUARD-001"))
+            .quantity(Quantity::from(1))
+            .build();
+        let mut source = actual_node("guard-source", directory.join("source"), None);
+        source
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        let (source_guard, source_current) = install_original_guard(&mut source, approved);
+        let instance = source.kernel.instance_id();
+        let recorder = source
+            .prepare_owned_native_trace(
+                "actual-guard-business-run".into(),
+                nautilus_event_store::native_trace::native_inventory_digest(
+                    &serde_json::to_value(&source.config).unwrap(),
+                )
+                .unwrap(),
+                "actual_registered_submission_guard_tail.v1".into(),
+                "actual_empty_registered_components.v1".into(),
+                |_, _, _| Ok(vec![]),
+                |_| Ok(()),
+            )
+            .unwrap();
+        let cuts = Rc::new(RefCell::new(vec![]));
+        let initial = Rc::new(tokio::sync::Notify::new());
+        let progress = Rc::new(tokio::sync::Notify::new());
+        let saved = cuts.clone();
+        let ready = initial.clone();
+        let advanced = progress.clone();
+        source
+            .set_running_checkpoint_handler(
+                guard_command_registry(),
+                RunningCheckpointSchedule::EveryCompletedRoot,
+                move |boundary| {
+                    boundary.verify()?;
+                    let cut = boundary
+                        .native_trace_cut()
+                        .context("actual guard source cut absent")?
+                        .clone();
+                    boundary
+                        .persist_native_checkpoint(serde_json::json!({"registered_guard":true}))?;
+                    saved.borrow_mut().push((
+                        cut,
+                        serde_json::to_value(boundary.inventory())?,
+                        boundary.components().clone(),
+                    ));
+                    if saved.borrow().len() == 1 {
+                        ready.notify_one();
+                    } else {
+                        advanced.notify_one();
+                    }
+                    Ok(())
+                },
+                |_| Ok(()),
+                |_| {},
+            )
+            .unwrap();
+        let command = TradingCommand::SubmitOrder(SubmitOrder::from_order(
+            &order,
+            order.trader_id(),
+            None,
+            None,
+            UUID4::new(),
+            nautilus_core::time::get_atomic_clock_realtime().get_time_ns(),
+        ));
+        let sender = source
+            .runner
+            .as_ref()
+            .unwrap()
+            .execution_command_sender_clone();
+        let stop = source.handle();
+        let command_calls = source_guard.clone();
+        let produced = async move {
+            initial.notified().await;
+            sender
+                .send(TradingCommandMessage::new(
+                    MessagingSwitchboard::exec_engine_execute(),
+                    command,
+                ))
+                .unwrap();
+            loop {
+                progress.notified().await;
+                if command_calls.get() == 1 {
+                    break;
+                }
+            }
+            stop.stop();
+        };
+        let mut producer = std::pin::pin!(produced);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut running = std::pin::pin!(source.run_with_mode(NodeRunMode::Hosted));
+            tokio::select! { result = &mut running => result, () = &mut producer => running.await }
+        })
+        .await
+        .expect("actual guard source did not complete within 15s")
+        .unwrap();
+        assert_eq!(source_guard.get(), 1);
+        assert_eq!(source_current.get(), 1);
+        assert!(source.kernel.exec_engine.borrow().client_ids().is_empty());
+        {
+            let cache = source.kernel.cache.borrow();
+            let original = cache.order(&order.client_order_id()).unwrap();
+            let nautilus_model::events::OrderEventAny::Denied(denied) = original.last_event()
+            else {
+                panic!("actual guard source did not record an OrderDenied terminal");
+            };
+            if approved {
+                assert!(denied.reason.as_str().starts_with("NO_EXECUTION_CLIENT"));
+            } else {
+                assert_eq!(
+                    denied.reason.as_str(),
+                    "Execution persistence/authorization barrier failed"
+                );
+            }
+        }
+        let original_order = serde_json::to_value(
+            source
+                .kernel
+                .cache
+                .borrow()
+                .order(&order.client_order_id())
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            source
+                .kernel
+                .cache
+                .borrow()
+                .order(&order.client_order_id())
+                .unwrap()
+                .status(),
+            OrderStatus::Denied
+        );
+        let first = cuts.borrow().first().unwrap().clone();
+        let identity = recorder.source().unwrap();
+        source.dispose();
+        drop(source);
+
+        // A new node owner reads the actual sealed Journal, never a public
+        // Begin DTO or synthetic transport receipt standing in for that source.
+        let child_directory = directory.clone();
+        std::thread::spawn(move || {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            executor.block_on(async move {
+                let reader = EventStoreReader::new(
+                    RedbBackend::open_sealed(
+                        child_directory.join("source"),
+                        &instance.to_string(),
+                        &identity.journal_run,
+                    )
+                    .unwrap(),
+                );
+                let high = reader.high_watermark().unwrap();
+                let verified = reader
+                    .verify_native_tail(&identity, &first.0, high)
+                    .unwrap();
+                let originals: Vec<_> = verified
+                    .roots()
+                    .iter()
+                    .flat_map(|root| root.inputs())
+                    .filter_map(|input| match input {
+                        NativeTraceRecord::Complete { transports, .. } => Some(transports),
+                        _ => None,
+                    })
+                    .flatten()
+                    .filter(|receipt| receipt.operation == "execution.root_guard")
+                    .collect();
+                assert_eq!(originals.len(), 1);
+                assert_eq!(
+                    originals[0].outcome,
+                    if approved {
+                        Ok(())
+                    } else {
+                        Err("node execution not activated".into())
+                    }
+                );
+                let fingerprint = EventStoreLifecycle::sealed_run_fingerprint(
+                    &child_directory.join("source"),
+                    instance,
+                    &identity.journal_run,
+                    high,
+                )
+                .unwrap();
+                let mut target = actual_node(
+                    "guard-target",
+                    child_directory.join("target"),
+                    Some((
+                        child_directory.join("source"),
+                        instance,
+                        identity.journal_run.clone(),
+                        high,
+                        fingerprint,
+                    )),
+                );
+                let mut cache = Cache::default();
+                cache.add_order(order.clone(), None, None, false).unwrap();
+                target.restore_native_cache(cache).unwrap();
+                target.restore_component_state(&first.2).unwrap();
+                target
+                    .kernel
+                    .risk_engine
+                    .borrow_mut()
+                    .set_trading_state(nautilus_model::enums::TradingState::Halted);
+                let (target_guard, target_current) = install_original_guard(&mut target, approved);
+                let observation = target
+                    .kernel
+                    .exec_engine
+                    .borrow()
+                    .begin_recovery_observation()
+                    .unwrap();
+                target
+                    .kernel
+                    .open_event_store_for_paused_recovery()
+                    .unwrap();
+                let watermark = RunnerRecoveryWatermark {
+                    recovery_id: "actual-original-registered-guard-cut".into(),
+                    checkpoint_sequence: first.0.prefix.sequence,
+                    dispatch_watermark: first.0.last_input_sequence,
+                };
+                target
+                    .replay_recovery_events(&watermark, &[], &guard_command_registry(), |_, _| {
+                        Ok(())
+                    })
+                    .unwrap();
+                target
+                    .restore_registered_engine_checkpoint(
+                        &first.1["execution_manager"],
+                        &first.1["data_engine"],
+                        first.0.captured_at_ns,
+                        &watermark,
+                    )
+                    .unwrap();
+                target
+                    .restore_registered_portfolio_checkpoint(
+                        &first.0.native_effects["portfolio"],
+                        &watermark,
+                    )
+                    .unwrap();
+                target
+                    .restore_registered_timer_checkpoint(
+                        first.0.registered_timers.clone(),
+                        vec![],
+                        &watermark,
+                    )
+                    .unwrap();
+                target
+                    .replay_native_tail(
+                        &verified,
+                        &watermark,
+                        |_, begin| {
+                            let NativeTraceRecord::Begin {
+                                input_source: NativeInputSource::TradingCommand,
+                                payload,
+                                ..
+                            } = begin
+                            else {
+                                anyhow::bail!("actual guard source decoder changed channel");
+                            };
+                            Ok(RunnerRecoveryEvent::ExecutionCommand(
+                                TradingCommandMessage::new(
+                                    payload["endpoint"]
+                                        .as_str()
+                                        .context("actual guard endpoint absent")?
+                                        .into(),
+                                    serde_json::from_value(payload["command"].clone())?,
+                                ),
+                            ))
+                        },
+                        |_, _| anyhow::bail!("actual guard source has no retained input"),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    target_guard.get(),
+                    1,
+                    "historical path skipped the actual registered guard"
+                );
+                assert_eq!(
+                    target_current.get(),
+                    0,
+                    "historical guard invoked current transport/permission closure"
+                );
+                assert_eq!(
+                    serde_json::to_value(
+                        target
+                            .kernel
+                            .cache
+                            .borrow()
+                            .order(&order.client_order_id())
+                            .unwrap()
+                            .clone()
+                    )
+                    .unwrap(),
+                    original_order
+                );
+                assert!(
+                    target
+                        .kernel
+                        .exec_engine
+                        .borrow()
+                        .recovery_observation_fenced()
+                );
+                assert!(!target.kernel.exec_engine.borrow().submissions_fenced());
+                assert!(target.kernel.exec_engine.borrow().client_ids().is_empty());
+                assert!(target.recovery_requires_release);
+                assert_eq!(target.state(), NodeState::Idle);
+                assert_eq!(
+                    target.kernel.risk_engine.borrow().trading_state(),
+                    nautilus_model::enums::TradingState::Halted
+                );
+                // After the original scope ends, even the successful old guard
+                // cannot authorize a current command or open the phase gate.
+                let current_command = TradingCommand::SubmitOrder(SubmitOrder::from_order(
+                    &order,
+                    order.trader_id(),
+                    None,
+                    None,
+                    UUID4::new(),
+                    nautilus_core::time::get_atomic_clock_realtime().get_time_ns(),
+                ));
+                target.kernel.exec_engine.borrow().execute(current_command);
+                assert_eq!(target_guard.get(), 1);
+                assert_eq!(target_current.get(), 0);
+                assert!(
+                    target
+                        .kernel
+                        .exec_engine
+                        .borrow()
+                        .recovery_observation_fenced()
+                );
+                target
+                    .kernel
+                    .prohibit_event_store_seal(
+                        "actual guard replay retains child without authenticated release",
+                    )
+                    .unwrap();
+                drop(observation);
+                // Dropping the unfinished phase capability retains the closed
+                // observation gate; it does not invent a permanent failure.
+                assert!(
+                    target
+                        .kernel
+                        .exec_engine
+                        .borrow()
+                        .recovery_observation_fenced()
+                );
+                target.kernel.exec_engine.borrow().failure_fence().latch();
+                assert!(target.kernel.exec_engine.borrow().submissions_fenced());
+                target.dispose();
+                drop(target);
+                drop(reader);
+            });
+        })
+        .join()
+        .expect("actual original guard child owner failed");
+        drop(recorder);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actual_reader_guard_denial_replays_original_terminal_before_client_routing() {
+        run_actual_original_guard_tail(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actual_reader_approved_guard_keeps_current_observation_fence_and_transport_closed() {
+        run_actual_original_guard_tail(true).await;
+    }
 }
 
 #[cfg(all(test, not(madsim)))]

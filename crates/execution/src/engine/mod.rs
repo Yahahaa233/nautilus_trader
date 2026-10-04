@@ -406,9 +406,21 @@ impl ExecutionEngine {
 
     fn check_submission_guard(&self, command: &TradingCommand) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !self.submissions_fenced.get() && !self.recovery_observation_gate.get(),
+            !self.submissions_fenced.get()
+                && (!self.recovery_observation_gate.get()
+                    || nautilus_common::recovery_trace::historical_active()),
             "execution submissions fenced"
         );
+        if nautilus_common::recovery_trace::historical_active() {
+            nautilus_common::recovery_trace::check_historical_input_health()?;
+            // A reader replay may consume its original registered guard while
+            // the current process remains observation-fenced. It never clears
+            // that gate or permits a permanent/external execution path.
+            anyhow::ensure!(
+                self.external_clients.is_empty(),
+                "historical execution has external transport"
+            );
+        }
         if let Some(guard) = &self.submission_guard {
             guard(command)?;
         }
@@ -2061,8 +2073,7 @@ impl ExecutionEngine {
                 | TradingCommand::SubmitOrderList(_)
                 | TradingCommand::ModifyOrder(_)
                 | TradingCommand::ModifyOrders(_)
-        ) && !nautilus_common::recovery_trace::historical_active()
-            && let Err(error) = self.check_submission_guard(&command)
+        ) && let Err(error) = self.check_submission_guard(&command)
         {
             log::error!("Execution submission barrier refused command: {error:#}");
             let orders = match &command {
