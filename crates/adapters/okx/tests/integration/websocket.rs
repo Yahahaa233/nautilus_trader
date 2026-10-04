@@ -1517,6 +1517,7 @@ async fn test_modify_event_order_omits_speed_bump(#[case] batch: bool, #[case] o
         .await
         .expect("client inactive");
 
+    let command_id = UUID4::new();
     if batch {
         client
             .batch_modify_orders(vec![(
@@ -1545,7 +1546,7 @@ async fn test_modify_event_order_omits_speed_bump(#[case] batch: bool, #[case] o
                 None,
                 Some(true),
                 Some(false),
-                UUID4::new(),
+                command_id,
             )
             .await
             .expect("modify event order failed");
@@ -1564,17 +1565,21 @@ async fn test_modify_event_order_omits_speed_bump(#[case] batch: bool, #[case] o
     let arg = &messages[0]["args"][0];
 
     assert_eq!(messages[0]["op"], operation);
-    assert_eq!(
-        *arg,
-        json!({
-            "instIdCode": EVENT_INST_ID_CODE,
-            "clOrdId": "O-event-amend",
-            "newPx": "0.430",
-            "newSz": "10",
-            "rpiTakerAccess": true,
-            "rpiPxRound": false,
-        })
-    );
+    assert!(arg.get("speedBump").is_none());
+    let mut expected = json!({
+        "instIdCode": EVENT_INST_ID_CODE,
+        "clOrdId": "O-event-amend",
+        "newPx": "0.430",
+        "newSz": "10",
+        "rpiTakerAccess": true,
+        "rpiPxRound": false,
+    });
+    if !batch {
+        let request_id = command_id.to_string().replace('-', "");
+        expected["reqId"] = json!(request_id);
+        assert_eq!(messages[0]["id"], expected["reqId"]);
+    }
+    assert_eq!(*arg, expected);
 
     client.close().await.expect("close failed");
 }

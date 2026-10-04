@@ -25,16 +25,21 @@ use std::{
     cell::Cell,
     fmt::Debug,
     fs,
-    io::ErrorKind,
+    io::{self, ErrorKind},
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread::ThreadId,
     time::SystemTime,
 };
 
 use nautilus_core::UnixNanos;
 use redb::{
     CommitError, Database, DatabaseError, Durability, ReadOnlyDatabase, ReadTransaction,
-    ReadableDatabase, ReadableTable, StorageError, TableDefinition, TableError, TransactionError,
-    WriteTransaction,
+    ReadableDatabase, ReadableTable, StorageBackend, StorageError, TableDefinition, TableError,
+    TransactionError, WriteTransaction, backends::FileBackend,
 };
 
 use crate::{
@@ -91,6 +96,133 @@ struct VerifiedAppendOnlyPrefix {
     run_id: String,
     hashes: Vec<EntryHash>,
     generation: FileGeneration,
+    writes: Arc<StorageWriteEpoch>,
+    verified_write_generation: u64,
+}
+
+/// Tracks the actual owned redb backend writes, independently of filesystem
+/// timestamp granularity. A legal operation owns one current-thread permit;
+/// writes outside it remain permanently visible even if a later legal commit
+/// would otherwise refresh file metadata. This adds no old-row reads.
+#[derive(Debug, Default)]
+struct StorageWriteEpoch {
+    generation: AtomicU64,
+    failed: AtomicBool,
+    armed: AtomicBool,
+    owner: Mutex<Option<ThreadId>>,
+}
+
+impl StorageWriteEpoch {
+    fn record_mutation(&self) -> io::Result<()> {
+        let owner = self.owner.lock().map_err(|_| {
+            self.failed.store(true, Ordering::SeqCst);
+            io::Error::other("native storage ownership lock poisoned")
+        })?;
+        if self.armed.load(Ordering::SeqCst) && *owner != Some(std::thread::current().id()) {
+            // Do not replace redb's I/O semantics: let the actual write happen,
+            // but never permit any following cached-prefix proof or ACK.
+            self.failed.store(true, Ordering::SeqCst);
+        }
+        self.generation
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| {
+                self.failed.store(true, Ordering::SeqCst);
+                io::Error::other("native storage generation exhausted")
+            })?;
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Result<u64, EventStoreError> {
+        let before = self.generation.load(Ordering::SeqCst);
+        if self.failed.load(Ordering::SeqCst) || before != self.generation.load(Ordering::SeqCst) {
+            return Err(EventStoreError::Backend(
+                "native storage writes changed or failed".into(),
+            ));
+        }
+        Ok(before)
+    }
+
+    fn begin_owned(self: &Arc<Self>, expected: u64) -> Result<StorageWritePermit, EventStoreError> {
+        let mut owner = self.owner.lock().map_err(|_| {
+            self.failed.store(true, Ordering::SeqCst);
+            EventStoreError::Backend("native storage ownership lock poisoned".into())
+        })?;
+        if owner.is_some() || self.snapshot()? != expected {
+            self.failed.store(true, Ordering::SeqCst);
+            return Err(EventStoreError::Backend(
+                "native storage write ownership changed".into(),
+            ));
+        }
+        *owner = Some(std::thread::current().id());
+        Ok(StorageWritePermit(self.clone()))
+    }
+
+    fn check_owned(&self) -> Result<(), EventStoreError> {
+        let owner = self.owner.lock().map_err(|_| {
+            self.failed.store(true, Ordering::SeqCst);
+            EventStoreError::Backend("native storage ownership lock poisoned".into())
+        })?;
+        if *owner != Some(std::thread::current().id()) {
+            self.failed.store(true, Ordering::SeqCst);
+            return Err(EventStoreError::Backend(
+                "native storage refresh lacks owned write".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct StorageWritePermit(Arc<StorageWriteEpoch>);
+impl Drop for StorageWritePermit {
+    fn drop(&mut self) {
+        match self.0.owner.lock() {
+            Ok(mut owner) => *owner = None,
+            Err(_) => self.0.failed.store(true, Ordering::SeqCst),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OwnedStorageBackend {
+    inner: FileBackend,
+    epoch: Arc<StorageWriteEpoch>,
+}
+impl StorageBackend for OwnedStorageBackend {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read(offset, out)
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.epoch.record_mutation()?;
+        let result = self.inner.set_len(len);
+        if result.is_err() {
+            self.epoch.failed.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        let result = self.inner.sync_data();
+        if result.is_err() {
+            self.epoch.failed.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        // Advance before delegation, including failed or partially written I/O.
+        self.epoch.record_mutation()?;
+        let result = self.inner.write(offset, data);
+        if result.is_err() {
+            self.epoch.failed.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+    fn close(&self) -> io::Result<()> {
+        self.inner.close()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -138,9 +270,12 @@ impl RunState {
         }
         let result = (|| {
             if let Some(prefix) = &self.append_only_prefix {
-                if prefix.run_id != self.manifest.run_id
+                let before = prefix.writes.snapshot()?;
+                if before != prefix.verified_write_generation
+                    || prefix.run_id != self.manifest.run_id
                     || u64::try_from(prefix.hashes.len()).ok() != Some(self.high_watermark)
                     || prefix.generation != FileGeneration::read(&self.file_path)?
+                    || before != prefix.writes.snapshot()?
                 {
                     return Err(EventStoreError::Backend(
                         "native prefix owner or generation changed".into(),
@@ -155,17 +290,40 @@ impl RunState {
         result
     }
 
-    fn refresh_prefix_generation(&mut self) -> Result<(), EventStoreError> {
-        if let Some(prefix) = &mut self.append_only_prefix {
-            match FileGeneration::read(&self.file_path) {
-                Ok(generation) => prefix.generation = generation,
-                Err(error) => {
-                    self.prefix_failed.set(true);
-                    return Err(error);
-                }
-            }
+    fn begin_owned_write(&self) -> Result<Option<StorageWritePermit>, EventStoreError> {
+        let result = (|| {
+            self.check_prefix_owner()?;
+            self.append_only_prefix
+                .as_ref()
+                .map(|prefix| prefix.writes.begin_owned(prefix.verified_write_generation))
+                .transpose()
+        })();
+        if result.is_err() {
+            self.prefix_failed.set(true);
         }
-        Ok(())
+        result
+    }
+
+    fn refresh_prefix_generation(&mut self) -> Result<(), EventStoreError> {
+        let result = (|| {
+            if let Some(prefix) = &mut self.append_only_prefix {
+                prefix.writes.check_owned()?;
+                let before = prefix.writes.snapshot()?;
+                let generation = FileGeneration::read(&self.file_path)?;
+                if before != prefix.writes.snapshot()? {
+                    return Err(EventStoreError::Backend(
+                        "native storage changed during refresh".into(),
+                    ));
+                }
+                prefix.generation = generation;
+                prefix.verified_write_generation = before;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.prefix_failed.set(true);
+        }
+        result
     }
 }
 
@@ -585,7 +743,23 @@ impl EventStore for RedbBackend {
         let path = self.run_path(&manifest.instance_id, &manifest.run_id);
         let path_existed = path.exists();
 
-        let db = Database::create(&path).map_err(map_database_err)?;
+        let writes = Arc::new(StorageWriteEpoch::default());
+        // Same FileBackend, OpenOptions, exclusive lock and builder defaults as
+        // Database::create; only actual write/resize ownership is instrumented.
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| map_database_err(e.into()))?;
+        let storage = OwnedStorageBackend {
+            inner: FileBackend::new(file).map_err(map_database_err)?,
+            epoch: writes.clone(),
+        };
+        let db = Database::builder()
+            .create_with_backend(storage)
+            .map_err(map_database_err)?;
 
         if path_existed {
             format::verify_store_format(&db)?;
@@ -629,11 +803,16 @@ impl EventStore for RedbBackend {
         // File identity/generation is part of this optimization's ownership proof.
         // Platforms without the native inode contract retain complete scans.
         #[cfg(unix)]
-        let append_only_prefix = Some(VerifiedAppendOnlyPrefix {
-            run_id: manifest.run_id.clone(),
-            hashes: Vec::new(),
-            generation: FileGeneration::read(&path)?,
-        });
+        let append_only_prefix = {
+            writes.armed.store(true, Ordering::SeqCst);
+            Some(VerifiedAppendOnlyPrefix {
+                run_id: manifest.run_id.clone(),
+                hashes: Vec::new(),
+                generation: FileGeneration::read(&path)?,
+                verified_write_generation: writes.snapshot()?,
+                writes,
+            })
+        };
         #[cfg(not(unix))]
         let append_only_prefix = None;
 
@@ -659,6 +838,7 @@ impl EventStore for RedbBackend {
         }
 
         state.check_prefix_owner()?;
+        let _storage_write = state.begin_owned_write()?;
 
         if entries.is_empty() {
             return Ok(state.high_watermark);
@@ -991,6 +1171,7 @@ impl EventStore for RedbBackend {
         }
 
         state.check_prefix_owner()?;
+        let _storage_write = state.begin_owned_write()?;
 
         let latest = Self::read_snapshot_anchor(state.db.readable())?;
         validate_new_anchor(&anchor, state.high_watermark, latest.as_ref())?;
@@ -1019,6 +1200,7 @@ impl EventStore for RedbBackend {
     fn seal(&mut self, status: RunStatus) -> Result<(), EventStoreError> {
         let state = self.state_mut()?;
         state.check_prefix_owner()?;
+        let _storage_write = state.begin_owned_write()?;
 
         // Running is not a terminal state; accepting it would leave `is_sealed()` returning
         // false while the seal call returned Ok, so subsequent appends would not see Closed.
@@ -1041,6 +1223,7 @@ impl EventStore for RedbBackend {
         }
 
         Self::write_manifest(state.db.read_write()?, &updated)?;
+        state.refresh_prefix_generation()?;
         state.manifest = updated;
         // Sealed readers independently scan every original payload; no live cache
         // is exported or reused as a reader-issued proof.
@@ -1402,6 +1585,138 @@ mod tests {
                 Err(EventStoreError::HashMismatch { seq: 1 })
             ));
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_prefix_same_length_rehashed_old_payload_is_not_laundered_by_owned_commit() {
+        for action in ["append", "anchor", "seal", "prefix"] {
+            let tmp = TempDir::new().expect("tempdir");
+            let mut backend = RedbBackend::new(tmp.path());
+            backend.open_run(prefix_manifest(action)).expect("open");
+            backend
+                .append_batch(&[prefix_entry(1)])
+                .expect("original commit");
+            let mut changed = prefix_entry(1).entry;
+            changed.payload = bytes::Bytes::from(vec![0x7f; changed.payload.len()]);
+            changed.entry_hash = changed.recompute_hash();
+            let encoded = codec::encode_to_vec(&changed).expect("valid same-length changed row");
+            {
+                let state = backend.state().expect("state");
+                let transaction = begin_immediate_write(state.db.read_write().expect("db"))
+                    .expect("unexpected actual write transaction");
+                {
+                    let mut table = transaction.open_table(ENTRIES_TABLE).expect("table");
+                    let original = table.get(1).expect("old row").expect("existing");
+                    assert_eq!(original.value().len(), encoded.len());
+                    drop(original);
+                    table
+                        .insert(1, encoded.as_slice())
+                        .expect("replace same length");
+                }
+                transaction
+                    .commit()
+                    .expect("actual unexpected durable commit");
+            }
+            assert_eq!(
+                backend.scan_seq(1).expect("independent self-hash scan"),
+                Some(changed)
+            );
+            let result = match action {
+                "append" => backend.append_batch(&[prefix_entry(2)]).map(|_| ()),
+                "anchor" => backend.record_snapshot_anchor(SnapshotAnchor::new(1, "cut", "hash")),
+                "seal" => backend.seal(RunStatus::Ended),
+                _ => crate::writer::read_durable_prefix(&backend).map(|_| ()),
+            };
+            let error = result.expect_err("valid rehash must not certify changed old bytes");
+            assert!(
+                error
+                    .to_string()
+                    .contains("native storage writes changed or failed")
+            );
+            assert!(backend.state().expect("state").prefix_failed.get());
+            assert_eq!(backend.high_watermark().expect("hwm"), 1);
+            assert_eq!(
+                backend.manifest().expect("manifest").status,
+                RunStatus::Running
+            );
+            assert!(backend.append_batch(&[prefix_entry(2)]).is_err());
+        }
+    }
+
+    #[test]
+    fn native_storage_write_epoch_rejects_concurrent_unowned_io_before_refresh() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("owned-io");
+        fs::write(&path, b"original").expect("owned file");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("file");
+        let epoch = Arc::new(StorageWriteEpoch::default());
+        epoch.armed.store(true, Ordering::SeqCst);
+        let storage = Arc::new(OwnedStorageBackend {
+            inner: FileBackend::new(file).expect("same locked FileBackend"),
+            epoch: epoch.clone(),
+        });
+        let _permit = epoch.begin_owned(0).expect("legal current-thread scope");
+        let concurrent = storage.clone();
+        std::thread::spawn(move || concurrent.write(0, b"changed!"))
+            .join()
+            .expect("owned thread")
+            .expect("actual other-thread IO");
+        let mut actual = [0; 8];
+        storage.read(0, &mut actual).expect("actual storage read");
+        assert_eq!(&actual, b"changed!");
+        assert_eq!(epoch.generation.load(Ordering::SeqCst), 1);
+        assert!(
+            epoch.snapshot().is_err(),
+            "legal scope cannot launder unowned write"
+        );
+    }
+
+    #[test]
+    fn native_storage_epoch_overflow_refuses_io_and_failed_resize_write_remain_visible() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("overflow-io");
+        fs::write(&path, b"original").expect("owned file");
+        let epoch = Arc::new(StorageWriteEpoch::default());
+        epoch.generation.store(u64::MAX, Ordering::SeqCst);
+        let storage = OwnedStorageBackend {
+            inner: FileBackend::new(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .expect("file"),
+            )
+            .expect("locked FileBackend"),
+            epoch: epoch.clone(),
+        };
+        assert!(storage.write(0, b"changed!").is_err());
+        assert!(storage.set_len(0).is_err());
+        assert_eq!(fs::read(&path).expect("original remains"), b"original");
+        assert!(epoch.snapshot().is_err());
+        drop(storage);
+        let readonly = fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("read-only descriptor");
+        let failed = Arc::new(StorageWriteEpoch::default());
+        let storage = OwnedStorageBackend {
+            inner: FileBackend::new(readonly).expect("same FileBackend lock"),
+            epoch: failed.clone(),
+        };
+        assert!(storage.write(0, b"changed!").is_err());
+        assert!(storage.set_len(0).is_err());
+        assert_eq!(
+            failed.generation.load(Ordering::SeqCst),
+            2,
+            "failed/partial IO advances before delegation, never an invisible write"
+        );
+        assert!(failed.snapshot().is_err());
+        assert_eq!(fs::read(&path).expect("original remains"), b"original");
     }
 
     #[test]

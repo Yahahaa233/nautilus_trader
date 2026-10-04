@@ -57,7 +57,7 @@ use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_live::{
     builder::LiveNodeBuilder,
     config::{LiveExecutionEngineConfig, LiveNodeConfig},
-    node::{LiveNode, LiveNodeHandle, NodeRunMode, NodeState},
+    node::{LiveNode, LiveNodeHandle, NodeRunMode, NodeState, StartupReconciliationPhase},
 };
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
@@ -104,6 +104,33 @@ impl TestActor {
 impl DataActor for TestActor {}
 
 nautilus_actor!(TestActor);
+
+#[derive(Debug)]
+struct StartupCountingActor {
+    core: DataActorCore,
+    starts: Arc<AtomicUsize>,
+}
+
+impl StartupCountingActor {
+    fn new(starts: Arc<AtomicUsize>) -> Self {
+        Self {
+            core: DataActorCore::new(DataActorConfig {
+                actor_id: Some(ActorId::from("STARTUP-COUNTING-ACTOR")),
+                ..Default::default()
+            }),
+            starts,
+        }
+    }
+}
+
+impl DataActor for StartupCountingActor {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.starts.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+nautilus_actor!(StartupCountingActor);
 
 #[derive(Debug)]
 struct TestStrategy {
@@ -333,6 +360,7 @@ pub(crate) mod serial_tests {
         connected: Arc<AtomicBool>,
         connect_attempted: Arc<AtomicBool>,
         disconnect_attempted: Arc<AtomicBool>,
+        stop_attempted: Arc<AtomicBool>,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -673,6 +701,7 @@ pub(crate) mod serial_tests {
         }
 
         fn stop(&mut self) -> anyhow::Result<()> {
+            self.state.stop_attempted.store(true, Ordering::Relaxed);
             Ok(())
         }
 
@@ -927,6 +956,7 @@ pub(crate) mod serial_tests {
         }
 
         fn stop(&mut self) -> anyhow::Result<()> {
+            self.state.stop_attempted.store(true, Ordering::Relaxed);
             Ok(())
         }
 
@@ -2314,6 +2344,23 @@ pub(crate) mod serial_tests {
         );
         let handle = node.handle();
         node.start().await.unwrap();
+        assert!(!data_state.stop_attempted.load(Ordering::Relaxed));
+        assert!(!exec_state.stop_attempted.load(Ordering::Relaxed));
+        let callback: Rc<dyn Fn(nautilus_common::timer::TimeEvent)> = Rc::new(|_| {});
+        node.kernel()
+            .clock()
+            .borrow_mut()
+            .set_timer_ns(
+                "disconnect-cleanup-fixture",
+                nautilus_core::DurationNanos::new(60_000_000_000),
+                None,
+                None,
+                Some(nautilus_common::timer::TimeEventCallback::from(callback)),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(node.kernel().clock().borrow().timer_count() > 0);
 
         let result = dst::time::timeout(Duration::from_millis(200), node.stop())
             .await
@@ -2324,14 +2371,25 @@ pub(crate) mod serial_tests {
             err.to_string().contains("disconnect readiness"),
             "unexpected error: {err:#}"
         );
-        // A client is still connected, so finalization has not reached the
-        // successful stop/seal boundary. Preserve the actual failed shutdown.
-        assert_eq!(handle.state(), NodeState::ShuttingDown);
+        // A client remains connected: cleanup may expose Stopped, but must
+        // preserve the disconnect error and permanently prohibit the seal.
+        assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!handle.is_running());
         assert!(data_state.disconnect_attempted.load(Ordering::Relaxed));
         assert!(data_state.connected.load(Ordering::Relaxed));
         assert!(exec_state.disconnect_attempted.load(Ordering::Relaxed));
         assert!(!exec_state.connected.load(Ordering::Relaxed));
+        assert!(data_state.stop_attempted.load(Ordering::Relaxed));
+        assert!(exec_state.stop_attempted.load(Ordering::Relaxed));
+        assert_eq!(node.kernel().clock().borrow().timer_count(), 0);
+        assert!(
+            node.kernel_mut()
+                .finalize_stop()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("event store seal prohibited")
+        );
     }
 
     #[rstest]
@@ -2348,6 +2406,23 @@ pub(crate) mod serial_tests {
         );
         let handle = node.handle();
         node.start().await.unwrap();
+        assert!(!data_state.stop_attempted.load(Ordering::Relaxed));
+        assert!(!exec_state.stop_attempted.load(Ordering::Relaxed));
+        let callback: Rc<dyn Fn(nautilus_common::timer::TimeEvent)> = Rc::new(|_| {});
+        node.kernel()
+            .clock()
+            .borrow_mut()
+            .set_timer_ns(
+                "disconnect-cleanup-fixture",
+                nautilus_core::DurationNanos::new(60_000_000_000),
+                None,
+                None,
+                Some(nautilus_common::timer::TimeEventCallback::from(callback)),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(node.kernel().clock().borrow().timer_count() > 0);
 
         let result = dst::time::timeout(Duration::from_millis(200), node.stop())
             .await
@@ -2362,6 +2437,17 @@ pub(crate) mod serial_tests {
         assert!(data_state.disconnect_attempted.load(Ordering::Relaxed));
         assert!(exec_state.disconnect_attempted.load(Ordering::Relaxed));
         assert!(!exec_state.connected.load(Ordering::Relaxed));
+        assert!(data_state.stop_attempted.load(Ordering::Relaxed));
+        assert!(exec_state.stop_attempted.load(Ordering::Relaxed));
+        assert_eq!(node.kernel().clock().borrow().timer_count(), 0);
+        assert!(
+            node.kernel_mut()
+                .finalize_stop()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("event store seal prohibited")
+        );
     }
 
     #[rstest]
@@ -2632,7 +2718,42 @@ pub(crate) mod serial_tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_start_continues_when_mass_status_unavailable() {
+    async fn test_disabled_reconciliation_starts_without_requesting_mass_status() {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            timeout_disconnection: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "DisabledStartupMassStatusNode",
+            config,
+            StartupMassStatusBehavior::Unavailable,
+        );
+        let starts = Arc::new(AtomicUsize::new(0));
+        node.add_actor(StartupCountingActor::new(starts.clone()))
+            .unwrap();
+        let handle = node.handle();
+        node.start().await.unwrap();
+        assert_eq!(handle.state(), NodeState::Running);
+        assert_eq!(starts.load(Ordering::Relaxed), 1);
+        assert!(!state.mass_status_requested.load(Ordering::Relaxed));
+        let observation = handle.startup_reconciliation().unwrap();
+        assert_eq!(observation.phase, StartupReconciliationPhase::Disabled);
+        assert_eq!(observation.clients, 1);
+        assert!(observation.reason.is_none());
+        node.stop().await.unwrap();
+        assert_eq!(handle.state(), NodeState::Stopped);
+        assert!(!state.connected.load(Ordering::Relaxed));
+        node.dispose();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_start_rejects_missing_mass_status_before_actor_start() {
         let config = LiveNodeConfig {
             exec_engine: LiveExecutionEngineConfig {
                 reconciliation: true,
@@ -2648,21 +2769,36 @@ pub(crate) mod serial_tests {
             config,
             StartupMassStatusBehavior::Unavailable,
         );
+        let starts = Arc::new(AtomicUsize::new(0));
+        node.add_actor(StartupCountingActor::new(starts.clone()))
+            .unwrap();
         let handle = node.handle();
 
-        let result = node.start().await;
-
-        assert!(result.is_ok(), "unexpected error: {result:#?}");
+        let err = node
+            .start()
+            .await
+            .expect_err("start must refuse missing mass status");
+        let reason = "Startup reconciliation requires mass status from STARTUP-MASS-STATUS; no report received";
+        assert!(
+            format!("{err:#}").contains(reason),
+            "unexpected error: {err:#}"
+        );
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
-        assert_eq!(handle.state(), NodeState::Running);
-        assert!(state.connected.load(Ordering::Relaxed));
-
-        node.stop().await.unwrap();
+        assert!(state.disconnect_attempted.load(Ordering::Relaxed));
+        assert_eq!(starts.load(Ordering::Relaxed), 0);
+        assert_eq!(handle.state(), NodeState::Stopped);
+        assert!(!handle.is_running());
+        assert!(!state.connected.load(Ordering::Relaxed));
+        let observation = handle
+            .startup_reconciliation()
+            .expect("actual failed reconciliation observation");
+        assert_eq!(observation.phase, StartupReconciliationPhase::Failed);
+        assert_eq!(observation.clients, 1);
+        assert!(observation.observed_at_ns > 0);
+        assert_eq!(observation.reason.as_deref(), Some(reason));
+        assert_eq!(node.kernel().clock().borrow().timer_count(), 0);
 
         node.dispose();
-
-        assert_eq!(handle.state(), NodeState::Stopped);
-        assert!(!state.connected.load(Ordering::Relaxed));
         assert!(node.kernel().trader().borrow().is_disposed());
         assert_eq!(node.kernel().trader().borrow().component_count(), 0);
     }
@@ -3178,7 +3314,7 @@ pub(crate) mod serial_tests {
 
     #[rstest]
     #[tokio::test(flavor = "current_thread")]
-    async fn test_run_continues_when_mass_status_unavailable() {
+    async fn test_run_rejects_missing_mass_status_before_actor_start() {
         let config = LiveNodeConfig {
             exec_engine: LiveExecutionEngineConfig {
                 reconciliation: true,
@@ -3194,24 +3330,38 @@ pub(crate) mod serial_tests {
             config,
             StartupMassStatusBehavior::Unavailable,
         );
+        let starts = Arc::new(AtomicUsize::new(0));
+        node.add_actor(StartupCountingActor::new(starts.clone()))
+            .unwrap();
         let handle = node.handle();
-        let stop_handle = handle.clone();
 
-        tokio::spawn(async move {
-            wait_until_async(
-                || async { stop_handle.is_running() },
-                Duration::from_secs(5),
-            )
-            .await;
-            stop_handle.stop();
-        });
-
-        let result = node.run().await;
-
-        assert!(result.is_ok(), "unexpected error: {result:#?}");
+        let err = dst::time::timeout(Duration::from_millis(200), node.run())
+            .await
+            .expect("missing mass status must abort without reaching Running")
+            .expect_err("run must refuse missing mass status");
+        let reason = "Startup reconciliation requires mass status from STARTUP-MASS-STATUS; no report received";
+        assert!(
+            format!("{err:#}").contains(reason),
+            "unexpected error: {err:#}"
+        );
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
+        assert!(state.disconnect_attempted.load(Ordering::Relaxed));
+        assert_eq!(starts.load(Ordering::Relaxed), 0);
         assert_eq!(handle.state(), NodeState::Stopped);
+        assert!(!handle.is_running());
         assert!(!state.connected.load(Ordering::Relaxed));
+        let observation = handle
+            .startup_reconciliation()
+            .expect("actual failed reconciliation observation");
+        assert_eq!(observation.phase, StartupReconciliationPhase::Failed);
+        assert_eq!(observation.clients, 1);
+        assert!(observation.observed_at_ns > 0);
+        assert_eq!(observation.reason.as_deref(), Some(reason));
+        assert_eq!(node.kernel().clock().borrow().timer_count(), 0);
+
+        node.dispose();
+        assert!(node.kernel().trader().borrow().is_disposed());
+        assert_eq!(node.kernel().trader().borrow().component_count(), 0);
     }
 
     #[rstest]

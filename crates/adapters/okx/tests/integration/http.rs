@@ -3417,8 +3417,11 @@ async fn test_request_trades_range_mode_pagination() {
     }
 }
 
+#[rstest]
+#[case::confirmed("1")]
+#[case::unconfirmed("0")]
 #[tokio::test]
-async fn test_request_bars_range_mode_pagination() {
+async fn test_request_bars_range_mode_pagination(#[case] confirmation: &'static str) {
     use nautilus_model::{
         data::{BarSpecification, BarType},
         enums::{AggregationSource, BarAggregation, PriceType},
@@ -3462,7 +3465,7 @@ async fn test_request_bars_range_mode_pagination() {
                                 "10.5",
                                 "0",
                                 "0",
-                                "0"
+                                confirmation
                             ]));
                         }
                         bars
@@ -3506,7 +3509,7 @@ async fn test_request_bars_range_mode_pagination() {
                                 "10.5",
                                 "0",
                                 "0",
-                                "0"
+                                confirmation
                             ]));
                         }
                         bars
@@ -3566,7 +3569,17 @@ async fn test_request_bars_range_mode_pagination() {
         .await
         .unwrap();
 
-    assert!(!bars.is_empty(), "Should retrieve bars in Range mode");
+    if confirmation == "0" {
+        assert!(
+            bars.is_empty(),
+            "Unconfirmed candles must never enter the closed-bar stream"
+        );
+        return;
+    }
+    assert!(
+        !bars.is_empty(),
+        "Should retrieve confirmed bars in Range mode"
+    );
 
     for bar in &bars {
         let bar_ts = bar.ts_event.as_i64();

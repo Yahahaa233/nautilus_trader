@@ -211,10 +211,18 @@ impl DataActor for CommandStrategy {
             self.on_order_event(e.clone());
             Ok(())
         } else if let Some(l) = input.downcast_ref::<NativeComponentLifecycle>() {
+            ensure!(
+                l.component_id == self.actor_id().as_str()
+                    && boundary.route().component_id == l.component_id
+                    && boundary.route().kind == "lifecycle.stop"
+                    && boundary.original_component_state()? == ComponentState::Running,
+                "original command lifecycle owner/route/state changed"
+            );
+            // The SDK callback route is `lifecycle.stop`; its business input
+            // action is `stop`. Strategy::stop is replayed by the SDK framework.
             match l.action.as_str() {
-                "lifecycle.stop" => DataActor::on_stop(self),
-                "lifecycle.strategy_stop" => Ok(()),
-                _ => anyhow::bail!("unknown command lifecycle"),
+                "stop" => DataActor::on_stop(self),
+                _ => anyhow::bail!("unknown command lifecycle action: {}", l.action),
             }
         } else {
             anyhow::bail!("unknown original command business input")
@@ -525,6 +533,35 @@ async fn command_run_case(changed: bool, startup: u8, changed_portfolio: bool) {
         assert_original_startup_receipts(&reader, first.0.prefix.sequence);
     }
     let verified = reader.verify_native_tail(&identity, &first.0, end).unwrap();
+    let stop_callbacks = verified
+        .roots()
+        .iter()
+        .flat_map(|root| root.inputs())
+        .filter_map(|input| match input {
+            NativeTraceRecord::Complete { callbacks, .. }
+                if callbacks.iter().any(|route| {
+                    route.component_id == STRATEGY && route.kind == "lifecycle.strategy_stop"
+                }) =>
+            {
+                Some(callbacks)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(stop_callbacks.len(), 1, "actual strategy stop root changed");
+    assert_eq!(
+        stop_callbacks[0]
+            .iter()
+            .filter(|route| route.component_id == STRATEGY)
+            .map(|route| (route.kind.as_str(), route.component_state.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("lifecycle.strategy_stop", "Running"),
+            ("lifecycle.strategy_stop.default", "Running"),
+            ("lifecycle.stop", "Running"),
+        ],
+        "actual command strategy stop framework/business routes changed"
+    );
     let mut draws = BTreeSet::new();
     let mut emitted = BTreeSet::new();
     let mut command_ids = Vec::new();
@@ -580,6 +617,10 @@ async fn command_run_case(changed: bool, startup: u8, changed_portfolio: bool) {
     );
     let original_state: serde_json::Value =
         serde_json::from_slice(&original["command_business.v1"]).unwrap();
+    assert_eq!(
+        original_state["stopped"], 1,
+        "actual source business stop hook must run exactly once"
+    );
     let source_events: Vec<OrderEventAny> =
         serde_json::from_value(original_state["events"].clone()).unwrap();
     let factory_id = source_events

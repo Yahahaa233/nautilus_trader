@@ -950,23 +950,129 @@ mod tests {
 
     #[rstest]
     fn test_file_writer_unwritable_directory_returns_none() {
-        let config = FileWriterConfig {
-            directory: Some("/nonexistent/path/that/should/not/exist".to_string()),
-            file_name: Some("test".to_string()),
-            file_format: None,
-            file_rotate: None,
-        };
+        #[cfg(unix)]
+        const CHILD_DIRECTORY: &str = "NAUTILUS_WRITER_UNWRITABLE_FIXTURE";
 
-        let writer = FileWriter::new(
-            "TRADER-001".to_string(),
-            "instance-123".to_string(),
-            config,
-            LevelFilter::Info,
-            false,
-            true,
-        );
+        #[cfg(unix)]
+        fn assert_refused(directory: &std::path::Path) {
+            assert!(directory.is_dir(), "fixture directory must be accessible");
+            let config = FileWriterConfig {
+                directory: Some(directory.to_str().unwrap().to_string()),
+                file_name: Some("test".to_string()),
+                file_format: None,
+                file_rotate: None,
+            };
+            let writer = FileWriter::new(
+                "TRADER-001".to_string(),
+                "instance-123".to_string(),
+                config,
+                LevelFilter::Info,
+                false,
+                true,
+            );
+            assert!(writer.is_none());
+            assert!(!directory.join("test.log").exists());
+        }
 
-        assert!(writer.is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::{
+                fs::{MetadataExt, PermissionsExt},
+                process::CommandExt,
+            };
+
+            // Observe the filesystem owner of our freshly created directory,
+            // rather than use an unsafe process-identity call in this fixture.
+            let temp = tempdir().unwrap();
+            let filesystem_owner_uid = std::fs::metadata(temp.path()).unwrap().uid();
+            // Some root environments bypass chmod. The physical probe decides
+            // whether the same assertion needs an owned unprivileged child.
+            if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+                assert_eq!(filesystem_owner_uid, 65534);
+                assert_refused(std::path::Path::new(&directory));
+                return;
+            }
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let directory = temp.path().join("unwritable");
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let probe_path = directory.join(".write-permission-probe");
+            let denied = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe_path)
+            {
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => true,
+                Ok(file) => {
+                    drop(file);
+                    std::fs::remove_file(&probe_path).unwrap();
+                    false
+                }
+                Err(error) => panic!("unexpected physical permission-probe failure: {error}"),
+            };
+            if denied {
+                // Container root without DAC override is already denied by the
+                // actual directory. No capability change or child is needed.
+                assert_refused(&directory);
+                std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            } else {
+                assert_eq!(
+                    filesystem_owner_uid, 0,
+                    "non-root filesystem owner fixture unexpectedly writable"
+                );
+                let child_temp = temp.path().join("child-temp");
+                std::fs::create_dir(&child_temp).unwrap();
+                std::fs::set_permissions(&child_temp, std::fs::Permissions::from_mode(0o777))
+                    .unwrap();
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "logging::writer::tests::test_file_writer_unwritable_directory_returns_none",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_DIRECTORY, &directory)
+                    .env("TMPDIR", &child_temp)
+                    .gid(65534)
+                    .uid(65534)
+                    .status();
+                std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                assert!(
+                    status.unwrap().success(),
+                    "unprivileged denial assertion failed"
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows directory readonly flags do not deny creating files.
+            // Refuse the actual readonly destination file instead.
+            let temp = tempdir().unwrap();
+            let target = temp.path().join("test.log");
+            std::fs::write(&target, b"owned readonly fixture").unwrap();
+            let original_permissions = std::fs::metadata(&target).unwrap().permissions();
+            let mut permissions = original_permissions.clone();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&target, permissions).unwrap();
+            let config = FileWriterConfig {
+                directory: Some(temp.path().to_str().unwrap().to_string()),
+                file_name: Some("test".to_string()),
+                ..Default::default()
+            };
+            let writer = FileWriter::new(
+                "TRADER-001".to_string(),
+                "instance-123".to_string(),
+                config,
+                LevelFilter::Info,
+                false,
+                true,
+            );
+            let actual = std::fs::read(&target).unwrap();
+            std::fs::set_permissions(&target, original_permissions).unwrap();
+            assert!(writer.is_none());
+            assert_eq!(actual, b"owned readonly fixture");
+        }
     }
 
     #[rstest]

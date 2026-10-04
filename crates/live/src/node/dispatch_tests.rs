@@ -392,6 +392,305 @@ fn final_drain_records_each_discarded_system_input() {
 }
 
 #[test]
+fn final_drain_discard_record_failure_contains_node_and_stops_remaining_inputs() {
+    use crate::dispatch::{DispatchInput, DispatchObserver};
+
+    for encoder_fails in [false, true] {
+        let mut node =
+            LiveNode::builder(TraderId::from("DISPATCH-DRAIN-001"), Environment::Sandbox)
+                .unwrap()
+                .with_reconciliation(false)
+                .build()
+                .unwrap();
+        let attempts = Rc::new(Cell::new(0));
+        let output = attempts.clone();
+        let protocol = DispatchObserver::new("fixture".into(), move |_| {
+            output.set(output.get() + 1);
+            anyhow::bail!("discard sink unavailable")
+        })
+        .unwrap();
+        node.set_dispatch_observer(NodeDispatchObserver::new(
+            protocol,
+            move |source, phase, _| {
+                if encoder_fails {
+                    anyhow::bail!("discard codec unavailable");
+                }
+                Ok(DispatchInput {
+                    source,
+                    phase: phase.into(),
+                    payload: serde_json::json!({"fixture":true}),
+                    batch_index: None,
+                })
+            },
+        ))
+        .unwrap();
+
+        let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
+        let (system_evt_tx, system_evt_rx) = tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+        let (system_cmd_tx, system_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
+        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (_exec_cmd_tx, exec_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+
+        system_evt_tx
+            .send(SystemEvent::SocketState(SocketStateChange::new(
+                ClientId::from("BINANCE"),
+                Some(Venue::from("BINANCE")),
+                "fixture".into(),
+                SocketState::Disconnected,
+            )))
+            .unwrap();
+        system_cmd_tx.send(stub_system_command()).unwrap();
+
+        let mut time_rx = crate::runner::SnapshotReceiver::from(time_rx);
+        let mut system_evt_rx = crate::runner::SnapshotReceiver::from(system_evt_rx);
+        let mut system_cmd_rx = crate::runner::SnapshotReceiver::from(system_cmd_rx);
+        let mut exec_evt_rx = crate::runner::SnapshotReceiver::from(exec_evt_rx);
+        let mut exec_cmd_rx = crate::runner::SnapshotReceiver::from(exec_cmd_rx);
+        let mut data_evt_rx = crate::runner::SnapshotReceiver::from(data_evt_rx);
+        let mut data_cmd_rx = crate::runner::SnapshotReceiver::from(data_cmd_rx);
+        node.drain_channels(
+            &mut time_rx,
+            &mut system_evt_rx,
+            &mut system_cmd_rx,
+            &mut exec_evt_rx,
+            &mut exec_cmd_rx,
+            &mut data_evt_rx,
+            &mut data_cmd_rx,
+        );
+
+        assert!(node.dispatch_failure.get());
+        assert!(node.kernel.is_shutdown_requested());
+        assert!(node.handle.should_stop());
+        assert_eq!(attempts.get(), usize::from(!encoder_fails));
+        // The command must remain queued after the first failed durable discard.
+        // Continuing would erase an unrecorded input and mutate a contained node.
+        assert!(system_cmd_rx.try_recv().is_ok());
+        assert!(
+            node.record_shutdown_discarded(
+                crate::dispatch::DispatchSource::SystemCommand,
+                &stub_system_command(),
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(feature = "native-tail-replay")]
+#[tokio::test(flavor = "current_thread")]
+async fn final_drain_attached_native_trace_refuses_discard_and_retains_original_receipts_unsealed()
+{
+    use crate::dispatch::{DispatchInput, DispatchObserver, DispatchSource};
+    use nautilus_common::recovery_trace::{NativeInputSource, scope};
+    use nautilus_event_store::{backend::RedbBackend, kernel::EventStoreLifecycle};
+
+    let directory = std::env::temp_dir().join(format!("native-discard-retention-{}", UUID4::new()));
+    let config = EventStoreConfig {
+        base_dir: directory.clone(),
+        ..Default::default()
+    };
+    let mut node = LiveNode::builder(TraderId::from("NATIVE-DISCARD-001"), Environment::Live)
+        .unwrap()
+        .with_load_state(false)
+        .with_reconciliation(false)
+        .with_exec_engine_config(crate::config::LiveExecutionEngineConfig {
+            load_cache: false,
+            reconciliation: false,
+            ..Default::default()
+        })
+        .with_event_store(move |instance, clock| {
+            Ok(Box::new(EventStoreLifecycle::boot(
+                Some(config),
+                instance,
+                clock,
+            )?))
+        })
+        .build()
+        .unwrap();
+    let encoded = Rc::new(Cell::new(0usize));
+    let encoder_count = encoded.clone();
+    let records = Rc::new(RefCell::new(Vec::new()));
+    let output = records.clone();
+    let protocol = DispatchObserver::new("actual-native-discard".into(), move |record| {
+        output.borrow_mut().push(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    node.set_dispatch_observer(NodeDispatchObserver::new(
+        protocol.clone(),
+        move |source, phase, _| {
+            encoder_count.set(encoder_count.get() + 1);
+            Ok(DispatchInput {
+                source,
+                phase: phase.into(),
+                payload: serde_json::json!({"actual_shutdown_input":true}),
+                batch_index: None,
+            })
+        },
+    ))
+    .unwrap();
+    let trace = node
+        .prepare_owned_native_trace(
+            "actual-native-discard-business-run".into(),
+            nautilus_event_store::native_trace::native_inventory_digest(
+                &serde_json::to_value(&node.config).unwrap(),
+            )
+            .unwrap(),
+            "actual_native_shutdown_discard.v1".into(),
+            "actual_no_registered_components.v1".into(),
+            |_, _, _| Ok(Vec::new()),
+            |_| Ok(()),
+        )
+        .unwrap();
+    let identity = trace.source().unwrap();
+    let original_event = SystemEvent::SocketState(SocketStateChange::new(
+        ClientId::from("BINANCE"),
+        Some(Venue::from("BINANCE")),
+        "actual-shutdown-source".into(),
+        SocketState::Disconnected,
+    ));
+    let original_command = stub_system_command();
+    let mut runner = node.runner.take().unwrap();
+    runner
+        .system_event_sender_clone()
+        .send(original_event)
+        .unwrap();
+    runner
+        .system_command_sender_clone()
+        .send(original_command)
+        .unwrap();
+    let channels = runner.startup_channels_mut();
+    assert_eq!(channels.system_evt_rx.len(), 1);
+    assert_eq!(channels.system_cmd_rx.len(), 1);
+    assert!(!node.kernel.exec_engine.borrow().submissions_fenced());
+    assert!(!node.event_store_halted());
+    node.drain_channels(
+        &mut channels.time_evt_rx,
+        &mut channels.system_evt_rx,
+        &mut channels.system_cmd_rx,
+        &mut channels.exec_evt_rx,
+        &mut channels.exec_cmd_rx,
+        &mut channels.data_evt_rx,
+        &mut channels.data_cmd_rx,
+    );
+    assert!(node.dispatch_failure.get());
+    assert!(node.kernel.is_shutdown_requested());
+    assert!(node.handle.should_stop());
+    assert!(node.kernel.exec_engine.borrow().submissions_fenced());
+    assert!(node.event_store_halted());
+    assert_eq!(channels.system_evt_rx.len(), 0);
+    assert_eq!(channels.system_cmd_rx.len(), 1);
+    assert_eq!(encoded.get(), 0, "unsupported disposition must not encode");
+    assert!(
+        records.borrow().is_empty(),
+        "no Begin, Complete or Discarded may be minted"
+    );
+    assert_eq!(protocol.completed_root().unwrap(), 0);
+    assert_eq!(protocol.depth().unwrap(), 0);
+    assert!(
+        node.dispatch_observer
+            .as_ref()
+            .unwrap()
+            .completion_proof()
+            .unwrap()
+            .is_none()
+    );
+
+    // These must fail against the same halted writer before consuming the
+    // original receipt. No new source root or checkpoint can repair this run.
+    let error = trace
+        .begin_native(
+            1,
+            1,
+            None,
+            NativeInputSource::SystemEvent,
+            "ShuttingDown",
+            serde_json::Value::Null,
+            Vec::new(),
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("native trace source failed"));
+    assert!(
+        trace
+            .checkpoint_cut(0, 0, "actual-failed-cut".into(), Vec::new())
+            .is_err()
+    );
+    let error = node.finish_stop_seal().await.unwrap_err();
+    assert!(format!("{error:#}").contains("event store halted before Stop seal"));
+    assert_eq!(encoded.get(), 0);
+    assert!(records.borrow().is_empty());
+
+    // Only the assertion reads the original TLS receipt; production rejection
+    // leaves it untouched. The untouched second member retains its own receipt
+    // and exact original command when the test subsequently inspects it.
+    let first = scope::take_ingress(NativeInputSource::SystemEvent)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.input_source, NativeInputSource::SystemEvent);
+    assert_eq!(first.channel_ordinal, 1);
+    assert!(first.caused_by.is_none());
+    let retained_command = channels.system_cmd_rx.try_recv().unwrap();
+    assert_eq!(retained_command, original_command);
+    let second = scope::take_ingress(NativeInputSource::SystemCommand)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.input_source, NativeInputSource::SystemCommand);
+    assert_eq!(second.channel_ordinal, 1);
+    assert_ne!(first.channel_id, second.channel_id);
+    assert_ne!(first.message_id, second.message_id);
+    assert!(second.caused_by.is_none());
+    let error = node
+        .record_shutdown_discarded(DispatchSource::SystemCommand, &retained_command)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "native trace shutdown discard disposition unsupported"
+    );
+    assert_eq!(encoded.get(), 0);
+    assert!(records.borrow().is_empty());
+
+    // Release every owner before independently reading the actual redb file.
+    node.runner = Some(runner);
+    node.dispose();
+    drop(node);
+    drop(trace);
+    drop(protocol);
+    let manifest = RedbBackend::list_runs(&directory, &identity.node_instance.to_string())
+        .unwrap()
+        .into_iter()
+        .find(|manifest| manifest.run_id == identity.journal_run)
+        .unwrap();
+    assert_eq!(
+        manifest.status,
+        nautilus_event_store::manifest::RunStatus::Running
+    );
+    assert!(manifest.end_ts_init.is_none());
+    let original_path = directory
+        .join(identity.node_instance.to_string())
+        .join(format!("{}.redb", identity.journal_run));
+    let original_bytes = std::fs::read(&original_path).unwrap();
+    match RedbBackend::open_sealed(
+        &directory,
+        &identity.node_instance.to_string(),
+        &identity.journal_run,
+    ) {
+        Err(nautilus_event_store::EventStoreError::Backend(reason)) => {
+            assert!(
+                reason.contains("not sealed, status was Running"),
+                "{reason}"
+            );
+        }
+        Err(error) => panic!("retained original must be readable and unsealed: {error}"),
+        Ok(_) => panic!("failed native discard must not seal the original run"),
+    }
+    assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn paused_queue_capture_holds_gate_through_callback_and_rejects_failure() {
     use crate::dispatch::DispatchObserver;
     use crate::runner_recovery::{RunnerRecoveryCodecRegistry, RunnerRecoveryWatermark};
