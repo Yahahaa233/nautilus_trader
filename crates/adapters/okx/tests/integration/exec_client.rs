@@ -611,10 +611,13 @@ async fn test_explicit_venue_modify_rejection_emits_order_modify_rejected() {
             config.max_retries = 0;
         });
     client.start().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), client.connect())
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        finish_bootstrap_connect(client.connect(), &mut rx, &cache),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let _ = drain_events(&mut rx);
     let cid = ClientOrderId::new("O-modify-explicit-reject");
     let instrument_id = InstrumentId::from("BTC-USD-SWAP.OKX");
