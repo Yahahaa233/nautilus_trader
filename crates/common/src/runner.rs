@@ -168,6 +168,46 @@ impl TimeEventCallbackToken {
         self.0.state.load(Ordering::Acquire) & CALLBACK_CLOSED != 0
     }
 
+    /// Reinstates an original queued lease on this still-retained callback.
+    /// This is not acquisition from a producer: the closed bit never changes.
+    #[cfg(feature = "live")]
+    pub(crate) fn restore_closed_queued_lease(
+        &self,
+        clock_id: nautilus_core::UUID4,
+    ) -> Option<TimeEventCallbackLease> {
+        if self.0.owner != thread::current().id() || self.0.owner_clock_id.get() != Some(&clock_id)
+        {
+            return None;
+        }
+        let registered = TIME_EVENT_CALLBACKS.with(|callbacks| {
+            callbacks.borrow().get(&self.0.id).is_some_and(|entry| {
+                entry
+                    .token
+                    .upgrade()
+                    .is_some_and(|token| Arc::ptr_eq(&token, &self.0))
+            })
+        });
+        if !registered {
+            return None;
+        }
+        let mut state = self.0.state.load(Ordering::Acquire);
+        loop {
+            let leases = state & CALLBACK_LEASES;
+            if state & CALLBACK_CLOSED == 0 || leases == 0 || leases == CALLBACK_LEASES {
+                return None;
+            }
+            match self.0.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(TimeEventCallbackLease(self.0.clone())),
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
     pub(crate) fn close(&self) {
         let previous = self.0.state.fetch_or(CALLBACK_CLOSED, Ordering::AcqRel);
         if previous & CALLBACK_LEASES == 0 {

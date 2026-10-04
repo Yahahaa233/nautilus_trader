@@ -177,6 +177,18 @@ pub trait RestoredTimerCheckpoint: Debug {
     ) -> anyhow::Result<Vec<crate::runner::TimeEventMessage>> {
         anyhow::bail!("historical owner queued callback admission unsupported")
     }
+    /// Restores only Reader-original messages accepted during the current
+    /// cancellation boundary. The actual closed callback must still be retained.
+    fn admit_historical_cancelled_messages(
+        &self,
+        _before: &serde_json::Value,
+        _after: &serde_json::Value,
+        _inputs: &[(TimeEvent, u64, bool, u64)],
+        _captured_before: u64,
+        _captured_after: u64,
+    ) -> anyhow::Result<Vec<crate::runner::TimeEventMessage>> {
+        anyhow::bail!("historical cancelled queued callback admission unsupported")
+    }
     /// Advances only the already installed owner schedules under their producer pause.
     /// The native reader supplies the original inventory; callback bindings cannot change.
     fn apply_historical_inventory(&self, _inventory: &serde_json::Value) -> anyhow::Result<()> {

@@ -767,6 +767,30 @@ impl NativeHistoricalRootReplay {
         );
         Ok(record.clone())
     }
+    /// Returns the Reader-original Begin for the currently executing input,
+    /// including nested inputs. This does not advance its cursor.
+    pub fn expected_begin(&self) -> Result<NativeTraceRecord> {
+        let state = self
+            .0
+            .try_borrow()
+            .context("historical native tree reentered")?;
+        ensure!(!state.failed, "historical native tree failed");
+        let input = *state
+            .stack
+            .last()
+            .context("historical native input absent")?;
+        state
+            .root
+            .inputs
+            .iter()
+            .find_map(|record| match record {
+                NativeTraceRecord::Begin { input_sequence, .. } if *input_sequence == input => {
+                    Some(record.clone())
+                }
+                _ => None,
+            })
+            .context("historical native source Begin missing")
+    }
     /// Returns the expected effects for the currently executing original input.
     pub fn expected_effects(&self) -> Result<Value> {
         let state = self

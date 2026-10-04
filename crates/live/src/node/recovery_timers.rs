@@ -287,9 +287,61 @@ impl RetainedNodeTimers {
         admissions: &[(String, u64, bool, TimeEvent, u64)],
         captured_at_ns: u64,
     ) -> Result<()> {
+        self.admit_historical_timers_inner(before, admissions, captured_at_ns, None)
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn admit_historical_timers_after_dispatch(
+        &self,
+        begin: &nautilus_common::recovery_trace::NativeTraceRecord,
+        after: &BTreeMap<String, serde_json::Value>,
+        admissions: &[(String, u64, bool, TimeEvent, u64)],
+        captured_after: u64,
+    ) -> Result<()> {
+        let nautilus_common::recovery_trace::NativeTraceRecord::Begin { read_witnesses, .. } =
+            begin
+        else {
+            anyhow::bail!("original current timer Begin absent")
+        };
+        let mut witnesses = read_witnesses
+            .iter()
+            .filter(|w| w.component_id == "native:timers");
+        let witness = witnesses
+            .next()
+            .context("original current timer witness absent")?;
+        ensure!(
+            witnesses.next().is_none()
+                && witness.profile == "actual_registered_owner_timer_input.v1"
+                && witness.source_version == "native_actual_registered_clock.v1",
+            "original current timer witness profile changed"
+        );
+        let before: BTreeMap<String, serde_json::Value> =
+            serde_json::from_value(witness.payload["inventory"].clone())?;
+        let captured_before = witness.payload["captured_at_ns"]
+            .as_u64()
+            .context("original current before capture absent")?;
+        ensure!(
+            before.keys().eq(after.keys()) && captured_before <= captured_after,
+            "original current cancellation boundary changed"
+        );
+        self.admit_historical_timers_inner(
+            after,
+            admissions,
+            captured_after,
+            Some((&before, captured_before)),
+        )
+    }
+    #[cfg(feature = "native-tail-replay")]
+    fn admit_historical_timers_inner(
+        &self,
+        before: &BTreeMap<String, serde_json::Value>,
+        admissions: &[(String, u64, bool, TimeEvent, u64)],
+        captured_at_ns: u64,
+        cancelled: Option<(&BTreeMap<String, serde_json::Value>, u64)>,
+    ) -> Result<()> {
         let mut pending = self.pending.try_borrow_mut()?;
         let mut admitted = self.historical_admitted.try_borrow_mut()?;
         let mut incoming = BTreeMap::<String, Vec<(TimeEvent, u64, bool)>>::new();
+        let mut accepted = std::collections::HashMap::new();
         let mut incoming_order = Vec::new();
         let mut incoming_ids = HashSet::new();
         for (owner, binding, cleanup, event, accepted_at) in admissions {
@@ -317,6 +369,7 @@ impl RetainedNodeTimers {
                 "duplicate original timer admission UUID"
             );
             incoming_order.push((event.clone(), *binding, *cleanup));
+            accepted.insert(event.event_id, *accepted_at);
             incoming
                 .entry(owner.clone())
                 .or_default()
@@ -335,10 +388,36 @@ impl RetainedNodeTimers {
                 .as_ref()
                 .context("historical timer owner resumed")?
                 .try_borrow()?;
-            let messages = receipt.admit_historical_messages(
-                inventory,
-                &incoming.remove(owner).unwrap_or_default(),
-            )?;
+            let all = incoming.remove(owner).unwrap_or_default();
+            let (active, retired): (Vec<_>, Vec<_>) =
+                all.into_iter().partition(|(_, binding, _)| {
+                    inventory["timers"].as_array().is_some_and(|rows| {
+                        rows.iter()
+                            .any(|row| row["binding"]["binding_id"].as_u64() == Some(*binding))
+                    })
+                });
+            let mut messages = receipt.admit_historical_messages(inventory, &active)?;
+            if !retired.is_empty() {
+                let (original_before, captured_before) = cancelled
+                    .context("cancelled original admission lacks its current Reader boundary")?;
+                let original = original_before
+                    .get(owner)
+                    .context("cancelled original owner absent")?;
+                let inputs = retired
+                    .into_iter()
+                    .map(|(event, binding, cleanup)| {
+                        let received = accepted[&event.event_id];
+                        (event, binding, cleanup, received)
+                    })
+                    .collect::<Vec<_>>();
+                messages.extend(receipt.admit_historical_cancelled_messages(
+                    original,
+                    inventory,
+                    &inputs,
+                    captured_before,
+                    captured_at_ns,
+                )?);
+            }
             for message in messages {
                 ensure!(
                     materialized

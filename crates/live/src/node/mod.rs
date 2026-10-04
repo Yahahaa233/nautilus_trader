@@ -535,12 +535,17 @@ impl LiveNode {
                     .as_ref()
                     .context("historical native owner clocks missing")?
                     .refresh_historical_dispatch(&scheduled)?;
-                self.admit_historical_native_timers(
-                    &scheduled,
-                    expected["timer_capture_ns"]
-                        .as_u64()
-                        .context("original timer boundary absent")?,
-                )?;
+                self.recovery_timers
+                    .as_ref()
+                    .context("historical native owner clocks missing")?
+                    .admit_historical_timers_after_dispatch(
+                        &replay.expected_begin()?,
+                        &scheduled,
+                        &self.historical_timer_admissions,
+                        expected["timer_capture_ns"]
+                            .as_u64()
+                            .context("original timer boundary absent")?,
+                    )?;
             }
             let effects = self.collect_native_trace_effects()?;
             return guard.complete_native(effects);

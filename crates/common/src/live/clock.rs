@@ -58,6 +58,9 @@ struct LiveRestoredTimers {
     pause: super::checkpoint::PausedCallbacks,
     source: serde_json::Value,
     tokens: BTreeMap<u64, (String, u64, u64, crate::runner::TimeEventCallbackToken)>,
+    // Removed schedules are not active inventory. Only their already retained,
+    // closed callback may carry original messages admitted during cancellation.
+    cancelled_tokens: BTreeMap<u64, (serde_json::Value, crate::runner::TimeEventCallbackToken)>,
     inspectors: Vec<TimerInspector>,
     updaters: BTreeMap<String, Box<dyn Fn(u64, bool) -> anyhow::Result<()>>>,
     restored: std::cell::RefCell<serde_json::Value>,
@@ -262,6 +265,93 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
         }
         Ok(actual)
     }
+    fn admit_historical_cancelled_messages(
+        &self,
+        before: &serde_json::Value,
+        after: &serde_json::Value,
+        inputs: &[(crate::timer::TimeEvent, u64, bool, u64)],
+        captured_before: u64,
+        captured_after: u64,
+    ) -> anyhow::Result<Vec<crate::runner::TimeEventMessage>> {
+        self.verify()?;
+        anyhow::ensure!(
+            crate::recovery_trace::historical::active()
+                && crate::recovery_trace::historical::pending_callback_route()?.is_none()
+                && captured_before <= captured_after
+                && self.historical_inventory()? == *after
+                && before["native_clock_id"] == after["native_clock_id"],
+            "cancelled queue restoration requires the same completed original dispatch"
+        );
+        let mut seen = std::collections::HashSet::new();
+        // Validate the complete batch before mutating any actual closed count.
+        for (event, binding, cleanup, accepted_at) in inputs {
+            anyhow::ensure!(
+                seen.insert(event.event_id),
+                "duplicate cancelled original timer UUID"
+            );
+            let (registration, token) = self
+                .cancelled_tokens
+                .get(binding)
+                .context("cancelled original callback is not retained by this clock")?;
+            let original = before["timers"]
+                .as_array()
+                .context("original before timers absent")?
+                .iter()
+                .find(|row| row["binding"]["binding_id"].as_u64() == Some(*binding))
+                .context("cancelled original registration absent before dispatch")?;
+            let state = token.checkpoint_inventory()["state"]
+                .as_u64()
+                .context("cancelled actual token state absent")?;
+            let closed = 1u64 << 63;
+            let next = registration["next_time_ns"]
+                .as_u64()
+                .context("cancelled frontier absent")?;
+            let interval = registration["interval_ns"]
+                .as_u64()
+                .context("cancelled interval absent")?;
+            anyhow::ensure!(
+                registration == original
+                    && original["status"] == "active"
+                    && original["callback_kind"] == "registered_owner_thread"
+                    && state & closed != 0
+                    && state & !closed != 0
+                    && original["binding"]["state"].as_u64() == Some(state & !closed)
+                    && !after["timers"]
+                        .as_array()
+                        .context("original after timers absent")?
+                        .iter()
+                        .any(|row| row["binding"]["binding_id"].as_u64() == Some(*binding))
+                    && !cleanup
+                    && interval > 0
+                    && event.name.as_str() == registration["name"].as_str().unwrap()
+                    && event.ts_event.as_u64() >= next
+                    && (event.ts_event.as_u64() - next) % interval == 0
+                    && event.ts_event.as_u64() <= captured_after
+                    && event.ts_init.as_u64() <= *accepted_at
+                    && captured_before < *accepted_at
+                    && *accepted_at <= captured_after,
+                "cancelled original timer registration, headers or admission boundary changed"
+            );
+        }
+        let messages = inputs
+            .iter()
+            .map(|(event, binding, _, _)| {
+                let token = &self.cancelled_tokens[binding].1;
+                let lease = token
+                    .restore_closed_queued_lease(self.clock_id.unwrap_or(self.actual_clock_id))
+                    .context("cancelled actual callback disappeared or has no retained lease")?;
+                Ok(
+                    crate::runner::TimeEventMessage::registered(event.clone(), lease)
+                        .with_native_source_callback_binding(*binding),
+                )
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            self.historical_inventory()? == *after,
+            "cancelled queue restoration changed actual schedules"
+        );
+        Ok(messages)
+    }
     fn apply_historical_inventory(&self, desired: &serde_json::Value) -> anyhow::Result<()> {
         self.pause.verify()?;
         let actual = self.historical_inventory()?;
@@ -433,8 +523,23 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
                         .is_some_and(|state| state & (1u64 << 63) != 0),
                     "historical timer disappeared without actual cancellation: {name}"
                 );
+                let mut registration = self.restored.try_borrow()?["timers"]
+                    .as_array()
+                    .context("retained original registrations absent")?
+                    .iter()
+                    .find(|row| row["name"].as_str() == Some(name))
+                    .context("cancelled actual registration was not retained")?
+                    .clone();
+                registration["binding"]["binding_id"] = (*id).into();
+                self.cancelled_tokens
+                    .insert(*id, (registration, token.clone()));
             }
         }
+        self.cancelled_tokens.retain(|_, (_, token)| {
+            token.checkpoint_inventory()["state"]
+                .as_u64()
+                .is_some_and(|state| state & ((1u64 << 63) - 1) != 0)
+        });
         self.updaters = clock
             .timers
             .iter()
@@ -796,6 +901,7 @@ impl Clock for LiveClock {
             pause,
             source: inventory.clone(),
             tokens,
+            cancelled_tokens: BTreeMap::new(),
             inspectors,
             updaters,
             restored: std::cell::RefCell::new(restored),
@@ -1503,6 +1609,220 @@ mod tests {
         );
         assert_eq!(count.get(), 1);
         assert_eq!(source.timer_count(), 0);
+    }
+
+    // Actual LiveTimer/token regression. The low-level historical scope here
+    // exercises clock mechanics only; it is not a Reader or execution permit.
+    // The CQS nonflat caller separately exercises the complete sealed Reader.
+    #[rstest]
+    #[case("valid")]
+    #[case("changed_binding")]
+    #[case("changed_event")]
+    #[case("changed_profile")]
+    #[case("accepted_before")]
+    #[case("accepted_after")]
+    #[case("foreign_clock")]
+    #[case("no_retained_lease")]
+    #[case("duplicate_original")]
+    fn actual_cancelled_timer_restores_only_original_late_queued_lease(#[case] fault: &str) {
+        use crate::recovery_trace::{
+            NativeInputSource, NativeProcessingReceipt, NativeTraceRecord, NativeTraceSource,
+            historical::HistoricalInputScope,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let (source_tx, source_rx) = mpsc::channel();
+        let mut source = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(source_tx))));
+        source.register_default_handler(TimeEventCallback::RustLocal(std::rc::Rc::new(|_| {})));
+        source
+            .set_timer_ns(
+                "late-during-cancel",
+                DurationNanos::from_millis(100),
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+            )
+            .unwrap();
+        let first = source_rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap();
+        let freeze = |clock: &LiveClock| loop {
+            match clock.freeze_running_timer_checkpoint() {
+                Ok(cut) => break cut,
+                Err(error)
+                    if error.to_string() == "adapter requests or callbacks remain in flight" =>
+                {
+                    assert!(std::time::Instant::now() < deadline, "{error:#}");
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("{error:#}"),
+            }
+        };
+        let before_cut = freeze(&source);
+        let original_before = before_cut.inventory().clone();
+        let captured_before = nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64;
+        let original_count = original_before["timers"][0]["binding"]["state"]
+            .as_u64()
+            .unwrap();
+        let mut original_queued = vec![first];
+        original_queued.extend(source_rx.try_iter());
+        assert!(original_count > 0);
+        assert_eq!(original_queued.len() as u64, original_count);
+        before_cut.finish().unwrap();
+        let late = source_rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap();
+        let accepted = nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64;
+        assert_eq!(
+            late.event().ts_event.as_u64(),
+            original_before["timers"][0]["next_time_ns"]
+                .as_u64()
+                .unwrap()
+        );
+        source.cancel_timer("late-during-cancel");
+        let after_cut = freeze(&source);
+        let after = after_cut.inventory().clone();
+        let captured_after = nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64;
+        assert!(after["timers"].as_array().unwrap().is_empty());
+        after_cut.finish().unwrap();
+
+        let (target_tx, _) = mpsc::channel();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let actual_calls = calls.clone();
+        let mut target = LiveClock::new(Some(Arc::new(CheckpointQueuedSender(target_tx))));
+        target.register_default_handler(TimeEventCallback::RustLocal(std::rc::Rc::new(
+            move |_| {
+                actual_calls.set(actual_calls.get() + 1);
+            },
+        )));
+        let mut receipt = target
+            .restore_running_timer_checkpoint(&original_before)
+            .unwrap();
+        let binding = original_queued[0].native_input_callback_binding()["binding_id"]
+            .as_u64()
+            .unwrap();
+        let original_inputs = original_queued
+            .iter()
+            .map(|message| (message.event().clone(), binding, false))
+            .collect::<Vec<_>>();
+        let mut first_target = receipt
+            .admit_historical_messages(&original_before, &original_inputs)
+            .unwrap();
+        if fault == "no_retained_lease" {
+            first_target.clear();
+        }
+        let native_source = NativeTraceSource {
+            schema_version: 1,
+            node_instance: nautilus_core::UUID4::new(),
+            process_incarnation: nautilus_core::UUID4::new(),
+            journal_run: "internal-clock-test".into(),
+            logical_run: "internal-clock-test".into(),
+            configuration_digest: "internal-clock-test".into(),
+            codec_profile: "internal-clock-test".into(),
+            registered_profile_digest: "internal-clock-test".into(),
+        };
+        let scope = HistoricalInputScope::enter(
+            std::rc::Rc::new(()),
+            NativeTraceRecord::Begin {
+                source: native_source,
+                root_sequence: 1,
+                input_sequence: 1,
+                stack_parent: None,
+                input_source: NativeInputSource::Lifecycle,
+                phase: "ShuttingDown".into(),
+                receipt: NativeProcessingReceipt {
+                    wall_ns: captured_before,
+                    process_elapsed_ns: 1,
+                    ingress: None,
+                },
+                payload: serde_json::json!({"kind":"stop.trader"}),
+                read_witnesses: Vec::new(),
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let actual_token = target.timers[&Ustr::from("late-during-cancel")]
+            .registered_checkpoint_token()
+            .unwrap();
+        target.cancel_timer("late-during-cancel");
+        receipt
+            .refresh_from_historical_dispatch(&target, &after)
+            .unwrap();
+        assert_eq!(receipt.historical_inventory().unwrap(), after);
+        let mut before = original_before.clone();
+        let mut event = late.event().clone();
+        let mut original_binding = binding;
+        let mut received = accepted;
+        match fault {
+            "changed_binding" => original_binding += 9999,
+            "changed_event" => event.ts_event += DurationNanos::new(1),
+            "changed_profile" => before["timers"][0]["callback_source"] = "foreign.profile".into(),
+            "accepted_before" => received = captured_before,
+            "accepted_after" => received = captured_after + 1,
+            "foreign_clock" => {
+                before["native_clock_id"] =
+                    serde_json::to_value(nautilus_core::UUID4::new()).unwrap()
+            }
+            _ => {}
+        }
+        let inputs = [(event, original_binding, false, received)];
+        let result = receipt.admit_historical_cancelled_messages(
+            &before,
+            &after,
+            &inputs,
+            captured_before,
+            captured_after,
+        );
+        if fault == "valid" || fault == "duplicate_original" {
+            let mut messages = result.unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].event(), late.event());
+            assert_eq!(
+                messages[0].native_input_callback_binding(),
+                late.native_input_callback_binding()
+            );
+            assert_eq!(
+                actual_token.checkpoint_inventory()["state"].as_u64(),
+                Some((1u64 << 63) | (original_count + 1))
+            );
+            assert!(
+                receipt
+                    .restore_message(late.event().clone(), binding, false)
+                    .is_err()
+            );
+            if fault == "duplicate_original" {
+                assert!(
+                    receipt
+                        .admit_historical_cancelled_messages(
+                            &before,
+                            &after,
+                            &inputs,
+                            captured_before,
+                            captured_after
+                        )
+                        .is_err()
+                );
+            }
+            for original in first_target {
+                assert!(original.dispatch());
+            }
+            assert!(messages.pop().unwrap().dispatch());
+            assert_eq!(calls.get(), original_count + 1);
+        } else {
+            assert!(
+                result.is_err(),
+                "changed original {fault} supplied a callback"
+            );
+            assert_eq!(calls.get(), 0);
+        }
+        assert_eq!(target.timer_count(), 0);
+        assert_eq!(receipt.historical_inventory().unwrap(), after);
+        scope.finish().unwrap();
+        assert!(target.timer_names().is_empty());
+        drop((receipt, original_queued, late));
     }
 
     #[rstest]
