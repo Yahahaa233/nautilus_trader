@@ -742,7 +742,10 @@ impl Trader {
                         &component_id,
                         "strategy.handle_time_event",
                         |boundary| {
-                            if !boundary.original_callback_admitted()? {
+                            if !boundary.original_callback_admitted()?
+                                || (boundary.original_component_state()? != ComponentState::Running
+                                    && !boundary.original_callback_is_observer()?)
+                            {
                                 return Ok(());
                             }
                             route_time_event(&mut *strategy, &event);

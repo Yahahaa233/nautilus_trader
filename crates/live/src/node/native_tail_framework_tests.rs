@@ -641,6 +641,31 @@ fn install(
     }
 }
 
+// Observe the actual registered LiveTimer publication only after its original
+// native sender has accepted it. The owner runloop can then wait for a real
+// admitted backlog; no message, lease or Ingress receipt is held outside it.
+#[derive(Debug)]
+struct QueuedMarketExitTimerSender {
+    original: std::sync::Arc<dyn nautilus_common::runner::TimeEventSender>,
+    publications: std::sync::Mutex<Vec<UUID4>>,
+    arrived: std::sync::Condvar,
+}
+impl nautilus_common::runner::TimeEventSender for QueuedMarketExitTimerSender {
+    fn invalidate_snapshot(&self) {
+        self.original.invalidate_snapshot();
+    }
+    fn send(&self, message: nautilus_common::runner::TimeEventMessage) {
+        if message.event().name.as_str() == format!("MARKET_EXIT_CHECK:{STRATEGY}") {
+            let event_id = message.event().event_id;
+            self.original.send(message);
+            self.publications.lock().unwrap().push(event_id);
+            self.arrived.notify_all();
+        } else {
+            self.original.send(message);
+        }
+    }
+}
+
 #[rstest]
 #[case(false, false, false, false, false, false, "")]
 #[case(true, false, false, false, false, false, "")]
@@ -665,6 +690,33 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(
     #[case] complete_gtd: bool,
     #[case] historical_clock_fault: &str,
 ) {
+    run_actual_registered_framework_tail(
+        changed,
+        historical_responses,
+        manage_stop,
+        complete_market_exit,
+        fail_historical_stop,
+        complete_gtd,
+        (historical_clock_fault, false),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_cancelled_queued_default_timer_after_stop_keeps_original_reader_route() {
+    run_actual_registered_framework_tail(false, false, true, true, false, false, ("", true)).await;
+}
+
+async fn run_actual_registered_framework_tail(
+    changed: bool,
+    historical_responses: bool,
+    manage_stop: bool,
+    complete_market_exit: bool,
+    fail_historical_stop: bool,
+    complete_gtd: bool,
+    historical: (&str, bool),
+) {
+    let (historical_clock_fault, cancelled_queued_after_stop) = historical;
     let directory = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap())
         .join(format!("framework-tail-{}", UUID4::new()));
     std::fs::create_dir_all(&directory).unwrap();
@@ -680,6 +732,18 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(
         .expire_time(UnixNanos::from(now.as_u64() + 60_000_000_000))
         .build();
     let mut source = actual_node("framework-source", directory.join("source"), None);
+    // The real runner is bound now; the strategy's fresh component LiveClock
+    // is constructed by install/add_strategy below and captures this sender.
+    // The existing kernel clock is left unchanged.
+    let held_timer = cancelled_queued_after_stop.then(|| {
+        let held = std::sync::Arc::new(QueuedMarketExitTimerSender {
+            original: nautilus_common::runner::get_time_event_sender(),
+            publications: Default::default(),
+            arrived: std::sync::Condvar::new(),
+        });
+        nautilus_common::runner::replace_time_event_sender(held.clone());
+        held
+    });
     install(
         &mut source,
         &order,
@@ -858,6 +922,9 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(
     ));
     let original_cuts = cuts.clone();
     let managed_order = order.clone();
+    let stopped_timer_ids = Rc::new(RefCell::new(Vec::new()));
+    let stopped_timers = stopped_timer_ids.clone();
+    let source_started = std::time::Instant::now();
     let produced = async move {
         ready.notified().await;
         if complete_gtd {
@@ -1030,6 +1097,48 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(
                 ),
             )))
             .unwrap();
+            let queued_before_dispatch =
+                original_cuts.borrow().last().unwrap().0.last_input_sequence;
+            if let Some(queued) = &held_timer {
+                // Wait until the real Canceled response is applied before
+                // delaying the owner runloop. The original LiveTimer runs on
+                // its real background runtime and admits each native message.
+                loop {
+                    progress.notified().await;
+                    let original = get_actor_unchecked::<FrameworkStrategy>(
+                        &StrategyId::from(STRATEGY).inner(),
+                    );
+                    if original
+                        .cache_ref()
+                        .order(&ClientOrderId::from(ORDER))
+                        .is_some_and(|order| order.status() == OrderStatus::Canceled)
+                    {
+                        assert_eq!(original.state(), ComponentState::Running);
+                        break;
+                    }
+                }
+                let mut publications = queued.publications.lock().unwrap();
+                let already_published = publications.len();
+                while publications.len() < already_published + 2 {
+                    let remaining = Duration::from_secs(20)
+                        .checked_sub(source_started.elapsed())
+                        .expect("actual timer backlog exceeded original Source budget");
+                    let (next, waited) = queued
+                        .arrived
+                        .wait_timeout(publications, remaining)
+                        .unwrap();
+                    publications = next;
+                    assert!(
+                        !waited.timed_out() || publications.len() >= already_published + 2,
+                        "actual native timer publication did not reach the original Source budget"
+                    );
+                }
+                // The first newly admitted real message completes normal stop;
+                // every later original message is already in the same FIFO.
+                stopped_timers
+                    .borrow_mut()
+                    .extend_from_slice(&publications[already_published + 1..]);
+            }
             loop {
                 progress.notified().await;
                 let value =
@@ -1038,6 +1147,41 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(
                 drop(value);
                 if finished {
                     break;
+                }
+            }
+            if held_timer.is_some() {
+                let original =
+                    get_actor_unchecked::<FrameworkStrategy>(&StrategyId::from(STRATEGY).inner());
+                assert_eq!(original.state(), ComponentState::Stopped);
+                assert!(!original.is_exiting());
+                assert!(
+                    !original
+                        .clock_rc()
+                        .borrow()
+                        .timer_names()
+                        .iter()
+                        .any(|name| { name == &format!("MARKET_EXIT_CHECK:{STRATEGY}") })
+                );
+                let business_time_events = original.time_events;
+                drop(original);
+                loop {
+                    progress.notified().await;
+                    let drained = original_cuts.borrow().last().is_some_and(|cut| {
+                        cut.0.last_input_sequence > queued_before_dispatch
+                            && !cut
+                                .0
+                                .pending
+                                .iter()
+                                .any(|pending| pending.input_source == NativeInputSource::Time)
+                    });
+                    if drained {
+                        let original = get_actor_unchecked::<FrameworkStrategy>(
+                            &StrategyId::from(STRATEGY).inner(),
+                        );
+                        assert_eq!(original.state(), ComponentState::Stopped);
+                        assert_eq!(original.time_events, business_time_events);
+                        break;
+                    }
                 }
             }
             handle.stop();
@@ -1220,6 +1364,68 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(
             read.value.as_u64().is_some_and(|now| now > 0),
             "timer start draw lost its exact nanos type"
         );
+    }
+    if cancelled_queued_after_stop {
+        let event_ids = stopped_timer_ids.borrow();
+        assert!(!event_ids.is_empty(), "actual queued timer was not sent");
+        for event_id in event_ids.iter().copied() {
+            let matches: Vec<_> = verified
+                .roots()
+                .iter()
+                .filter_map(|root| {
+                    let has_original = root.inputs().iter().any(|input| {
+                        matches!(input,
+                NativeTraceRecord::Begin { input_source: NativeInputSource::Time, payload, .. }
+                    if payload["event_id"] == serde_json::to_value(event_id).unwrap())
+                    });
+                    has_original.then_some(root)
+                })
+                .collect();
+            assert_eq!(matches.len(), 1);
+            let original = matches[0]
+                .inputs()
+                .iter()
+                .find_map(|input| {
+                    if let NativeTraceRecord::Complete {
+                        callbacks,
+                        transports,
+                        uuid_draws,
+                        output_count,
+                        queued_outputs,
+                        clock_reads,
+                        ..
+                    } = input
+                    {
+                        Some((
+                            callbacks,
+                            transports,
+                            uuid_draws,
+                            output_count,
+                            queued_outputs,
+                            clock_reads,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert_eq!(original.0.len(), 1);
+            assert_eq!(original.0[0].component_id, STRATEGY);
+            assert_eq!(original.0[0].kind, "strategy.handle_time_event");
+            assert_eq!(original.0[0].component_state, "Stopped");
+            assert!(original.1.is_empty());
+            assert!(original.2.is_empty());
+            // The source retains the actual initial TimeEvent bus capture. No
+            // business/default-framework output was executed after physical stop.
+            assert_eq!(*original.3, 1);
+            assert!(original.4.is_empty());
+            assert_eq!(original.5.len(), 1);
+            assert_eq!(original.5[0].operation, "timestamp_ns");
+            assert_eq!(
+                serde_json::to_value(original.5[0].clock_id).unwrap(),
+                first.0.registered_timers["kernel"]["native_clock_id"]
+            );
+        }
     }
     if complete_gtd {
         assert_original_gtd_timer_tail(&verified);
