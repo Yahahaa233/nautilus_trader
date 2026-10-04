@@ -851,6 +851,11 @@ pub fn dispatch_ws_message(
                             .pending_amends
                             .remove_if(cl_ord_id, |_, info| info.matches_amendment(id.as_deref()));
                         if let Some((_, info)) = pending {
+                            let reason = if s_msg.is_empty() {
+                                reason
+                            } else {
+                                format!("sCode={s_code}: {reason}")
+                            };
                             emitter.send_order_event(info.rejection(
                                 account_id,
                                 client_order_id,
@@ -3772,7 +3777,7 @@ mod tests {
                     event.venue_order_id,
                     Some(VenueOrderId::from("2500000000000000002"))
                 );
-                assert_eq!(event.reason.as_str(), reason);
+                assert_eq!(event.reason.as_str(), format!("sCode=54051: {reason}"));
                 assert!(!event.reconciliation);
             }
             event => panic!("Unexpected event: {event:?}"),
