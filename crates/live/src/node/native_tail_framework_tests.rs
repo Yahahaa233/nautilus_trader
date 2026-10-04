@@ -707,6 +707,175 @@ async fn actual_cancelled_queued_default_timer_after_stop_keeps_original_reader_
     run_actual_registered_framework_tail(false, false, true, true, false, false, ("", true)).await;
 }
 
+// These are original Reader inputs and their actual native Ingress receipts,
+// not elapsed-time estimates of how many ticks should have fired.
+fn assert_original_market_timer_admission_boundary(trace: &VerifiedNativeTrace) {
+    assert!(
+        trace.cut().registered_timers.values().all(|inventory| {
+            inventory["timers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|timer| timer["name"] != format!("MARKET_EXIT_CHECK:{STRATEGY}"))
+        }),
+        "the market exit timer must be created after this original cut"
+    );
+    let mut original = Vec::new();
+    for root in trace.roots() {
+        for input in root.inputs() {
+            let NativeTraceRecord::Begin {
+                input_source: NativeInputSource::Time,
+                input_sequence,
+                receipt,
+                read_witnesses,
+                ..
+            } = input
+            else {
+                continue;
+            };
+            let witness = read_witnesses
+                .iter()
+                .find(|witness| witness.component_id == "native:timers")
+                .unwrap();
+            let timer = &witness.payload["input"];
+            if timer["event"]["name"] != format!("MARKET_EXIT_CHECK:{STRATEGY}") {
+                continue;
+            }
+            original.push((
+                timer["owner"].as_str().unwrap().to_owned(),
+                timer["binding"]["binding_id"].as_u64().unwrap(),
+                *input_sequence,
+                receipt.ingress.as_ref().unwrap().accepted_wall_ns,
+                timer["event"]["event_id"].as_str().unwrap().to_owned(),
+            ));
+        }
+    }
+    assert!(
+        !original.is_empty(),
+        "Source never admitted its real market exit timer"
+    );
+    let mut seen = std::collections::HashSet::new();
+    assert!(original.iter().all(|(_, _, _, _, id)| seen.insert(id)));
+    let mut checked = 0;
+    for root in trace.roots() {
+        for input in root.inputs() {
+            let NativeTraceRecord::Begin {
+                input_sequence,
+                read_witnesses,
+                ..
+            } = input
+            else {
+                continue;
+            };
+            let witness = read_witnesses
+                .iter()
+                .find(|witness| witness.component_id == "native:timers")
+                .unwrap();
+            let captured_at_ns = witness.payload["captured_at_ns"].as_u64().unwrap();
+            for (owner, inventory) in witness.payload["inventory"].as_object().unwrap() {
+                for timer in inventory["timers"].as_array().unwrap() {
+                    if timer["name"] != format!("MARKET_EXIT_CHECK:{STRATEGY}") {
+                        continue;
+                    }
+                    let binding = timer["binding"]["binding_id"].as_u64().unwrap();
+                    let accepted = original
+                        .iter()
+                        .filter(|(o, b, _, at, _)| {
+                            o == owner && *b == binding && *at <= captured_at_ns
+                        })
+                        .count();
+                    let previously_dispatched = original
+                        .iter()
+                        .filter(|(o, b, sequence, _, _)| {
+                            o == owner && *b == binding && *sequence < *input_sequence
+                        })
+                        .count();
+                    let expected = accepted.checked_sub(previously_dispatched).unwrap();
+                    assert_eq!(
+                        timer["binding"]["state"].as_u64().unwrap() & !(1u64 << 63),
+                        expected as u64,
+                        "original Begin timer snapshot and capture timestamp cross an actual admission: root={} input={} owner={owner} binding={binding}",
+                        root.root_sequence(),
+                        input_sequence,
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "Source has no original live market exit snapshot"
+    );
+}
+
+// A publisher observation used only to check the actual freeze. The original
+// native Ingress receipts in the Reader caller below remain the admission proof.
+#[derive(Debug)]
+struct TimerSnapshotPublicationSender {
+    delivered: std::sync::mpsc::Sender<(u64, nautilus_common::runner::TimeEventMessage)>,
+}
+impl nautilus_common::runner::TimeEventSender for TimerSnapshotPublicationSender {
+    fn send(&self, message: nautilus_common::runner::TimeEventMessage) {
+        let publisher_observed_ns =
+            nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64;
+        self.delivered
+            .send((publisher_observed_ns, message))
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_registered_timer_witness_capture_keeps_original_admission_boundary() {
+    use nautilus_common::clock::Clock;
+    let (delivered, received) = std::sync::mpsc::channel();
+    let mut clock = nautilus_common::live::clock::LiveClock::new(Some(std::sync::Arc::new(
+        TimerSnapshotPublicationSender { delivered },
+    )));
+    let called = Rc::new(Cell::new(0));
+    let original_called = called.clone();
+    let due = clock.timestamp_ns() + nautilus_core::DurationNanos::from_millis(100);
+    clock
+        .set_time_alert_ns(
+            "ORIGINAL_TIMER_CAPTURE_BOUNDARY",
+            due,
+            Some(nautilus_common::timer::TimeEventCallback::RustLocal(
+                Rc::new(move |_| {
+                    original_called.set(original_called.get() + 1);
+                }),
+            )),
+            Some(false),
+        )
+        .unwrap();
+    let frozen = clock.freeze_running_timer_checkpoint().unwrap();
+    // Cross the real deadline while the same FrozenCallbacks producer gate is
+    // retained. A queued publication cannot appear before its snapshot stamp.
+    assert!(matches!(
+        received.recv_timeout(Duration::from_millis(150)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    frozen.verify().unwrap();
+    let original_inventory = frozen.inventory().clone();
+    let captured_at_ns = nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64;
+    assert_eq!(original_inventory["timers"][0]["binding"]["state"], 0);
+    assert_eq!(
+        original_inventory["timers"][0]["next_time_ns"],
+        due.as_u64()
+    );
+    frozen.finish().unwrap();
+    let (publisher_observed_ns, original_message) =
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(publisher_observed_ns > captured_at_ns);
+    assert_eq!(original_message.event().ts_event, due);
+    assert_eq!(called.get(), 0);
+    assert!(original_message.dispatch());
+    assert_eq!(called.get(), 1);
+    clock.cancel_timers();
+    // Same original-object Source / sealed Reader / Target path as the managed
+    // timer fixture, with independently checked Begin snapshot/Ingress counts.
+    run_actual_registered_framework_tail(false, false, true, true, false, false, ("", false)).await;
+}
+
 async fn run_actual_registered_framework_tail(
     changed: bool,
     historical_responses: bool,
@@ -1426,6 +1595,9 @@ async fn run_actual_registered_framework_tail(
                 first.0.registered_timers["kernel"]["native_clock_id"]
             );
         }
+    }
+    if complete_market_exit {
+        assert_original_market_timer_admission_boundary(&verified);
     }
     if complete_gtd {
         assert_original_gtd_timer_tail(&verified);

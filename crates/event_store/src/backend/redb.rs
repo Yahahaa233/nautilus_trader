@@ -26,6 +26,7 @@ use std::{
     fmt::Debug,
     fs,
     io::{self, ErrorKind},
+    ops::Bound,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -37,9 +38,9 @@ use std::{
 
 use nautilus_core::UnixNanos;
 use redb::{
-    CommitError, Database, DatabaseError, Durability, ReadOnlyDatabase, ReadTransaction,
-    ReadableDatabase, ReadableTable, StorageBackend, StorageError, TableDefinition, TableError,
-    TransactionError, WriteTransaction, backends::FileBackend,
+    BackendError, CommitError, Database, DatabaseError, Durability, ReadOnlyDatabase,
+    ReadTransaction, ReadableDatabase, ReadableTable, StorageBackend, StorageError,
+    TableDefinition, TableError, TransactionError, WriteTransaction, backends::FileBackend,
 };
 
 use crate::{
@@ -222,6 +223,30 @@ impl StorageBackend for OwnedStorageBackend {
     }
     fn close(&self) -> io::Result<()> {
         self.inner.close()
+    }
+    // Redb 4.3 acquires its actual file lock through this backend. These
+    // operations do not mutate the file and must preserve FileBackend semantics.
+    fn try_lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<bool, BackendError> {
+        self.inner.try_lock_range(start, end)
+    }
+    fn try_lock_shared_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        self.inner.try_lock_shared_range(start, end)
+    }
+    fn lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        self.inner.lock_range(start, end)
+    }
+    fn lock_shared_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        self.inner.lock_shared_range(start, end)
+    }
+    fn unlock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        self.inner.unlock_range(start, end)
+    }
+    fn query_lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<bool, BackendError> {
+        self.inner.query_lock_range(start, end)
     }
 }
 
@@ -1443,6 +1468,167 @@ mod tests {
             sequence,
             entry_hash_digest: digest.finalize().to_hex().to_string(),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_owned_storage_range_locks_do_not_mutate_write_epoch() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("range-locks");
+        fs::write(&path, b"original").expect("original file");
+        let original = fs::read(&path).expect("original bytes");
+        let epoch = Arc::new(StorageWriteEpoch::default());
+        epoch.armed.store(true, Ordering::SeqCst);
+        let storage = OwnedStorageBackend {
+            inner: FileBackend::new(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .expect("file"),
+            )
+            .expect("actual FileBackend"),
+            epoch: epoch.clone(),
+        };
+        let start = Bound::Included(1 << 62);
+        let end = Bound::Excluded((1 << 62) + 1);
+        assert!(
+            storage
+                .try_lock_range(start, end)
+                .expect("exclusive lock supported")
+        );
+        storage.unlock_range(start, end).expect("exclusive unlock");
+        assert!(
+            storage
+                .try_lock_shared_range(start, end)
+                .expect("shared lock supported")
+        );
+        storage.unlock_range(start, end).expect("shared unlock");
+        storage
+            .lock_range(start, end)
+            .expect("blocking exclusive lock");
+        storage
+            .unlock_range(start, end)
+            .expect("blocking exclusive unlock");
+        storage
+            .lock_shared_range(start, end)
+            .expect("blocking shared lock");
+        storage
+            .unlock_range(start, end)
+            .expect("blocking shared unlock");
+        assert!(
+            !storage
+                .query_lock_range(start, end)
+                .expect("query supported")
+        );
+        assert_eq!(epoch.snapshot().expect("locking is not a file write"), 0);
+        storage.close().expect("actual close");
+        assert_eq!(fs::read(&path).expect("unchanged bytes"), original);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_owned_redb_cross_process_lock_and_unsealed_clean_close_preserve_original_bytes() {
+        const CHILD_PATH: &str = "NAUTILUS_TEST_OWNED_REDB_LOCK_PATH";
+        const CHILD_PHASE: &str = "NAUTILUS_TEST_OWNED_REDB_LOCK_PHASE";
+        const LEAF: &str = "backend::redb::tests::native_owned_redb_cross_process_lock_and_unsealed_clean_close_preserve_original_bytes";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let path = PathBuf::from(path);
+            match std::env::var(CHILD_PHASE).expect("parent phase").as_str() {
+                "owned" => {
+                    assert!(matches!(
+                        Database::create(&path),
+                        Err(DatabaseError::DatabaseAlreadyOpen)
+                    ));
+                    assert!(matches!(
+                        ReadOnlyDatabase::open(&path),
+                        Err(DatabaseError::DatabaseAlreadyOpen)
+                    ));
+                }
+                "released" => {
+                    let original = fs::read(&path).expect("original unsealed bytes");
+                    let db = ReadOnlyDatabase::open(&path).expect("clean close requires no repair");
+                    let manifest = RedbBackend::read_manifest(&db)
+                        .expect("manifest read")
+                        .expect("manifest");
+                    assert_eq!(manifest.status, RunStatus::Running);
+                    assert_eq!(manifest.run_id, "locked-unsealed");
+                    let read = db.begin_read().expect("original read");
+                    let entries = read.open_table(ENTRIES_TABLE).expect("entries");
+                    let row = entries.get(1).expect("row lookup").expect("original row");
+                    let decoded: EventStoreEntry =
+                        codec::decode_from_slice(row.value()).expect("original entry");
+                    assert_eq!(decoded, prefix_entry(1).entry);
+                    drop(row);
+                    drop(entries);
+                    drop(read);
+                    drop(db);
+                    assert!(matches!(RedbBackend::open_sealed_file(&path),
+                        Err(EventStoreError::Backend(reason)) if reason.contains("not sealed, status was Running")));
+                    assert_eq!(fs::read(&path).expect("read-only bytes"), original);
+                }
+                phase => panic!("unknown owned-lock child phase {phase}"),
+            }
+            return;
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        let mut backend = RedbBackend::new(tmp.path());
+        backend
+            .open_run(prefix_manifest("locked-unsealed"))
+            .expect("actual owned run");
+        backend
+            .append_batch(&[prefix_entry(1)])
+            .expect("original durable append");
+        let path = backend
+            .current_path()
+            .expect("actual run path")
+            .to_path_buf();
+        let prefix = crate::writer::read_durable_prefix(&backend).expect("actual prefix");
+        let original_while_owned = fs::read(&path).expect("original owned bytes");
+        let run_child = |phase: &str| {
+            use std::process::{Command, Stdio};
+            let mut child = Command::new(std::env::current_exe().expect("actual test executable"))
+                .args(["--exact", LEAF, "--nocapture"])
+                .env(CHILD_PATH, &path)
+                .env(CHILD_PHASE, phase)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("actual independent process");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if child.try_wait().expect("child status").is_some() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().expect("stop owned failed probe");
+                    let output = child.wait_with_output().expect("reap owned probe");
+                    panic!("actual lock probe {phase} exceeded 5s: {output:?}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let output = child.wait_with_output().expect("actual child output");
+            assert!(
+                output.status.success(),
+                "actual lock probe {phase}: {output:?}"
+            );
+            let stdout = String::from_utf8(output.stdout).expect("test output");
+            assert!(
+                stdout.contains("1 passed"),
+                "child must execute the exact original leaf: {stdout}"
+            );
+        };
+        run_child("owned");
+        assert_eq!(
+            fs::read(&path).expect("failed peers did not write"),
+            original_while_owned
+        );
+        assert_eq!(
+            crate::writer::read_durable_prefix(&backend).expect("same owned prefix"),
+            prefix
+        );
+        drop(backend);
+        run_child("released");
     }
 
     #[test]

@@ -464,9 +464,11 @@ impl LiveNode {
                     source_version: "native_actual_registered_admission.v1".into(),
                     payload: serde_json::json!({"components":admission}),
                 });
-                let timers = recovery_quiescence::with_registered_timer_inventory_mode(
+                let (timers, timer_capture_ns) = recovery_quiescence::with_registered_timer_inventory_mode(
                     &actual_clock, &actual_trader, false, |_, inventory, verify, _| {
-                        verify()?; Ok(inventory.clone())
+                        verify()?;
+                        let captured_at_ns = nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64;
+                        Ok((inventory.clone(), captured_at_ns))
                     })?;
                 let mut timer_input = serde_json::Value::Null;
                 if source == crate::dispatch::DispatchSource::Time {
@@ -490,7 +492,7 @@ impl LiveNode {
                 found.push(nautilus_common::recovery_trace::NativeReadWitness {
                     component_id: "native:timers".into(), profile: "actual_registered_owner_timer_input.v1".into(),
                     source_version: "native_actual_registered_clock.v1".into(),
-                    payload: serde_json::json!({"inventory":timers,"input":timer_input,"captured_at_ns":nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64}),
+                    payload: serde_json::json!({"inventory":timers,"input":timer_input,"captured_at_ns":timer_capture_ns}),
                 });
                 Ok(found)
             }, move |found| {
@@ -502,20 +504,12 @@ impl LiveNode {
 
     #[cfg(feature = "native-tail-replay")]
     fn bind_native_ingress_codec(&self) -> anyhow::Result<()> {
-        let observer = self
+        let encoder = self
             .dispatch_observer
             .as_ref()
             .context("native derived ingress observer absent")?
-            .handle();
-        nautilus_common::recovery_trace::set_native_ingress_encoder(move |source, input| {
-            Ok(observer
-                .encode_historical_source(
-                    dispatch::source_dispatch(source)?,
-                    "native_enqueue",
-                    input,
-                )?
-                .payload)
-        });
+            .weak_native_ingress_codec();
+        nautilus_common::recovery_trace::set_native_ingress_encoder(encoder);
         Ok(())
     }
 

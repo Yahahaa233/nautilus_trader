@@ -215,6 +215,32 @@ impl NodeDispatchObserver {
         Ok(encoded)
     }
 
+    /// The thread-local derived codec must not extend this node's lifetime.
+    /// An expired owner is refused without replacing any newer node's codec.
+    #[cfg(feature = "native-tail-replay")]
+    pub(super) fn weak_native_ingress_codec(
+        &self,
+    ) -> impl Fn(
+        nautilus_common::recovery_trace::NativeInputSource,
+        &dyn Any,
+    ) -> Result<serde_json::Value>
+    + 'static
+    + use<> {
+        let encoder = Rc::downgrade(&self.encoder);
+        move |source, input| {
+            let source = source_dispatch(source)?;
+            let encoder = encoder
+                .upgrade()
+                .context("native derived queue codec owner released")?;
+            let encoded = encoder(source, "native_enqueue", input)?;
+            anyhow::ensure!(
+                encoded.source == source && encoded.phase == "native_enqueue",
+                "historical native codec source/phase mismatch"
+            );
+            Ok(encoded.payload)
+        }
+    }
+
     /// Begins a dispatch from an already encoded durable envelope. This is
     /// the entry point for startup/free functions that cannot borrow a
     /// `LiveNode` mutably while an async future is being driven.

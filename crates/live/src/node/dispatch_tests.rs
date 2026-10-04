@@ -1066,3 +1066,186 @@ fn empty_bootstrap_adapter_faults_block_receipt_and_child_checkpoint() {
         assert!(node.recovery_empty_bootstrap.is_none());
     }
 }
+
+#[cfg(feature = "native-tail-replay")]
+#[test]
+fn native_derived_codec_weak_owner_preserves_source_phase_and_newer_owner() {
+    use crate::dispatch::{DispatchInput, DispatchObserver, DispatchSource};
+    use nautilus_common::recovery_trace::NativeInputSource;
+    let old_owner = Rc::new(Cell::new(0usize));
+    let old_weak = Rc::downgrade(&old_owner);
+    let old_capture = old_owner.clone();
+    let old = NodeDispatchObserver::new(
+        DispatchObserver::new("old-derived-owner".into(), |_| Ok(())).unwrap(),
+        move |source, phase, _| {
+            old_capture.set(old_capture.get() + 1);
+            Ok(DispatchInput {
+                source,
+                phase: phase.into(),
+                payload: serde_json::json!({"owner":"old"}),
+                batch_index: None,
+            })
+        },
+    );
+    let old_codec = old.weak_native_ingress_codec();
+    drop(old_owner);
+    assert_eq!(
+        old_codec(NativeInputSource::TradingCommand, &()).unwrap()["owner"],
+        "old"
+    );
+    assert_eq!(old_weak.upgrade().unwrap().get(), 1);
+    let new = NodeDispatchObserver::new(
+        DispatchObserver::new("new-derived-owner".into(), |_| Ok(())).unwrap(),
+        |source, phase, _| {
+            Ok(DispatchInput {
+                source,
+                phase: phase.into(),
+                payload: serde_json::json!({"owner":"new"}),
+                batch_index: None,
+            })
+        },
+    );
+    let new_codec = new.weak_native_ingress_codec();
+    drop(old);
+    assert!(
+        old_weak.upgrade().is_none(),
+        "retired codec retained its actual encoder capture"
+    );
+    assert!(
+        old_codec(NativeInputSource::TradingCommand, &())
+            .unwrap_err()
+            .to_string()
+            .contains("owner released")
+    );
+    assert_eq!(
+        new_codec(NativeInputSource::TradingCommand, &()).unwrap()["owner"],
+        "new"
+    );
+    for changed_source in [false, true] {
+        let changed = NodeDispatchObserver::new(
+            DispatchObserver::new("changed-derived-owner".into(), |_| Ok(())).unwrap(),
+            move |source, phase, _| {
+                Ok(DispatchInput {
+                    source: if changed_source {
+                        DispatchSource::Time
+                    } else {
+                        source
+                    },
+                    phase: if changed_source {
+                        phase.into()
+                    } else {
+                        "changed".into()
+                    },
+                    payload: serde_json::Value::Null,
+                    batch_index: None,
+                })
+            },
+        );
+        assert!(
+            changed.weak_native_ingress_codec()(NativeInputSource::TradingCommand, &())
+                .unwrap_err()
+                .to_string()
+                .contains("source/phase mismatch")
+        );
+    }
+}
+
+#[cfg(feature = "native-tail-replay")]
+#[tokio::test(flavor = "current_thread")]
+async fn halted_native_dispose_releases_primary_writer_with_retained_exec_engine() {
+    use crate::dispatch::{DispatchInput, DispatchObserver};
+    use nautilus_event_store::{backend::RedbBackend, kernel::EventStoreLifecycle};
+    let directory =
+        std::env::temp_dir().join(format!("native-halted-owner-release-{}", UUID4::new()));
+    let config = EventStoreConfig {
+        base_dir: directory.clone(),
+        ..Default::default()
+    };
+    let mut node = LiveNode::builder(TraderId::from("HALTED-OWNER-001"), Environment::Live)
+        .unwrap()
+        .with_load_state(false)
+        .with_reconciliation(false)
+        .with_exec_engine_config(crate::config::LiveExecutionEngineConfig {
+            load_cache: false,
+            reconciliation: false,
+            ..Default::default()
+        })
+        .with_event_store(move |instance, clock| {
+            Ok(Box::new(EventStoreLifecycle::boot(
+                Some(config),
+                instance,
+                clock,
+            )?))
+        })
+        .build()
+        .unwrap();
+    // Match the actual production encoder capture while independently retaining
+    // this engine after the node is dropped. It must no longer retain its writer.
+    let retained_engine = node.kernel.exec_engine.clone();
+    let encoder_engine = retained_engine.clone();
+    let protocol = DispatchObserver::new("actual-halted-owner".into(), |_| Ok(())).unwrap();
+    node.set_dispatch_observer(NodeDispatchObserver::new(
+        protocol,
+        move |source, phase, _| {
+            let fenced = encoder_engine.borrow().submissions_fenced();
+            Ok(DispatchInput {
+                source,
+                phase: phase.into(),
+                payload: serde_json::json!({"fenced":fenced}),
+                batch_index: None,
+            })
+        },
+    ))
+    .unwrap();
+    let trace = node
+        .prepare_owned_native_trace(
+            "actual-halted-owner-business-run".into(),
+            nautilus_event_store::native_trace::native_inventory_digest(
+                &serde_json::to_value(&node.config).unwrap(),
+            )
+            .unwrap(),
+            "actual_halted_owned_writer.v1".into(),
+            "actual_no_registered_components.v1".into(),
+            |_, _, _| Ok(Vec::new()),
+            |_| Ok(()),
+        )
+        .unwrap();
+    let source = trace.source().unwrap();
+    node.fail_native_dispatch("actual halted owner cleanup regression");
+    assert!(node.event_store_halted());
+    assert!(retained_engine.borrow().submissions_fenced());
+    node.dispose();
+    assert_eq!(node.state(), NodeState::Stopped);
+    assert!(node.kernel.event_store().unwrap().is_halted());
+    drop(node);
+    drop(trace);
+    // The surviving execution-engine Rc is intentional. Neither the weak TLS
+    // codec nor this disposed engine may postpone the actual primary DB close.
+    assert!(retained_engine.borrow().submissions_fenced());
+    let original_path = directory
+        .join(source.node_instance.to_string())
+        .join(format!("{}.redb", source.journal_run));
+    let original_bytes = std::fs::read(&original_path).unwrap();
+    match RedbBackend::open_sealed_file(&original_path) {
+        Err(nautilus_event_store::EventStoreError::Backend(reason)) => assert!(
+            reason.contains("not sealed, status was Running"),
+            "{reason}"
+        ),
+        Err(error) => panic!("halted original writer was not cleanly released: {error}"),
+        Ok(_) => panic!("halted cleanup published a normal seal"),
+    }
+    assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
+    let manifest = RedbBackend::list_runs(&directory, &source.node_instance.to_string())
+        .unwrap()
+        .into_iter()
+        .find(|m| m.run_id == source.journal_run)
+        .unwrap();
+    assert_eq!(
+        manifest.status,
+        nautilus_event_store::manifest::RunStatus::Running
+    );
+    assert!(manifest.end_ts_init.is_none());
+    drop(retained_engine);
+    assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
+    std::fs::remove_dir_all(directory).unwrap();
+}

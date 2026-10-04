@@ -1222,10 +1222,13 @@ impl NautilusKernel {
         // run for non-streaming backtests. finalize_stop (live) consumes the session
         // first; this call is then a no-op. Callers that skip dispose entirely fall
         // back to the event-store implementation's Drop.
+        // Saving, stop hooks and timer cancellation above retain their original
+        // order. Teardown must release this writer anchor even when failure
+        // containment forbids a normal seal and another owner keeps the engine.
+        self.exec_engine.borrow_mut().set_snapshot_anchorer(None);
         if !self.event_store_seal_blocked.get()
             && let Some(event_store) = self.event_store.as_deref_mut()
         {
-            self.exec_engine.borrow_mut().set_snapshot_anchorer(None);
             let ts_dispose = self.clock.borrow().timestamp_ns();
             event_store.seal(ts_dispose);
         }

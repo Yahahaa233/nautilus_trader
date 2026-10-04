@@ -231,7 +231,7 @@ rand = { version = "0.10.2", default-features = false, features = [
   "std",
   "thread_rng",
 ] }
-redb = { version = "4.2.0", default-features = false }
+redb = { version = "4.3.0", default-features = false }
 redis = { version = "1.7.0", default-features = false, features = [
   "connection-manager",
   "sentinel",
