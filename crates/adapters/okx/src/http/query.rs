@@ -32,11 +32,22 @@ use serde::{self, Deserialize, Serialize};
 
 use crate::{
     common::enums::{
-        OKXAlgoOrderStatus, OKXAlgoOrderType, OKXInstrumentType, OKXOrderStatus, OKXOrderType,
-        OKXPositionMode, OKXPositionSide, OKXTradeMode,
+        OKXAlgoOrderStatus, OKXAlgoOrderType, OKXInstrumentType, OKXMarginMode, OKXOrderStatus,
+        OKXOrderType, OKXPositionMode, OKXPositionSide, OKXTradeMode,
     },
     http::error::BuildError,
 };
+
+/// Parameters for the GET /api/v5/account/leverage-info endpoint.
+#[derive(Clone, Debug, Deserialize, Serialize, Builder)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetLeverageParams {
+    /// Instrument ID or comma-separated IDs (up to 20).
+    pub inst_id: String,
+    /// Margin mode: cross or isolated.
+    pub mgn_mode: OKXMarginMode,
+}
 
 /// Parameters for the POST /api/v5/account/set-position-mode endpoint.
 #[derive(Clone, Debug, Deserialize, Serialize, Builder)]

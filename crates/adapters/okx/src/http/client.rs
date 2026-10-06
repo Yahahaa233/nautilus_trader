@@ -89,18 +89,18 @@ use super::{
         OKXCancelAlgoOrderResponse, OKXCancelAllSpreadOrdersRequest, OKXCancelOrderRequest,
         OKXCancelOrderResponse, OKXCancelSpreadOrderRequest, OKXEventContractEvent,
         OKXEventContractMarket, OKXEventContractSeries, OKXFeeRate, OKXFundingRateHistory,
-        OKXIndexTicker, OKXMarkPrice, OKXOptionSummary, OKXOrderAlgo, OKXOrderBookSnapshot,
-        OKXOrderHistory, OKXPlaceAlgoOrderRequest, OKXPlaceAlgoOrderResponse, OKXPlaceOrderRequest,
-        OKXPlaceOrderResponse, OKXPlaceSpreadOrderRequest, OKXPosition, OKXPositionHistory,
-        OKXPositionTier, OKXPriceLimit, OKXRpiOrderBookSnapshot, OKXServerTime, OKXSpread,
-        OKXSpreadOrder, OKXSpreadTrade, OKXTransactionDetail,
+        OKXIndexTicker, OKXLeverageInfo, OKXMarkPrice, OKXOptionSummary, OKXOrderAlgo,
+        OKXOrderBookSnapshot, OKXOrderHistory, OKXPlaceAlgoOrderRequest, OKXPlaceAlgoOrderResponse,
+        OKXPlaceOrderRequest, OKXPlaceOrderResponse, OKXPlaceSpreadOrderRequest, OKXPosition,
+        OKXPositionHistory, OKXPositionTier, OKXPriceLimit, OKXRpiOrderBookSnapshot, OKXServerTime,
+        OKXSpread, OKXSpreadOrder, OKXSpreadTrade, OKXTransactionDetail,
     },
     query::{
         ActivateFeatureParams, GetAlgoOrderParams, GetAlgoOrderParamsBuilder, GetAlgoOrdersParams,
         GetAlgoOrdersParamsBuilder, GetCandlesticksParams, GetCandlesticksParamsBuilder,
         GetEventContractEventsParams, GetEventContractMarketsParams, GetEventContractSeriesParams,
         GetFundingRateHistoryParams, GetIndexTickerParams, GetIndexTickerParamsBuilder,
-        GetInstrumentsParams, GetInstrumentsParamsBuilder, GetMarkPriceParams,
+        GetInstrumentsParams, GetInstrumentsParamsBuilder, GetLeverageParams, GetMarkPriceParams,
         GetMarkPriceParamsBuilder, GetOptionSummaryParams, GetOrderBookParams,
         GetOrderHistoryParams, GetOrderHistoryParamsBuilder, GetOrderListParams,
         GetOrderListParamsBuilder, GetOrderParams, GetOrderParamsBuilder, GetPositionTiersParams,
@@ -2098,6 +2098,29 @@ impl OKXRawHttpClient {
         let path = "/api/v5/account/config";
         self.send_request::<_, ()>(Method::GET, path, None, None, true)
             .await
+    }
+
+    /// Requests the authenticated account's leverage settings, including flat instruments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the query fails, or required fields are invalid.
+    ///
+    /// # References
+    ///
+    /// <https://www.okx.com/docs-v5/en/#trading-account-rest-api-get-leverage>
+    pub async fn get_leverage_info(
+        &self,
+        params: GetLeverageParams,
+    ) -> Result<Vec<OKXLeverageInfo>, OKXHttpError> {
+        self.send_request(
+            Method::GET,
+            "/api/v5/account/leverage-info",
+            Some(&params),
+            None,
+            true,
+        )
+        .await
     }
 
     /// Requests a list of assets (with non-zero balance), remaining balance, and available amount

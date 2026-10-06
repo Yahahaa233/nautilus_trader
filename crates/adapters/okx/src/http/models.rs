@@ -28,6 +28,20 @@ use crate::common::{
     },
 };
 
+/// Represents an authenticated account leverage setting, including flat instruments.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXLeverageInfo {
+    /// Exchange instrument ID.
+    pub inst_id: String,
+    /// Margin mode for this setting.
+    pub mgn_mode: crate::common::enums::OKXMarginMode,
+    /// Position side; empty for cross-margin settings.
+    pub pos_side: String,
+    /// Exact leverage as reported by OKX.
+    pub lever: String,
+}
+
 /// Represents a trade tick from the GET /api/v5/market/trades endpoint.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
