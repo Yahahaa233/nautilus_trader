@@ -23,10 +23,7 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
     clients::ExecutionClient,
-    live::{
-        dst::time::{self, Duration, Instant},
-        runner::get_exec_event_sender,
-    },
+    live::runner::get_exec_event_sender,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -1538,35 +1535,6 @@ impl OKXExecutionClient {
         self.core.set_disconnected();
     }
 
-    /// Polls the cache until the account is registered or timeout is reached.
-    async fn await_account_registered(&self, timeout_secs: f64) -> anyhow::Result<()> {
-        let account_id = self.core.account_id;
-
-        if self.core.cache().account(&account_id).is_some() {
-            log::info!("Account {account_id} registered");
-            return Ok(());
-        }
-
-        let start = Instant::now();
-        let timeout = Duration::from_secs_f64(timeout_secs);
-        let interval = Duration::from_millis(10);
-
-        loop {
-            time::sleep(interval).await;
-
-            if self.core.cache().account(&account_id).is_some() {
-                log::info!("Account {account_id} registered");
-                return Ok(());
-            }
-
-            if start.elapsed() >= timeout {
-                anyhow::bail!(
-                    "Timeout waiting for account {account_id} to be registered after {timeout_secs}s"
-                );
-            }
-        }
-    }
-
     /// Establishes instrument context, both WebSocket transports, private
     /// subscriptions, and initial account state.
     ///
@@ -1857,10 +1825,14 @@ impl OKXExecutionClient {
                 account_state.balances.len()
             );
         }
-        self.emitter.send_account_state(account_state);
+        self.emitter
+            .try_send_account_state(account_state)
+            .context("failed to enqueue OKX bootstrap account state")?;
 
-        // Wait for account to be registered in cache before completing connect
-        self.await_account_registered(30.0).await?;
+        // The caller owns the execution engine borrow during connect. Return
+        // it before the original account event is dispatched into that engine.
+        // is_connected keeps readiness false until native dispatch registers
+        // this account; LiveNode's existing connection deadline still bounds it.
 
         Ok(())
     }
@@ -2020,7 +1992,7 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn is_connected(&self) -> bool {
-        self.core.is_connected()
+        self.core.is_connected() && self.core.cache().account(&self.core.account_id).is_some()
     }
 
     fn client_id(&self) -> ClientId {
@@ -2069,7 +2041,10 @@ impl ExecutionClient for OKXExecutionClient {
 
         self.core.set_connected();
         setup_guard.disarm();
-        log::info!("Connected: client_id={}", self.core.client_id);
+        log::info!(
+            "Transports connected; account registration pending native dispatch: client_id={}",
+            self.core.client_id
+        );
         Ok(())
     }
 

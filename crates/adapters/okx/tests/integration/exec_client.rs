@@ -6840,6 +6840,117 @@ fn bootstrap_response(families: bool, scope: usize) -> Response {
     Json(response).into_response()
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_bootstrap_returns_engine_borrow_before_account_dispatch() {
+    let mut server = BootstrapServer::start().await;
+    let (mut client, mut rx, cache) = server.client(true, false);
+    let mut connect = Box::pin(client.connect());
+
+    for scope in 0..2 {
+        let request = server.next_request(&mut connect).await;
+        assert_eq!(request.params, bootstrap_scope(true, scope));
+        request.respond(bootstrap_response(true, scope));
+    }
+
+    // Match LiveNode startup: no execution event can be dispatched while this
+    // future holds the engine borrow. The old implementation waits 30 seconds
+    // for exactly that dispatch and fails this bounded local-venue regression.
+    tokio::time::timeout(Duration::from_secs(5), &mut connect)
+        .await
+        .expect("connect must return before native account dispatch")
+        .unwrap();
+    drop(connect);
+    assert_eq!(server.ws.opened.load(Ordering::Relaxed), 2);
+    assert!(
+        cache
+            .borrow()
+            .account(&AccountId::from("OKX-001"))
+            .is_none()
+    );
+    assert!(
+        !client.is_connected(),
+        "transports alone are not account readiness"
+    );
+
+    let ExecutionEvent::Account(original) = rx.recv().await.unwrap() else {
+        panic!("bootstrap must preserve the original account event");
+    };
+    assert_eq!(original.account_id, AccountId::from("OKX-001"));
+    let mut foreign = original.clone();
+    foreign.account_id = AccountId::from("OKX-OTHER");
+    cache
+        .borrow_mut()
+        .add_account(AccountAny::Margin(MarginAccount::new(foreign, true)))
+        .unwrap();
+    assert!(
+        !client.is_connected(),
+        "a different account must not complete readiness"
+    );
+    cache
+        .borrow_mut()
+        .add_account(AccountAny::Margin(MarginAccount::new(original, true)))
+        .unwrap();
+    assert!(client.is_connected());
+    client.disconnect().await.unwrap();
+    assert!(
+        !client.is_connected(),
+        "cached account must not mask disconnected transports"
+    );
+    server.assert_closed().await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_bootstrap_without_account_dispatch_stays_unready_and_tears_down() {
+    let mut server = BootstrapServer::start().await;
+    let (mut client, mut rx, _) = server.client(true, false);
+    let mut connect = Box::pin(client.connect());
+    for scope in 0..2 {
+        server
+            .next_request(&mut connect)
+            .await
+            .respond(bootstrap_response(true, scope));
+    }
+    tokio::time::timeout(Duration::from_secs(5), &mut connect)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(connect);
+    assert!(matches!(rx.try_recv(), Ok(ExecutionEvent::Account(_))));
+    // Losing the event never manufactures a registered account or readiness.
+    assert!(!client.is_connected());
+    tokio::time::timeout(Duration::from_secs(5), client.disconnect())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!client.is_connected());
+    server.assert_closed().await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_bootstrap_closed_account_ingress_fails_and_tears_down() {
+    let mut server = BootstrapServer::start().await;
+    let (mut client, rx, _) = server.client(true, false);
+    drop(rx);
+    let mut connect = Box::pin(client.connect());
+    for scope in 0..2 {
+        server
+            .next_request(&mut connect)
+            .await
+            .respond(bootstrap_response(true, scope));
+    }
+    let error = tokio::time::timeout(Duration::from_secs(5), &mut connect)
+        .await
+        .expect("closed ingress must fail without waiting for cache registration")
+        .unwrap_err();
+    drop(connect);
+    assert!(format!("{error:#}").contains("failed to enqueue OKX bootstrap account state"));
+    assert!(!client.is_connected());
+    server.assert_closed().await;
+}
+
 async fn finish_bootstrap_connect(
     connect: impl Future<Output = anyhow::Result<()>>,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
@@ -6847,9 +6958,21 @@ async fn finish_bootstrap_connect(
 ) -> anyhow::Result<()> {
     tokio::pin!(connect);
     tokio::time::timeout(Duration::from_secs(10), async {
+        let mut connected = false;
         loop {
+            if connected
+                && cache
+                    .borrow()
+                    .account(&AccountId::from("OKX-001"))
+                    .is_some()
+            {
+                return Ok(());
+            }
             tokio::select! {
-                result = &mut connect => return result,
+                result = &mut connect, if !connected => {
+                    result?;
+                    connected = true;
+                },
                 event = rx.recv() => {
                     let ExecutionEvent::Account(state) =
                         event.expect("execution event channel closed")
