@@ -57,15 +57,22 @@ async fn dispatch(
     assert!(
         matches!(&message,crate::websocket::messages::OKXWsMessage::OriginalOrderData {payload_json,..} if payload_json==&wire)
     );
+    let mut stream = client.private_stream_state.lock();
+    let crate::checkpoint::ExecutionStreamState {
+        fee_cache,
+        filled_qty_cache,
+        order_state_cache,
+    } = &mut *stream;
     dispatch_ws_message(
         message,
         &client.emitter,
         &client.ws_dispatch_state,
         client.core.account_id,
+        client.core.account_type,
         instruments,
-        &mut AHashMap::new(),
-        &mut AHashMap::new(),
-        &mut AHashMap::new(),
+        fee_cache,
+        filled_qty_cache,
+        order_state_cache,
         client.clock,
     );
 }

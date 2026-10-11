@@ -1,3 +1,39 @@
+## Current bounded native profile — selected develop batch
+
+The current managed batch integrates official `develop` revision
+`021f9d6642c1fbaff7590b5609ebc59d0ed9ee32` with Rust 1.99. The original text below
+records earlier source batches and their validation limits; it remains unchanged
+as historical provenance. Its statements that all composite checkpoint/replay or
+paused strategy progression remain unimplemented do not describe the bounded
+native profile added since those batches.
+
+With `native-tail-replay`, an actual owned Journal, registered input codecs and
+supported component/adapter/timer profiles, `RunningCheckpointBoundary` captures
+a completed-root cut with the seven real native FIFOs, original ingress receipts
+and the official shared callback ancestry. `LiveNode::replay_native_tail` installs
+the verified original initial cut once, processes original sealed tail inputs
+through their actual registered handlers/framework and compares the resulting
+final state/FIFO/ancestry. It never restores final metadata over replay-produced
+state. Recorder-attached replay consumes the exact actual dequeue receipt;
+reader-only replay keeps its original frozen-FIFO validation and closed transport.
+
+`NodeDispatchObserver::coverage()` still reports `coverage_complete=false` and
+`queue_state_collected=false` for the protocol-only observer. Those fields are not
+the native checkpoint inventory or a recovery-ready flag. Unknown/active/failed
+callback work, in-flight reconciliation HTTP, external forwarding/message buses,
+private stream/execution-algorithm state, unsupported active order books or local
+order-manager state, unsupported timer profiles and unsealed/incomplete source
+tails remain refused. Legacy nonempty pending FIFO without its original callback
+ancestry sidecar remains unsupported; original bytes are not upgraded or inferred.
+
+SDK regressions include 1055 Live library tests passed (1 skipped), the 17 native
+framework/timer/FIFO cases within the 154-test Live/OKX targeted run, and 98 current
+ordinary manager/reconciliation tests passed after fixture reduction. These are
+range-scoped SDK assertions, not CQS runtime recovery acceptance, current account
+reconciliation, execution/release authorization or venue-accepted orders.
+
+---
+
 # Managed source and opt-in dispatch protocol
 
 Source: NautilusTrader v2.0.0rc4, a0400251110653b6d8ae6a9b5b89c4543fa85a2d,

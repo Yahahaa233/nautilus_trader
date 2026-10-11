@@ -857,7 +857,8 @@ impl PyMessageBusScope {
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid pattern, a non-callable handler, or an inactive runtime bus.
+    /// Returns an error if the operation encounters an invalid pattern, a non-callable handler, or
+    /// an inactive runtime bus.
     pub fn subscribe_topic(
         &self,
         py: Python<'_>,
@@ -900,7 +901,8 @@ impl PyMessageBusScope {
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid pattern, a non-callable handler, or an inactive runtime bus.
+    /// Returns an error if the operation encounters an invalid pattern, a non-callable handler, or
+    /// an inactive runtime bus.
     pub fn unsubscribe_topic(&self, topic: &str, handler: &Bound<'_, PyAny>) -> PyResult<()> {
         let pattern = MStr::<Pattern>::pattern_checked(topic).map_err(to_pyvalue_err)?;
         let identity = CallableIdentity::new(handler)?;
@@ -1016,7 +1018,7 @@ mod tests {
     use crate::{
         actor::registry::with_actor_registry,
         cache::Cache,
-        clock::TestClock,
+        clock::VirtualClock,
         component::{release_component_subscriptions, with_component_registry},
         msgbus::set_message_bus,
         python::{actor::PyDataActor, wrappers::release_python_wrapper},
@@ -1582,7 +1584,7 @@ class Actor(DataActor):
             borrowed
                 .register(
                     TraderId::from("TRADER-001"),
-                    Rc::new(RefCell::new(TestClock::new())),
+                    Rc::new(RefCell::new(VirtualClock::new())),
                     Rc::new(RefCell::new(Cache::default())),
                 )
                 .unwrap();

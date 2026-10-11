@@ -37,9 +37,6 @@ audit-as-crates-io = false
 [policy.nautilus-binance]
 audit-as-crates-io = false
 
-[policy.nautilus-bitmex]
-audit-as-crates-io = false
-
 [policy.nautilus-blockchain]
 audit-as-crates-io = false
 
@@ -103,6 +100,9 @@ audit-as-crates-io = false
 [policy.nautilus-live]
 audit-as-crates-io = false
 
+[policy.nautilus-macros]
+audit-as-crates-io = false
+
 [policy.nautilus-model]
 audit-as-crates-io = false
 
@@ -113,9 +113,6 @@ audit-as-crates-io = false
 audit-as-crates-io = false
 
 [policy.nautilus-persistence]
-audit-as-crates-io = false
-
-[policy.nautilus-persistence-macros]
 audit-as-crates-io = false
 
 [policy.nautilus-plugin]
@@ -1237,10 +1234,6 @@ criteria = "safe-to-deploy"
 version = "0.3.33"
 criteria = "safe-to-deploy"
 
-[[exemptions.futures-core]]
-version = "0.3.33"
-criteria = "safe-to-deploy"
-
 [[exemptions.futures-executor]]
 version = "0.3.33"
 criteria = "safe-to-deploy"
@@ -1411,10 +1404,6 @@ criteria = "safe-to-run"
 
 [[exemptions.iana-time-zone]]
 version = "0.1.65"
-criteria = "safe-to-deploy"
-
-[[exemptions.ibapi]]
-version = "3.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.icu_collections]]
@@ -1847,10 +1836,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.pkcs8]]
 version = "0.10.2"
-criteria = "safe-to-deploy"
-
-[[exemptions.pkg-config]]
-version = "0.3.33"
 criteria = "safe-to-deploy"
 
 [[exemptions.portable-atomic]]
@@ -2317,10 +2302,6 @@ criteria = "safe-to-deploy"
 version = "0.1.8"
 criteria = "safe-to-deploy"
 
-[[exemptions.shlex]]
-version = "2.0.1"
-criteria = "safe-to-deploy"
-
 [[exemptions.signal-hook-registry]]
 version = "1.4.8"
 criteria = "safe-to-deploy"
@@ -2577,10 +2558,6 @@ criteria = "safe-to-deploy"
 version = "0.1.31"
 criteria = "safe-to-deploy"
 
-[[exemptions.tracing-core]]
-version = "0.1.36"
-criteria = "safe-to-deploy"
-
 [[exemptions.tracing-subscriber]]
 version = "0.3.23"
 criteria = "safe-to-deploy"
@@ -2607,10 +2584,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.uint]]
 version = "0.9.4"
-criteria = "safe-to-deploy"
-
-[[exemptions.unbounded-interval-tree]]
-version = "1.1.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.unic-emoji-char]]

@@ -87,11 +87,12 @@ const DECODE_NIBBLE: [u8; 256] = {
 /// Returns the input borrowed when every byte is already in the unreserved
 /// set, otherwise an owned encoded copy.
 ///
-/// # Panics
-///
-/// Never panics in practice: [`encode_bytes`] only emits ASCII bytes
-/// (unreserved characters or `%HH` pairs), so [`String::from_utf8`] always
-/// succeeds.
+/// [`encode_bytes`] only emits ASCII bytes (unreserved characters or `%HH` pairs), so
+/// [`String::from_utf8`] always succeeds.
+#[allow(
+    clippy::missing_panics_doc,
+    reason = "percent-encoded output contains only ASCII bytes"
+)]
 #[must_use]
 pub fn encode(input: &str) -> Cow<'_, str> {
     match encode_bytes(input.as_bytes()) {
@@ -141,8 +142,7 @@ pub fn encode_bytes(input: &[u8]) -> Cow<'_, [u8]> {
 ///
 /// # Errors
 ///
-/// Returns [`DecodeError::InvalidUtf8`] if the decoded bytes are not valid
-/// UTF-8.
+/// Returns an error if the decoded bytes are not valid UTF-8.
 pub fn decode(input: &str) -> Result<Cow<'_, str>, DecodeError> {
     match decode_bytes(input.as_bytes()) {
         Cow::Borrowed(_) => Ok(Cow::Borrowed(input)),
@@ -360,6 +360,7 @@ mod tests {
     #[case("%%25", "%%")]
     #[case("%2%26", "%2&")]
     #[case("a%2Zb%20c", "a%2Zb c")]
+    #[case("%:0", "%:0")]
     fn test_decode_malformed_then_valid(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(decode(input).unwrap(), expected);
     }

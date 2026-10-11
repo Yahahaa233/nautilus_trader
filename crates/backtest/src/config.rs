@@ -15,7 +15,7 @@
 
 //! Configuration types for the backtest engine, venues, data, and run parameters.
 
-use std::{fmt::Display, str::FromStr, time::Duration};
+use std::time::Duration;
 
 use ahash::AHashMap;
 use nautilus_common::{
@@ -25,7 +25,7 @@ use nautilus_common::{
     logging::logger::LoggerConfig,
     msgbus::MessageBusConfig,
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{UUID4, UnixNanos, string::secret::SecretString};
 use nautilus_data::engine::config::DataEngineConfig;
 use nautilus_execution::{
     engine::config::ExecutionEngineConfig,
@@ -37,16 +37,20 @@ use nautilus_execution::{
 };
 use nautilus_model::{
     accounts::margin_model::{MarginModelAny, MarginModelHandle},
-    data::{BarSpecification, BarType},
+    data::{BarSpecification, BarType, NautilusDataType},
     enums::{AccountType, BookType, OmsType, OtoTriggerMode},
     identifiers::{ClientId, InstrumentId, TraderId, Venue},
     types::{Currency, Money},
 };
 #[cfg(feature = "streaming")]
+use nautilus_persistence::config::CatalogBackendType;
+#[cfg(feature = "streaming")]
 use nautilus_persistence::config::DataCatalogConfig;
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
-use nautilus_system::config::{NautilusKernelConfig, StreamingConfig};
+use nautilus_system::config::NautilusKernelConfig;
+#[cfg(feature = "streaming")]
+use nautilus_system::config::StreamingConfig;
 use nautilus_trading::ImportableControllerConfig;
 use rust_decimal::Decimal;
 use ustr::Ustr;
@@ -54,49 +58,6 @@ use ustr::Ustr;
 use crate::modules::{SimulationModuleAny, SimulationModuleHandle};
 
 pub(crate) const MAX_BACKTEST_CHUNK_SIZE: usize = 1_000_000;
-
-/// Represents a type of market data for catalog queries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NautilusDataType {
-    QuoteTick,
-    TradeTick,
-    Bar,
-    OrderBookDelta,
-    OrderBookDepth10,
-    MarkPriceUpdate,
-    IndexPriceUpdate,
-    FundingRateUpdate,
-    InstrumentStatus,
-    OptionGreeks,
-    InstrumentClose,
-}
-
-impl Display for NautilusDataType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self, f)
-    }
-}
-
-impl FromStr for NautilusDataType {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> anyhow::Result<Self> {
-        match s {
-            stringify!(QuoteTick) => Ok(Self::QuoteTick),
-            stringify!(TradeTick) => Ok(Self::TradeTick),
-            stringify!(Bar) => Ok(Self::Bar),
-            stringify!(OrderBookDelta) => Ok(Self::OrderBookDelta),
-            stringify!(OrderBookDepth10) => Ok(Self::OrderBookDepth10),
-            stringify!(MarkPriceUpdate) => Ok(Self::MarkPriceUpdate),
-            stringify!(IndexPriceUpdate) => Ok(Self::IndexPriceUpdate),
-            stringify!(FundingRateUpdate) => Ok(Self::FundingRateUpdate),
-            stringify!(InstrumentStatus) => Ok(Self::InstrumentStatus),
-            stringify!(OptionGreeks) => Ok(Self::OptionGreeks),
-            stringify!(InstrumentClose) => Ok(Self::InstrumentClose),
-            _ => anyhow::bail!("Invalid `NautilusDataType`: '{s}'"),
-        }
-    }
-}
 
 /// Configuration for ``BacktestEngine`` instances.
 #[cfg_attr(
@@ -172,6 +133,7 @@ pub struct BacktestEngineConfig {
     /// The importable controller configuration.
     pub controller: Option<ImportableControllerConfig>,
     /// The configuration for streaming to feather files.
+    #[cfg(feature = "streaming")]
     pub streaming: Option<StreamingConfig>,
     /// Configurations for existing data catalogs.
     #[cfg(feature = "streaming")]
@@ -262,6 +224,7 @@ impl NautilusKernelConfig for BacktestEngineConfig {
         self.portfolio
     }
 
+    #[cfg(feature = "streaming")]
     fn streaming(&self) -> Option<StreamingConfig> {
         self.streaming.clone()
     }
@@ -329,7 +292,10 @@ pub struct SimulatedVenueConfig {
     #[builder(default)]
     pub fill_model: FillModelHandle,
     /// The model used to calculate trading fees.
-    #[builder(default)]
+    ///
+    /// Must be configured explicitly, including an explicit zero-fee model.
+    /// Missing configuration must not silently turn a fee-paying replay into
+    /// a zero-fee replay.
     pub fee_model: FeeModelHandle,
     /// The optional model used to simulate command latency.
     pub latency_model: Option<LatencyModelHandle>,
@@ -406,8 +372,7 @@ impl<S: simulated_venue_config_builder::IsComplete> SimulatedVenueConfigBuilder<
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if any field fails validation
-    /// (see [`SimulatedVenueConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`SimulatedVenueConfig::validate`]).
     pub fn build(self) -> ConfigResult<SimulatedVenueConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -420,8 +385,8 @@ impl SimulatedVenueConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
 
@@ -564,6 +529,9 @@ pub struct BacktestVenueConfig {
     /// The latency model for the venue.
     latency_model: Option<LatencyModelAny>,
     /// The fee model for the venue.
+    ///
+    /// Required when building engines from this config, including an explicit
+    /// zero-fee model; node build fails without one.
     fee_model: Option<FeeModelAny>,
     /// Defines an exchange-calculated price boundary to prevent a market order from being
     /// filled at an extremely aggressive price.
@@ -586,8 +554,7 @@ impl<S: backtest_venue_config_builder::IsComplete> BacktestVenueConfigBuilder<S>
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if any field fails validation
-    /// (see [`BacktestVenueConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`BacktestVenueConfig::validate`]).
     pub fn build(self) -> ConfigResult<BacktestVenueConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -600,8 +567,8 @@ impl BacktestVenueConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
 
@@ -840,12 +807,16 @@ pub struct BacktestDataConfig {
     data_type: NautilusDataType,
     /// The path to the data catalog.
     catalog_path: String,
+    /// Catalog backend used for data loading.
+    #[builder(default)]
+    #[cfg(feature = "streaming")]
+    catalog_backend: CatalogBackendType,
     /// The `fsspec` filesystem protocol for the catalog.
     catalog_fs_protocol: Option<String>,
     /// The filesystem storage options for the catalog (e.g. cloud auth credentials).
-    catalog_fs_storage_options: Option<AHashMap<String, String>>,
+    catalog_fs_storage_options: Option<AHashMap<String, SecretString>>,
     /// Rust-specific storage options for the catalog backend.
-    catalog_fs_rust_storage_options: Option<AHashMap<String, String>>,
+    catalog_fs_rust_storage_options: Option<AHashMap<String, SecretString>>,
     /// The instrument ID for the data configuration (single).
     instrument_id: Option<InstrumentId>,
     /// Multiple instrument IDs for the data configuration.
@@ -867,6 +838,9 @@ pub struct BacktestDataConfig {
     /// If directory-based file registration should be used for more efficient loading.
     #[builder(default)]
     optimize_file_loading: bool,
+    /// If order book deltas should replay as `OrderBookDeltas` batches closed by the `F_LAST` flag.
+    #[builder(default = true)]
+    batch_deltas: bool,
 }
 
 impl<S: backtest_data_config_builder::IsComplete> BacktestDataConfigBuilder<S> {
@@ -874,8 +848,7 @@ impl<S: backtest_data_config_builder::IsComplete> BacktestDataConfigBuilder<S> {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if any field fails validation
-    /// (see [`BacktestDataConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`BacktestDataConfig::validate`]).
     pub fn build(self) -> ConfigResult<BacktestDataConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -884,14 +857,43 @@ impl<S: backtest_data_config_builder::IsComplete> BacktestDataConfigBuilder<S> {
 }
 
 impl BacktestDataConfig {
+    /// Returns the configured catalog backend.
+    #[must_use]
+    #[cfg(feature = "streaming")]
+    pub fn catalog_backend(&self) -> CatalogBackendType {
+        self.catalog_backend.clone()
+    }
+
     /// Validates the data configuration, collecting every field violation.
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
+
+        errors.check(
+            matches!(
+                self.data_type,
+                NautilusDataType::OrderBookDelta
+                    | NautilusDataType::OrderBookDepth
+                    | NautilusDataType::QuoteTick
+                    | NautilusDataType::TradeTick
+                    | NautilusDataType::Bar
+                    | NautilusDataType::MarkPriceUpdate
+                    | NautilusDataType::IndexPriceUpdate
+                    | NautilusDataType::FundingRateUpdate
+                    | NautilusDataType::OptionGreeks
+                    | NautilusDataType::InstrumentStatus
+                    | NautilusDataType::InstrumentClose
+                    | NautilusDataType::Instrument
+            ),
+            ConfigError::unsupported_value(
+                "data_type",
+                format!("{} is not supported by BacktestDataConfig", self.data_type),
+            ),
+        );
 
         if self.catalog_path.trim().is_empty() {
             errors.push(ConfigError::empty_field("catalog_path"));
@@ -922,8 +924,8 @@ impl BacktestDataConfig {
     }
 
     #[must_use]
-    pub const fn data_type(&self) -> NautilusDataType {
-        self.data_type
+    pub const fn data_type(&self) -> &NautilusDataType {
+        &self.data_type
     }
 
     #[must_use]
@@ -937,12 +939,12 @@ impl BacktestDataConfig {
     }
 
     #[must_use]
-    pub fn catalog_fs_storage_options(&self) -> Option<&AHashMap<String, String>> {
+    pub fn catalog_fs_storage_options(&self) -> Option<&AHashMap<String, SecretString>> {
         self.catalog_fs_storage_options.as_ref()
     }
 
     #[must_use]
-    pub fn catalog_fs_rust_storage_options(&self) -> Option<&AHashMap<String, String>> {
+    pub fn catalog_fs_rust_storage_options(&self) -> Option<&AHashMap<String, SecretString>> {
         self.catalog_fs_rust_storage_options.as_ref()
     }
 
@@ -994,6 +996,11 @@ impl BacktestDataConfig {
     #[must_use]
     pub fn optimize_file_loading(&self) -> bool {
         self.optimize_file_loading
+    }
+
+    #[must_use]
+    pub fn batch_deltas(&self) -> bool {
+        self.batch_deltas
     }
 
     /// Constructs identifier strings for catalog queries.
@@ -1123,8 +1130,7 @@ impl<S: backtest_run_config_builder::IsComplete> BacktestRunConfigBuilder<S> {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if any field fails validation
-    /// (see [`BacktestRunConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`BacktestRunConfig::validate`]).
     pub fn build(self) -> ConfigResult<BacktestRunConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -1137,8 +1143,8 @@ impl BacktestRunConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
 
@@ -1214,6 +1220,8 @@ impl BacktestRunConfig {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_core::string::secret::REDACTED;
+    use nautilus_execution::models::fee::MakerTakerFeeModel;
     use rstest::rstest;
 
     use super::*;
@@ -1228,6 +1236,60 @@ mod tests {
         };
     }
 
+    #[rstest]
+    #[case(NautilusDataType::OrderBookDelta)]
+    #[case(NautilusDataType::OrderBookDepth)]
+    #[case(NautilusDataType::QuoteTick)]
+    #[case(NautilusDataType::TradeTick)]
+    #[case(NautilusDataType::Bar)]
+    #[case(NautilusDataType::MarkPriceUpdate)]
+    #[case(NautilusDataType::IndexPriceUpdate)]
+    #[case(NautilusDataType::FundingRateUpdate)]
+    #[case(NautilusDataType::OptionGreeks)]
+    #[case(NautilusDataType::InstrumentStatus)]
+    #[case(NautilusDataType::InstrumentClose)]
+    fn test_data_config_accepts_supported_family(#[case] data_type: NautilusDataType) {
+        let config = BacktestDataConfig::builder()
+            .data_type(data_type.clone())
+            .catalog_path("/tmp/catalog".to_string())
+            .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
+            .build()
+            .unwrap();
+
+        assert_eq!(config.data_type(), &data_type);
+    }
+
+    #[rstest]
+    fn test_data_config_accepts_the_instrument_family() {
+        let config = BacktestDataConfig::builder()
+            .data_type(NautilusDataType::Instrument)
+            .catalog_path("/tmp/catalog".to_string())
+            .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
+            .build()
+            .unwrap();
+
+        assert_eq!(config.data_type(), &NautilusDataType::Instrument);
+    }
+
+    #[rstest]
+    #[case(NautilusDataType::Custom { type_name: "Signal".to_string() })]
+    fn test_data_config_rejects_unsupported_family(#[case] data_type: NautilusDataType) {
+        let error = BacktestDataConfig::builder()
+            .data_type(data_type.clone())
+            .catalog_path("/tmp/catalog".to_string())
+            .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
+            .build()
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ConfigError::unsupported_value(
+                "data_type",
+                format!("{data_type} is not supported by BacktestDataConfig"),
+            ),
+        );
+    }
+
     macro_rules! minimal_simulated_builder {
         () => {
             SimulatedVenueConfig::builder()
@@ -1236,6 +1298,7 @@ mod tests {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         };
     }
 
@@ -1461,6 +1524,35 @@ mod tests {
         assert_eq!(errors.len(), 3);
     }
 
+    #[rstest]
+    fn test_data_config_debug_redacts_storage_option_values() {
+        let config = BacktestDataConfig::builder()
+            .data_type(NautilusDataType::QuoteTick)
+            .catalog_path("/tmp/catalog".to_string())
+            .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
+            .catalog_fs_storage_options(AHashMap::from([(
+                "key".to_string(),
+                SecretString::from("fs-key-sentinel"),
+            )]))
+            .catalog_fs_rust_storage_options(AHashMap::from([(
+                "aws_secret_access_key".to_string(),
+                SecretString::from("rust-secret-sentinel"),
+            )]))
+            .build()
+            .unwrap();
+
+        let debug_output = format!("{config:?}");
+
+        assert!(!debug_output.contains("fs-key-sentinel"));
+        assert!(!debug_output.contains("rust-secret-sentinel"));
+        assert!(debug_output.contains(&format!(
+            "catalog_fs_storage_options: Some({{\"key\": {REDACTED}}})"
+        )));
+        assert!(debug_output.contains(&format!(
+            "catalog_fs_rust_storage_options: Some({{\"aws_secret_access_key\": {REDACTED}}})"
+        )));
+    }
+
     macro_rules! minimal_sim_builder {
         () => {
             SimulatedVenueConfig::builder()
@@ -1469,6 +1561,7 @@ mod tests {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         };
     }
 
@@ -1486,6 +1579,7 @@ mod tests {
             .account_type(AccountType::Margin)
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build();
         assert!(
             matches!(result, Err(ConfigError::EmptyField { field }) if field == "starting_balances")

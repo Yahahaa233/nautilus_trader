@@ -49,25 +49,27 @@ use nautilus_model::{
         OrderAccepted, OrderCancelRejected, OrderCanceled, OrderEventAny, OrderExpired,
         OrderFilled, OrderInitialized, OrderRejected, OrderUpdated,
     },
+    fees::MakerTakerFeeRates,
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, Venue, VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance, Money, Price, Quantity},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::{
     common::{
         auth::run_auth_token_refresh,
         consts::{
-            AX_ACCOUNT_REGISTRATION_TIMEOUT_SECS, AX_AUTH_TOKEN_TTL_SECS, AX_POST_ONLY_REJECT,
-            AX_VENUE,
+            AX_ACCOUNT_REGISTRATION_TIMEOUT_SECS, AX_AUTH_TOKEN_TTL_SECS,
+            AX_FILLS_MAX_LOOKBACK_DAYS, AX_POST_ONLY_REJECT, AX_VENUE,
         },
         credential::Credential,
-        enums::{AxOrderSide, AxTimeInForce},
+        enums::{AxOrderSide, AxOrderStatus, AxTimeInForce},
         parse::{
             ax_timestamp_stn_to_unix_nanos, cid_to_client_order_id, client_order_id_to_cid,
             quantity_to_contracts,
@@ -549,18 +551,15 @@ impl ExecutionClient for AxExecutionClient {
         .context("API credentials not configured")?;
         let token = self.authenticate(&credential).await?;
 
-        // Instruments load after authenticating because their fee rates come from the
-        // authenticated `/whoami`. A zero-fee fallback would outlive the failure that caused it,
-        // since `set_instruments_initialized` stops a reconnect from retrying the load.
-        if !self.core.instruments_initialized() {
-            self.http_client
-                .request_account_fees()
-                .await
-                .context("failed to resolve AX account fee rates")?;
+        self.http_client
+            .request_account_fees()
+            .await
+            .context("failed to resolve AX account fee rates")?;
 
+        if !self.core.instruments_initialized() {
             let instruments = self
                 .http_client
-                .request_instruments(None, None)
+                .request_instruments()
                 .await
                 .context("failed to request AX instruments")?;
 
@@ -582,6 +581,7 @@ impl ExecutionClient for AxExecutionClient {
         let caches = self.ws_orders.caches().clone();
         let account_id = self.core.account_id;
         let instruments_cache = self.ws_orders.instruments_cache();
+        let account_fee_rates = self.http_client.account_fee_rates.clone();
         let clock = self.clock;
 
         if let Err(e) = self.session_tasks.spawn(async move {
@@ -593,6 +593,7 @@ impl ExecutionClient for AxExecutionClient {
                     &caches,
                     account_id,
                     &instruments_cache,
+                    &account_fee_rates,
                     clock,
                 );
             }
@@ -714,7 +715,7 @@ impl ExecutionClient for AxExecutionClient {
                     cleanup_closed_order_status_report(&report, &caches);
                     emitter.send_order_status_report(report);
                 }
-                Err(e) => log::error!("AX query order failed: {e}"),
+                Err(e) => log::warn!("AX query order failed: {e}"),
             }
             Ok(())
         });
@@ -964,6 +965,49 @@ impl ExecutionClient for AxExecutionClient {
     }
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
+        if cmd.order_side.is_some() {
+            // AX cancel-all has no side parameter, so select matching open
+            // orders and cancel their explicit IDs through the batch path.
+            let cancels: Vec<CancelOrder> = {
+                let cache = self.core.cache();
+                cache
+                    .orders_open(None, Some(&cmd.instrument_id), None, None, cmd.order_side)
+                    .iter()
+                    .map(|order| CancelOrder {
+                        trader_id: order.trader_id(),
+                        client_id: cmd.client_id,
+                        strategy_id: order.strategy_id(),
+                        instrument_id: order.instrument_id(),
+                        client_order_id: order.client_order_id(),
+                        venue_order_id: order.venue_order_id(),
+                        command_id: cmd.command_id,
+                        ts_init: cmd.ts_init,
+                        params: cmd.params.clone(),
+                        correlation_id: cmd.correlation_id,
+                        causation_id: cmd.causation_id,
+                    })
+                    .collect()
+            };
+
+            if cancels.is_empty() {
+                log::debug!("No open orders to cancel for {}", cmd.instrument_id);
+                return Ok(());
+            }
+
+            return self.batch_cancel_orders(BatchCancelOrders {
+                trader_id: cmd.trader_id,
+                client_id: cmd.client_id,
+                strategy_id: cmd.strategy_id,
+                instrument_id: cmd.instrument_id,
+                cancels,
+                command_id: cmd.command_id,
+                ts_init: cmd.ts_init,
+                params: cmd.params,
+                correlation_id: cmd.correlation_id,
+                causation_id: cmd.causation_id,
+            });
+        }
+
         let http_client = self.http_client.clone();
         let emitter = self.emitter.clone();
         let clock = self.clock;
@@ -1163,6 +1207,11 @@ impl ExecutionClient for AxExecutionClient {
             .transpose()?
             .map(|lookback| ts_now.saturating_sub(lookback));
 
+        // Floor the declared window at the /fills span cap so it does not overstate coverage
+        let fills_span = DurationNanos::try_from_days(u64::try_from(AX_FILLS_MAX_LOOKBACK_DAYS)?)?;
+        let fills_floor = ts_now.saturating_sub(fills_span);
+        let declared_start = start.map(|start| start.max(fills_floor));
+
         let order_cmd = GenerateOrderStatusReports::new(
             UUID4::new(),
             ts_now,
@@ -1212,6 +1261,9 @@ impl ExecutionClient for AxExecutionClient {
             ts_now,
             None,
         );
+
+        // Declare the window so these fills are bounded history, not live fills
+        mass_status.set_report_window(declared_start, true);
 
         mass_status.add_order_reports(order_reports);
         mass_status.add_fill_reports(fill_reports);
@@ -1264,11 +1316,20 @@ fn dispatch_ws_message(
     caches: &OrdersCaches,
     account_id: AccountId,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
+    account_fee_rates: &AtomicMap<Option<Ustr>, MakerTakerFeeRates>,
     clock: &'static AtomicTime,
 ) {
     match message {
         AxOrdersWsMessage::Event(event) => {
-            dispatch_order_event(*event, emitter, caches, account_id, instruments, clock);
+            dispatch_order_event(
+                *event,
+                emitter,
+                caches,
+                account_id,
+                instruments,
+                account_fee_rates,
+                clock,
+            );
         }
         AxOrdersWsMessage::PlaceOrderResponse(resp) => {
             log::debug!(
@@ -1288,7 +1349,7 @@ fn dispatch_ws_message(
             log::debug!("Open orders response: {} orders", resp.res.orders.len());
         }
         AxOrdersWsMessage::Error(err) => {
-            log::warn!("WebSocket error: {}", err.message);
+            log::debug!("WebSocket error: {}", err.message);
         }
         AxOrdersWsMessage::Reconnected => {
             log::info!("WebSocket reconnected");
@@ -1305,6 +1366,7 @@ fn dispatch_order_event(
     caches: &OrdersCaches,
     account_id: AccountId,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
+    account_fee_rates: &AtomicMap<Option<Ustr>, MakerTakerFeeRates>,
     clock: &'static AtomicTime,
 ) {
     match event {
@@ -1337,6 +1399,8 @@ fn dispatch_order_event(
                 caches,
                 account_id,
                 instruments,
+                account_fee_rates,
+                false,
                 clock,
             );
         }
@@ -1350,9 +1414,10 @@ fn dispatch_order_event(
                 caches,
                 account_id,
                 instruments,
+                account_fee_rates,
+                true,
                 clock,
             );
-            cleanup_terminal_order_tracking(&msg.o, caches);
         }
         AxWsOrderEvent::Canceled(msg) => {
             if let Some(event) =
@@ -1374,15 +1439,11 @@ fn dispatch_order_event(
             cleanup_terminal_order_tracking(&msg.o, caches);
         }
         AxWsOrderEvent::Rejected(msg) => {
-            let known_reason = msg.r.filter(|r| !matches!(r, AxOrderRejectReason::Unknown));
-            let reason = known_reason
-                .as_ref()
-                .map(AsRef::as_ref)
-                .or(msg.txt.as_deref())
-                .unwrap_or("UNKNOWN");
+            let reason = AxOrderRejectReason::reason_str(msg.r, msg.txt.as_deref())
+                .unwrap_or_else(|| "UNKNOWN".to_string());
 
             if let Some(event) =
-                create_order_rejected(&msg.o, reason, msg.ts, msg.tn, caches, account_id, clock)
+                create_order_rejected(&msg.o, &reason, msg.ts, msg.tn, caches, account_id, clock)
             {
                 emitter.send_order_event(OrderEventAny::Rejected(event));
             }
@@ -1428,8 +1489,10 @@ fn dispatch_order_event(
                 }
             };
 
+            let order = msg.no.as_deref().unwrap_or(&msg.ro);
+
             if let Some(event) = create_order_updated(
-                &msg.no,
+                order,
                 &msg.ro,
                 replacement_venue_order_id,
                 (msg.ts, msg.tn),
@@ -1439,7 +1502,7 @@ fn dispatch_order_event(
             ) {
                 emitter.send_order_event(OrderEventAny::Updated(event));
             } else if let Some(report) = create_order_status_report(
-                &msg.no,
+                order,
                 OrderStatus::Accepted,
                 msg.ts,
                 msg.tn,
@@ -1490,7 +1553,7 @@ fn dispatch_order_event(
                 );
                 emitter.send_order_event(OrderEventAny::CancelRejected(event));
             } else {
-                log::warn!(
+                log::debug!(
                     "Could not find metadata for cancel rejected order {}",
                     msg.oid
                 );
@@ -1509,9 +1572,36 @@ fn dispatch_fill_event(
     caches: &OrdersCaches,
     account_id: AccountId,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
+    account_fee_rates: &AtomicMap<Option<Ustr>, MakerTakerFeeRates>,
+    complete: bool,
     clock: &'static AtomicTime,
 ) {
-    if let Some(event) = create_order_filled(order, execution, ts, tn, caches, account_id, clock) {
+    if order.o == AxOrderStatus::Unknown || order.tif == AxTimeInForce::Unknown {
+        log::warn!(
+            "Unknown AX order classification in fill, order_id={}, instrument={}, trade_id={}, state={}, time_in_force={}",
+            order.oid,
+            order.s,
+            execution.tid,
+            order.o,
+            order.tif,
+        );
+    }
+
+    let commission =
+        match calculate_fill_commission(order, execution, instruments, account_fee_rates) {
+            Ok(commission) => commission,
+            Err(e) => {
+                log::warn!(
+                    "Cannot calculate AX commission for trade_id={}: {e}",
+                    execution.tid
+                );
+                return;
+            }
+        };
+
+    if let Some(event) = create_order_filled(
+        order, execution, ts, tn, caches, account_id, commission, clock,
+    ) {
         emitter.send_order_event(OrderEventAny::Filled(event));
     } else if let Some(report) = create_fill_report(
         order,
@@ -1521,10 +1611,51 @@ fn dispatch_fill_event(
         caches,
         account_id,
         instruments,
+        commission,
         clock,
     ) {
         emitter.send_fill_report(report);
+    } else {
+        return;
     }
+
+    if complete {
+        cleanup_terminal_order_tracking(order, caches);
+    }
+}
+
+fn calculate_fill_commission(
+    order: &AxWsOrder,
+    execution: &AxWsTradeExecution,
+    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    account_fee_rates: &AtomicMap<Option<Ustr>, MakerTakerFeeRates>,
+) -> anyhow::Result<Money> {
+    let instruments = instruments.load();
+    let instrument = instruments
+        .get(&order.s)
+        .context("AX fill instrument is not cached")?;
+    let rates = account_fee_rates.load();
+    let rates = rates
+        .get(&execution.aid.or(order.aid))
+        .context("AX fill account fee rates are not cached")?;
+
+    let liquidity_side = if execution.agg {
+        LiquiditySide::Taker
+    } else {
+        LiquiditySide::Maker
+    };
+
+    let rate = rates.rate_for(liquidity_side)?;
+
+    // Keep notional in Decimal so sub-cent rounding happens only after applying the rate
+    let commission = Decimal::from(execution.q)
+        .checked_mul(execution.p.abs())
+        .and_then(|notional| notional.checked_mul(instrument.multiplier().as_decimal()))
+        .and_then(|notional| notional.checked_mul(rate))
+        .context("AX fill commission calculation overflow")?;
+
+    Money::from_decimal(commission, Currency::USD())
+        .context("failed to convert AX fill commission to Money")
 }
 
 pub(crate) fn lookup_order_metadata<'a>(
@@ -1552,15 +1683,13 @@ pub(crate) fn lookup_order_metadata<'a>(
 pub(crate) fn replacement_venue_order_id(
     message: &crate::websocket::messages::AxWsOrderReplaced,
 ) -> anyhow::Result<VenueOrderId> {
-    if message.noid != message.no.oid {
-        anyhow::bail!(
-            "noid '{}' does not match new order oid '{}'",
-            message.noid,
-            message.no.oid
-        );
+    match (&message.noid, &message.no) {
+        (Some(noid), Some(order)) if noid == &order.oid => {
+            VenueOrderId::new_checked(noid).map_err(anyhow::Error::from)
+        }
+        (None, None) => VenueOrderId::new_checked(&message.ro.oid).map_err(anyhow::Error::from),
+        _ => anyhow::bail!("Inconsistent AX replacement order identity"),
     }
-
-    VenueOrderId::new_checked(&message.noid).map_err(anyhow::Error::from)
 }
 
 pub(crate) fn create_order_accepted(
@@ -1632,7 +1761,7 @@ pub(crate) fn create_order_updated(
         .map_err(|e| log::error!("{e}"))
         .ok()?;
 
-    let quantity = Quantity::new(order.q as f64, size_precision);
+    let quantity = Quantity::from_decimal_dp(Decimal::from(order.q), size_precision).ok()?;
     let price = Price::from_decimal_dp(order.p, price_precision).ok();
 
     Some(OrderUpdated::new(
@@ -1654,6 +1783,7 @@ pub(crate) fn create_order_updated(
     ))
 }
 
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn create_order_filled(
     order: &AxWsOrder,
     execution: &AxWsTradeExecution,
@@ -1661,6 +1791,7 @@ pub(crate) fn create_order_filled(
     event_tn: i64,
     caches: &OrdersCaches,
     account_id: AccountId,
+    commission: Money,
     clock: &'static AtomicTime,
 ) -> Option<OrderFilled> {
     let venue_order_id = VenueOrderId::new(&order.oid);
@@ -1670,7 +1801,8 @@ pub(crate) fn create_order_filled(
         .map_err(|e| log::error!("{e}"))
         .ok()?;
 
-    let last_qty = Quantity::new(execution.q as f64, metadata.size_precision);
+    let last_qty =
+        Quantity::from_decimal_dp(Decimal::from(execution.q), metadata.size_precision).ok()?;
     let last_px = Price::from_decimal_dp(execution.p, metadata.price_precision).ok()?;
 
     let order_side = OrderSide::from(order.d);
@@ -1700,7 +1832,7 @@ pub(crate) fn create_order_filled(
         clock.get_time_ns(),
         false,
         None,
-        None,
+        Some(commission),
         None,
     ))
 }
@@ -1883,10 +2015,21 @@ fn create_order_status_report(
     let venue_order_id = VenueOrderId::new(&order.oid);
     let instrument_id = instrument.id();
     let order_side = OrderSide::from(order.d);
-    let time_in_force = order.tif.into();
 
-    let quantity = Quantity::new(order.q as f64, instrument.size_precision());
-    let filled_qty = Quantity::new(order.xq as f64, instrument.size_precision());
+    let time_in_force = TimeInForce::try_from(order.tif)
+        .map_err(|e| {
+            log::warn!(
+                "Cannot map AX order time in force, order_id={}, instrument={}, error={e}",
+                order.oid,
+                order.s
+            );
+        })
+        .ok()?;
+
+    let quantity =
+        Quantity::from_decimal_dp(Decimal::from(order.q), instrument.size_precision()).ok()?;
+    let filled_qty =
+        Quantity::from_decimal_dp(Decimal::from(order.xq), instrument.size_precision()).ok()?;
 
     let ts_event = ax_timestamp_stn_to_unix_nanos(event_ts, event_tn)
         .map_err(|e| log::error!("{e}"))
@@ -1921,6 +2064,8 @@ fn create_order_status_report(
         report = report.with_price(price);
     }
 
+    report = report.with_post_only(order.po);
+
     Some(report)
 }
 
@@ -1933,6 +2078,7 @@ fn create_fill_report(
     caches: &OrdersCaches,
     account_id: AccountId,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
+    commission: Money,
     clock: &'static AtomicTime,
 ) -> Option<FillReport> {
     let instruments_snap = instruments.load();
@@ -1941,7 +2087,8 @@ fn create_fill_report(
     let instrument_id = instrument.id();
     let order_side = order.d.into();
 
-    let last_qty = Quantity::new(execution.q as f64, instrument.size_precision());
+    let last_qty =
+        Quantity::from_decimal_dp(Decimal::from(execution.q), instrument.size_precision()).ok()?;
     let last_px = Price::from_decimal_dp(execution.p, instrument.price_precision()).ok()?;
 
     let liquidity_side = if execution.agg {
@@ -1961,11 +2108,6 @@ fn create_fill_report(
             .get(&cid)
             .map_or_else(|| cid_to_client_order_id(cid), |v| *v)
     });
-
-    // The WS trade execution payload does not include fee data so
-    // commission is zero here. The REST /fills endpoint (used during
-    // reconciliation via parse_fill_report) includes accurate fees.
-    let commission = Money::zero(instrument.quote_currency());
 
     Some(FillReport::new(
         account_id,
@@ -2080,7 +2222,10 @@ mod tests {
     use std::{cell::RefCell, net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
 
     use dashmap::DashMap;
-    use nautilus_common::{cache::Cache, messages::ExecutionEvent};
+    use nautilus_common::{
+        cache::Cache,
+        messages::{ExecutionEvent, ExecutionReport},
+    };
     use nautilus_core::time::get_atomic_clock_realtime;
     use nautilus_live::ExecutionClientCore;
     use nautilus_model::{
@@ -2106,7 +2251,7 @@ mod tests {
         config::AxExecutionClientConfig,
         http::error::AxBuildError,
         websocket::{
-            messages::{AxWsOrderExpired, AxWsTradeExecution, OrderMetadata},
+            messages::{AxWsOrderExpired, AxWsOrderFilled, AxWsTradeExecution, OrderMetadata},
             orders::OrdersCaches,
         },
     };
@@ -2121,8 +2266,12 @@ mod tests {
 
     fn test_ws_order(oid: &str, price: Decimal, qty: u64) -> AxWsOrder {
         AxWsOrder {
+            aid: None,
+            po: false,
+            rb: None,
+            r: None,
             oid: oid.to_string(),
-            u: "user".to_string(),
+            u: Ustr::from("user"),
             s: Ustr::from("BTC-PERP"),
             p: price,
             q: qty,
@@ -2232,6 +2381,7 @@ mod tests {
 
     fn test_execution(tid: &str, price: Decimal, qty: u64, agg: bool) -> AxWsTradeExecution {
         AxWsTradeExecution {
+            aid: None,
             tid: tid.to_string(),
             s: Ustr::from("BTC-PERP"),
             q: qty,
@@ -2279,8 +2429,6 @@ mod tests {
             .size_increment(Quantity::from("1"))
             .margin_init(Decimal::new(1, 2))
             .margin_maint(Decimal::new(5, 3))
-            .maker_fee(Decimal::new(2, 4))
-            .taker_fee(Decimal::new(5, 4))
             .ts_event(0.into())
             .ts_init(0.into())
             .build()
@@ -2443,7 +2591,14 @@ mod tests {
         let execution = test_execution("TID-1", dec!(50500.00), 25, agg);
 
         let event = create_order_filled(
-            &order, &execution, 1609459200, 0, &caches, account_id, clock,
+            &order,
+            &execution,
+            1609459200,
+            0,
+            &caches,
+            account_id,
+            Money::from("12.34 USD"),
+            clock,
         )
         .expect("should produce OrderFilled");
 
@@ -2453,6 +2608,256 @@ mod tests {
         assert_eq!(event.last_qty, Quantity::new(25.0, 0));
         assert_eq!(event.last_px, Price::from("50500.00"));
         assert_eq!(event.liquidity_side, expected);
+        assert_eq!(event.commission, Some(Money::from("12.34 USD")));
+    }
+
+    #[rstest]
+    #[case::maker(false, dec!(0.0002), dec!(0.0025), dec!(100.25), 20, dec!(2.5), "1.00 USD")]
+    #[case::taker(true, dec!(0.0002), dec!(0.0025), dec!(100.25), 20, dec!(2.5), "12.53 USD")]
+    #[case::zero(false, dec!(0), dec!(0.0025), dec!(100.25), 20, dec!(2.5), "0.00 USD")]
+    #[case::rebate(false, dec!(-0.0002), dec!(0.0025), dec!(100.25), 20, dec!(2.5), "-1.00 USD")]
+    #[case::negative_price(false, dec!(0.0002), dec!(0.0025), dec!(-100.25), 20, dec!(2.5), "1.00 USD")]
+    #[case::sub_cent_notional(false, dec!(0.0002), dec!(0.0025), dec!(0.007499), 10_001, dec!(1), "0.01 USD")]
+    fn test_calculate_fill_commission(
+        #[case] agg: bool,
+        #[case] maker: Decimal,
+        #[case] taker: Decimal,
+        #[case] price: Decimal,
+        #[case] quantity: u64,
+        #[case] multiplier: Decimal,
+        #[case] expected: &str,
+    ) {
+        let mut instrument = test_perp_instrument("BTC-PERP");
+        if let InstrumentAny::PerpetualContract(ref mut instrument) = instrument {
+            instrument.multiplier = Quantity::from_decimal(multiplier).unwrap();
+        }
+
+        let instruments = AtomicMap::new();
+        instruments.insert(Ustr::from("BTC-PERP"), instrument);
+        let rates = AtomicMap::new();
+        rates.insert(None, MakerTakerFeeRates::new(maker, taker));
+        let order = test_ws_order("OID-FILL", price, quantity);
+        let execution = test_execution("TID-FILL", price, quantity, agg);
+
+        let commission =
+            calculate_fill_commission(&order, &execution, &instruments, &rates).unwrap();
+
+        assert_eq!(commission, Money::from(expected));
+    }
+
+    #[rstest]
+    #[case::default(None, None, "0.05 USD")]
+    #[case::order_account(Some("order-account"), None, "0.10 USD")]
+    #[case::execution_account(None, Some("execution-account"), "0.15 USD")]
+    #[case::execution_account_precedence(
+        Some("order-account"),
+        Some("execution-account"),
+        "0.15 USD"
+    )]
+    fn test_calculate_fill_commission_resolves_account(
+        #[case] order_account: Option<&str>,
+        #[case] execution_account: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let instruments = AtomicMap::new();
+        instruments.insert(Ustr::from("BTC-PERP"), test_perp_instrument("BTC-PERP"));
+        let rates = AtomicMap::new();
+        rates.insert(None, MakerTakerFeeRates::new(dec!(0.0001), dec!(0.0002)));
+        rates.insert(
+            Some(Ustr::from("order-account")),
+            MakerTakerFeeRates::new(dec!(0.0003), dec!(0.0004)),
+        );
+        rates.insert(
+            Some(Ustr::from("execution-account")),
+            MakerTakerFeeRates::new(dec!(0.0005), dec!(0.0006)),
+        );
+        let mut order = test_ws_order("OID-FILL", dec!(10), 25);
+        order.aid = order_account.map(Ustr::from);
+        let mut execution = test_execution("TID-FILL", dec!(10), 25, true);
+        execution.aid = execution_account.map(Ustr::from);
+
+        let commission =
+            calculate_fill_commission(&order, &execution, &instruments, &rates).unwrap();
+
+        assert_eq!(commission, Money::from(expected));
+    }
+
+    #[rstest]
+    #[case::tracked_partial(true, false, "500.00 USD")]
+    #[case::tracked_full(true, true, "1000.00 USD")]
+    #[case::untracked_partial(false, false, "500.00 USD")]
+    #[case::untracked_full(false, true, "1000.00 USD")]
+    fn test_dispatch_stream_fill_carries_commission(
+        #[case] tracked: bool,
+        #[case] complete: bool,
+        #[case] expected: &str,
+    ) {
+        let raw = if complete {
+            include_str!("../test_data/ws_order_filled.json")
+        } else {
+            include_str!("../test_data/ws_order_partially_filled.json")
+        };
+
+        let event: AxWsOrderEvent = serde_json::from_str(raw).unwrap();
+        let clock = get_atomic_clock_realtime();
+        let account_id = AccountId::from("AX-001");
+        let client_order_id = ClientOrderId::from("O-FILL");
+        let venue_order_id = VenueOrderId::new("O-01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
+        let caches = test_caches();
+        if tracked {
+            caches.orders_metadata.insert(
+                client_order_id,
+                test_metadata(client_order_id, instrument_id),
+            );
+            caches
+                .venue_to_client_id
+                .insert(venue_order_id, client_order_id);
+        }
+
+        let instruments = AtomicMap::new();
+        instruments.insert(
+            Ustr::from("EURUSD-PERP"),
+            test_perp_instrument("EURUSD-PERP"),
+        );
+        let rates = AtomicMap::new();
+        rates.insert(
+            Some(Ustr::from("fixture-account")),
+            MakerTakerFeeRates::new(dec!(0.0002), dec!(0.0025)),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut emitter = ExecutionEventEmitter::new(
+            clock,
+            TraderId::from("TESTER-001"),
+            account_id,
+            AccountType::Margin,
+            None,
+        );
+        emitter.set_sender(tx);
+
+        dispatch_order_event(
+            event,
+            &emitter,
+            &caches,
+            account_id,
+            &instruments,
+            &rates,
+            clock,
+        );
+
+        let expected_qty = if complete { dec!(100) } else { dec!(50) };
+
+        match rx.try_recv().unwrap() {
+            ExecutionEvent::Order(OrderEventAny::Filled(fill)) => {
+                assert!(tracked);
+                assert_eq!(fill.commission, Some(Money::from(expected)));
+                assert_eq!(fill.client_order_id, client_order_id);
+                assert_eq!(fill.venue_order_id, venue_order_id);
+                assert_eq!(fill.trade_id.as_str(), "T-01ARZ3NDEKTSV4RRFFQ69G5FAV");
+                assert_eq!(fill.last_qty.as_decimal(), expected_qty);
+                assert_eq!(fill.last_px.as_decimal(), dec!(50000));
+                assert_eq!(fill.liquidity_side, LiquiditySide::Maker);
+            }
+            ExecutionEvent::Report(report) => {
+                let ExecutionReport::Fill(fill) = report else {
+                    panic!("expected fill report");
+                };
+
+                assert!(!tracked);
+                assert_eq!(fill.commission, Money::from(expected));
+                assert_eq!(fill.instrument_id, instrument_id);
+                assert_eq!(fill.venue_order_id, venue_order_id);
+                assert_eq!(fill.last_qty.as_decimal(), expected_qty);
+                assert_eq!(fill.last_px.as_decimal(), dec!(50000));
+                assert_eq!(fill.liquidity_side, LiquiditySide::Maker);
+            }
+            other => panic!("unexpected fill event: {other:?}"),
+        }
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            caches.orders_metadata.len(),
+            usize::from(tracked && !complete)
+        );
+        assert_eq!(
+            caches.venue_to_client_id.len(),
+            usize::from(tracked && !complete)
+        );
+    }
+
+    #[rstest]
+    #[case::missing_account(Some("unknown"), dec!(100), "AX fill account fee rates are not cached")]
+    #[case::overflow(None, Decimal::MAX, "AX fill commission calculation overflow")]
+    fn test_dispatch_fill_fee_error_retains_tracking(
+        #[case] account: Option<&str>,
+        #[case] price: Decimal,
+        #[case] expected: &str,
+    ) {
+        let clock = get_atomic_clock_realtime();
+        let account_id = AccountId::from("AX-001");
+        let client_order_id = ClientOrderId::from("O-FILL");
+        let venue_order_id = VenueOrderId::new("OID-FILL");
+        let caches = test_caches();
+        caches.orders_metadata.insert(
+            client_order_id,
+            test_metadata(client_order_id, InstrumentId::from("BTC-PERP.AX")),
+        );
+        caches
+            .venue_to_client_id
+            .insert(venue_order_id, client_order_id);
+        let instruments = AtomicMap::new();
+        instruments.insert(Ustr::from("BTC-PERP"), test_perp_instrument("BTC-PERP"));
+        let rates = AtomicMap::new();
+        rates.insert(None, MakerTakerFeeRates::new(dec!(0.0002), dec!(0.0025)));
+        let mut order = test_ws_order("OID-FILL", dec!(100), 25);
+        order.aid = account.map(Ustr::from);
+        let execution = test_execution("TID-FILL", price, 25, true);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut emitter = ExecutionEventEmitter::new(
+            clock,
+            TraderId::from("TESTER-001"),
+            account_id,
+            AccountType::Margin,
+            None,
+        );
+        emitter.set_sender(tx);
+
+        let event = AxWsOrderEvent::Filled(AxWsOrderFilled {
+            ts: 1609459200,
+            tn: 0,
+            eid: "E-FILL".to_owned(),
+            o: order.clone(),
+            xs: execution.clone(),
+        });
+
+        let error =
+            calculate_fill_commission(&order, &execution, &instruments, &rates).unwrap_err();
+        dispatch_order_event(
+            event,
+            &emitter,
+            &caches,
+            account_id,
+            &instruments,
+            &rates,
+            clock,
+        );
+
+        assert_eq!(error.to_string(), expected);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            caches
+                .orders_metadata
+                .get(&client_order_id)
+                .unwrap()
+                .client_order_id,
+            client_order_id
+        );
+        assert_eq!(
+            *caches.venue_to_client_id.get(&venue_order_id).unwrap(),
+            client_order_id
+        );
     }
 
     #[rstest]
@@ -2549,7 +2954,15 @@ mod tests {
         });
 
         let instruments: AtomicMap<Ustr, InstrumentAny> = AtomicMap::new();
-        dispatch_order_event(event, &emitter, &caches, account_id, &instruments, clock);
+        dispatch_order_event(
+            event,
+            &emitter,
+            &caches,
+            account_id,
+            &instruments,
+            &AtomicMap::new(),
+            clock,
+        );
 
         match rx.try_recv().expect("an order event should be emitted") {
             ExecutionEvent::Order(OrderEventAny::Canceled(_)) => assert!(expect_canceled),
@@ -3183,5 +3596,145 @@ mod tests {
         };
 
         assert_eq!(classify_ax_ws_failure(&error), expected);
+    }
+
+    #[rstest]
+    #[case(include_str!("../test_data/ws_order_filled_unknown_state.json"))]
+    #[case(include_str!("../test_data/ws_order_filled_unknown_tif.json"))]
+    fn test_dispatch_fill_with_unknown_sibling_classification(#[case] raw: &str) {
+        let event: AxWsOrderEvent = serde_json::from_str(raw).unwrap();
+        let clock = get_atomic_clock_realtime();
+        let account_id = AccountId::from("AX-001");
+        let client_order_id = ClientOrderId::from("O-UNKNOWN-STATE");
+        let venue_order_id = VenueOrderId::new("O-01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        let caches = test_caches();
+        caches.orders_metadata.insert(
+            client_order_id,
+            test_metadata(client_order_id, InstrumentId::from("EURUSD-PERP.AX")),
+        );
+        caches
+            .venue_to_client_id
+            .insert(venue_order_id, client_order_id);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut emitter = ExecutionEventEmitter::new(
+            clock,
+            TraderId::from("TESTER-001"),
+            account_id,
+            AccountType::Margin,
+            None,
+        );
+        emitter.set_sender(tx);
+        let instruments = AtomicMap::new();
+        instruments.insert(
+            Ustr::from("EURUSD-PERP"),
+            test_perp_instrument("EURUSD-PERP"),
+        );
+        let account_fee_rates = AtomicMap::new();
+        account_fee_rates.insert(
+            Some(Ustr::from("fixture-account")),
+            MakerTakerFeeRates::new(dec!(0.0002), dec!(0.0025)),
+        );
+
+        dispatch_order_event(
+            event,
+            &emitter,
+            &caches,
+            account_id,
+            &instruments,
+            &account_fee_rates,
+            clock,
+        );
+
+        let ExecutionEvent::Order(OrderEventAny::Filled(fill)) = rx.try_recv().unwrap() else {
+            panic!("expected fill")
+        };
+
+        assert_eq!(fill.venue_order_id, venue_order_id);
+        assert_eq!(fill.client_order_id, client_order_id);
+        assert_eq!(fill.trade_id.as_str(), "T-01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(fill.last_qty.as_decimal(), dec!(100));
+        assert_eq!(fill.last_px.as_decimal(), dec!(50000));
+        assert_eq!(fill.ts_event, UnixNanos::from(1609459200123456789));
+        assert!(rx.try_recv().is_err());
+        assert!(caches.orders_metadata.is_empty());
+        assert!(caches.venue_to_client_id.is_empty());
+    }
+
+    #[rstest]
+    fn test_amendment_keeps_venue_identity_and_updates_quantity() {
+        let message: crate::websocket::messages::AxWsOrderReplaced =
+            serde_json::from_str(include_str!("../test_data/ws_order_amended.json")).unwrap();
+        let venue_order_id = VenueOrderId::new(&message.ro.oid);
+        let client_order_id = ClientOrderId::from("O-AMEND");
+        let caches = test_caches();
+        caches.orders_metadata.insert(
+            client_order_id,
+            test_metadata(client_order_id, InstrumentId::from("EURUSD-PERP.AX")),
+        );
+        caches
+            .venue_to_client_id
+            .insert(venue_order_id, client_order_id);
+        let clock = get_atomic_clock_realtime();
+        let account_id = AccountId::from("AX-001");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut emitter = ExecutionEventEmitter::new(
+            clock,
+            TraderId::from("TESTER-001"),
+            account_id,
+            AccountType::Margin,
+            None,
+        );
+        emitter.set_sender(tx);
+        let instruments = AtomicMap::new();
+
+        dispatch_order_event(
+            AxWsOrderEvent::Replaced(message),
+            &emitter,
+            &caches,
+            account_id,
+            &instruments,
+            &AtomicMap::new(),
+            clock,
+        );
+
+        let ExecutionEvent::Order(OrderEventAny::Updated(update)) = rx.try_recv().unwrap() else {
+            panic!("expected update")
+        };
+
+        assert_eq!(update.venue_order_id, Some(venue_order_id));
+        assert_eq!(update.client_order_id, client_order_id);
+        assert_eq!(update.quantity.as_decimal(), dec!(150));
+        assert_eq!(
+            *caches.venue_to_client_id.get(&venue_order_id).unwrap(),
+            client_order_id
+        );
+        assert_eq!(caches.venue_to_client_id.len(), 1);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[case(true, false)]
+    #[case(false, true)]
+    #[case(true, true)]
+    fn test_replacement_rejects_inconsistent_identity(
+        #[case] has_id: bool,
+        #[case] has_order: bool,
+    ) {
+        let mut message: crate::websocket::messages::AxWsOrderReplaced =
+            serde_json::from_str(include_str!("../test_data/ws_order_replaced_live.json")).unwrap();
+        message.noid = has_id.then(|| "MISMATCHED".to_owned());
+
+        if !has_order {
+            message.no = None;
+        }
+
+        assert_eq!(
+            replacement_venue_order_id(&message)
+                .unwrap_err()
+                .to_string(),
+            "Inconsistent AX replacement order identity"
+        );
     }
 }

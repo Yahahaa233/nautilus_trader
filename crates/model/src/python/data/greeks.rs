@@ -67,6 +67,18 @@ impl GreeksData {
         Self::from_delta(instrument_id, delta, multiplier, UnixNanos::from(ts_event))
     }
 
+    /// Returns portfolio values with `pnl`, `price`, and all Greeks scaled by the contract multiplier.
+    ///
+    /// Preserves both timestamps and leaves position quantity scaling to the caller.
+    #[pyo3(name = "to_portfolio_greeks")]
+    fn py_to_portfolio_greeks(&self) -> PortfolioGreeks {
+        self.to_portfolio_greeks()
+    }
+
+    fn __rmul__(&self, scalar: f64) -> PortfolioGreeks {
+        scalar * &self.to_portfolio_greeks()
+    }
+
     #[getter]
     fn ts_init(&self) -> u64 {
         self.ts_init.as_u64()
@@ -182,6 +194,14 @@ impl GreeksData {
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PortfolioGreeks {
+    fn __rmul__(&self, scalar: f64) -> Self {
+        scalar * self
+    }
+
+    fn __add__(&self, other: &Self) -> Self {
+        self.clone() + other.clone()
+    }
+
     #[getter]
     fn ts_init(&self) -> u64 {
         self.ts_init.as_u64()
@@ -289,7 +309,7 @@ pub fn py_black_scholes_greeks(
 ///
 /// # Errors
 ///
-/// Returns a `PyErr` if implied volatility calculation fails.
+/// Returns an error if implied volatility calculation fails.
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.model")]
 #[pyo3(name = "imply_vol")]

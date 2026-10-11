@@ -38,7 +38,7 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
-//! - `defi`: Enables `DeFi` (Decentralized Finance) support.
+//! - `defi`: Enables DeFi (Decentralized Finance) support.
 //! - `extension-module`: Builds as a Python extension module.
 //! - `live`: Enables live trading mode dependencies.
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs) and auto-enables `streaming`.
@@ -76,7 +76,9 @@ pub mod python;
 // Re-exports
 pub use builder::NautilusKernelBuilder;
 pub use clock_factory::ClockFactory;
-pub use config::{NautilusKernelConfig, RotationConfig, StreamingConfig};
+pub use config::NautilusKernelConfig;
+#[cfg(feature = "streaming")]
+pub use config::{RotationConfig, StreamingConfig};
 pub use controller::Controller;
 pub use event_store::{EventStoreFactory, KernelEventStore, RegisteredComponents};
 pub use kernel::NautilusKernel;

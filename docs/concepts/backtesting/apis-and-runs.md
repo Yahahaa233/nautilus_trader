@@ -100,13 +100,17 @@ The high-level API centers on `BacktestNode`. Each `BacktestRunConfig` contains:
 Build the node before adding strategies through its run-specific methods:
 
 ```python
+from decimal import Decimal
+
 from nautilus_trader.config import BacktestDataConfig
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.backtest import BacktestNode
 from nautilus_trader.config import BacktestRunConfig
 from nautilus_trader.config import BacktestVenueConfig
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import BookType
+from nautilus_trader.model import NautilusDataType
 from nautilus_trader.model import OmsType
 
 venue = BacktestVenueConfig(
@@ -115,9 +119,13 @@ venue = BacktestVenueConfig(
     account_type=AccountType.MARGIN,
     book_type=BookType.L1_MBP,
     starting_balances=["1_000_000 USD"],
+    fee_model=MakerTakerFeeModel(
+        maker_rate=Decimal("0"),
+        taker_rate=Decimal("0"),
+    ),
 )
 data = BacktestDataConfig(
-    data_type="QuoteTick",
+    data_type=NautilusDataType.QuoteTick,
     catalog_path="/data/catalog",
     instrument_id=instrument_id,
 )
@@ -134,10 +142,48 @@ node.add_strategy_from_config(config.id, strategy_config)
 results = node.run()
 ```
 
+Fees belong to the venue configuration, not to instruments. Every venue needs an explicit
+`fee_model`, including an explicit zero-rate model for a frictionless baseline. Two accounts can
+trade the same instrument under different schedules without changing the instrument definition.
+
 Set `chunk_size` to a value in `[1, 1_000_000]` to enable streaming. Leave it as `None` to load all
 data at once.
 
 `BacktestNode` also provides methods for adding actors and built-in strategies to a built run.
+
+### Order book delta replay
+
+`BacktestNode` replays `OrderBookDelta` catalog data as `OrderBookDeltas` batches by default, in
+both one-shot and streaming runs. It groups each instrument's deltas in catalog order and closes a
+batch at the delta that carries the `F_LAST` flag, so each batch holds one complete book event. A
+batch takes its flags, sequence, and timestamps from its closing delta and replays at that delta's
+`ts_init`.
+
+Batching changes how the backtest processes book events:
+
+- The matching engine applies a whole event before it matches orders, so an order cannot fill
+  against a book state that exists only partway through an event. Fills can differ from individual
+  delta replay.
+- Strategies receive each event in one `on_book_deltas` callback, even when the data engine's
+  `buffer_deltas` is disabled.
+- In streaming runs, `chunk_size` counts each batch as one replay item, so a chunk can hold more
+  rows than `chunk_size`.
+
+Every event must end with a delta that has `F_LAST` set. If a query ends while an instrument still
+has deltas without a closing `F_LAST` delta, the run fails with an error that names the instrument.
+Time bounds and `filter_expr` select individual rows, so choose them to keep events complete: a
+bound that cuts off the start of an event goes undetected.
+
+Set `batch_deltas=False` to replay each delta individually:
+
+```python
+data = BacktestDataConfig(
+    data_type=NautilusDataType.OrderBookDelta,
+    catalog_path="/data/catalog",
+    instrument_id=instrument_id,
+    batch_deltas=False,
+)
+```
 
 ## Shutdown on error
 

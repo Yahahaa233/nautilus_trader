@@ -105,7 +105,7 @@ pub fn duration_since_unix_epoch() -> Duration {
 /// `tokio::time::Instant` which is monotonic and carries no epoch).
 #[inline(always)]
 #[must_use]
-fn wall_clock_now() -> SystemTime {
+pub fn wall_clock_now() -> SystemTime {
     #[cfg(not(all(feature = "simulation", madsim)))]
     {
         SystemTime::now()
@@ -710,6 +710,16 @@ mod tests {
         assert!(result4 >= result3);
         assert!(result5 >= result4);
         assert!(result1.as_u64() > 1_650_000_000_000_000_000);
+    }
+
+    #[rstest]
+    #[allow(
+        clippy::float_cmp,
+        reason = "1e18 ns and 1e9 s are exactly representable, the division is exact"
+    )]
+    fn test_get_time_static_mode_returns_exact_seconds() {
+        let time = AtomicTime::new(false, UnixNanos::from(1_000_000_000_000_000_000));
+        assert_eq!(time.get_time(), 1_000_000_000.0);
     }
 
     #[rstest]

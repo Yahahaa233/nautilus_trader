@@ -157,6 +157,10 @@ make pytest
 The Makefile target isolates certain test modules in separate pytest processes to avoid
 global Rust state conflicts. Use `make pytest` rather than invoking pytest directly.
 
+`make pytest` runs tests in parallel with pytest-xdist, using one worker per CPU up to 32. Set
+`PYTEST_XDIST_AUTO_NUM_WORKERS` to change the worker count, for example
+`make pytest PYTEST_XDIST_AUTO_NUM_WORKERS=8`.
+
 Local `make pytest` runs use the debug extension from `make build-debug`.
 CI tests a release wheel.
 Do not write `python/tests/` cases that probe Rust panic paths in process with
@@ -341,8 +345,8 @@ existing types are tested, so new types can follow the same pattern.
 
 | Layer                  | Location                                    | What it covers                                             |
 | ---------------------- | ------------------------------------------- | ---------------------------------------------------------- |
-| DataEngine subscribe   | `crates/data/tests/integration/engine.rs`   | Engine processes subscribe/unsubscribe commands correctly. |
-| DataEngine publish     | `crates/data/tests/integration/engine.rs`   | Engine routes published data to the message bus.           |
+| DataEngine subscribe   | `crates/data/tests/integration/engine/`     | Engine processes subscribe/unsubscribe commands correctly. |
+| DataEngine publish     | `crates/data/tests/integration/engine/`     | Engine routes published data to the message bus.           |
 | DataActor subscribe    | `crates/common/src/actor/tests.rs`          | Actor subscribes and receives data via typed publish.      |
 | DataActor unsubscribe  | `crates/common/src/actor/tests.rs`          | Actor stops receiving data after unsubscribe.              |
 | PyO3 actor dispatch    | `crates/common/src/python/actor.rs`         | Rust handler dispatches to Python `on_*` method.           |
@@ -379,7 +383,7 @@ greeks and quote subscriptions. It does not have its own engine subscribe comman
 
 When introducing a new data type, add tests at each layer:
 
-1. **DataEngine** (`crates/data/tests/integration/engine.rs`): Add `test_execute_subscribe_<type>` and
+1. **DataEngine** (`crates/data/tests/integration/engine/`): Add `test_execute_subscribe_<type>` and
    `test_execute_unsubscribe_<type>` tests. Follow the pattern in existing subscribe tests:
    register client, build command, call `engine.execute`, assert subscription list.
 

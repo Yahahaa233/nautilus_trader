@@ -34,7 +34,7 @@ use nautilus_model::defi::{
 use nautilus_model::{
     data::{
         Bar, BarType, CustomData, DataType, FundingRateUpdate, IndexPriceUpdate, InstrumentStatus,
-        MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
         close::InstrumentClose,
         option_chain::{OptionChainSlice, OptionGreeks, StrikeRange},
     },
@@ -62,7 +62,7 @@ use crate::python::msgbus::PyMessageBusScope;
 use crate::{
     cache::{Cache, CacheApi},
     clock::{Clock, ClockApi},
-    component::Component,
+    component::{Component, ComponentAccessError},
     enums::{ComponentState, ComponentTrigger},
     logging::{CMD, RECV, REQ, SEND},
     messages::{
@@ -72,12 +72,12 @@ use crate::{
             QuotesResponse, RequestBars, RequestBookDeltas, RequestBookDepth, RequestBookSnapshot,
             RequestCommand, RequestCustomData, RequestFundingRates, RequestInstrument,
             RequestInstruments, RequestQuotes, RequestTrades, SubscribeBars, SubscribeBookDeltas,
-            SubscribeBookDepth10, SubscribeBookSnapshots, SubscribeCommand, SubscribeCustomData,
+            SubscribeBookDepth, SubscribeBookSnapshots, SubscribeCommand, SubscribeCustomData,
             SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
             SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments,
             SubscribeMarkPrices, SubscribeOptionChain, SubscribeOptionGreeks, SubscribeQuotes,
             SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
-            UnsubscribeBookDepth10, UnsubscribeBookSnapshots, UnsubscribeCommand,
+            UnsubscribeBookDepth, UnsubscribeBookSnapshots, UnsubscribeCommand,
             UnsubscribeCustomData, UnsubscribeFundingRates, UnsubscribeIndexPrices,
             UnsubscribeInstrument, UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus,
             UnsubscribeInstruments, UnsubscribeMarkPrices, UnsubscribeOptionChain,
@@ -89,11 +89,12 @@ use crate::{
         self, MStr, Pattern, ShareableMessageHandler, Topic, TypedHandler, get_message_bus,
         switchboard::{
             MessagingSwitchboard, get_bars_topic, get_book_deltas_pattern, get_book_deltas_topic,
-            get_book_depth10_pattern, get_book_depth10_topic, get_book_snapshots_topic,
-            get_custom_topic, get_funding_rate_topic, get_index_price_topic,
-            get_instrument_close_topic, get_instrument_status_topic, get_instrument_topic,
-            get_instruments_pattern, get_mark_price_topic, get_option_chain_topic,
-            get_option_greeks_topic, get_quotes_topic, get_signal_pattern, get_trades_topic,
+            get_book_depth_pattern, get_book_depth_topic, get_book_snapshots_topic,
+            get_custom_subscription_topics, get_custom_topic, get_funding_rate_topic,
+            get_index_price_topic, get_instrument_close_topic, get_instrument_status_topic,
+            get_instrument_topic, get_instruments_pattern, get_mark_price_topic,
+            get_option_chain_topic, get_option_greeks_topic, get_quotes_topic, get_signal_pattern,
+            get_trades_topic,
         },
     },
     runner::SystemChannel,
@@ -183,18 +184,29 @@ pub trait DataActorNative {
     ///
     /// # Panics
     ///
-    /// Panics if the actor has not been registered with a trader.
+    /// Panics if the actor is unregistered or the clock is already borrowed.
     fn clock_mut(&mut self) -> RefMut<'_, dyn Clock> {
-        let core = self.core_mut();
-        core.clock
+        self.try_clock_mut().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Returns a mutable clock borrow without panicking on an access conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is unregistered or the clock is already borrowed.
+    fn try_clock_mut(&mut self) -> Result<RefMut<'_, dyn Clock>, ComponentAccessError> {
+        self.core_mut()
+            .clock
             .as_ref()
-            .unwrap_or_else(|| {
-                panic!(
-                    "DataActor {} must be registered before calling `clock_mut()` - trader_id: {:?}",
-                    core.actor_id, core.trader_id
-                )
+            .ok_or(ComponentAccessError::NotRegistered {
+                resource: "clock",
+                operation: "clock_mut",
+            })?
+            .try_borrow_mut()
+            .map_err(|_| ComponentAccessError::WriteConflict {
+                resource: "clock",
+                operation: "clock_mut",
             })
-            .borrow_mut()
     }
 
     /// Returns a clone of the reference-counted clock.
@@ -214,13 +226,29 @@ pub trait DataActorNative {
     ///
     /// # Panics
     ///
-    /// Panics if the actor has not yet been registered.
+    /// Panics if the actor is unregistered or the cache is already mutably borrowed.
     fn cache_ref(&self) -> Ref<'_, Cache> {
+        self.try_cache_ref().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Returns a cache borrow without panicking on an access conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor is unregistered or the cache is already mutably borrowed.
+    fn try_cache_ref(&self) -> Result<Ref<'_, Cache>, ComponentAccessError> {
         self.core()
             .cache
             .as_ref()
-            .expect("DataActor must be registered before accessing cache")
-            .borrow()
+            .ok_or(ComponentAccessError::NotRegistered {
+                resource: "cache",
+                operation: "cache_ref",
+            })?
+            .try_borrow()
+            .map_err(|_| ComponentAccessError::ReadConflict {
+                resource: "cache",
+                operation: "cache_ref",
+            })
     }
 
     /// Returns a clone of the reference-counted cache.
@@ -308,7 +336,7 @@ pub trait DataActor {
     ///
     /// # Panics
     ///
-    /// Panics when a callback-scoped binding is used outside an active callback.
+    /// Panics if a callback-scoped binding is used outside an active callback.
     fn actor_id(&self) -> ActorId
     where
         Self: DataActorBinding,
@@ -512,13 +540,13 @@ pub trait DataActor {
         Ok(())
     }
 
-    /// Actions to be performed when receiving an order book depth10 snapshot.
+    /// Actions to be performed when receiving an order book depth snapshot.
     ///
     /// # Errors
     ///
     /// Returns an error if handling the book depth fails.
     #[allow(unused_variables)]
-    fn on_book_depth(&mut self, depth: &OrderBookDepth10) -> anyhow::Result<()> {
+    fn on_book_depth(&mut self, depth: &OrderBookDepth) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -727,7 +755,7 @@ pub trait DataActor {
     ///
     /// Returns an error if handling the historical book depth fails.
     #[allow(unused_variables)]
-    fn on_historical_book_depth(&mut self, depths: &[OrderBookDepth10]) -> anyhow::Result<()> {
+    fn on_historical_book_depth(&mut self, depths: &[OrderBookDepth]) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1159,8 +1187,8 @@ pub trait DataActor {
         }
     }
 
-    /// Handles a received order book depth10 snapshot.
-    fn handle_book_depth(&mut self, depth: &OrderBookDepth10)
+    /// Handles a received order book depth snapshot.
+    fn handle_book_depth(&mut self, depth: &OrderBookDepth)
     where
         Self: Component,
     {
@@ -2708,15 +2736,19 @@ pub trait DataActor {
         );
     }
 
-    /// Subscribe to streaming [`OrderBookDepth10`] data for the `instrument_id`.
+    /// Subscribe to streaming [`OrderBookDepth`] data for the `instrument_id`.
+    ///
+    /// `depth` limits the number of levels per side; `None` uses the adapter default.
+    /// Venue channel limits still apply.
     ///
     /// When `managed` is true, the data engine maintains an [`OrderBook`] in the cache for each
     /// instrument the subscription resolves to, applying each update as it arrives.
     /// A parent subscription resolves to every matching underlying instrument.
-    fn subscribe_book_depth10(
+    fn subscribe_book_depth(
         &mut self,
         instrument_id: InstrumentId,
         book_type: BookType,
+        depth: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
         managed: bool,
         params: Option<Params>,
@@ -2726,12 +2758,12 @@ pub trait DataActor {
     {
         let actor_id = self.core().actor_id().inner();
         let pattern = if is_parent_subscription(params.as_ref()) {
-            get_book_depth10_pattern(instrument_id)
+            get_book_depth_pattern(instrument_id)
         } else {
-            get_book_depth10_topic(instrument_id).into()
+            get_book_depth_topic(instrument_id).into()
         };
 
-        let handler = TypedHandler::from(move |depth: &OrderBookDepth10| {
+        let handler = TypedHandler::from(move |depth: &OrderBookDepth| {
             if !super::recovery_observation::callback_admitted(&actor_id) {
                 return;
             }
@@ -2742,12 +2774,13 @@ pub trait DataActor {
             }
         });
 
-        DataActorCore::subscribe_book_depth10(
+        DataActorCore::subscribe_book_depth(
             self.core_mut(),
             pattern,
             handler,
             instrument_id,
             book_type,
+            depth,
             client_id,
             managed,
             params,
@@ -3387,8 +3420,8 @@ pub trait DataActor {
         DataActorCore::unsubscribe_book_deltas(self.core_mut(), instrument_id, client_id, params);
     }
 
-    /// Unsubscribe from streaming [`OrderBookDepth10`] data for the `instrument_id`.
-    fn unsubscribe_book_depth10(
+    /// Unsubscribe from streaming [`OrderBookDepth`] data for the `instrument_id`.
+    fn unsubscribe_book_depth(
         &mut self,
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
@@ -3397,7 +3430,7 @@ pub trait DataActor {
         Self: DataActorNative,
         Self: 'static + Debug + Sized,
     {
-        DataActorCore::unsubscribe_book_depth10(self.core_mut(), instrument_id, client_id, params);
+        DataActorCore::unsubscribe_book_depth(self.core_mut(), instrument_id, client_id, params);
     }
 
     /// Unsubscribe from [`OrderBook`] snapshots at a specified interval for the `instrument_id`.
@@ -3857,7 +3890,7 @@ pub trait DataActor {
         )
     }
 
-    /// Request historical [`OrderBookDepth10`] data for the given `instrument_id`.
+    /// Request historical [`OrderBookDepth`] data for the given `instrument_id`.
     ///
     /// # Errors
     ///
@@ -4216,7 +4249,7 @@ pub struct DataActorCore {
     topic_handlers: AHashMap<MStr<Pattern>, Subscription<ShareableMessageHandler>>,
     instrument_handlers: AHashMap<MStr<Pattern>, Subscription<TypedHandler<InstrumentAny>>>,
     deltas_handlers: AHashMap<MStr<Pattern>, Subscription<TypedHandler<OrderBookDeltas>>>,
-    depth10_handlers: AHashMap<MStr<Pattern>, Subscription<TypedHandler<OrderBookDepth10>>>,
+    depth_handlers: AHashMap<MStr<Pattern>, Subscription<TypedHandler<OrderBookDepth>>>,
     book_handlers: AHashMap<MStr<Topic>, Subscription<TypedHandler<OrderBook>>>,
     quote_handlers: AHashMap<MStr<Topic>, Subscription<TypedHandler<QuoteTick>>>,
     trade_handlers: AHashMap<MStr<Topic>, Subscription<TypedHandler<TradeTick>>>,
@@ -4523,36 +4556,36 @@ impl DataActorCore {
         subscription.command
     }
 
-    pub(crate) fn add_depth10_subscription(
+    pub(crate) fn add_depth_subscription(
         &mut self,
         pattern: MStr<Pattern>,
-        handler: TypedHandler<OrderBookDepth10>,
+        handler: TypedHandler<OrderBookDepth>,
         command: DataCommand,
     ) -> bool {
-        if self.depth10_handlers.contains_key(&pattern) {
+        if self.depth_handlers.contains_key(&pattern) {
             log::warn!(
-                "Actor {} attempted duplicate depth10 subscription to '{pattern}'",
+                "Actor {} attempted duplicate depth subscription to '{pattern}'",
                 self.actor_id
             );
             return false;
         }
-        self.depth10_handlers.insert(
+        self.depth_handlers.insert(
             pattern,
             Subscription {
                 handler: handler.clone(),
                 command: Some(command),
             },
         );
-        msgbus::subscribe_book_depth10(pattern, handler, None);
+        msgbus::subscribe_book_depth(pattern, handler, None);
         true
     }
 
-    pub(crate) fn remove_depth10_subscription(
+    pub(crate) fn remove_depth_subscription(
         &mut self,
         pattern: MStr<Pattern>,
     ) -> Option<DataCommand> {
-        let subscription = self.depth10_handlers.remove(&pattern)?;
-        msgbus::unsubscribe_book_depth10(pattern, &subscription.handler);
+        let subscription = self.depth_handlers.remove(&pattern)?;
+        msgbus::unsubscribe_book_depth(pattern, &subscription.handler);
         subscription.command
     }
 
@@ -5087,9 +5120,9 @@ impl DataActorCore {
             msgbus::unsubscribe_book_deltas,
         );
         Self::drain_subscriptions(
-            std::mem::take(&mut self.depth10_handlers),
+            std::mem::take(&mut self.depth_handlers),
             &mut commands,
-            msgbus::unsubscribe_book_depth10,
+            msgbus::unsubscribe_book_depth,
         );
         Self::drain_subscriptions(
             std::mem::take(&mut self.book_handlers),
@@ -5216,7 +5249,7 @@ impl DataActorCore {
             topic_handlers: AHashMap::new(),
             instrument_handlers: AHashMap::new(),
             deltas_handlers: AHashMap::new(),
-            depth10_handlers: AHashMap::new(),
+            depth_handlers: AHashMap::new(),
             book_handlers: AHashMap::new(),
             quote_handlers: AHashMap::new(),
             trade_handlers: AHashMap::new(),
@@ -5640,7 +5673,14 @@ impl DataActorCore {
             self.cache.is_some()
         );
 
-        let topic = get_custom_topic(&data_type);
+        let mut topics = get_custom_subscription_topics(&data_type);
+        let Some(topic) = topics.pop() else {
+            return;
+        };
+
+        for alias in topics {
+            self.add_subscription_any(alias, handler.clone(), None, None);
+        }
 
         // If no client ID specified, just subscribe to the topic
         if client_id.is_none() {
@@ -5841,34 +5881,35 @@ impl DataActorCore {
         }
     }
 
-    /// Subscribes the actor to book depth10.
+    /// Subscribes the actor to book depth.
     #[expect(clippy::too_many_arguments)]
-    pub fn subscribe_book_depth10(
+    pub fn subscribe_book_depth(
         &mut self,
         pattern: MStr<Pattern>,
-        handler: TypedHandler<OrderBookDepth10>,
+        handler: TypedHandler<OrderBookDepth>,
         instrument_id: InstrumentId,
         book_type: BookType,
+        depth: Option<NonZeroUsize>,
         client_id: Option<ClientId>,
         managed: bool,
         params: Option<Params>,
     ) {
         self.check_registered();
 
-        let command = DataCommand::Subscribe(SubscribeCommand::BookDepth10(SubscribeBookDepth10 {
+        let command = DataCommand::Subscribe(SubscribeCommand::BookDepth(SubscribeBookDepth {
             instrument_id,
             book_type,
             client_id,
             venue: Some(instrument_id.venue),
             command_id: crate::recovery_trace::native_event_uuid(),
             ts_init: self.timestamp_ns(),
-            depth: NonZeroUsize::new(10),
+            depth,
             managed,
             correlation_id: None,
             params,
         }));
 
-        if self.add_depth10_subscription(pattern, handler, command.clone()) {
+        if self.add_depth_subscription(pattern, handler, command.clone()) {
             self.send_data_cmd(command);
         }
     }
@@ -6174,8 +6215,13 @@ impl DataActorCore {
     ) {
         self.check_registered();
 
-        let topic = get_custom_topic(&data_type);
-        let retained = self.remove_subscription_any(topic);
+        let mut retained = None;
+
+        for topic in get_custom_subscription_topics(&data_type) {
+            if let Some(command) = self.remove_subscription_any(topic) {
+                retained = Some(command);
+            }
+        }
 
         if client_id.is_none() && retained.is_none() {
             return;
@@ -6319,8 +6365,8 @@ impl DataActorCore {
         self.send_unsubscribe_cmd(retained, DataCommand::Unsubscribe(command));
     }
 
-    /// Unsubscribes the actor from book depth10 snapshots.
-    pub fn unsubscribe_book_depth10(
+    /// Unsubscribes the actor from book depth snapshots.
+    pub fn unsubscribe_book_depth(
         &mut self,
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
@@ -6329,13 +6375,13 @@ impl DataActorCore {
         self.check_registered();
 
         let pattern = if is_parent_subscription(params.as_ref()) {
-            get_book_depth10_pattern(instrument_id)
+            get_book_depth_pattern(instrument_id)
         } else {
-            get_book_depth10_topic(instrument_id).into()
+            get_book_depth_topic(instrument_id).into()
         };
-        let retained = self.remove_depth10_subscription(pattern);
+        let retained = self.remove_depth_subscription(pattern);
 
-        let command = UnsubscribeCommand::BookDepth10(UnsubscribeBookDepth10 {
+        let command = UnsubscribeCommand::BookDepth(UnsubscribeBookDepth {
             instrument_id,
             client_id,
             venue: Some(instrument_id.venue),
@@ -7087,8 +7133,8 @@ impl DataActorCore {
     }
 
     #[cfg(test)]
-    pub fn depth10_handler_count(&self) -> usize {
-        self.depth10_handlers.len()
+    pub fn depth_handler_count(&self) -> usize {
+        self.depth_handlers.len()
     }
 
     #[cfg(test)]
@@ -7115,8 +7161,8 @@ impl DataActorCore {
     }
 
     #[cfg(test)]
-    pub fn has_depth10_handler(&self, pattern: &str) -> bool {
-        self.depth10_handlers
+    pub fn has_depth_handler(&self, pattern: &str) -> bool {
+        self.depth_handlers
             .contains_key(&MStr::<Pattern>::from(pattern))
     }
 }

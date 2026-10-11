@@ -91,7 +91,7 @@ impl AccountBalance {
     ///
     /// # Errors
     ///
-    /// Returns a `PyErr` if parsing or conversion fails.
+    /// Returns an error if parsing or conversion fails.
     #[staticmethod]
     #[pyo3(name = "from_dict")]
     pub fn py_from_dict(values: &Bound<'_, PyDict>) -> PyResult<Self> {
@@ -121,7 +121,7 @@ impl AccountBalance {
     ///
     /// # Errors
     ///
-    /// Returns a `PyErr` if serialization fails.
+    /// Returns an error if serialization fails.
     #[pyo3(name = "to_dict")]
     pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
@@ -131,7 +131,7 @@ impl AccountBalance {
             format!(
                 "{:.*}",
                 self.total.currency.precision as usize,
-                self.total.as_f64()
+                self.total.as_decimal()
             ),
         )?;
         dict.set_item(
@@ -139,7 +139,7 @@ impl AccountBalance {
             format!(
                 "{:.*}",
                 self.locked.currency.precision as usize,
-                self.locked.as_f64()
+                self.locked.as_decimal()
             ),
         )?;
         dict.set_item(
@@ -147,7 +147,7 @@ impl AccountBalance {
             format!(
                 "{:.*}",
                 self.free.currency.precision as usize,
-                self.free.as_f64()
+                self.free.as_decimal()
             ),
         )?;
         dict.set_item("currency", self.currency.code.to_string())?;
@@ -229,7 +229,7 @@ impl MarginBalance {
     ///
     /// # Errors
     ///
-    /// Returns a `PyErr` if parsing or conversion fails.
+    /// Returns an error if parsing or conversion fails.
     #[staticmethod]
     #[pyo3(name = "from_dict")]
     pub fn py_from_dict(values: &Bound<'_, PyDict>) -> PyResult<Self> {
@@ -262,7 +262,7 @@ impl MarginBalance {
     ///
     /// # Errors
     ///
-    /// Returns a `PyErr` if serialization fails.
+    /// Returns an error if serialization fails.
     #[pyo3(name = "to_dict")]
     pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
@@ -272,7 +272,7 @@ impl MarginBalance {
             format!(
                 "{:.*}",
                 self.initial.currency.precision as usize,
-                self.initial.as_f64()
+                self.initial.as_decimal()
             ),
         )?;
         dict.set_item(
@@ -280,7 +280,7 @@ impl MarginBalance {
             format!(
                 "{:.*}",
                 self.maintenance.currency.precision as usize,
-                self.maintenance.as_f64()
+                self.maintenance.as_decimal()
             ),
         )?;
         dict.set_item("currency", self.currency.code.to_string())?;

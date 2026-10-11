@@ -46,6 +46,7 @@ where
         );
     }
 
+    #[cfg(all(feature = "node", feature = "dispatch-observer"))]
     pub(crate) fn checkpoint_entries(
         &self,
         at: dst::time::Instant,
@@ -61,6 +62,7 @@ where
             .collect()
     }
 
+    #[cfg(all(feature = "node", feature = "dispatch-observer"))]
     pub(crate) fn from_checkpoint(
         entries: Vec<(K, u64)>,
         at: dst::time::Instant,

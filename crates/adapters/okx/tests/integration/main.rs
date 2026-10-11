@@ -18,10 +18,12 @@
     reason = "integration tests combine arrange-act-assert flows that exceed the default threshold"
 )]
 
+mod book_lifecycle;
 mod data_client;
 mod dst;
 mod exec_client;
 mod http;
 mod leverage;
+mod node;
 mod python;
 mod websocket;

@@ -27,7 +27,7 @@
 //! - Handlers implement `Handler<T>`, receive `&T` directly.
 //! - No runtime type checking enables inlining and static dispatch.
 //! - Built-in routers: `QuoteTick`, `TradeTick`, `Bar`, `OrderBookDeltas`,
-//!   `OrderBookDepth10`, `OrderEventAny`, `PositionEvent`, `AccountState`.
+//!   `OrderBookDepth`, `OrderEventAny`, `PositionEvent`, `AccountState`.
 //!
 //! **Any-based routing** provides flexibility for extensibility:
 //! - `subscriptions`/`topics` maps with `ShareableMessageHandler`.
@@ -98,7 +98,7 @@ use nautilus_core::UUID4;
 use nautilus_model::{
     data::{
         Bar, Data, FundingRateUpdate, GreeksData, IndexPriceUpdate, MarkPriceUpdate,
-        OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
         option_chain::{OptionChainSlice, OptionGreeks},
     },
     events::{AccountState, OrderEventAny, PortfolioSnapshot, PositionEvent},
@@ -241,7 +241,7 @@ pub struct MessageBus {
     pub(crate) router_trades: TopicRouter<TradeTick>,
     pub(crate) router_bars: TopicRouter<Bar>,
     pub(crate) router_deltas: TopicRouter<OrderBookDeltas>,
-    pub(crate) router_depth10: TopicRouter<OrderBookDepth10>,
+    pub(crate) router_depth: TopicRouter<OrderBookDepth>,
     pub(crate) router_book_snapshots: TopicRouter<OrderBook>,
     pub(crate) router_mark_prices: TopicRouter<MarkPriceUpdate>,
     pub(crate) router_index_prices: TopicRouter<IndexPriceUpdate>,
@@ -337,7 +337,7 @@ impl MessageBus {
             router_trades: TopicRouter::new(),
             router_bars: TopicRouter::new(),
             router_deltas: TopicRouter::new(),
-            router_depth10: TopicRouter::new(),
+            router_depth: TopicRouter::new(),
             router_book_snapshots: TopicRouter::new(),
             router_mark_prices: TopicRouter::new(),
             router_index_prices: TopicRouter::new(),
@@ -448,7 +448,7 @@ impl MessageBus {
     ///
     /// # Errors
     ///
-    /// Returns a [`crate::config::ConfigError`] if the config selects an unsupported encoding.
+    /// Returns an error if the config selects an unsupported encoding.
     pub fn set_external_egress_config(
         &mut self,
         external_egress: Box<dyn MessageBusExternalEgress>,
@@ -558,7 +558,7 @@ impl MessageBus {
         self.router_trades.clear();
         self.router_bars.clear();
         self.router_deltas.clear();
-        self.router_depth10.clear();
+        self.router_depth.clear();
         self.router_book_snapshots.clear();
         self.router_mark_prices.clear();
         self.router_index_prices.clear();
@@ -740,9 +740,11 @@ impl MessageBus {
 
     /// Close the message bus which will close the sender channel and join the thread.
     ///
-    /// # Errors
-    ///
-    /// This function never returns an error (TBD once backing database added).
+    /// This function does not return an error.
+    #[allow(
+        clippy::missing_errors_doc,
+        reason = "closing the in-memory message bus returns no errors"
+    )]
     pub fn close(&mut self) -> anyhow::Result<()> {
         if let Some(external_egress) = self.external_egress.take() {
             external_egress.borrow_mut().close();

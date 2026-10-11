@@ -61,7 +61,7 @@
 
 #[cfg(feature = "native-tail-replay")]
 use anyhow::Context;
-
+use nautilus_common::live::ingress::{FrozenIngress, IngressGate, IngressSender};
 use std::{
     fmt::Debug,
     sync::{
@@ -70,12 +70,14 @@ use std::{
     },
 };
 
-use nautilus_common::live::ingress::{FrozenIngress, IngressGate, IngressSender};
-
 use nautilus_common::{
-    live::runner::{
-        replace_data_event_sender, replace_exec_event_sender, replace_system_command_sender,
-        replace_system_event_sender,
+    live::{
+        dispatch::DispatchMessage,
+        runner::{
+            replace_data_event_sender, replace_exec_event_sender, replace_system_command_sender,
+            replace_system_event_sender,
+        },
+        sender::{DispatchSender, EventSender},
     },
     messages::{
         DataEvent, ExecutionEvent, ExecutionReport, SystemCommand, SystemEvent, data::DataCommand,
@@ -90,20 +92,24 @@ use nautilus_common::{
 };
 use nautilus_model::events::OrderEventAny;
 
+use crate::dispatch::drain_callbacks;
 #[cfg(feature = "node")]
 use crate::node::{LiveNodeHandle, NodeState};
 
 /// Asynchronous implementation of `DataCommandSender` for live environments.
 #[derive(Debug)]
 pub struct AsyncDataCommandSender {
-    cmd_tx: IngressSender<DataCommand>,
+    cmd_tx: DispatchSender<DataCommand>,
     #[cfg(feature = "node")]
     node_handle: Option<LiveNodeHandle>,
 }
 
 impl AsyncDataCommandSender {
+    /// Creates a sender owned by the calling thread.
+    ///
+    /// Construct it on the runtime thread so command sends capture callback roots.
     #[must_use]
-    pub fn new(cmd_tx: impl Into<IngressSender<DataCommand>>) -> Self {
+    pub fn new(cmd_tx: impl Into<DispatchSender<DataCommand>>) -> Self {
         let cmd_tx = cmd_tx.into();
         Self {
             cmd_tx,
@@ -138,14 +144,16 @@ impl DataCommandSender for AsyncDataCommandSender {
 /// Asynchronous implementation of `TimeEventSender` for live environments.
 #[derive(Debug, Clone)]
 pub struct AsyncTimeEventSender {
-    time_tx: IngressSender<TimeEventMessage>,
+    time_tx: DispatchSender<TimeEventMessage>,
 }
 
 impl AsyncTimeEventSender {
+    /// Creates a sender owned by the calling runtime thread.
     #[must_use]
-    pub fn new(time_tx: impl Into<IngressSender<TimeEventMessage>>) -> Self {
-        let time_tx = time_tx.into();
-        Self { time_tx }
+    pub fn new(time_tx: impl Into<DispatchSender<TimeEventMessage>>) -> Self {
+        Self {
+            time_tx: time_tx.into(),
+        }
     }
 }
 
@@ -164,14 +172,18 @@ impl TimeEventSender for AsyncTimeEventSender {
 /// Asynchronous implementation of `TradingCommandSender` for live environments.
 #[derive(Debug)]
 pub struct AsyncTradingCommandSender {
-    cmd_tx: IngressSender<TradingCommandMessage>,
+    cmd_tx: DispatchSender<TradingCommandMessage>,
 }
 
 impl AsyncTradingCommandSender {
+    /// Creates a sender owned by the calling thread.
+    ///
+    /// Construct it on the runtime thread so command sends capture callback roots.
     #[must_use]
-    pub fn new(cmd_tx: impl Into<IngressSender<TradingCommandMessage>>) -> Self {
-        let cmd_tx = cmd_tx.into();
-        Self { cmd_tx }
+    pub fn new(cmd_tx: impl Into<DispatchSender<TradingCommandMessage>>) -> Self {
+        Self {
+            cmd_tx: cmd_tx.into(),
+        }
     }
 }
 
@@ -203,13 +215,13 @@ pub trait Runner {
 /// the event loop directly on the same thread as the msgbus endpoints.
 #[derive(Debug)]
 pub struct AsyncRunnerChannels {
-    pub time_evt_rx: SnapshotReceiver<TimeEventMessage>,
-    pub system_evt_rx: SnapshotReceiver<SystemEvent>,
-    pub system_cmd_rx: SnapshotReceiver<SystemCommand>,
-    pub exec_evt_rx: SnapshotReceiver<ExecutionEvent>,
-    pub exec_cmd_rx: SnapshotReceiver<TradingCommandMessage>,
-    pub data_evt_rx: SnapshotReceiver<DataEvent>,
-    pub data_cmd_rx: SnapshotReceiver<DataCommand>,
+    pub time_evt_rx: SnapshotReceiver<DispatchMessage<TimeEventMessage>>,
+    pub system_evt_rx: SnapshotReceiver<DispatchMessage<SystemEvent>>,
+    pub system_cmd_rx: SnapshotReceiver<DispatchMessage<SystemCommand>>,
+    pub exec_evt_rx: SnapshotReceiver<DispatchMessage<ExecutionEvent>>,
+    pub exec_cmd_rx: SnapshotReceiver<DispatchMessage<TradingCommandMessage>>,
+    pub data_evt_rx: SnapshotReceiver<DispatchMessage<DataEvent>>,
+    pub data_cmd_rx: SnapshotReceiver<DispatchMessage<DataCommand>>,
 }
 
 #[cfg(feature = "node")]
@@ -218,27 +230,27 @@ pub struct AsyncRunnerChannels {
     reason = "runner events are consumed immediately; boxing would add routing allocations"
 )]
 pub(crate) enum PendingRunnerEvent {
-    TimeEvent(TimeEventMessage),
-    SystemEvent(SystemEvent),
-    SystemCommand(SystemCommand),
-    ExecEvent(ExecutionEvent),
-    ExecCommand(TradingCommandMessage),
-    DataEvent(DataEvent),
-    DataCommand(DataCommand),
+    TimeEvent(DispatchMessage<TimeEventMessage>),
+    SystemEvent(DispatchMessage<SystemEvent>),
+    SystemCommand(DispatchMessage<SystemCommand>),
+    ExecEvent(DispatchMessage<ExecutionEvent>),
+    ExecCommand(DispatchMessage<TradingCommandMessage>),
+    DataEvent(DispatchMessage<DataEvent>),
+    DataCommand(DispatchMessage<DataCommand>),
 }
 
 pub struct AsyncRunner {
     ingress: IngressGate,
     channels: AsyncRunnerChannels,
-    time_evt_tx: IngressSender<TimeEventMessage>,
-    system_evt_tx: IngressSender<SystemEvent>,
-    system_cmd_tx: IngressSender<SystemCommand>,
+    time_evt_tx: IngressSender<DispatchMessage<TimeEventMessage>>,
+    system_evt_tx: IngressSender<DispatchMessage<SystemEvent>>,
+    system_cmd_tx: IngressSender<DispatchMessage<SystemCommand>>,
     signal_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     signal_tx: tokio::sync::mpsc::UnboundedSender<()>,
-    exec_evt_tx: IngressSender<ExecutionEvent>,
-    exec_cmd_tx: IngressSender<TradingCommandMessage>,
-    data_evt_tx: IngressSender<DataEvent>,
-    data_cmd_tx: IngressSender<DataCommand>,
+    exec_evt_tx: IngressSender<DispatchMessage<ExecutionEvent>>,
+    exec_cmd_tx: IngressSender<DispatchMessage<TradingCommandMessage>>,
+    data_evt_tx: IngressSender<DispatchMessage<DataEvent>>,
+    data_cmd_tx: IngressSender<DispatchMessage<DataCommand>>,
     recovery_handoff_available: Arc<AtomicBool>,
     recovery_progress: crate::runner_recovery::RunnerRecoveryProgressHandle,
 }
@@ -274,19 +286,56 @@ impl Debug for AsyncRunner {
 
 /// Borrowed receiver inventory owned by the running node loop. This cannot be
 /// constructed by an application and cannot replace the actual channel receivers.
-#[cfg(feature = "node")]
+#[cfg(all(feature = "node", feature = "dispatch-observer"))]
 pub(crate) struct RunningReceivers<'a> {
-    pub time_evt_rx: &'a mut SnapshotReceiver<TimeEventMessage>,
-    pub system_evt_rx: &'a mut SnapshotReceiver<SystemEvent>,
-    pub system_cmd_rx: &'a mut SnapshotReceiver<SystemCommand>,
-    pub exec_evt_rx: &'a mut SnapshotReceiver<ExecutionEvent>,
-    pub exec_cmd_rx: &'a mut SnapshotReceiver<TradingCommandMessage>,
-    pub data_evt_rx: &'a mut SnapshotReceiver<DataEvent>,
-    pub data_cmd_rx: &'a mut SnapshotReceiver<DataCommand>,
+    pub time_evt_rx: &'a mut SnapshotReceiver<DispatchMessage<TimeEventMessage>>,
+    pub system_evt_rx: &'a mut SnapshotReceiver<DispatchMessage<SystemEvent>>,
+    pub system_cmd_rx: &'a mut SnapshotReceiver<DispatchMessage<SystemCommand>>,
+    pub exec_evt_rx: &'a mut SnapshotReceiver<DispatchMessage<ExecutionEvent>>,
+    pub exec_cmd_rx: &'a mut SnapshotReceiver<DispatchMessage<TradingCommandMessage>>,
+    pub data_evt_rx: &'a mut SnapshotReceiver<DispatchMessage<DataEvent>>,
+    pub data_cmd_rx: &'a mut SnapshotReceiver<DispatchMessage<DataCommand>>,
 }
 
-#[cfg(feature = "node")]
+#[cfg(all(feature = "node", feature = "dispatch-observer"))]
 impl RunningReceivers<'_> {
+    pub(crate) fn callback_ancestry(
+        &self,
+    ) -> anyhow::Result<crate::runner_recovery::RunnerCallbackAncestry> {
+        let mut contexts = Vec::new();
+        let mut receipts = Vec::new();
+        macro_rules! capture {
+            ($field:ident) => {
+                #[cfg(feature = "native-tail-replay")]
+                let members = self.$field.pending().zip(self.$field.pending_receipts());
+                #[cfg(not(feature = "native-tail-replay"))]
+                let members = self.$field.pending().map(|message| {
+                    (
+                        message,
+                        None::<&nautilus_common::recovery_trace::NativeIngressReceipt>,
+                    )
+                });
+                for (message, receipt) in members {
+                    contexts.push(message.checkpoint_context());
+                    receipts.push(receipt.cloned());
+                }
+            };
+        }
+        capture!(time_evt_rx);
+        capture!(system_evt_rx);
+        capture!(system_cmd_rx);
+        capture!(exec_evt_rx);
+        capture!(exec_cmd_rx);
+        capture!(data_evt_rx);
+        capture!(data_cmd_rx);
+        let state = nautilus_common::actor::capture_channel_contexts(&contexts)?;
+        Ok(crate::runner_recovery::RunnerCallbackAncestry {
+            profile: crate::runner_recovery::CALLBACK_ANCESTRY_PROFILE.into(),
+            receipts,
+            state,
+        })
+    }
+
     pub(crate) fn reborrow(&mut self) -> RunningReceivers<'_> {
         RunningReceivers {
             time_evt_rx: self.time_evt_rx,
@@ -363,7 +412,7 @@ impl RunningReceivers<'_> {
                 for (message, receipt) in self.$field.pending().zip(self.$field.pending_receipts()) {
                     let receipt = receipt.context("actual staged input has no native receipt")?.clone();
                     anyhow::ensure!(receipt.input_source == NativeInputSource::$source, "native staged channel changed");
-                    let any: &dyn std::any::Any = message;
+                    let any: &dyn std::any::Any = message.message();
                     let callback_binding = any.downcast_ref::<TimeEventMessage>().map(TimeEventMessage::native_input_callback_binding);
                     let timer_event = any.downcast_ref::<TimeEventMessage>().map(|message| {
                         let event = message.event(); serde_json::json!({"name":event.name,"event_id":event.event_id,"ts_event":event.ts_event,"ts_init":event.ts_init})
@@ -397,7 +446,7 @@ impl RunningReceivers<'_> {
                 for (ordinal, message) in self.$field.pending().enumerate() {
                     guard.verify()?;
                     entries.push(registry.encode(
-                        crate::runner_recovery::RunnerRecoveryEventRef::$variant(message),
+                        crate::runner_recovery::RunnerRecoveryEventRef::$variant(message.message()),
                         u64::try_from(ordinal)?,
                     )?);
                     guard.verify()?;
@@ -412,7 +461,12 @@ impl RunningReceivers<'_> {
         capture!(data_evt_rx, DataEvent);
         capture!(data_cmd_rx, DataCommand);
         guard.verify()?;
-        Ok(crate::runner_recovery::RunnerPendingSnapshot { entries })
+        let callback_ancestry = Some(self.callback_ancestry()?);
+        guard.verify()?;
+        Ok(crate::runner_recovery::RunnerPendingSnapshot {
+            entries,
+            callback_ancestry,
+        })
     }
 }
 
@@ -423,26 +477,27 @@ impl AsyncRunner {
     /// Call [`bind_senders`](Self::bind_senders) before creating clients that
     /// read from TLS, and again before entering the event loop.
     #[must_use]
+    #[rustfmt::skip]
     pub fn new() -> Self {
         use tokio::sync::mpsc::unbounded_channel; // tokio-import-ok
 
         let ingress = IngressGate::new();
         use nautilus_common::recovery_trace::NativeInputSource;
         let (time_evt_tx, time_evt_rx) =
-            ingress.native_channel::<TimeEventMessage>(NativeInputSource::Time);
+            ingress.native_channel::<DispatchMessage<TimeEventMessage>>(NativeInputSource::Time);
         let (system_evt_tx, system_evt_rx) =
-            ingress.native_channel::<SystemEvent>(NativeInputSource::SystemEvent);
+            ingress.native_channel::<DispatchMessage<SystemEvent>>(NativeInputSource::SystemEvent);
         let (system_cmd_tx, system_cmd_rx) =
-            ingress.native_channel::<SystemCommand>(NativeInputSource::SystemCommand);
+            ingress.native_channel::<DispatchMessage<SystemCommand>>(NativeInputSource::SystemCommand);
         let (signal_tx, signal_rx) = unbounded_channel::<()>();
         let (exec_evt_tx, exec_evt_rx) =
-            ingress.native_channel::<ExecutionEvent>(NativeInputSource::ExecutionEvent);
+            ingress.native_channel::<DispatchMessage<ExecutionEvent>>(NativeInputSource::ExecutionEvent);
         let (exec_cmd_tx, exec_cmd_rx) =
-            ingress.native_channel::<TradingCommandMessage>(NativeInputSource::TradingCommand);
+            ingress.native_channel::<DispatchMessage<TradingCommandMessage>>(NativeInputSource::TradingCommand);
         let (data_evt_tx, data_evt_rx) =
-            ingress.native_channel::<DataEvent>(NativeInputSource::DataEvent);
+            ingress.native_channel::<DispatchMessage<DataEvent>>(NativeInputSource::DataEvent);
         let (data_cmd_tx, data_cmd_rx) =
-            ingress.native_channel::<DataCommand>(NativeInputSource::DataCommand);
+            ingress.native_channel::<DispatchMessage<DataCommand>>(NativeInputSource::DataCommand);
         let recovery_progress = crate::runner_recovery::RunnerRecoveryProgressHandle::new();
 
         Self {
@@ -501,6 +556,7 @@ impl AsyncRunner {
         guard: &FrozenIngress,
         event: crate::runner_recovery::RunnerRecoveryEvent,
         receipt: nautilus_common::recovery_trace::NativeIngressReceipt,
+        context: Option<nautilus_common::actor::RestoredCallbackContext>,
     ) -> anyhow::Result<()> {
         use crate::runner_recovery::RunnerRecoveryEvent;
         use nautilus_common::recovery_trace::NativeInputSource;
@@ -513,54 +569,249 @@ impl AsyncRunner {
             RunnerRecoveryEvent::TimeEvent(message)
                 if receipt.input_source == NativeInputSource::Time =>
             {
-                self.channels
-                    .time_evt_rx
-                    .append_native_retained(message, receipt)?
+                self.channels.time_evt_rx.append_native_retained(
+                    DispatchMessage::from_checkpoint_context(message, context),
+                    receipt,
+                )?
             }
             RunnerRecoveryEvent::SystemEvent(message)
                 if receipt.input_source == NativeInputSource::SystemEvent =>
             {
-                self.channels
-                    .system_evt_rx
-                    .append_native_retained(message, receipt)?
+                self.channels.system_evt_rx.append_native_retained(
+                    DispatchMessage::from_checkpoint_context(message, context),
+                    receipt,
+                )?
             }
             RunnerRecoveryEvent::SystemCommand(message)
                 if receipt.input_source == NativeInputSource::SystemCommand =>
             {
-                self.channels
-                    .system_cmd_rx
-                    .append_native_retained(message, receipt)?
+                self.channels.system_cmd_rx.append_native_retained(
+                    DispatchMessage::from_checkpoint_context(message, context),
+                    receipt,
+                )?
             }
             RunnerRecoveryEvent::ExecutionEvent(message)
                 if receipt.input_source == NativeInputSource::ExecutionEvent =>
             {
-                self.channels
-                    .exec_evt_rx
-                    .append_native_retained(message, receipt)?
+                self.channels.exec_evt_rx.append_native_retained(
+                    DispatchMessage::from_checkpoint_context(message, context),
+                    receipt,
+                )?
             }
             RunnerRecoveryEvent::ExecutionCommand(message)
                 if receipt.input_source == NativeInputSource::TradingCommand =>
             {
-                self.channels
-                    .exec_cmd_rx
-                    .append_native_retained(message, receipt)?
+                self.channels.exec_cmd_rx.append_native_retained(
+                    DispatchMessage::from_checkpoint_context(message, context),
+                    receipt,
+                )?
             }
             RunnerRecoveryEvent::DataEvent(message)
                 if receipt.input_source == NativeInputSource::DataEvent =>
             {
-                self.channels
-                    .data_evt_rx
-                    .append_native_retained(message, receipt)?
+                self.channels.data_evt_rx.append_native_retained(
+                    DispatchMessage::from_checkpoint_context(message, context),
+                    receipt,
+                )?
             }
             RunnerRecoveryEvent::DataCommand(message)
                 if receipt.input_source == NativeInputSource::DataCommand =>
             {
-                self.channels
-                    .data_cmd_rx
-                    .append_native_retained(message, receipt)?
+                self.channels.data_cmd_rx.append_native_retained(
+                    DispatchMessage::from_checkpoint_context(message, context),
+                    receipt,
+                )?
             }
             _ => anyhow::bail!("retained original input decoder changed its channel"),
         }
+        guard.verify()
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn bind_historical_source_frontiers(
+        &mut self,
+        guard: &FrozenIngress,
+        frontiers: &[(
+            nautilus_common::recovery_trace::NativeInputSource,
+            nautilus_core::UUID4,
+            u64,
+        )],
+    ) -> anyhow::Result<()> {
+        use nautilus_common::recovery_trace::NativeInputSource as N;
+        anyhow::ensure!(
+            guard.belongs_to(&self.ingress),
+            "foreign historical source frontier gate"
+        );
+        guard.verify()?;
+        for &(source, channel, ordinal) in frontiers {
+            macro_rules! bind {
+                ($field:ident) => {
+                    self.channels
+                        .$field
+                        .bind_historical_source_frontier(guard, channel, ordinal)?
+                };
+            }
+            match source {
+                N::Time => bind!(time_evt_rx),
+                N::SystemEvent => bind!(system_evt_rx),
+                N::SystemCommand => bind!(system_cmd_rx),
+                N::ExecutionEvent => bind!(exec_evt_rx),
+                N::TradingCommand => bind!(exec_cmd_rx),
+                N::DataEvent => bind!(data_evt_rx),
+                N::DataCommand => bind!(data_cmd_rx),
+                _ => anyhow::bail!("historical frontier is not a physical runner channel"),
+            }
+        }
+        guard.verify()
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn install_historical_external_input(
+        &mut self,
+        guard: &FrozenIngress,
+        event: crate::runner_recovery::RunnerRecoveryEvent,
+        receipt: nautilus_common::recovery_trace::NativeIngressReceipt,
+    ) -> anyhow::Result<()> {
+        use crate::runner_recovery::RunnerRecoveryEvent as E;
+        use nautilus_common::recovery_trace::NativeInputSource as N;
+        anyhow::ensure!(
+            guard.belongs_to(&self.ingress) && receipt.caused_by.is_none(),
+            "historical external input is foreign or claims an unprocessed native parent"
+        );
+        guard.verify()?;
+        macro_rules! append {
+            ($field:ident, $message:ident) => {
+                self.channels.$field.append_historical_external(
+                    guard,
+                    DispatchMessage::from($message),
+                    receipt,
+                )?
+            };
+        }
+        match event {
+            E::TimeEvent(message) if receipt.input_source == N::Time => {
+                append!(time_evt_rx, message)
+            }
+            E::SystemEvent(message) if receipt.input_source == N::SystemEvent => {
+                append!(system_evt_rx, message)
+            }
+            E::SystemCommand(message) if receipt.input_source == N::SystemCommand => {
+                append!(system_cmd_rx, message)
+            }
+            E::ExecutionEvent(message) if receipt.input_source == N::ExecutionEvent => {
+                append!(exec_evt_rx, message)
+            }
+            E::ExecutionCommand(message) if receipt.input_source == N::TradingCommand => {
+                append!(exec_cmd_rx, message)
+            }
+            E::DataEvent(message) if receipt.input_source == N::DataEvent => {
+                append!(data_evt_rx, message)
+            }
+            E::DataCommand(message) if receipt.input_source == N::DataCommand => {
+                append!(data_cmd_rx, message)
+            }
+            _ => anyhow::bail!("historical external source decoder changed its channel"),
+        }
+        guard.verify()
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn take_historical_native_input(
+        &mut self,
+        guard: &FrozenIngress,
+        receipt: &nautilus_common::recovery_trace::NativeIngressReceipt,
+    ) -> anyhow::Result<Option<PendingRunnerEvent>> {
+        use nautilus_common::recovery_trace::NativeInputSource as N;
+        anyhow::ensure!(
+            guard.belongs_to(&self.ingress),
+            "foreign historical source dequeue gate"
+        );
+        guard.verify()?;
+        macro_rules! take {
+            ($field:ident, $variant:ident) => {
+                self.channels
+                    .$field
+                    .take_historical_front(receipt)?
+                    .map(|entry| PendingRunnerEvent::$variant(entry.activate()))
+            };
+        }
+        let event = match receipt.input_source {
+            N::Time => take!(time_evt_rx, TimeEvent),
+            N::SystemEvent => take!(system_evt_rx, SystemEvent),
+            N::SystemCommand => take!(system_cmd_rx, SystemCommand),
+            N::ExecutionEvent => take!(exec_evt_rx, ExecEvent),
+            N::TradingCommand => take!(exec_cmd_rx, ExecCommand),
+            N::DataEvent => take!(data_evt_rx, DataEvent),
+            N::DataCommand => take!(data_cmd_rx, DataCommand),
+            _ => anyhow::bail!("historical source is not a physical runner channel"),
+        };
+        guard.verify()?;
+        Ok(event)
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn historical_pending_inputs(
+        &mut self,
+        guard: &FrozenIngress,
+        encode: &dyn Fn(
+            nautilus_common::recovery_trace::NativeInputSource,
+            &dyn std::any::Any,
+        ) -> anyhow::Result<serde_json::Value>,
+    ) -> anyhow::Result<(
+        Vec<nautilus_common::recovery_trace::NativePendingInput>,
+        crate::runner_recovery::RunnerCallbackAncestry,
+    )> {
+        anyhow::ensure!(
+            guard.belongs_to(&self.ingress),
+            "foreign historical FIFO inventory gate"
+        );
+        guard.verify()?;
+        let receivers = RunningReceivers {
+            time_evt_rx: &mut self.channels.time_evt_rx,
+            system_evt_rx: &mut self.channels.system_evt_rx,
+            system_cmd_rx: &mut self.channels.system_cmd_rx,
+            exec_evt_rx: &mut self.channels.exec_evt_rx,
+            exec_cmd_rx: &mut self.channels.exec_cmd_rx,
+            data_evt_rx: &mut self.channels.data_evt_rx,
+            data_cmd_rx: &mut self.channels.data_cmd_rx,
+        };
+        receivers.time_evt_rx.hold_historical_pending()?;
+        receivers.system_evt_rx.hold_historical_pending()?;
+        receivers.system_cmd_rx.hold_historical_pending()?;
+        receivers.exec_evt_rx.hold_historical_pending()?;
+        receivers.exec_cmd_rx.hold_historical_pending()?;
+        receivers.data_evt_rx.hold_historical_pending()?;
+        receivers.data_cmd_rx.hold_historical_pending()?;
+        let inputs = receivers.native_pending_inputs(encode)?;
+        let ancestry = receivers.callback_ancestry()?;
+        guard.verify()?;
+        Ok((inputs, ancestry))
+    }
+
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn verify_native_callback_ancestry(
+        &mut self,
+        guard: &FrozenIngress,
+        expected: &crate::runner_recovery::RunnerCallbackAncestry,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            guard.belongs_to(&self.ingress),
+            "foreign callback restore gate"
+        );
+        guard.verify()?;
+        let receivers = RunningReceivers {
+            time_evt_rx: &mut self.channels.time_evt_rx,
+            system_evt_rx: &mut self.channels.system_evt_rx,
+            system_cmd_rx: &mut self.channels.system_cmd_rx,
+            exec_evt_rx: &mut self.channels.exec_evt_rx,
+            exec_cmd_rx: &mut self.channels.exec_cmd_rx,
+            data_evt_rx: &mut self.channels.data_evt_rx,
+            data_cmd_rx: &mut self.channels.data_cmd_rx,
+        };
+        anyhow::ensure!(
+            receivers.callback_ancestry()? == *expected,
+            "restored shared callback chains or physical receipts differ from source"
+        );
         guard.verify()
     }
 
@@ -588,15 +839,34 @@ impl AsyncRunner {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             anyhow::ensure!(registry.is_sealed(), "capture registry is not sealed");
             let mut entries = Vec::new();
+            let mut contexts = Vec::new();
+            let mut receipts = Vec::new();
             macro_rules! capture {
                 ($field:ident, $variant:ident) => {
                     self.channels.$field.stage()?;
-                    for (ordinal, message) in self.channels.$field.pending().enumerate() {
+                    #[cfg(feature = "native-tail-replay")]
+                    let members = self
+                        .channels
+                        .$field
+                        .pending()
+                        .zip(self.channels.$field.pending_receipts());
+                    #[cfg(not(feature = "native-tail-replay"))]
+                    let members = self.channels.$field.pending().map(|message| {
+                        (
+                            message,
+                            None::<&nautilus_common::recovery_trace::NativeIngressReceipt>,
+                        )
+                    });
+                    for (ordinal, (message, receipt)) in members.enumerate() {
                         guard.verify()?;
                         entries.push(registry.encode(
-                            crate::runner_recovery::RunnerRecoveryEventRef::$variant(message),
+                            crate::runner_recovery::RunnerRecoveryEventRef::$variant(
+                                message.message(),
+                            ),
                             u64::try_from(ordinal)?,
                         )?);
+                        contexts.push(message.checkpoint_context());
+                        receipts.push(receipt.cloned());
                         guard.verify()?;
                     }
                 };
@@ -609,7 +879,16 @@ impl AsyncRunner {
             capture!(data_evt_rx, DataEvent);
             capture!(data_cmd_rx, DataCommand);
             guard.verify()?;
-            Ok(crate::runner_recovery::RunnerPendingSnapshot { entries })
+            let callback_ancestry = Some(crate::runner_recovery::RunnerCallbackAncestry {
+                profile: crate::runner_recovery::CALLBACK_ANCESTRY_PROFILE.into(),
+                receipts,
+                state: nautilus_common::actor::capture_channel_contexts(&contexts)?,
+            });
+            guard.verify()?;
+            Ok(crate::runner_recovery::RunnerPendingSnapshot {
+                entries,
+                callback_ancestry,
+            })
         }));
         match outcome {
             Ok(Ok(snapshot)) => Ok(snapshot),
@@ -636,22 +915,19 @@ impl AsyncRunner {
     #[cfg(feature = "node")]
     pub(crate) fn bind_senders_for_node(&self, handle: LiveNodeHandle) {
         self.bind_senders_with_data_sender(AsyncDataCommandSender {
-            cmd_tx: self.data_cmd_tx.clone(),
+            cmd_tx: self.data_cmd_tx.clone().into(),
             node_handle: Some(handle),
         });
     }
 
+    #[rustfmt::skip]
     fn bind_senders_with_data_sender(&self, sender: AsyncDataCommandSender) {
-        replace_time_event_sender(Arc::new(AsyncTimeEventSender::new(
-            self.time_evt_tx.clone(),
-        )));
-        replace_system_event_sender(self.system_evt_tx.clone());
-        replace_system_command_sender(self.system_cmd_tx.clone());
-        replace_exec_event_sender(self.exec_evt_tx.clone());
-        replace_exec_cmd_sender(Arc::new(AsyncTradingCommandSender::new(
-            self.exec_cmd_tx.clone(),
-        )));
-        replace_data_event_sender(self.data_evt_tx.clone());
+        replace_time_event_sender(Arc::new(AsyncTimeEventSender::new(self.time_evt_tx.clone())));
+        replace_system_event_sender(EventSender::new(self.system_evt_tx.clone()));
+        replace_system_command_sender(DispatchSender::new(self.system_cmd_tx.clone()));
+        replace_exec_event_sender(EventSender::new(self.exec_evt_tx.clone()));
+        replace_exec_cmd_sender(Arc::new(AsyncTradingCommandSender::new(self.exec_cmd_tx.clone())));
+        replace_data_event_sender(EventSender::new(self.data_evt_tx.clone()));
         replace_data_cmd_sender(Arc::new(sender));
     }
 
@@ -714,31 +990,39 @@ impl AsyncRunner {
         &self.recovery_handoff_available
     }
 
-    pub(crate) fn time_event_sender_clone(&self) -> IngressSender<TimeEventMessage> {
+    pub(crate) fn time_event_sender_clone(
+        &self,
+    ) -> IngressSender<DispatchMessage<TimeEventMessage>> {
         self.time_evt_tx.clone()
     }
 
-    pub(crate) fn system_event_sender_clone(&self) -> IngressSender<SystemEvent> {
+    pub(crate) fn system_event_sender_clone(&self) -> IngressSender<DispatchMessage<SystemEvent>> {
         self.system_evt_tx.clone()
     }
 
-    pub(crate) fn system_command_sender_clone(&self) -> IngressSender<SystemCommand> {
+    pub(crate) fn system_command_sender_clone(
+        &self,
+    ) -> IngressSender<DispatchMessage<SystemCommand>> {
         self.system_cmd_tx.clone()
     }
 
-    pub(crate) fn execution_event_sender_clone(&self) -> IngressSender<ExecutionEvent> {
+    pub(crate) fn execution_event_sender_clone(
+        &self,
+    ) -> IngressSender<DispatchMessage<ExecutionEvent>> {
         self.exec_evt_tx.clone()
     }
 
-    pub(crate) fn execution_command_sender_clone(&self) -> IngressSender<TradingCommandMessage> {
+    pub(crate) fn execution_command_sender_clone(
+        &self,
+    ) -> IngressSender<DispatchMessage<TradingCommandMessage>> {
         self.exec_cmd_tx.clone()
     }
 
-    pub(crate) fn data_event_sender_clone(&self) -> IngressSender<DataEvent> {
+    pub(crate) fn data_event_sender_clone(&self) -> IngressSender<DispatchMessage<DataEvent>> {
         self.data_evt_tx.clone()
     }
 
-    pub(crate) fn data_command_sender_clone(&self) -> IngressSender<DataCommand> {
+    pub(crate) fn data_command_sender_clone(&self) -> IngressSender<DispatchMessage<DataCommand>> {
         self.data_cmd_tx.clone()
     }
 
@@ -795,7 +1079,7 @@ impl AsyncRunner {
             // subscription command (e.g. `SubscribeBars`) processed before the
             // matching instrument lands would be rejected by the data engine.
             while let Ok(evt) = self.channels.data_evt_rx.try_recv() {
-                Self::handle_data_event(evt);
+                Self::dispatch_data_event(evt);
                 progressed = true;
                 total += 1;
             }
@@ -816,8 +1100,9 @@ impl AsyncRunner {
         }
     }
 
-    #[cfg(all(test, feature = "node"))]
-    pub(crate) fn drain_pending_system_events(&mut self) -> Vec<SystemEvent> {
+    #[cfg(feature = "node")]
+    #[cfg(test)]
+    pub(crate) fn drain_pending_system_events(&mut self) -> Vec<DispatchMessage<SystemEvent>> {
         self.ingress.invalidate_if_frozen();
         let mut events = Vec::new();
 
@@ -828,8 +1113,9 @@ impl AsyncRunner {
         events
     }
 
-    #[cfg(all(test, feature = "node"))]
-    pub(crate) fn drain_pending_system_commands(&mut self) -> Vec<SystemCommand> {
+    #[cfg(feature = "node")]
+    #[cfg(test)]
+    pub(crate) fn drain_pending_system_commands(&mut self) -> Vec<DispatchMessage<SystemCommand>> {
         self.ingress.invalidate_if_frozen();
         let mut commands = Vec::new();
 
@@ -844,7 +1130,12 @@ impl AsyncRunner {
     ///
     /// This method processes time, system, execution, and data events in an async loop.
     /// It will run until a signal is received or the event streams are closed.
-    pub async fn run(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if callback dispatch fails. Pending channel messages and the failure latch
+    /// are retained.
+    pub async fn run(&mut self) -> anyhow::Result<()> {
         self.ingress.invalidate_if_frozen();
         self.close_recovery_handoff();
         self.bind_senders();
@@ -852,13 +1143,16 @@ impl AsyncRunner {
         log::info!("AsyncRunner starting");
 
         loop {
+            let callbacks_pending = drain_callbacks().await?;
+
             tokio::select! {
                 biased;
 
                 Some(()) = self.signal_rx.recv() => {
                     log::info!("AsyncRunner received signal, shutting down");
-                    return;
+                    return Ok(());
                 },
+                () = std::future::ready(()), if callbacks_pending => {},
                 Some(handler) = self.channels.time_evt_rx.recv() => {
                     let _ = Self::handle_time_event(handler);
                 },
@@ -869,36 +1163,64 @@ impl AsyncRunner {
                     log::error!("System command {command} requires the LiveNode runner");
                 },
                 Some(evt) = self.channels.exec_evt_rx.recv() => {
-                    Self::handle_exec_event(evt);
+                    Self::dispatch_exec_event(evt);
                 },
                 Some(cmd) = self.channels.exec_cmd_rx.recv() => {
                     Self::handle_trading_command(cmd);
                 },
                 Some(evt) = self.channels.data_evt_rx.recv() => {
-                    Self::handle_data_event(evt);
+                    Self::dispatch_data_event(evt);
                 },
                 Some(cmd) = self.channels.data_cmd_rx.recv() => {
                     Self::handle_data_command(cmd);
                 },
                 else => {
                     log::debug!("AsyncRunner all channels closed, exiting");
-                    return;
+                    return Ok(());
                 }
             };
         }
     }
 
-    /// Handles a time event by running its callback.
+    /// Handles a time event under its originating callback root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a rooted message is processed outside its owner thread.
     #[inline]
     #[must_use]
-    pub fn handle_time_event(message: TimeEventMessage) -> bool {
-        message.dispatch()
+    pub fn handle_time_event(message: impl Into<DispatchMessage<TimeEventMessage>>) -> bool {
+        message.into().dispatch(TimeEventMessage::dispatch)
     }
 
-    /// Handles a data command by sending to the `DataEngine`.
+    /// Handles a data command under its captured callback root by sending to the `DataEngine`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a rooted command is processed outside its owner thread.
     #[inline]
-    pub fn handle_data_command(cmd: DataCommand) {
-        msgbus::send_data_command(MessagingSwitchboard::data_engine_execute(), cmd);
+    pub fn handle_data_command(cmd: impl Into<DispatchMessage<DataCommand>>) {
+        cmd.into().dispatch(|cmd| {
+            msgbus::send_data_command(MessagingSwitchboard::data_engine_execute(), cmd);
+        });
+    }
+
+    /// Dispatches a received data event under its originating callback root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a rooted message is processed outside its owner thread.
+    pub fn dispatch_data_event(event: DispatchMessage<DataEvent>) {
+        event.dispatch(Self::handle_data_event);
+    }
+
+    /// Dispatches a received execution event under its originating callback root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a rooted message is processed outside its owner thread.
+    pub fn dispatch_exec_event(event: DispatchMessage<ExecutionEvent>) {
+        event.dispatch(Self::handle_exec_event);
     }
 
     /// Handles a data event by sending to the appropriate `DataEngine` endpoint.
@@ -927,6 +1249,18 @@ impl AsyncRunner {
             DataEvent::DeFi(data) => {
                 msgbus::send_defi_data(MessagingSwitchboard::data_engine_process_defi_data(), data);
             }
+            #[cfg(feature = "defi")]
+            DataEvent::PoolSnapshotResponse(response) => {
+                msgbus::send_any(MessagingSwitchboard::data_engine_process(), &response);
+            }
+            #[cfg(not(feature = "defi"))]
+            #[allow(
+                unreachable_patterns,
+                reason = "DeFi variants can exist without this crate's defi feature"
+            )]
+            other => log::error!(
+                "Cannot handle {other} data event, nautilus-live built without its `defi` feature"
+            ),
         }
     }
 
@@ -936,13 +1270,14 @@ impl AsyncRunner {
         msgbus::send_trading_command(MessagingSwitchboard::exec_engine_execute(), cmd);
     }
 
-    /// Dispatches a deferred trading command to its direct endpoint.
+    /// Dispatches a trading command and its deferred children under their captured callback roots.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a rooted command is processed outside its owner thread.
     #[inline]
-    pub fn handle_trading_command(message: TradingCommandMessage) {
-        let mut messages = vec![message];
-        while let Some(message) = messages.pop() {
-            messages.extend(message.dispatch().into_iter().rev());
-        }
+    pub fn handle_trading_command(message: impl Into<DispatchMessage<TradingCommandMessage>>) {
+        message.into().dispatch_trading(|_| {});
     }
 
     /// Handles an execution event by sending to the appropriate engine endpoint.
@@ -1010,6 +1345,7 @@ impl AsyncRunner {
             self.channels.data_evt_rx.len(),
             self.channels.data_cmd_rx.len(),
         );
+
         let mut processed = 0;
         processed += poll_channel(
             &mut self.channels.time_evt_rx,
@@ -1110,28 +1446,40 @@ fn poll_channel<T>(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    use std::num::NonZeroU64;
+    use std::{cell::RefCell, rc::Rc, sync::Arc, thread, time::Duration};
 
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    use nautilus_common::live::LiveTimer;
     use nautilus_common::{
+        actor,
         cache::Cache,
-        clock::TestClock,
-        live::runner::{
-            get_data_event_sender, get_exec_event_sender, get_system_command_sender,
-            get_system_event_sender, try_get_system_command_sender, try_get_system_event_sender,
+        clock::VirtualClock,
+        live::{
+            dispatch::DispatchMessage,
+            runner::{
+                get_data_event_sender, get_exec_event_sender, get_system_command_sender,
+                get_system_event_sender, try_get_system_command_sender,
+                try_get_system_event_sender,
+            },
         },
         messages::{
             ExecutionEvent, ExecutionReport,
             data::{SubscribeCommand, SubscribeCustomData},
-            execution::{CancelAllOrders, TradingCommand},
+            execution::{CancelAllOrders, QueryAccount, TradingCommand},
             system::{ReconnectSocket, SocketState, SocketStateChange},
         },
         msgbus::{TypedIntoHandler, stubs::get_typed_into_message_saving_handler},
         runner::{
-            TimeEventMessage, get_data_cmd_sender, get_time_event_sender, get_trading_cmd_sender,
+            SyncTradingCommandSender, TimeEventMessage, drain_trading_cmd_queue,
+            get_data_cmd_sender, get_time_event_sender, get_trading_cmd_sender,
             replace_exec_cmd_sender, try_get_time_event_sender, try_get_trading_cmd_sender,
         },
         timer::{TimeEvent, TimeEventCallback},
     };
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    use nautilus_core::time::get_atomic_clock_realtime;
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_execution::engine::ExecutionEngine;
     use nautilus_model::{
@@ -1189,7 +1537,10 @@ mod tests {
         assert!(frozen.finish().is_err());
         let runner = AsyncRunner::new();
         runner.stop();
-        runner.system_evt_tx.send(test_system_event()).unwrap();
+        runner
+            .system_evt_tx
+            .send(test_system_event().into())
+            .unwrap();
         assert_eq!(runner.channels.system_evt_rx.len(), 1);
     }
 
@@ -1205,7 +1556,10 @@ mod tests {
     #[tokio::test]
     async fn ingress_freeze_is_invalidated_by_receiver_consumption() {
         let mut runner = AsyncRunner::new();
-        runner.system_evt_tx.send(test_system_event()).unwrap();
+        runner
+            .system_evt_tx
+            .send(test_system_event().into())
+            .unwrap();
         let frozen = runner.freeze_ingress().unwrap();
         assert!(matches!(
             runner.recv().await,
@@ -1219,8 +1573,145 @@ mod tests {
         let runner = AsyncRunner::new();
         runner.handle().stop();
         assert!(runner.freeze_ingress().is_err());
-        runner.system_evt_tx.send(test_system_event()).unwrap();
+        runner
+            .system_evt_tx
+            .send(test_system_event().into())
+            .unwrap();
         assert_eq!(runner.channels.system_evt_rx.len(), 1);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn test_runner_callback_failure_stops_before_next_command(#[case] before_run: bool) {
+        actor::clear_callbacks().unwrap();
+        let mut runner = AsyncRunner::new();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let observed = received.clone();
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_execute(),
+            TypedIntoHandler::from(move |command: TradingCommand| {
+                observed.borrow_mut().push(command.ts_init());
+                crate::dispatch::tests::latch_callback_failure();
+            }),
+        );
+
+        let sender = AsyncTradingCommandSender::new(runner.exec_cmd_tx.clone());
+        let seed_endpoint = ustr::Ustr::from("test.callback-root-seed");
+        msgbus::register_trading_command_endpoint(
+            seed_endpoint.into(),
+            TypedIntoHandler::from(move |command: TradingCommand| {
+                sender.execute(TradingCommandMessage::new(
+                    MessagingSwitchboard::risk_engine_execute(),
+                    command,
+                ));
+            }),
+        );
+
+        for timestamp in [17, 23] {
+            SyncTradingCommandSender.execute(TradingCommandMessage::new(
+                seed_endpoint.into(),
+                TradingCommand::QueryAccount(QueryAccount::new(
+                    "TRADER-001".into(),
+                    None,
+                    "SIM-001".into(),
+                    UUID4::new(),
+                    timestamp.into(),
+                    None,
+                    None,
+                )),
+            ));
+        }
+
+        drain_trading_cmd_queue();
+        let first = runner.channels.exec_cmd_rx.try_recv().unwrap();
+        let second = runner.channels.exec_cmd_rx.try_recv().unwrap();
+        assert!(first.is_rooted());
+        assert!(second.is_rooted());
+        runner.exec_cmd_tx.send(first).unwrap();
+        runner.exec_cmd_tx.send(second).unwrap();
+
+        if before_run {
+            crate::dispatch::tests::latch_callback_failure();
+        }
+
+        let error = runner.run().await.unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<actor::CallbackDispatchError>(),
+            Some(&actor::CallbackDispatchError::DeliveryUnwound)
+        );
+        assert_eq!(
+            *received.borrow(),
+            if before_run {
+                vec![]
+            } else {
+                vec![UnixNanos::from(17)]
+            }
+        );
+        assert_eq!(
+            runner.channels.exec_cmd_rx.len(),
+            if before_run { 2 } else { 1 }
+        );
+        assert!(!runner.exec_cmd_tx.is_closed());
+        assert_eq!(
+            actor::callback_failure(),
+            Some(actor::CallbackDispatchError::DeliveryUnwound)
+        );
+        drop(runner);
+        assert_eq!(actor::clear_callbacks(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn test_runner_stop_preserves_messages_and_channel_only_scheduling() {
+        let mut runner = AsyncRunner::new();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let stop = runner.signal_tx.clone();
+
+        for timestamp in 1..=65 {
+            let received = received.clone();
+            let stop = stop.clone();
+            runner
+                .time_evt_tx
+                .send(
+                    TimeEventMessage::new(
+                        TimeEvent::new(
+                            "runner-resume".into(),
+                            UUID4::new(),
+                            timestamp.into(),
+                            timestamp.into(),
+                        ),
+                        TimeEventCallback::RustLocal(Rc::new(move |_| {
+                            received.borrow_mut().push(timestamp);
+                            if timestamp == 65 {
+                                stop.send(()).unwrap();
+                            }
+                        })),
+                    )
+                    .into(),
+                )
+                .unwrap();
+        }
+
+        stop.send(()).unwrap();
+        runner.run().await.unwrap();
+
+        assert!(received.borrow().is_empty());
+        assert_eq!(runner.channels.time_evt_rx.len(), 65);
+        assert!(!runner.time_evt_tx.is_closed());
+
+        let (result, at_yield) = tokio::join!(biased;
+            runner.run(),
+            async { received.borrow().clone() },
+        );
+        result.unwrap();
+
+        let expected: Vec<u64> = (1..=65).collect();
+        assert_eq!(at_yield, expected);
+        assert_eq!(*received.borrow(), expected);
+        assert_eq!(runner.channels.time_evt_rx.len(), 0);
+        assert!(!runner.time_evt_tx.is_closed());
     }
 
     // Test fixture for creating test quotes
@@ -1312,8 +1803,8 @@ mod tests {
                 Ustr::from("different-stream"),
                 SocketState::Connected,
             ));
-            runner.system_evt_tx.send(first).unwrap();
-            runner.system_evt_tx.send(second).unwrap();
+            runner.system_evt_tx.send(first.into()).unwrap();
+            runner.system_evt_tx.send(second.into()).unwrap();
             let guard = runner.freeze_ingress().unwrap();
             let registry = snapshot_registry(fail, panic);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1331,10 +1822,95 @@ mod tests {
                 assert_eq!(first_snapshot.entries()[1].channel_ordinal, 1);
                 guard.verify().unwrap();
             }
-            assert_eq!(runner.channels.system_evt_rx.try_recv().unwrap(), first);
-            assert_eq!(runner.channels.system_evt_rx.try_recv().unwrap(), second);
+            assert_eq!(
+                runner.channels.system_evt_rx.try_recv().unwrap().message(),
+                &first
+            );
+            assert_eq!(
+                runner.channels.system_evt_rx.try_recv().unwrap().message(),
+                &second
+            );
             assert!(runner.channels.system_evt_rx.try_recv().is_err());
         }
+    }
+    #[cfg(feature = "native-tail-replay")]
+    #[test]
+    fn actual_native_fifo_restores_shared_official_callback_chain_and_same_source_receipts() {
+        use crate::runner_recovery::RunnerRecoveryEvent;
+        use nautilus_common::{live::sender::EventSender, msgbus};
+        actor::clear_callbacks().unwrap();
+        let mut source = AsyncRunner::new();
+        let first = test_system_event();
+        let second = SystemEvent::SocketState(SocketStateChange::new(
+            ClientId::from("SECOND"),
+            None,
+            Ustr::from("source-second-stream"),
+            SocketState::Connected,
+        ));
+        let sender = EventSender::<SystemEvent>::new(source.system_evt_tx.clone());
+        let handler = msgbus::ShareableMessageHandler::from_typed(move |_: &u8| {
+            sender.send(first).unwrap();
+            sender.send(second).unwrap();
+        });
+        msgbus::subscribe_any("runner.actual.callback.ancestry".into(), handler, None);
+        msgbus::publish_any("runner.actual.callback.ancestry".into(), &1_u8);
+        assert!(actor::callbacks_pending());
+        let guard = source.freeze_ingress().unwrap();
+        let snapshot = source
+            .snapshot_pending(&guard, &snapshot_registry(false, false))
+            .unwrap();
+        let ancestry = snapshot.callback_ancestry().unwrap().clone();
+        assert_eq!(ancestry.state.entry_chains, vec![Some(0), Some(0)]);
+        let receipts = ancestry
+            .receipts
+            .iter()
+            .map(|receipt| receipt.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(receipts[0].channel_id, receipts[1].channel_id);
+        assert!(receipts[0].channel_ordinal < receipts[1].channel_ordinal);
+        let original = serde_json::to_vec(&snapshot).unwrap();
+        guard.finish().unwrap();
+        drop(source);
+        assert!(!actor::callbacks_pending());
+        let mut target = AsyncRunner::new();
+        let frozen = target.freeze_ingress().unwrap();
+        let mut bank = actor::restore_channel_contexts(&ancestry.state).unwrap();
+        for (index, message) in [first, second].into_iter().enumerate() {
+            target
+                .install_native_retained_input(
+                    &frozen,
+                    RunnerRecoveryEvent::SystemEvent(message),
+                    receipts[index].clone(),
+                    bank.take(index).unwrap(),
+                )
+                .unwrap();
+        }
+        drop(bank);
+        target
+            .verify_native_callback_ancestry(&frozen, &ancestry)
+            .unwrap();
+        let restored = target
+            .snapshot_pending(&frozen, &snapshot_registry(false, false))
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), original);
+        assert!(actor::callbacks_pending());
+        assert!(target.channels.system_evt_rx.try_recv().is_err());
+        assert!(target.channels.system_evt_rx.dispatch_is_empty());
+        target
+            .channels
+            .system_evt_rx
+            .prepare_recovered_prefix_release()
+            .unwrap();
+        target.channels.system_evt_rx.release_recovered_prefix();
+        frozen.finish().unwrap();
+        for expected in [first, second] {
+            let message = target.channels.system_evt_rx.try_recv().unwrap();
+            assert!(message.is_rooted());
+            assert_eq!(message.dispatch(|event| event), expected);
+        }
+        assert!(target.channels.system_evt_rx.try_recv().is_err());
+        assert!(!actor::callbacks_pending());
+        actor::clear_callbacks().unwrap();
     }
     #[test]
     fn queue_snapshot_rejects_timer_without_consuming_callback_or_other_queues() {
@@ -1349,14 +1925,20 @@ mod tests {
         );
         runner
             .time_evt_tx
-            .send(TimeEventMessage::new(
-                event,
-                TimeEventCallback::from(move |_: TimeEvent| {
-                    callback_count.fetch_add(1, Ordering::SeqCst);
-                }),
-            ))
+            .send(
+                TimeEventMessage::new(
+                    event,
+                    TimeEventCallback::from(move |_: TimeEvent| {
+                        callback_count.fetch_add(1, Ordering::SeqCst);
+                    }),
+                )
+                .into(),
+            )
             .unwrap();
-        runner.system_evt_tx.send(test_system_event()).unwrap();
+        runner
+            .system_evt_tx
+            .send(test_system_event().into())
+            .unwrap();
         let guard = runner.freeze_ingress().unwrap();
         assert!(
             runner
@@ -1364,18 +1946,28 @@ mod tests {
                 .is_err()
         );
         assert_eq!(count.load(Ordering::SeqCst), 0);
-        assert!(runner.channels.time_evt_rx.try_recv().unwrap().dispatch());
+        assert!(
+            runner
+                .channels
+                .time_evt_rx
+                .try_recv()
+                .unwrap()
+                .dispatch(|message| message.dispatch())
+        );
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert!(runner.channels.time_evt_rx.try_recv().is_err());
         assert_eq!(
-            runner.channels.system_evt_rx.try_recv().unwrap(),
-            test_system_event()
+            runner.channels.system_evt_rx.try_recv().unwrap().message(),
+            &test_system_event()
         );
     }
     #[test]
     fn queue_snapshot_refuses_foreign_or_stopped_boundary() {
         let mut runner = AsyncRunner::new();
-        runner.system_evt_tx.send(test_system_event()).unwrap();
+        runner
+            .system_evt_tx
+            .send(test_system_event().into())
+            .unwrap();
         let other = IngressGate::new();
         let foreign = other.freeze().unwrap();
         assert!(
@@ -1392,8 +1984,8 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            runner.channels.system_evt_rx.try_recv().unwrap(),
-            test_system_event()
+            runner.channels.system_evt_rx.try_recv().unwrap().message(),
+            &test_system_event()
         );
     }
 
@@ -1401,11 +1993,11 @@ mod tests {
     // Sender halves are dummies (not connected to the test receivers) since
     // these tests exercise the event loop, not TLS binding.
     fn create_test_runner(
-        time_evt_rx: SnapshotReceiver<TimeEventMessage>,
-        data_evt_rx: SnapshotReceiver<DataEvent>,
-        data_cmd_rx: SnapshotReceiver<DataCommand>,
-        exec_evt_rx: SnapshotReceiver<ExecutionEvent>,
-        exec_cmd_rx: SnapshotReceiver<TradingCommandMessage>,
+        time_evt_rx: SnapshotReceiver<DispatchMessage<TimeEventMessage>>,
+        data_evt_rx: SnapshotReceiver<DispatchMessage<DataEvent>>,
+        data_cmd_rx: SnapshotReceiver<DispatchMessage<DataCommand>>,
+        exec_evt_rx: SnapshotReceiver<DispatchMessage<ExecutionEvent>>,
+        exec_cmd_rx: SnapshotReceiver<DispatchMessage<TradingCommandMessage>>,
         signal_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
         signal_tx: tokio::sync::mpsc::UnboundedSender<()>,
     ) -> AsyncRunner {
@@ -1460,40 +2052,46 @@ mod tests {
             UnixNanos::from(2),
         );
         time_evt_tx
-            .send(TimeEventMessage::new(
-                time_event,
-                TimeEventCallback::from(|_: TimeEvent| {}),
-            ))
+            .send(
+                (TimeEventMessage::new(time_event, TimeEventCallback::from(|_: TimeEvent| {})))
+                    .into(),
+            )
             .unwrap();
         exec_evt_tx
-            .send(ExecutionEvent::Order(OrderEventAny::Submitted(
-                OrderSubmittedSpec::builder()
-                    .client_order_id(ClientOrderId::from("O-POLL-001"))
-                    .build(),
-            )))
+            .send(
+                (ExecutionEvent::Order(OrderEventAny::Submitted(
+                    OrderSubmittedSpec::builder()
+                        .client_order_id(ClientOrderId::from("O-POLL-001"))
+                        .build(),
+                )))
+                .into(),
+            )
             .unwrap();
         exec_cmd_tx
-            .send(TradingCommandMessage::new(
-                MessagingSwitchboard::exec_engine_execute(),
-                TradingCommand::CancelAllOrders(CancelAllOrders::new(
-                    TraderId::from("TRADER-001"),
-                    None,
-                    StrategyId::from("S-POLL-001"),
-                    InstrumentId::from("EUR/USD.SIM"),
-                    Some(OrderSide::Buy),
-                    UUID4::new(),
-                    UnixNanos::from(3),
-                    None,
-                    None,
-                )),
-            ))
+            .send(
+                TradingCommandMessage::new(
+                    MessagingSwitchboard::exec_engine_execute(),
+                    TradingCommand::CancelAllOrders(CancelAllOrders::new(
+                        TraderId::from("TRADER-001"),
+                        None,
+                        StrategyId::from("S-POLL-001"),
+                        InstrumentId::from("EUR/USD.SIM"),
+                        Some(OrderSide::Buy),
+                        UUID4::new(),
+                        UnixNanos::from(3),
+                        None,
+                        None,
+                    )),
+                )
+                .into(),
+            )
             .unwrap();
         data_evt_tx
-            .send(DataEvent::Data(Data::Quote(test_quote())))
+            .send((DataEvent::Data(Data::Quote(test_quote()))).into())
             .unwrap();
         data_cmd_tx
-            .send(DataCommand::Subscribe(SubscribeCommand::Data(
-                SubscribeCustomData {
+            .send(
+                DataCommand::Subscribe(SubscribeCommand::Data(SubscribeCustomData {
                     client_id: Some(ClientId::from("POLL")),
                     venue: None,
                     data_type: DataType::new("QuoteTick", None, None),
@@ -1501,8 +2099,9 @@ mod tests {
                     ts_init: UnixNanos::from(4),
                     correlation_id: None,
                     params: None,
-                },
-            )))
+                }))
+                .into(),
+            )
             .unwrap();
 
         let mut runner = create_test_runner(
@@ -1548,7 +2147,7 @@ mod tests {
                 processed_by_channel[5] += 1;
                 processed_order.push("data_event");
                 data_evt_tx
-                    .send(DataEvent::Data(Data::Quote(test_quote())))
+                    .send((DataEvent::Data(Data::Quote(test_quote()))).into())
                     .unwrap();
             }
             PendingRunnerEvent::DataCommand(_) => {
@@ -1603,8 +2202,14 @@ mod tests {
             signal_tx,
         );
 
-        runner.system_cmd_tx.send(test_system_command()).unwrap();
-        runner.system_evt_tx.send(test_system_event()).unwrap();
+        runner
+            .system_cmd_tx
+            .send((test_system_command()).into())
+            .unwrap();
+        runner
+            .system_evt_tx
+            .send((test_system_event()).into())
+            .unwrap();
 
         assert!(matches!(
             runner.recv().await,
@@ -1618,7 +2223,7 @@ mod tests {
 
     #[rstest]
     fn test_async_data_command_sender_creation() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
         let sender = AsyncDataCommandSender::new(tx);
         assert!(format!("{sender:?}").contains("AsyncDataCommandSender"));
     }
@@ -1673,7 +2278,14 @@ mod tests {
             }
 
             sender.execute(command.clone());
-            assert_eq!(channels.data_cmd_rx.try_recv().unwrap(), command);
+            assert_eq!(
+                channels
+                    .data_cmd_rx
+                    .try_recv()
+                    .unwrap()
+                    .dispatch(|command| command),
+                command
+            );
         }
 
         drop(channels);
@@ -1703,7 +2315,7 @@ mod tests {
         );
 
         ERRORS.0.lock().unwrap().clear();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
         drop(rx);
         AsyncDataCommandSender::new(tx).execute(command);
         assert_eq!(
@@ -1714,14 +2326,14 @@ mod tests {
 
     #[rstest]
     fn test_async_time_event_sender_creation() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
         let sender = AsyncTimeEventSender::new(tx);
         assert!(format!("{sender:?}").contains("AsyncTimeEventSender"));
     }
 
     #[tokio::test]
     async fn test_async_data_command_sender_execute() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
         let sender = AsyncDataCommandSender::new(tx);
 
         let command = DataCommand::Subscribe(SubscribeCommand::Data(SubscribeCustomData {
@@ -1736,7 +2348,7 @@ mod tests {
 
         sender.execute(command.clone());
 
-        let received = rx.recv().await.unwrap();
+        let received = rx.recv().await.unwrap().dispatch(|command| command);
         match (received, command) {
             (
                 DataCommand::Subscribe(SubscribeCommand::Data(r)),
@@ -1749,9 +2361,355 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_async_command_senders_capture_owner_root(#[case] rooted: bool) {
+        let runner = AsyncRunner::new();
+        runner.bind_senders();
+        let mut channels = runner.take_channels();
+
+        let data = DataCommand::Subscribe(SubscribeCommand::Data(SubscribeCustomData {
+            client_id: Some(ClientId::from("ROOT")),
+            venue: None,
+            data_type: DataType::new("QuoteTick", None, None),
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::from(7),
+            correlation_id: None,
+            params: None,
+        }));
+
+        let trading = TradingCommand::CancelAllOrders(CancelAllOrders::new(
+            TraderId::from("TRADER-001"),
+            None,
+            StrategyId::from("ROOT-001"),
+            InstrumentId::from("EUR/USD.SIM"),
+            Some(OrderSide::Sell),
+            UUID4::new(),
+            UnixNanos::from(11),
+            None,
+            None,
+        ));
+        let expected_data = data.clone();
+        let expected_trading = trading.clone();
+        let trigger = trading.clone();
+
+        let send = move || {
+            get_data_cmd_sender().execute(data.clone());
+            get_trading_cmd_sender().execute(TradingCommandMessage::new(
+                MessagingSwitchboard::exec_engine_execute(),
+                trading.clone(),
+            ));
+        };
+
+        if rooted {
+            msgbus::register_trading_command_endpoint(
+                MessagingSwitchboard::risk_engine_execute(),
+                TypedIntoHandler::from(move |_| send()),
+            );
+            SyncTradingCommandSender.execute(TradingCommandMessage::new(
+                MessagingSwitchboard::risk_engine_execute(),
+                trigger,
+            ));
+            drain_trading_cmd_queue();
+        } else {
+            send();
+        }
+
+        let data = channels.data_cmd_rx.try_recv().unwrap();
+        let trading = channels.exec_cmd_rx.try_recv().unwrap();
+
+        let results = thread::spawn(move || {
+            let data = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                data.dispatch(|command| command)
+            }));
+
+            let trading = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                trading.dispatch(|message| (message.endpoint(), message.command().clone()))
+            }));
+
+            (data, trading)
+        })
+        .join()
+        .unwrap();
+
+        if rooted {
+            for error in [results.0.unwrap_err(), results.1.unwrap_err()] {
+                let message = error.downcast_ref::<String>().unwrap();
+                assert!(message.contains("command context dispatched outside its owner thread"));
+            }
+        } else {
+            assert_eq!(results.0.unwrap(), expected_data);
+            assert_eq!(
+                results.1.unwrap(),
+                (
+                    MessagingSwitchboard::exec_engine_execute(),
+                    expected_trading
+                ),
+            );
+        }
+
+        assert!(channels.data_cmd_rx.is_empty());
+        assert!(channels.exec_cmd_rx.is_empty());
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_event_senders_capture_owner_root(
+        #[case] rooted: bool,
+        #[values(false, true)] dispatch: bool,
+    ) {
+        let runner = AsyncRunner::new();
+        runner.bind_senders();
+        let mut channels = runner.take_channels();
+        let expected_quote = test_quote();
+        let expected_order = OrderSubmittedSpec::builder()
+            .client_order_id(ClientOrderId::from("EVENT-017"))
+            .build();
+        let order = expected_order.clone();
+
+        let send = move || {
+            get_data_event_sender()
+                .send(DataEvent::Data(Data::Quote(expected_quote)))
+                .unwrap();
+            get_exec_event_sender()
+                .send(ExecutionEvent::Order(OrderEventAny::Submitted(
+                    order.clone(),
+                )))
+                .unwrap();
+        };
+
+        if rooted {
+            msgbus::register_trading_command_endpoint(
+                MessagingSwitchboard::risk_engine_execute(),
+                TypedIntoHandler::from(move |_| send()),
+            );
+            SyncTradingCommandSender.execute(TradingCommandMessage::new(
+                MessagingSwitchboard::risk_engine_execute(),
+                TradingCommand::QueryAccount(QueryAccount::new(
+                    "TRADER-001".into(),
+                    None,
+                    "SIM-001".into(),
+                    UUID4::new(),
+                    19.into(),
+                    None,
+                    None,
+                )),
+            ));
+            drain_trading_cmd_queue();
+        } else {
+            send();
+        }
+
+        if dispatch {
+            msgbus::register_data_endpoint(
+                MessagingSwitchboard::data_engine_process_data(),
+                TypedIntoHandler::from(move |data| {
+                    assert_eq!(data, Data::Quote(expected_quote));
+                    get_data_event_sender().send(DataEvent::Data(data)).unwrap();
+                }),
+            );
+
+            let order = expected_order.clone();
+            msgbus::register_order_event_endpoint(
+                MessagingSwitchboard::exec_engine_process(),
+                TypedIntoHandler::from(move |event| {
+                    assert_eq!(event, OrderEventAny::Submitted(order.clone()));
+                    get_exec_event_sender()
+                        .send(ExecutionEvent::Order(event))
+                        .unwrap();
+                }),
+            );
+
+            AsyncRunner::dispatch_data_event(channels.data_evt_rx.try_recv().unwrap());
+            AsyncRunner::dispatch_exec_event(channels.exec_evt_rx.try_recv().unwrap());
+        }
+
+        let data = channels.data_evt_rx.try_recv().unwrap();
+        let exec = channels.exec_evt_rx.try_recv().unwrap();
+
+        let (data, exec) = thread::spawn(move || {
+            (
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    data.dispatch(|event| event)
+                })),
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    exec.dispatch(|event| event)
+                })),
+            )
+        })
+        .join()
+        .unwrap();
+
+        if rooted || dispatch {
+            for error in [data.unwrap_err(), exec.unwrap_err()] {
+                assert!(
+                    error
+                        .downcast_ref::<String>()
+                        .unwrap()
+                        .contains("command context dispatched outside its owner thread")
+                );
+            }
+        } else {
+            let DataEvent::Data(Data::Quote(quote)) = data.unwrap() else {
+                panic!("expected quote")
+            };
+
+            let ExecutionEvent::Order(OrderEventAny::Submitted(order)) = exec.unwrap() else {
+                panic!("expected submitted order")
+            };
+
+            assert_eq!(quote, expected_quote);
+            assert_eq!(order, expected_order);
+        }
+
+        assert!(channels.data_evt_rx.is_empty());
+        assert!(channels.exec_evt_rx.is_empty());
+    }
+
+    #[rstest]
+    fn test_system_and_time_senders_capture_owner_root(#[values(false, true)] rooted: bool) {
+        let runner = AsyncRunner::new();
+        runner.bind_senders();
+        let mut channels = runner.take_channels();
+        let event = TimeEvent::new("system-time".into(), UUID4::new(), 17.into(), 23.into());
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let received = observed.clone();
+        let expected_event = event.clone();
+
+        let callback = TimeEventCallback::RustLocal(Rc::new(move |event| {
+            received.borrow_mut().push(event);
+            get_system_command_sender()
+                .send(test_system_command())
+                .unwrap();
+        }));
+
+        let send = move || {
+            get_system_event_sender().send(test_system_event()).unwrap();
+            get_system_command_sender()
+                .send(test_system_command())
+                .unwrap();
+            get_time_event_sender().send(TimeEventMessage::new(event.clone(), callback.clone()));
+        };
+
+        if rooted {
+            msgbus::register_trading_command_endpoint(
+                MessagingSwitchboard::risk_engine_execute(),
+                TypedIntoHandler::from(move |_| send()),
+            );
+            SyncTradingCommandSender.execute(TradingCommandMessage::new(
+                MessagingSwitchboard::risk_engine_execute(),
+                TradingCommand::QueryAccount(QueryAccount::new(
+                    "TRADER-001".into(),
+                    None,
+                    "SIM-001".into(),
+                    UUID4::new(),
+                    31.into(),
+                    None,
+                    None,
+                )),
+            ));
+            drain_trading_cmd_queue();
+        } else {
+            send();
+        }
+
+        let system_event = channels.system_evt_rx.try_recv().unwrap();
+        let system_command = channels.system_cmd_rx.try_recv().unwrap();
+        let time_event = channels.time_evt_rx.try_recv().unwrap();
+        assert_eq!(system_event.is_rooted(), rooted);
+        assert_eq!(system_command.is_rooted(), rooted);
+        assert_eq!(time_event.is_rooted(), rooted);
+        assert!(AsyncRunner::handle_time_event(time_event));
+        let child = channels.system_cmd_rx.try_recv().unwrap();
+
+        assert_eq!(system_event.dispatch(|event| event), test_system_event());
+        assert_eq!(
+            system_command.dispatch(|command| command),
+            test_system_command()
+        );
+        assert_eq!(*observed.borrow(), vec![expected_event]);
+        assert!(child.is_rooted());
+        assert_eq!(child.dispatch(|command| command), test_system_command());
+        assert!(channels.time_evt_rx.is_empty());
+        assert!(channels.system_evt_rx.is_empty());
+        assert!(channels.system_cmd_rx.is_empty());
+    }
+
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    #[tokio::test]
+    async fn test_live_timer_started_under_root_emits_independent_event() {
+        let runner = AsyncRunner::new();
+        runner.bind_senders();
+        let mut channels = runner.take_channels();
+        let now = get_atomic_clock_realtime().get_time_ns();
+        let name = Ustr::from("ROOTED_TIMER");
+        let owner = thread::current().id();
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let received = observed.clone();
+
+        let callback = TimeEventCallback::RustLocal(Rc::new(move |event| {
+            received
+                .borrow_mut()
+                .push((event.name, event.ts_event, thread::current().id()));
+        }));
+
+        let timer = Rc::new(RefCell::new(None));
+        let started = timer.clone();
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_execute(),
+            TypedIntoHandler::from(move |_| {
+                get_system_command_sender()
+                    .send(test_system_command())
+                    .unwrap();
+
+                let mut timer = LiveTimer::new(
+                    name,
+                    NonZeroU64::new(1_000_000).unwrap(),
+                    now,
+                    Some(now),
+                    callback.clone(),
+                    true,
+                    Some(get_time_event_sender()),
+                );
+                timer.start();
+                *started.borrow_mut() = Some(timer);
+            }),
+        );
+
+        SyncTradingCommandSender.execute(TradingCommandMessage::new(
+            MessagingSwitchboard::risk_engine_execute(),
+            TradingCommand::QueryAccount(QueryAccount::new(
+                "TRADER-001".into(),
+                None,
+                "SIM-001".into(),
+                UUID4::new(),
+                31.into(),
+                None,
+                None,
+            )),
+        ));
+        drain_trading_cmd_queue();
+        let witness = channels.system_cmd_rx.try_recv().unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(2), channels.time_evt_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        timer.borrow_mut().take().unwrap().cancel();
+
+        assert!(witness.is_rooted());
+        assert!(!message.is_rooted());
+        assert!(observed.borrow().is_empty());
+        assert!(AsyncRunner::handle_time_event(message));
+        assert_eq!(*observed.borrow(), vec![(name, now, owner)]);
+        assert!(channels.time_evt_rx.is_empty());
+    }
+
     #[tokio::test]
     async fn test_async_time_event_sender_send() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
         let sender = AsyncTimeEventSender::new(tx);
 
         let event = TimeEvent::new(
@@ -1771,12 +2729,16 @@ mod tests {
     #[tokio::test]
     async fn test_runner_shutdown_signal() {
         // Create runner with manual channels to avoid global state
-        let (_data_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (_time_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (_data_tx, data_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
+        let (_cmd_tx, data_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
+        let (_time_tx, time_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
+        let (_exec_evt_tx, exec_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
         let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
@@ -1791,7 +2753,7 @@ mod tests {
 
         // Start runner
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         // Send shutdown signal
@@ -1804,12 +2766,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_closes_on_channel_drop() {
-        let (data_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (_time_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (data_tx, data_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
+        let (_cmd_tx, data_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
+        let (_time_tx, time_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
+        let (_exec_evt_tx, exec_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
         let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
@@ -1824,7 +2790,7 @@ mod tests {
 
         // Start runner
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         drop(data_tx);
@@ -1843,13 +2809,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_event_sending() {
-        let (data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (data_evt_tx, data_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
+        let (_data_cmd_tx, data_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
         let (_time_evt_tx, time_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
+        let (_exec_evt_tx, exec_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
         let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         // Setup runner
@@ -1872,7 +2841,9 @@ mod tests {
             let handle = tokio::spawn(async move {
                 for _ in 0..20 {
                     let quote = test_quote();
-                    tx_clone.send(DataEvent::Data(Data::Quote(quote))).unwrap();
+                    tx_clone
+                        .send(DataEvent::Data(Data::Quote(quote)).into())
+                        .unwrap();
                     tokio::task::yield_now().await;
                 }
             });
@@ -1882,7 +2853,7 @@ mod tests {
 
         // Start runner in background
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         // Wait for all senders
@@ -1912,6 +2883,7 @@ mod tests {
 
         // Verify all received
         let mut received = 0;
+
         while rx.try_recv().is_ok() {
             received += 1;
         }
@@ -1921,7 +2893,8 @@ mod tests {
 
     #[rstest]
     fn test_async_trading_command_sender_creation() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let sender = AsyncTradingCommandSender::new(tx);
         assert!(format!("{sender:?}").contains("AsyncTradingCommandSender"));
     }
@@ -1947,7 +2920,8 @@ mod tests {
                 exec_handler,
             );
 
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            let (tx, mut rx) =
+                tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
             let sender = AsyncTradingCommandSender::new(tx);
             sender.execute(TradingCommandMessage::new(
                 MessagingSwitchboard::risk_engine_execute(),
@@ -2003,7 +2977,7 @@ mod tests {
     fn test_async_runner_preserves_deferred_follow_up_order() {
         std::thread::spawn(|| {
             msgbus::get_message_bus().borrow_mut().dispose();
-            let clock = Rc::new(RefCell::new(TestClock::new()));
+            let clock = Rc::new(RefCell::new(VirtualClock::new()));
             let cache = Rc::new(RefCell::new(Cache::default()));
             let exec_engine = Rc::new(RefCell::new(ExecutionEngine::new(clock, cache, None)));
             ExecutionEngine::register_msgbus_handlers(&exec_engine);
@@ -2026,7 +3000,8 @@ mod tests {
                 exec_handler,
             );
 
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            let (tx, mut rx) =
+                tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
             let sender = Arc::new(AsyncTradingCommandSender::new(tx));
             replace_exec_cmd_sender(sender.clone());
             sender.execute(TradingCommandMessage::new(
@@ -2084,12 +3059,13 @@ mod tests {
     fn test_async_runner_dispatches_deferred_exec_command_once() {
         std::thread::spawn(|| {
             msgbus::get_message_bus().borrow_mut().dispose();
-            let clock = Rc::new(RefCell::new(TestClock::new()));
+            let clock = Rc::new(RefCell::new(VirtualClock::new()));
             let cache = Rc::new(RefCell::new(Cache::default()));
             let exec_engine = Rc::new(RefCell::new(ExecutionEngine::new(clock, cache, None)));
             ExecutionEngine::register_msgbus_handlers(&exec_engine);
 
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            let (tx, mut rx) =
+                tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
             replace_exec_cmd_sender(Arc::new(AsyncTradingCommandSender::new(tx)));
             let command = TradingCommand::CancelAllOrders(CancelAllOrders::new(
                 TraderId::from("TRADER-001"),
@@ -2120,13 +3096,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_processes_trading_commands() {
-        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (_data_evt_tx, data_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
+        let (_data_cmd_tx, data_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
         let (_time_evt_tx, time_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
+        let (_exec_evt_tx, exec_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
         let (exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
@@ -2140,7 +3119,7 @@ mod tests {
         );
 
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         let command = TradingCommand::CancelAllOrders(CancelAllOrders::new(
@@ -2155,10 +3134,10 @@ mod tests {
             None, // correlation_id
         ));
         exec_cmd_tx
-            .send(TradingCommandMessage::new(
-                MessagingSwitchboard::exec_engine_execute(),
-                command,
-            ))
+            .send(
+                TradingCommandMessage::new(MessagingSwitchboard::exec_engine_execute(), command)
+                    .into(),
+            )
             .unwrap();
 
         tokio::task::yield_now().await;
@@ -2170,13 +3149,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_processes_multiple_trading_commands() {
-        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        let (_data_evt_tx, data_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
+        let (_data_cmd_tx, data_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
         let (_time_evt_tx, time_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
+        let (_exec_evt_tx, exec_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
         let (exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
@@ -2190,7 +3172,7 @@ mod tests {
         );
 
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         for i in 0..10 {
@@ -2207,10 +3189,13 @@ mod tests {
                 None, // correlation_id
             ));
             exec_cmd_tx
-                .send(TradingCommandMessage::new(
-                    MessagingSwitchboard::exec_engine_execute(),
-                    command,
-                ))
+                .send(
+                    TradingCommandMessage::new(
+                        MessagingSwitchboard::exec_engine_execute(),
+                        command,
+                    )
+                    .into(),
+                )
                 .unwrap();
         }
 
@@ -2375,12 +3360,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_stop_method() {
-        let (_data_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (_time_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (_data_tx, data_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
+        let (_cmd_tx, data_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
+        let (_time_tx, time_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
+        let (_exec_evt_tx, exec_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
         let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
@@ -2394,7 +3383,7 @@ mod tests {
         );
 
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         // Use stop via signal_tx directly
@@ -2406,12 +3395,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_all_event_types_integration() {
-        let (data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (time_evt_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (data_evt_tx, data_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
+        let (data_cmd_tx, data_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
+        let (time_evt_tx, time_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
+        let (exec_evt_tx, exec_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
         let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
@@ -2425,13 +3418,13 @@ mod tests {
         );
 
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         // Send data event
         let quote = test_quote();
         data_evt_tx
-            .send(DataEvent::Data(Data::Quote(quote)))
+            .send((DataEvent::Data(Data::Quote(quote))).into())
             .unwrap();
 
         // Send data command
@@ -2445,7 +3438,7 @@ mod tests {
             params: None,
         }));
 
-        data_cmd_tx.send(command).unwrap();
+        data_cmd_tx.send(command.into()).unwrap();
 
         // Send time event
         let event = TimeEvent::new(
@@ -2456,14 +3449,14 @@ mod tests {
         );
         let callback = TimeEventCallback::from(|_: TimeEvent| {});
         let message = TimeEventMessage::new(event, callback);
-        time_evt_tx.send(message).unwrap();
+        time_evt_tx.send((message).into()).unwrap();
 
         // Send execution order event
         let order_event = OrderSubmittedSpec::builder()
             .client_order_id(ClientOrderId::from("O-001"))
             .build();
         exec_evt_tx
-            .send(ExecutionEvent::Order(OrderEventAny::Submitted(order_event)))
+            .send((ExecutionEvent::Order(OrderEventAny::Submitted(order_event))).into())
             .unwrap();
 
         // Send execution report (OrderStatus)
@@ -2484,9 +3477,7 @@ mod tests {
             None,
         );
         exec_evt_tx
-            .send(ExecutionEvent::Report(ExecutionReport::Order(Box::new(
-                order_status,
-            ))))
+            .send((ExecutionEvent::Report(ExecutionReport::Order(Box::new(order_status)))).into())
             .unwrap();
 
         // Send execution report (Fill)
@@ -2507,9 +3498,7 @@ mod tests {
             None,
         );
         exec_evt_tx
-            .send(ExecutionEvent::Report(ExecutionReport::Fill(Box::new(
-                fill,
-            ))))
+            .send((ExecutionEvent::Report(ExecutionReport::Fill(Box::new(fill)))).into())
             .unwrap();
 
         // Send execution report (Position)
@@ -2525,9 +3514,7 @@ mod tests {
             None,
         );
         exec_evt_tx
-            .send(ExecutionEvent::Report(ExecutionReport::Position(Box::new(
-                position,
-            ))))
+            .send((ExecutionEvent::Report(ExecutionReport::Position(Box::new(position)))).into())
             .unwrap();
 
         // Send account event
@@ -2543,7 +3530,7 @@ mod tests {
             None,
         );
         exec_evt_tx
-            .send(ExecutionEvent::Account(account_state))
+            .send((ExecutionEvent::Account(account_state)).into())
             .unwrap();
 
         // Yield to let runner enter event loop before stop signal
@@ -2559,12 +3546,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_handle_stops_runner() {
-        let (_data_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (_time_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (_data_tx, data_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
+        let (_cmd_tx, data_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
+        let (_time_tx, time_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
+        let (_exec_evt_tx, exec_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
         let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
@@ -2581,7 +3572,7 @@ mod tests {
         let handle = runner.handle();
 
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         // Use handle to stop
@@ -2608,12 +3599,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_processes_events_before_stop() {
-        let (data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-        let (_time_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (data_evt_tx, data_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
+        let (_cmd_tx, data_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
+        let (_time_tx, time_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
+        let (_exec_evt_tx, exec_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
         let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
@@ -2632,12 +3627,12 @@ mod tests {
         for _ in 0..10 {
             let quote = test_quote();
             data_evt_tx
-                .send(DataEvent::Data(Data::Quote(quote)))
+                .send((DataEvent::Data(Data::Quote(quote))).into())
                 .unwrap();
         }
 
         let runner_handle = tokio::spawn(async move {
-            runner.run().await;
+            runner.run().await.unwrap();
         });
 
         // Yield to let runner enter event loop before stop signal
@@ -2709,7 +3704,12 @@ mod tests {
 
             get_system_event_sender().send(test_system_event()).unwrap();
             assert_eq!(
-                runner.channels.system_evt_rx.try_recv().unwrap(),
+                runner
+                    .channels
+                    .system_evt_rx
+                    .try_recv()
+                    .unwrap()
+                    .dispatch(|value| value),
                 test_system_event()
             );
 
@@ -2717,7 +3717,12 @@ mod tests {
                 .send(test_system_command())
                 .unwrap();
             assert_eq!(
-                runner.channels.system_cmd_rx.try_recv().unwrap(),
+                runner
+                    .channels
+                    .system_cmd_rx
+                    .try_recv()
+                    .unwrap()
+                    .dispatch(|value| value),
                 test_system_command()
             );
 
@@ -2759,7 +3764,11 @@ mod tests {
                 .send(DataEvent::Data(Data::Quote(test_quote())))
                 .unwrap();
 
-            let system_events = runner.drain_pending_system_events();
+            let system_events = runner
+                .drain_pending_system_events()
+                .into_iter()
+                .map(|message| message.dispatch(|value| value))
+                .collect::<Vec<_>>();
 
             assert_eq!(system_events, vec![system_event]);
             assert!(runner.channels.system_evt_rx.try_recv().is_err());
@@ -2780,7 +3789,11 @@ mod tests {
             get_system_command_sender().send(system_command).unwrap();
             get_system_event_sender().send(test_system_event()).unwrap();
 
-            let system_commands = runner.drain_pending_system_commands();
+            let system_commands = runner
+                .drain_pending_system_commands()
+                .into_iter()
+                .map(|message| message.dispatch(|value| value))
+                .collect::<Vec<_>>();
 
             assert_eq!(system_commands, vec![system_command]);
             assert!(runner.channels.system_cmd_rx.try_recv().is_err());
@@ -2897,5 +3910,46 @@ mod tests {
             }
             _ => panic!("Expected OrderCanceledBatch event"),
         }
+    }
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    fn test_handle_data_event_routes_pool_snapshot_response_to_data_engine() {
+        use nautilus_common::{
+            messages::defi::PoolSnapshotResponse, msgbus::ShareableMessageHandler,
+        };
+        use nautilus_model::defi::{
+            data::block::BlockPosition,
+            pool_analysis::snapshot::{PoolAnalytics, PoolSnapshot, PoolState},
+        };
+
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let sink = received.clone();
+        msgbus::register_any(
+            MessagingSwitchboard::data_engine_process(),
+            ShareableMessageHandler::from_typed(move |response: &PoolSnapshotResponse| {
+                sink.borrow_mut().push(response.correlation_id);
+            }),
+        );
+
+        let correlation_id = UUID4::new();
+
+        let snapshot = PoolSnapshot::new(
+            InstrumentId::from("0x11b815efB8f581194ae79006d24E0d814B7697F6.Arbitrum:UniswapV3"),
+            PoolState::default(),
+            Vec::new(),
+            Vec::new(),
+            PoolAnalytics::default(),
+            BlockPosition::new(1000, "0x0".to_string(), 0, 0),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+
+        AsyncRunner::handle_data_event(DataEvent::PoolSnapshotResponse(PoolSnapshotResponse::new(
+            correlation_id,
+            snapshot,
+        )));
+
+        assert_eq!(*received.borrow(), vec![correlation_id]);
     }
 }

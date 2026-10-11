@@ -32,7 +32,7 @@ use super::{
     BusMessage, BusPayloadType, HAS_EXTERNAL_EGRESS, SUPPRESS_EXTERNAL_DEPTH,
     SuppressExternalGuard,
     api::{
-        publish_account_state, publish_any, publish_bar, publish_deltas, publish_depth10,
+        publish_account_state, publish_any, publish_bar, publish_deltas, publish_depth,
         publish_funding_rate, publish_index_price, publish_instrument, publish_mark_price,
         publish_option_greeks, publish_order_event, publish_portfolio_snapshot,
         publish_position_event, publish_quote, publish_trade,
@@ -217,12 +217,12 @@ pub fn republish_external_message(message: &BusMessage) -> anyhow::Result<()> {
             codec::deserialize_order_book_deltas,
             publish_deltas,
         )?,
-        BusPayloadType::OrderBookDepth10 => handle_market_data(
+        BusPayloadType::OrderBookDepth => handle_market_data(
             topic,
             message.encoding,
             &message.payload,
-            codec::deserialize_order_book_depth10,
-            publish_depth10,
+            codec::deserialize_order_book_depth,
+            publish_depth,
         )?,
         BusPayloadType::QuoteTick => handle_market_data(
             topic,
@@ -356,7 +356,7 @@ pub fn republish_external_message(message: &BusMessage) -> anyhow::Result<()> {
 /// Decodes a supported typed payload and passes it to `processor` before applying normal inbound
 /// republishing rules.
 ///
-/// JSON or `MessagePack` payloads identified by [`BusPayloadType::is_typed_message`] reach
+/// JSON or MessagePack payloads identified by [`BusPayloadType::is_typed_message`] reach
 /// `processor` regardless of internal streaming registration. Internal republishing still requires
 /// registration. Unsupported type/encoding pairs are skipped with a warning. The processor mapping
 /// includes a `payload_type` field containing the [`BusPayloadType`] name. External egress is

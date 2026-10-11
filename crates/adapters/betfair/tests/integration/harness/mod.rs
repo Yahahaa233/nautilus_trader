@@ -20,6 +20,7 @@
 //! stream feeder.
 
 use std::{
+    cell::RefCell,
     ops::{Deref, DerefMut},
     time::Duration,
 };
@@ -29,16 +30,21 @@ use nautilus_betfair::{
     config::BetfairExecutionClientConfig,
     execution::BetfairExecutionClient,
 };
-use nautilus_common::clients::ExecutionClient;
+use nautilus_common::{clients::ExecutionClient, messages::execution::GenerateOrderStatusReports};
 use nautilus_core::UnixNanos;
 pub(crate) use nautilus_live::testing::{RoutedKind, invariants};
-use nautilus_live::{ExecutionClientCore, testing::ExecutionHarness};
+use nautilus_live::{
+    ExecutionClientCore,
+    execution::{config::ExecutionManagerConfig, manager::ExecutionManager},
+    testing::ExecutionHarness,
+};
 use nautilus_model::{
     data::QuoteTick,
     enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     instruments::{InstrumentAny, stubs::betting},
     orders::{OrderAny, builder::OrderTestBuilder},
+    reports::{ExecutionMassStatus, OrderStatusReport},
     types::{Currency, Price, Quantity},
 };
 use tokio::{io::AsyncWriteExt, net::TcpListener, sync::mpsc::UnboundedSender};
@@ -53,6 +59,7 @@ const TRADER_ID: &str = "TESTER-001";
 
 pub(crate) struct Harness {
     execution: ExecutionHarness,
+    manager: RefCell<ExecutionManager>,
     pub(crate) mock_state: MockState,
     pub(crate) feeder: StreamFeeder,
 }
@@ -62,7 +69,7 @@ impl Harness {
         let trader_id = TraderId::from(TRADER_ID);
         let account_id = AccountId::from("BETFAIR-001");
         let instrument = InstrumentAny::Betting(betting());
-        let execution =
+        let mut execution =
             ExecutionHarness::new(trader_id, *BETFAIR_CLIENT_ID, account_id, instrument);
         let (addr, mock_state) = start_mock_http().await;
         let (stream_port, listener) = start_mock_stream().await;
@@ -96,11 +103,76 @@ impl Harness {
         .await;
         execution.register_client(Box::new(client)).unwrap();
 
+        assert!(
+            execution
+                .pump_until(Duration::from_secs(2), |cache| cache
+                    .account(&account_id)
+                    .is_some())
+                .await,
+            "Connected account must reach the cache before orders are submitted",
+        );
+
+        let manager = RefCell::new(
+            ExecutionManager::new(
+                execution.clock().clone(),
+                execution.cache().clone(),
+                ExecutionManagerConfig::default(),
+            )
+            .unwrap(),
+        );
+
         Self {
             execution,
+            manager,
             mock_state,
             feeder,
         }
+    }
+
+    #[allow(
+        clippy::await_holding_refcell_ref,
+        reason = "only mock venue tasks run while the test borrows the registered client"
+    )]
+    pub(crate) async fn reconcile_snapshot_from_venue(
+        &self,
+        use_execution_engine: bool,
+    ) -> ExecutionMassStatus {
+        let mass_status = self
+            .exec_engine()
+            .borrow_mut()
+            .generate_mass_status(&self.client_id(), None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        if use_execution_engine {
+            self.exec_engine()
+                .borrow_mut()
+                .reconcile_execution_mass_status(&mass_status);
+        } else {
+            self.manager
+                .borrow_mut()
+                .reconcile_execution_mass_status(&mass_status, self.exec_engine());
+        }
+
+        mass_status
+    }
+
+    #[allow(
+        clippy::await_holding_refcell_ref,
+        reason = "only mock venue tasks run while the test borrows the registered client"
+    )]
+    pub(crate) async fn generate_order_status_reports(
+        &self,
+        command: &GenerateOrderStatusReports,
+    ) -> Vec<OrderStatusReport> {
+        self.exec_engine()
+            .borrow()
+            .get_client(&self.client_id())
+            .unwrap()
+            .generate_order_status_reports(command)
+            .await
+            .unwrap()
     }
 
     pub(crate) fn override_betting_result(&self, method: &str, fixture_rel_path: &str) {
@@ -140,6 +212,19 @@ pub(crate) fn limit_order(instrument_id: &InstrumentId, client_order_id: &str) -
         .build()
 }
 
+pub(crate) fn sell_limit_order(instrument_id: &InstrumentId, client_order_id: &str) -> OrderAny {
+    OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from(TRADER_ID))
+        .strategy_id(StrategyId::from(STRATEGY_ID))
+        .instrument_id(*instrument_id)
+        .client_order_id(ClientOrderId::from(client_order_id))
+        .side(OrderSide::Sell)
+        .price(Price::from("3.0"))
+        .quantity(Quantity::from("10.0"))
+        .time_in_force(TimeInForce::Gtc)
+        .build()
+}
+
 pub(crate) fn quote(instrument_id: &InstrumentId, bid: &str, ask: &str) -> QuoteTick {
     QuoteTick::new(
         *instrument_id,
@@ -153,21 +238,38 @@ pub(crate) fn quote(instrument_id: &InstrumentId, bid: &str, ask: &str) -> Quote
 }
 
 pub(crate) struct StreamFeeder {
-    tx: UnboundedSender<String>,
+    tx: UnboundedSender<StreamCommand>,
 }
 
 impl StreamFeeder {
     fn spawn(listener: TcpListener) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         tokio::spawn(async move {
-            let (_reader, mut write_half) = accept_and_activate(&listener).await;
+            let mut activated: Option<tokio::sync::oneshot::Sender<()>> = None;
 
-            while let Some(frame) = rx.recv().await {
-                write_half
-                    .write_all(format!("{}\r\n", frame.trim()).as_bytes())
-                    .await
-                    .unwrap();
+            loop {
+                let (_reader, mut write_half) = accept_and_activate(&listener).await;
+
+                if let Some(tx) = activated.take() {
+                    tx.send(()).unwrap();
+                }
+
+                loop {
+                    match rx.recv().await {
+                        Some(StreamCommand::Frame(frame)) => {
+                            write_half
+                                .write_all(format!("{}\r\n", frame.trim()).as_bytes())
+                                .await
+                                .unwrap();
+                        }
+                        Some(StreamCommand::Reconnect(tx)) => {
+                            activated = Some(tx);
+                            break;
+                        }
+                        None => return,
+                    }
+                }
             }
         });
         Self { tx }
@@ -176,6 +278,22 @@ impl StreamFeeder {
     pub(crate) fn feed(&self, fixture_rel_path: &str) {
         let mut frame = load_json_fixture(fixture_rel_path);
         frame["id"] = 2.into();
-        self.tx.send(frame.to_string()).unwrap();
+        self.tx
+            .send(StreamCommand::Frame(frame.to_string()))
+            .unwrap();
     }
+
+    pub(crate) async fn reconnect(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(StreamCommand::Reconnect(tx)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("execution stream did not accept a replacement connection")
+            .unwrap();
+    }
+}
+
+enum StreamCommand {
+    Frame(String),
+    Reconnect(tokio::sync::oneshot::Sender<()>),
 }

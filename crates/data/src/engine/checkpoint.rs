@@ -52,10 +52,10 @@ impl DataEngine {
         count!(book_snapshot_counts);
         count!(book_snapshot_sources);
         count!(book_deltas_counts);
-        count!(book_depth10_counts);
+        count!(book_depth_counts);
         count!(book_updaters);
-        count!(book_deltas_parent_expansions);
-        count!(book_depth10_parent_expansions);
+        count!(book_subscriptions);
+        count!(book_subscription_owners);
         count!(book_snapshotters);
         count!(bar_aggregators);
         count!(bar_aggregator_handlers);
@@ -99,7 +99,6 @@ impl DataEngine {
         #[cfg(feature = "defi")]
         {
             count!(pool_updaters);
-            count!(pool_updaters_pending);
             count!(pool_snapshot_pending);
             count!(pool_event_buffers);
         }
@@ -159,7 +158,7 @@ impl DataEngine {
             }
         }
         Ok(serde_json::to_value(Snapshot {
-            profile: "native_data_engine_external_bars_no_internal_pipelines.v1".into(),
+            profile: "native_data_engine_external_bars_no_internal_pipelines.v2".into(),
             configuration: self.config.clone(),
             clients: self.clients.keys().copied().collect(),
             default_client_id: self.default_client_id,
@@ -180,7 +179,32 @@ impl DataEngine {
     /// Installs counters only into the same actual routing/configuration before
     /// tail replay. Internal request/aggregation pipelines have no supported path.
     pub fn restore_running_checkpoint_state(&mut self, source: &serde_json::Value) -> Result<()> {
-        let source: Snapshot = serde_json::from_value(source.clone())?;
+        let mut source: Snapshot = serde_json::from_value(source.clone())?;
+        if source.profile == "native_data_engine_external_bars_no_internal_pipelines.v1" {
+            // The original profile supports only external bars. New book owners
+            // are incompatible with active old expansions; retain original bytes
+            // and translate only verified empty unsupported families in memory.
+            for (old, new) in [
+                ("book_depth10_counts", "book_depth_counts"),
+                ("book_deltas_parent_expansions", "book_subscriptions"),
+                ("book_depth10_parent_expansions", "book_subscription_owners"),
+            ] {
+                ensure!(
+                    source.subsystem_counts.remove(old) == Some(0),
+                    "legacy native DataEngine unsupported pipeline is absent or active: {old}"
+                );
+                ensure!(
+                    source.subsystem_counts.insert(new.into(), 0).is_none(),
+                    "legacy native DataEngine contains a duplicate new pipeline: {new}"
+                );
+            }
+            #[cfg(feature = "defi")]
+            ensure!(
+                source.subsystem_counts.remove("pool_updaters_pending") == Some(0),
+                "legacy native DataEngine pending pool updater is absent or active"
+            );
+            source.profile = "native_data_engine_external_bars_no_internal_pipelines.v2".into();
+        }
         ensure!(
             !self.checkpoint_restored,
             "native DataEngine checkpoint already installed"
@@ -219,7 +243,7 @@ mod tests {
     use super::*;
     fn engine() -> DataEngine {
         DataEngine::new(
-            Rc::new(RefCell::new(nautilus_common::clock::TestClock::new())),
+            Rc::new(RefCell::new(nautilus_common::clock::VirtualClock::new())),
             Rc::new(RefCell::new(Cache::default())),
             None,
         )
@@ -292,6 +316,37 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("another engine")
+        );
+    }
+    #[rstest::rstest]
+    fn original_empty_external_bar_v1_inventory_reads_without_mutating_source() {
+        let mut source = engine();
+        source.command_count = 11;
+        source.data_count = 42;
+        let current = source.running_checkpoint_state().unwrap();
+        let mut original = current.clone();
+        original["profile"] = "native_data_engine_external_bars_no_internal_pipelines.v1".into();
+        let counts = original["subsystem_counts"].as_object_mut().unwrap();
+        for (old, new) in [
+            ("book_depth10_counts", "book_depth_counts"),
+            ("book_deltas_parent_expansions", "book_subscriptions"),
+            ("book_depth10_parent_expansions", "book_subscription_owners"),
+        ] {
+            let value = counts.remove(new).unwrap();
+            counts.insert(old.into(), value);
+        }
+        #[cfg(feature = "defi")]
+        counts.insert("pool_updaters_pending".into(), 0.into());
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let mut target = engine();
+        target.restore_running_checkpoint_state(&original).unwrap();
+        assert_eq!(target.running_checkpoint_state().unwrap(), current);
+        assert_eq!(serde_json::to_vec(&original).unwrap(), bytes);
+        original["subsystem_counts"]["book_deltas_parent_expansions"] = 1.into();
+        assert!(
+            engine()
+                .restore_running_checkpoint_state(&original)
+                .is_err()
         );
     }
 }

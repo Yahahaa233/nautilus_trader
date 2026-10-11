@@ -64,6 +64,28 @@ Use of this software is subject to the [Disclaimer](https://nautilustrader.io/le
 
 ## Managed Metis extension
 
+### Current bounded native profile
+
+The current managed batch selects official `develop`
+`021f9d6642c1fbaff7590b5609ebc59d0ed9ee32` (Rust 1.99). The contract table and limits
+below describe earlier protocol/handoff batches and retain their historical scope.
+With `native-tail-replay`, an actual owned Journal and explicitly registered
+codecs/component/adapter/timer profiles, the current node also captures completed
+roots with seven physical native FIFOs, original receipts and shared callback
+ancestry, then replays a verified sealed original tail through actual handlers and
+compares the resulting final cut. See `RunningCheckpointBoundary` and
+`LiveNode::replay_native_tail`.
+
+The legacy observer's `coverage_complete` and `queue_state_collected` remain false;
+only the separately verified native inventory proves its bounded capture. Missing
+codecs/owner profiles, unknown active or failed callbacks, in-flight venue queries,
+external forwarding/private pipelines and unsealed original tails are refused.
+Legacy nonempty pending FIFO lacking its original ancestry sidecar is unsupported.
+Execution observation and transport fences stay closed during history; SDK tests
+do not establish CQS recovery readiness, account reconciliation, authorization or
+venue acceptance. The current facts supersede only the appendix's general
+"queue state is not collected" description for this explicitly admitted profile.
+
 | Local contract | Scope and regression entry | Removal criterion |
 |---|---|---|
 | Explicit dispatch begin/complete/abort protocol | Opt-in `dispatch-observer`; `dispatch::tests` checks nesting, ordered tokens, durable failure and aborts | Equivalent upstream protocol plus complete ingress wiring and failure tests |

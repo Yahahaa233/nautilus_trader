@@ -3,7 +3,7 @@
 use super::{EngineConnectionStatus, LiveNode, RunnerReceivers};
 use crate::runner::{AsyncRunnerChannels, Retained};
 use nautilus_common::{
-    live::dst,
+    live::{dispatch::DispatchMessage, dst},
     messages::{DataEvent, ExecutionEvent, SystemCommand, SystemEvent, data::DataCommand},
     runner::{TimeEventMessage, TradingCommandMessage},
 };
@@ -11,13 +11,13 @@ use std::{collections::VecDeque, time::Duration};
 
 #[derive(Default)]
 pub(super) struct StartupPending {
-    time: VecDeque<Retained<TimeEventMessage>>,
-    system_events: VecDeque<Retained<SystemEvent>>,
-    system_commands: VecDeque<Retained<SystemCommand>>,
-    data_events: VecDeque<Retained<DataEvent>>,
-    data_commands: VecDeque<Retained<DataCommand>>,
-    execution_events: VecDeque<Retained<ExecutionEvent>>,
-    execution_commands: VecDeque<Retained<TradingCommandMessage>>,
+    time: VecDeque<Retained<DispatchMessage<TimeEventMessage>>>,
+    system_events: VecDeque<Retained<DispatchMessage<SystemEvent>>>,
+    system_commands: VecDeque<Retained<DispatchMessage<SystemCommand>>>,
+    data_events: VecDeque<Retained<DispatchMessage<DataEvent>>>,
+    data_commands: VecDeque<Retained<DispatchMessage<DataCommand>>>,
+    execution_events: VecDeque<Retained<DispatchMessage<ExecutionEvent>>>,
+    execution_commands: VecDeque<Retained<DispatchMessage<TradingCommandMessage>>>,
 }
 impl StartupPending {
     #[cfg(all(test, feature = "native-tail-replay"))]
@@ -129,7 +129,9 @@ impl LiveNode {
         // Account, reports, individual orders and whole native batches retain
         // their original relative FIFO order on the execution channel.
         while let Some(entry) = pending.execution_events.pop_front() {
-            self.process_exec_event(entry.activate());
+            entry
+                .activate()
+                .dispatch(|event| self.process_exec_event(event));
             self.check_startup_dispatch()?;
         }
         while let Some(entry) = pending.execution_commands.pop_front() {
@@ -143,11 +145,15 @@ impl LiveNode {
         pending: &mut StartupPending,
     ) -> anyhow::Result<()> {
         while let Some(entry) = pending.system_events.pop_front() {
-            self.process_system_event(entry.activate());
+            entry
+                .activate()
+                .dispatch(|event| self.process_system_event(event));
             self.check_startup_dispatch()?;
         }
         while let Some(entry) = pending.system_commands.pop_front() {
-            self.process_system_command(entry.activate());
+            entry
+                .activate()
+                .dispatch(|command| self.process_system_command(command));
             self.check_startup_dispatch()?;
         }
         Ok(())

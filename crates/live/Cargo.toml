@@ -44,6 +44,7 @@ extension-module = [
   "streaming",
 ]
 python = [
+  "streaming",
   "node",
   "nautilus-common/python",
   "nautilus-core/python",
@@ -131,6 +132,7 @@ nautilus-testkit = { workspace = true, default-features = false, features = [
   "testers",
 ] }
 
+axum = { workspace = true }
 bytes = { workspace = true }
 criterion = { workspace = true }
 madsim = { workspace = true }
@@ -139,6 +141,7 @@ rmp-serde = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 ustr = { workspace = true }
 
@@ -153,7 +156,17 @@ name = "queue_monitor"
 harness = false
 required-features = ["node"]
 
+[[bench]]
+name = "reconciliation"
+path = "benches/reconciliation.rs"
+harness = false
+
 [[test]]
 name = "integration"
 path = "tests/integration/main.rs"
 required-features = ["node"]
+
+[[test]]
+name = "book"
+path = "tests/book/main.rs"
+required-features = ["test-support"]

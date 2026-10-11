@@ -41,7 +41,7 @@ use nautilus_model::{
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
 };
 use nautilus_network::{
-    http::{HttpClient, Method},
+    http::{HttpClient, HttpRedirectPolicy, Method, create_standard_nautilus_headers},
     ratelimiter::quota::Quota,
     retry::{RetryConfig, RetryError, RetryManager},
 };
@@ -220,6 +220,7 @@ impl DeribitRawHttpClient {
         Ok(Self {
             base_url,
             client: HttpClient::builder()
+                .headers(create_standard_nautilus_headers().into_iter().collect())
                 .keyed_quotas(Self::rate_limiter_quotas())
                 .default_quota(*DERIBIT_HTTP_REST_QUOTA)
                 .timeout_secs(timeout_secs)
@@ -354,6 +355,8 @@ impl DeribitRawHttpClient {
         Ok(Self {
             base_url,
             client: HttpClient::builder()
+                .redirect_policy(HttpRedirectPolicy::Reject)
+                .headers(create_standard_nautilus_headers().into_iter().collect())
                 .keyed_quotas(Self::rate_limiter_quotas())
                 .default_quota(*DERIBIT_HTTP_REST_QUOTA)
                 .timeout_secs(timeout_secs)
@@ -376,8 +379,8 @@ impl DeribitRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The HTTP client cannot be created
-    /// - Credentials are not provided and environment variables are not set
+    /// - The HTTP client cannot be created.
+    /// - Credentials are not provided and environment variables are not set.
     #[expect(clippy::too_many_arguments)]
     pub fn new_with_env(
         api_key: Option<String>,
@@ -488,9 +491,25 @@ impl DeribitRawHttpClient {
                 // Note: Deribit may return JSON-RPC errors with non-2xx HTTP status (e.g., 400)
                 // Always try to parse as JSON-RPC first, then fall back to HTTP error handling
 
-                // Try to parse as JSON first
-                let json_value: serde_json::Value = match serde_json::from_slice(&resp.body) {
-                    Ok(json) => json,
+                // Decode the body directly so exact decimal fields read the raw numeric tokens
+                let json_rpc_response: DeribitJsonRpcResponse<T> = match serde_json::from_slice(
+                    &resp.body,
+                ) {
+                    Ok(response) => response,
+                    Err(e) if e.is_data() => {
+                        log::warn!(
+                            "Failed to deserialize Deribit JSON-RPC response: method={method}, status={}, error={e}",
+                            resp.status.as_u16()
+                        );
+                        log::debug!(
+                            "Response JSON (first 2000 chars): {}",
+                            String::from_utf8_lossy(&resp.body)
+                                .chars()
+                                .take(2000)
+                                .collect::<String>()
+                        );
+                        return Err(DeribitHttpError::JsonError(e.to_string()));
+                    }
                     Err(_) => {
                         // Not valid JSON - treat as HTTP error
                         let error_body = String::from_utf8_lossy(&resp.body);
@@ -504,24 +523,6 @@ impl DeribitRawHttpClient {
                         });
                     }
                 };
-
-                // Try to parse as JSON-RPC response
-                let json_rpc_response: DeribitJsonRpcResponse<T> =
-                    serde_json::from_value(json_value.clone()).map_err(|e| {
-                        log::warn!(
-                            "Failed to deserialize Deribit JSON-RPC response: method={method}, status={}, error={e}",
-                            resp.status.as_u16()
-                        );
-                        log::debug!(
-                            "Response JSON (first 2000 chars): {}",
-                            json_value
-                                .to_string()
-                                .chars()
-                                .take(2000)
-                                .collect::<String>()
-                        );
-                        DeribitHttpError::JsonError(e.to_string())
-                    })?;
 
                 // Check if it's a success or error result
                 if json_rpc_response.result.is_some() {
@@ -584,7 +585,7 @@ impl DeribitRawHttpClient {
         if let Err(ref e) = result
             && e.is_retryable()
         {
-            log::error!("Request exhausted retries: method={method}, error={e}");
+            log::warn!("Request exhausted retries: method={method}, error={e}");
         }
 
         result
@@ -693,9 +694,9 @@ impl DeribitRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Credentials are missing ([`DeribitHttpError::MissingCredentials`])
-    /// - Authentication fails (invalid signature, expired timestamp)
-    /// - The request fails or the response cannot be parsed
+    /// - Credentials are missing.
+    /// - Authentication fails (invalid signature, expired timestamp).
+    /// - The request fails or the response cannot be parsed.
     pub async fn get_account_summaries(
         &self,
         params: GetAccountSummariesParams,
@@ -722,9 +723,9 @@ impl DeribitRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Credentials are missing ([`DeribitHttpError::MissingCredentials`])
-    /// - Authentication fails (invalid signature, expired timestamp)
-    /// - The request fails or the response cannot be parsed
+    /// - Credentials are missing.
+    /// - Authentication fails (invalid signature, expired timestamp).
+    /// - The request fails or the response cannot be parsed.
     pub async fn get_order_state(
         &self,
         params: GetOrderStateParams,
@@ -738,9 +739,9 @@ impl DeribitRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Credentials are missing ([`DeribitHttpError::MissingCredentials`])
-    /// - Authentication fails (invalid signature, expired timestamp)
-    /// - The request fails or the response cannot be parsed
+    /// - Credentials are missing.
+    /// - Authentication fails (invalid signature, expired timestamp).
+    /// - The request fails or the response cannot be parsed.
     pub async fn get_open_orders(
         &self,
         params: GetOpenOrdersParams,
@@ -754,9 +755,9 @@ impl DeribitRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Credentials are missing ([`DeribitHttpError::MissingCredentials`])
-    /// - Authentication fails (invalid signature, expired timestamp)
-    /// - The request fails or the response cannot be parsed
+    /// - Credentials are missing.
+    /// - Authentication fails (invalid signature, expired timestamp).
+    /// - The request fails or the response cannot be parsed.
     pub async fn get_open_orders_by_instrument(
         &self,
         params: GetOpenOrdersByInstrumentParams,
@@ -770,9 +771,9 @@ impl DeribitRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Credentials are missing ([`DeribitHttpError::MissingCredentials`])
-    /// - Authentication fails (invalid signature, expired timestamp)
-    /// - The request fails or the response cannot be parsed
+    /// - Credentials are missing.
+    /// - Authentication fails (invalid signature, expired timestamp).
+    /// - The request fails or the response cannot be parsed.
     pub async fn get_order_history_by_instrument(
         &self,
         params: GetOrderHistoryByInstrumentParams,
@@ -786,9 +787,9 @@ impl DeribitRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Credentials are missing ([`DeribitHttpError::MissingCredentials`])
-    /// - Authentication fails (invalid signature, expired timestamp)
-    /// - The request fails or the response cannot be parsed
+    /// - Credentials are missing.
+    /// - Authentication fails (invalid signature, expired timestamp).
+    /// - The request fails or the response cannot be parsed.
     pub async fn get_order_history_by_currency(
         &self,
         params: GetOrderHistoryByCurrencyParams,
@@ -802,9 +803,9 @@ impl DeribitRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Credentials are missing ([`DeribitHttpError::MissingCredentials`])
-    /// - Authentication fails (invalid signature, expired timestamp)
-    /// - The request fails or the response cannot be parsed
+    /// - Credentials are missing.
+    /// - Authentication fails (invalid signature, expired timestamp).
+    /// - The request fails or the response cannot be parsed.
     pub async fn get_user_trades_by_instrument_and_time(
         &self,
         params: GetUserTradesByInstrumentAndTimeParams,
@@ -822,9 +823,9 @@ impl DeribitRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Credentials are missing ([`DeribitHttpError::MissingCredentials`])
-    /// - Authentication fails (invalid signature, expired timestamp)
-    /// - The request fails or the response cannot be parsed
+    /// - Credentials are missing.
+    /// - Authentication fails (invalid signature, expired timestamp).
+    /// - The request fails or the response cannot be parsed.
     pub async fn get_user_trades_by_currency_and_time(
         &self,
         params: GetUserTradesByCurrencyAndTimeParams,
@@ -863,9 +864,9 @@ impl DeribitRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Credentials are missing ([`DeribitHttpError::MissingCredentials`])
-    /// - Authentication fails (invalid signature, expired timestamp)
-    /// - The request fails or the response cannot be parsed
+    /// - Credentials are missing.
+    /// - Authentication fails (invalid signature, expired timestamp).
+    /// - The request fails or the response cannot be parsed.
     pub async fn get_positions(
         &self,
         params: GetPositionsParams,
@@ -968,8 +969,8 @@ impl DeribitHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The HTTP client cannot be created
-    /// - Credentials are not provided and environment variables are not set
+    /// - The HTTP client cannot be created.
+    /// - Credentials are not provided and environment variables are not set.
     #[expect(clippy::too_many_arguments)]
     pub fn new_with_env(
         api_key: Option<String>,
@@ -1079,9 +1080,9 @@ impl DeribitHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The instrument name format is invalid (error code `-32602`)
-    /// - The instrument doesn't exist (error code `13020`)
-    /// - Network or API errors occur
+    /// - The instrument name format is invalid (error code `-32602`).
+    /// - The instrument doesn't exist (error code `13020`).
+    /// - Network or API errors occur.
     pub async fn request_instrument(
         &self,
         instrument_id: InstrumentId,
@@ -1232,9 +1233,9 @@ impl DeribitHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The instrument is not found in cache
-    /// - The request fails
-    /// - Trade parsing fails
+    /// - The instrument is not found in cache.
+    /// - The request fails.
+    /// - Trade parsing fails.
     ///
     /// # Pagination
     ///
@@ -1356,10 +1357,10 @@ impl DeribitHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Aggregation source is not EXTERNAL
-    /// - Bar aggregation type is not supported by Deribit
-    /// - The instrument is not found in cache
-    /// - The request fails or response cannot be parsed
+    /// - Aggregation source is not EXTERNAL.
+    /// - Bar aggregation type is not supported by Deribit.
+    /// - The instrument is not found in cache.
+    /// - The request fails or response cannot be parsed.
     ///
     /// # Supported Resolutions
     ///
@@ -1475,9 +1476,9 @@ impl DeribitHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The instrument is not found in cache
-    /// - The request fails
-    /// - Order book parsing fails
+    /// - The instrument is not found in cache.
+    /// - The request fails.
+    /// - Order book parsing fails.
     pub async fn request_book_snapshot(
         &self,
         instrument_id: InstrumentId,
@@ -1528,8 +1529,8 @@ impl DeribitHttpClient {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The request fails
-    /// - Currency conversion fails
+    /// - The request fails.
+    /// - Currency conversion fails.
     pub async fn request_account_state(
         &self,
         account_id: AccountId,
@@ -2015,12 +2016,39 @@ impl DeribitHttpClient {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_testkit::http::assert_http_redirect_rejected;
     use rstest::rstest;
 
     use super::*;
     use crate::common::consts::{
         DERIBIT_ACCOUNT_RATE_KEY, DERIBIT_GLOBAL_RATE_KEY, DERIBIT_ORDER_RATE_KEY,
     };
+
+    #[tokio::test]
+    async fn test_authenticated_client_rejects_redirects() {
+        let client = DeribitRawHttpClient::with_credentials(
+            "key".into(),
+            "secret".into(),
+            None,
+            DeribitEnvironment::Testnet,
+            3,
+            0,
+            1,
+            1,
+            None,
+        )
+        .unwrap()
+        .client;
+        assert_http_redirect_rejected(|url| async move {
+            client
+                .get(url, None, None, Some(3), None)
+                .await
+                .unwrap()
+                .status
+                .as_u16()
+        })
+        .await;
+    }
 
     #[rstest]
     #[case("private/buy", true, false)]

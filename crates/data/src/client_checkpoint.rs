@@ -35,7 +35,8 @@ struct Snapshot {
     active: Vec<Active>,
     subscriptions_custom: Vec<DataType>,
     subscriptions_book_deltas: Vec<InstrumentId>,
-    subscriptions_book_depth10: Vec<InstrumentId>,
+    #[serde(alias = "subscriptions_book_depth10")]
+    subscriptions_book_depth: Vec<InstrumentId>,
     subscriptions_quotes: Vec<InstrumentId>,
     subscriptions_trades: Vec<InstrumentId>,
     subscriptions_bars: Vec<BarType>,
@@ -85,7 +86,7 @@ impl DataClientAdapter {
             .collect::<Result<Vec<_>>>()?;
         active.sort_by_key(|value| value.command.command_id().to_string());
         let snapshot = Snapshot {
-            profile: "native_data_client_subscription_owners.v1".into(),
+            profile: "native_data_client_subscription_owners.v2".into(),
             client_id: self.client_id,
             venue: self.venue,
             handles_book_deltas: self.handles_book_deltas,
@@ -93,7 +94,7 @@ impl DataClientAdapter {
             active,
             subscriptions_custom: ordered(&self.subscriptions_custom)?,
             subscriptions_book_deltas: ordered(&self.subscriptions_book_deltas)?,
-            subscriptions_book_depth10: ordered(&self.subscriptions_book_depth10)?,
+            subscriptions_book_depth: ordered(&self.subscriptions_book_depth)?,
             subscriptions_quotes: ordered(&self.subscriptions_quotes)?,
             subscriptions_trades: ordered(&self.subscriptions_trades)?,
             subscriptions_bars: ordered(&self.subscriptions_bars)?,
@@ -111,8 +112,11 @@ impl DataClientAdapter {
     pub fn restore_running_checkpoint_state(&mut self, source: &serde_json::Value) -> Result<()> {
         let snapshot: Snapshot = serde_json::from_value(source.clone())?;
         ensure!(
-            snapshot.profile == "native_data_client_subscription_owners.v1"
-                && snapshot.client_id == self.client_id
+            matches!(
+                snapshot.profile.as_str(),
+                "native_data_client_subscription_owners.v1"
+                    | "native_data_client_subscription_owners.v2"
+            ) && snapshot.client_id == self.client_id
                 && snapshot.venue == self.venue
                 && snapshot.handles_book_deltas == self.handles_book_deltas
                 && snapshot.handles_book_snapshots == self.handles_book_snapshots,
@@ -133,10 +137,16 @@ impl DataClientAdapter {
         );
         let book_deltas = unique(snapshot.subscriptions_book_deltas)?;
         ensure!(
-            self.subscriptions_book_depth10.is_empty(),
+            self.subscriptions_book_depth.is_empty(),
             "native facade subscription state already used"
         );
-        let book_depth10 = unique(snapshot.subscriptions_book_depth10)?;
+        if snapshot.profile == "native_data_client_subscription_owners.v1" {
+            ensure!(
+                snapshot.subscriptions_book_depth.is_empty(),
+                "legacy depth10 native subscriptions have no source-faithful variable-depth restoration contract"
+            );
+        }
+        let book_depth = unique(snapshot.subscriptions_book_depth)?;
         ensure!(
             self.subscriptions_quotes.is_empty(),
             "native facade subscription state already used"
@@ -207,7 +217,7 @@ impl DataClientAdapter {
         self.subscriptions_active.restore_entries(entries)?;
         self.subscriptions_custom = custom;
         self.subscriptions_book_deltas = book_deltas;
-        self.subscriptions_book_depth10 = book_depth10;
+        self.subscriptions_book_depth = book_depth;
         self.subscriptions_quotes = quotes;
         self.subscriptions_trades = trades;
         self.subscriptions_bars = bars;

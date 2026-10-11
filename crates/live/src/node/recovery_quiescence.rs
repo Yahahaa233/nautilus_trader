@@ -65,7 +65,7 @@ pub(super) fn with_registered_timer_inventory_mode<T>(
         }
         let kind = (**clock).type_id();
         ensure!(
-            kind == TypeId::of::<nautilus_common::clock::TestClock>()
+            kind == TypeId::of::<nautilus_common::clock::VirtualClock>()
                 || kind == TypeId::of::<nautilus_common::live::clock::LiveClock>(),
             "unsupported running clock implementation: {id}"
         );
@@ -151,7 +151,7 @@ pub(super) fn with_registered_timer_inventory<T>(
         for (id, clock) in &held {
             let kind = (**clock).type_id();
             ensure!(
-                kind == TypeId::of::<nautilus_common::clock::TestClock>()
+                kind == TypeId::of::<nautilus_common::clock::VirtualClock>()
                     || kind == TypeId::of::<nautilus_common::live::clock::LiveClock>(),
                 "unsupported clock implementation: {id}"
             );

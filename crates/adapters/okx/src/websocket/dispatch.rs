@@ -34,7 +34,7 @@ use nautilus_live::{
     },
 };
 use nautilus_model::{
-    enums::OrderStatus,
+    enums::{AccountType, OrderStatus},
     events::{
         OrderAccepted, OrderCanceled, OrderEventAny, OrderFilled, OrderRejected, OrderTriggered,
         OrderUpdated,
@@ -45,7 +45,7 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     orders::TRIGGERABLE_ORDER_TYPES,
     reports::FillReport,
-    types::{Currency, Money, Quantity},
+    types::Currency,
 };
 use parking_lot::Mutex;
 use ustr::Ustr;
@@ -70,8 +70,9 @@ use crate::{
         handler::{is_post_only_auto_cancel, is_unfilled_rpi_cancel},
         messages::{ExecutionReport, OKXAlgoOrderMsg, OKXOrderMsg, OKXWsMessage},
         parse::{
-            OrderStateSnapshot, ParsedOrderEvent, parse_algo_order_msg,
-            parse_algo_order_status_report, parse_order_event, parse_order_msg, parse_order_update,
+            FeeCache, FilledQtyCache, OrderStateSnapshot, ParsedOrderEvent,
+            is_terminal_order_state, parse_algo_order_msg, parse_algo_order_status_report,
+            parse_order_event, parse_order_msg, parse_order_status_report, parse_order_update,
             parse_spread_order_event, parse_spread_order_msg, update_fee_fill_caches,
         },
     },
@@ -182,6 +183,7 @@ pub struct WsDispatchState {
     pub(crate) protection_sources: crate::protection::ProtectionSourceEmitter,
     pub order_identities: DashMap<ClientOrderId, OrderIdentity>,
     order_contexts: DashMap<ClientOrderId, OrderContext>,
+    pub(crate) algo_order_states: DashMap<ClientOrderId, AlgoOrderState>,
     pub(crate) pending_orders: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) retained_submit_contexts: Arc<DashMap<String, PendingSubmitInfo>>,
     pub(crate) pending_cancels: Arc<DashMap<String, PendingOrderInfo>>,
@@ -200,12 +202,19 @@ pub struct WsDispatchState {
     linked_child_notify: tokio::sync::Notify,
 }
 
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AlgoOrderState {
+    pub(crate) order_type: OKXAlgoOrderType,
+    pub(crate) ts_last: UnixNanos,
+}
+
 impl Default for WsDispatchState {
     fn default() -> Self {
         Self {
             protection_sources: crate::protection::ProtectionSourceEmitter::default(),
             order_identities: DashMap::new(),
             order_contexts: DashMap::new(),
+            algo_order_states: DashMap::new(),
             pending_orders: Arc::new(DashMap::new()),
             retained_submit_contexts: Arc::new(DashMap::new()),
             pending_cancels: Arc::new(DashMap::new()),
@@ -233,6 +242,8 @@ impl WsDispatchState {
         struct Snapshot {
             order_identities: AHashMap<ClientOrderId, OrderIdentity>,
             order_contexts: AHashMap<ClientOrderId, OrderContext>,
+            #[serde(default)]
+            algo_order_states: std::collections::BTreeMap<ClientOrderId, AlgoOrderState>,
             accepted_venue_order_ids: Vec<(ClientOrderId, VenueOrderId)>,
             triggered_orders: Vec<ClientOrderId>,
             filled_orders: Vec<ClientOrderId>,
@@ -433,6 +444,17 @@ impl WsDispatchState {
         for (key, context) in source.retained_submit_contexts {
             self.retained_submit_contexts.insert(key, context);
         }
+        anyhow::ensure!(
+            source.algo_order_states.len() <= DEDUP_CAPACITY
+                && source
+                    .algo_order_states
+                    .keys()
+                    .all(|id| source.order_contexts.contains_key(id)),
+            "source algo order state is unbound or exceeds inventory"
+        );
+        for (key, value) in source.algo_order_states {
+            self.algo_order_states.insert(key, value);
+        }
         for (key, value) in source.order_contexts {
             self.order_contexts.insert(key, value);
         }
@@ -528,6 +550,7 @@ impl WsDispatchState {
                 .collect::<std::collections::BTreeMap<_,_>>(),
             "order_contexts":self.order_contexts.iter().map(|entry| (*entry.key(), *entry.value()))
                 .collect::<std::collections::BTreeMap<_,_>>(),
+            "algo_order_states":self.algo_order_states.iter().map(|entry| (*entry.key(), *entry.value())).collect::<std::collections::BTreeMap<_,_>>(),
             "accepted_venue_order_ids":self.accepted_venue_order_ids.lock().checkpoint_entries(),
             "triggered_orders":self.triggered_orders.inner.lock().checkpoint_entries(),
             "filled_orders":self.filled_orders.inner.lock().checkpoint_entries(),
@@ -641,9 +664,8 @@ impl WsDispatchState {
     }
 
     pub(crate) fn order_identity(&self, client_order_id: ClientOrderId) -> Option<OrderIdentity> {
-        self.order_contexts
-            .get(&client_order_id)
-            .map(|entry| entry.identity)
+        self.order_context(client_order_id)
+            .map(|context| context.identity)
             .or_else(|| {
                 self.order_identities
                     .get(&client_order_id)
@@ -700,6 +722,12 @@ impl WsDispatchState {
         });
     }
 
+    pub(crate) fn order_context(&self, client_order_id: ClientOrderId) -> Option<OrderContext> {
+        self.order_contexts
+            .get(&client_order_id)
+            .map(|entry| *entry)
+    }
+
     pub(crate) fn remove_order_tracking(&self, client_order_id: ClientOrderId) {
         let pending = self.pending_linked_children.lock();
         let removed_context = self.order_contexts.remove(&client_order_id).is_some();
@@ -718,6 +746,7 @@ impl WsDispatchState {
         }
         self.retained_cancel_contexts
             .remove(client_order_id.as_str());
+        self.algo_order_states.remove(&client_order_id);
         drop(pending);
 
         if removed_context {
@@ -1084,9 +1113,10 @@ pub fn dispatch_ws_message(
     emitter: &ExecutionEventEmitter,
     state: &WsDispatchState,
     account_id: AccountId,
+    account_type: AccountType,
     instruments: &AtomicMap<Ustr, InstrumentAny>,
-    fee_cache: &mut AHashMap<Ustr, Money>,
-    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
+    fee_cache: &mut FeeCache,
+    filled_qty_cache: &mut FilledQtyCache,
     order_state_cache: &mut AHashMap<ClientOrderId, OrderStateSnapshot>,
     clock: &AtomicTime,
 ) {
@@ -1201,7 +1231,10 @@ pub fn dispatch_ws_message(
                 Ok(accounts) => {
                     for account in &accounts {
                         match crate::common::parse::parse_account_state(
-                            account, account_id, ts_init,
+                            account,
+                            account_id,
+                            account_type,
+                            ts_init,
                         ) {
                             Ok(account_state) => emitter.send_account_state(account_state),
                             Err(e) => log::error!("Failed to parse account state: {e}"),
@@ -1617,8 +1650,14 @@ pub fn dispatch_ws_message(
                             client_order_id,
                             &request_id,
                         );
-                        if !is_ambiguous {
-                            state.pending_amends.remove(key);
+                        if !is_ambiguous && let Some(ident) = state.order_identity(client_order_id)
+                        {
+                            state.pending_amends.remove_if(key, |_, info| {
+                                info.matches_amendment(Some(&request_id))
+                                    && info.trader_id == emitter.trader_id()
+                                    && info.strategy_id == ident.strategy_id
+                                    && info.instrument_id == ident.instrument_id
+                            });
                         }
                     }
                     _ => {}
@@ -1657,14 +1696,7 @@ pub fn dispatch_ws_message(
         | OKXWsMessage::Instruments(_) => {
             log::debug!("Ignoring data message on execution client");
         }
-        OKXWsMessage::Error(e) => {
-            log::warn!(
-                "Websocket error: code={} message={} conn_id={:?}",
-                e.code,
-                e.message,
-                e.conn_id
-            );
-        }
+        OKXWsMessage::Error(_) => {}
         OKXWsMessage::Reconnected => {
             log::info!("Websocket reconnected");
         }
@@ -1896,8 +1928,13 @@ fn dispatch_tracked_algo_order_message(
     }
 
     if binding.child.is_none() {
-        context = refresh_algo_order_context(msg, context, instrument, account_id, ts_init);
-        state.track_order_context(context);
+        let Some(refreshed) = dispatch_pending_algo_order(
+            msg, context, instrument, account_id, ts_event, ts_init, emitter, state,
+        ) else {
+            return;
+        };
+
+        context = refreshed;
     }
 
     bindings
@@ -1905,25 +1942,7 @@ fn dispatch_tracked_algo_order_message(
         .insert(parent_venue_order_id, client_order_id);
 
     match msg.state {
-        OKXAlgoOrderStatus::Live | OKXAlgoOrderStatus::Pause => {
-            if binding.child.is_some() {
-                log::debug!(
-                    "Suppressing stale algo parent acceptance for {client_order_id}: algo_id={}",
-                    msg.algo_id,
-                );
-            } else {
-                ensure_accepted_emitted(
-                    client_order_id,
-                    account_id,
-                    parent_venue_order_id,
-                    &context.identity,
-                    emitter,
-                    state,
-                    ts_event,
-                    ts_init,
-                );
-            }
-        }
+        OKXAlgoOrderStatus::Live | OKXAlgoOrderStatus::Pause => {}
         OKXAlgoOrderStatus::Effective
         | OKXAlgoOrderStatus::OrderPlaced
         | OKXAlgoOrderStatus::PartiallyEffective
@@ -2009,9 +2028,9 @@ fn dispatch_tracked_algo_order_message(
                 );
             } else {
                 let reason = if msg.fail_code.is_empty() {
-                    "OKX algo order failed"
+                    "OKX algo order failed".to_string()
                 } else {
-                    msg.fail_code.as_str()
+                    format_order_response_reason(&msg.fail_code, "", "")
                 };
                 let rejected = OrderRejected::new(
                     emitter.trader_id(),
@@ -2019,7 +2038,7 @@ fn dispatch_tracked_algo_order_message(
                     context.identity.instrument_id,
                     client_order_id,
                     account_id,
-                    Ustr::from(reason),
+                    Ustr::from(reason.as_str()),
                     UUID4::new(),
                     ts_event,
                     ts_init,
@@ -2074,13 +2093,47 @@ fn algo_child_venue_order_id(msg: &OKXAlgoOrderMsg) -> Option<VenueOrderId> {
     }
 }
 
-fn refresh_algo_order_context(
+#[expect(clippy::too_many_arguments)]
+fn dispatch_pending_algo_order(
     msg: &OKXAlgoOrderMsg,
     mut context: OrderContext,
     instrument: &InstrumentAny,
     account_id: AccountId,
+    ts_event: UnixNanos,
     ts_init: UnixNanos,
-) -> OrderContext {
+    emitter: &ExecutionEventEmitter,
+    state: &WsDispatchState,
+) -> Option<OrderContext> {
+    if state
+        .algo_order_states
+        .get(&context.identity.client_order_id)
+        .is_some_and(|previous| ts_event < previous.ts_last)
+    {
+        return None;
+    }
+
+    let client_order_id = context.identity.client_order_id;
+    let pending = matches!(
+        msg.state,
+        OKXAlgoOrderStatus::Live | OKXAlgoOrderStatus::Pause
+    );
+    let parent_venue_order_id = VenueOrderId::new(msg.algo_id.as_str());
+
+    if pending {
+        ensure_accepted_emitted(
+            client_order_id,
+            account_id,
+            parent_venue_order_id,
+            &context.identity,
+            emitter,
+            state,
+            ts_event,
+            ts_init,
+        );
+    }
+
+    let previous = context;
+
     match parse_algo_order_status_report(msg, instrument, account_id, ts_init) {
         Ok(report) => {
             if !msg.sz.is_empty() {
@@ -2096,7 +2149,7 @@ fn refresh_algo_order_context(
                 "Failed to refresh tracked algo order context for {}: {e}",
                 context.identity.client_order_id,
             );
-            return context;
+            return Some(context);
         }
     }
 
@@ -2110,7 +2163,33 @@ fn refresh_algo_order_context(
         }
     }
 
-    context
+    state.track_order_context(context);
+    state.algo_order_states.insert(
+        client_order_id,
+        AlgoOrderState {
+            order_type: msg.ord_type,
+            ts_last: ts_event,
+        },
+    );
+
+    if pending
+        && msg.ord_type != OKXAlgoOrderType::MoveOrderStop
+        && (previous.quantity != context.quantity
+            || previous.price != context.price
+            || previous.trigger_price != context.trigger_price)
+    {
+        emit_order_update(
+            client_order_id,
+            parent_venue_order_id,
+            context,
+            account_id,
+            ts_event,
+            ts_init,
+            emitter,
+        );
+    }
+
+    Some(context)
 }
 
 fn refresh_regular_child_context(
@@ -2180,7 +2259,7 @@ fn bind_algo_child_and_emit_transition(
 
     if state.accepted_venue_order_id(&client_order_id) != Some(child_venue_order_id) {
         state.insert_accepted(client_order_id, child_venue_order_id);
-        emit_child_update(
+        emit_order_update(
             client_order_id,
             child_venue_order_id,
             context,
@@ -2239,7 +2318,7 @@ fn refresh_bound_child_and_emit_update(
     }
 
     state.insert_accepted(client_order_id, child_venue_order_id);
-    emit_child_update(
+    emit_order_update(
         client_order_id,
         child_venue_order_id,
         context,
@@ -2250,7 +2329,7 @@ fn refresh_bound_child_and_emit_update(
     );
 }
 
-fn emit_child_update(
+fn emit_order_update(
     client_order_id: ClientOrderId,
     child_venue_order_id: VenueOrderId,
     context: OrderContext,
@@ -2288,8 +2367,8 @@ fn dispatch_order_messages(
     state: &WsDispatchState,
     account_id: AccountId,
     instruments: &AHashMap<Ustr, InstrumentAny>,
-    fee_cache: &mut AHashMap<Ustr, Money>,
-    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
+    fee_cache: &mut FeeCache,
+    filled_qty_cache: &mut FilledQtyCache,
     order_state_cache: &mut AHashMap<ClientOrderId, OrderStateSnapshot>,
     ts_init: UnixNanos,
 ) {
@@ -2511,6 +2590,8 @@ fn dispatch_order_messages(
                 ts_init,
             ) {
                 Ok(event) => {
+                    let needs_status =
+                        matches!(event, ParsedOrderEvent::Fill(_) | ParsedOrderEvent::Skipped);
                     let mut events = Vec::with_capacity(2);
                     let req_id = msg.req_id.as_deref().filter(|id| !id.is_empty());
                     let pending = state
@@ -2579,6 +2660,15 @@ fn dispatch_order_messages(
                             ts_init,
                         );
                     }
+                    dispatch_filled_order_status(
+                        msg,
+                        Some(client_order_id),
+                        instrument,
+                        emitter,
+                        state,
+                        ts_init,
+                        needs_status,
+                    );
                     if state.contains_terminal(&client_order_id)
                         && let Some(bindings) = lifecycle_bindings.as_mut()
                         && let Some(binding) =
@@ -2634,7 +2724,7 @@ fn dispatch_spread_order_messages(
     state: &WsDispatchState,
     account_id: AccountId,
     instruments: &AHashMap<Ustr, InstrumentAny>,
-    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
+    filled_qty_cache: &mut FilledQtyCache,
     order_state_cache: &mut AHashMap<ClientOrderId, OrderStateSnapshot>,
     ts_init: UnixNanos,
 ) {
@@ -2933,7 +3023,9 @@ fn dispatch_parsed_order_event(
             );
             emitter.send_order_status_report(*report);
         }
-        ParsedOrderEvent::Skipped => return,
+        ParsedOrderEvent::Skipped => {
+            is_terminal = venue_status == OKXOrderStatus::Filled;
+        }
     }
 
     if is_terminal {
@@ -3076,8 +3168,8 @@ fn dispatch_order_msg_as_report(
     msg: &OKXOrderMsg,
     account_id: AccountId,
     instruments: &AHashMap<Ustr, InstrumentAny>,
-    fee_cache: &mut AHashMap<Ustr, Money>,
-    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
+    fee_cache: &mut FeeCache,
+    filled_qty_cache: &mut FilledQtyCache,
     emitter: &ExecutionEventEmitter,
     state: &WsDispatchState,
     ts_init: UnixNanos,
@@ -3091,13 +3183,58 @@ fn dispatch_order_msg_as_report(
         ts_init,
     ) {
         Ok(report) => {
+            let needs_status = matches!(report, ExecutionReport::Fill(_));
             dispatch_execution_reports(vec![report], emitter, state);
 
             if let Some(instrument) = instruments.get(&msg.inst_id) {
+                dispatch_filled_order_status(
+                    msg,
+                    None,
+                    instrument,
+                    emitter,
+                    state,
+                    ts_init,
+                    needs_status,
+                );
                 update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
             }
         }
         Err(e) => log::error!("Failed to parse order message as report: {e}"),
+    }
+}
+
+fn dispatch_filled_order_status(
+    msg: &OKXOrderMsg,
+    client_order_id: Option<ClientOrderId>,
+    instrument: &InstrumentAny,
+    emitter: &ExecutionEventEmitter,
+    state: &WsDispatchState,
+    ts_init: UnixNanos,
+    needs_status: bool,
+) {
+    if !needs_status || msg.state != OKXOrderStatus::Filled {
+        return;
+    }
+
+    let report = parse_order_status_report(msg, instrument, emitter.account_id(), ts_init)
+        .and_then(|report| {
+            let requested = parse_quantity(&msg.sz, instrument.size_precision())?;
+            Ok((report, requested))
+        });
+
+    match report {
+        Ok((mut report, requested)) => {
+            if report.filled_qty.is_positive() && report.quantity != requested {
+                report.client_order_id = client_order_id.or(report.client_order_id);
+
+                // The caller dispatches any real fill first; reconcile base shortfalls and quote sizing
+                dispatch_execution_reports(vec![ExecutionReport::Order(report)], emitter, state);
+            }
+        }
+        Err(e) => log::error!(
+            "Failed to parse filled order status for {}: {e}",
+            msg.ord_id
+        ),
     }
 }
 
@@ -3107,8 +3244,8 @@ fn dispatch_terminal_order_fill_as_report(
     client_order_id: ClientOrderId,
     account_id: AccountId,
     instruments: &AHashMap<Ustr, InstrumentAny>,
-    fee_cache: &mut AHashMap<Ustr, Money>,
-    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
+    fee_cache: &mut FeeCache,
+    filled_qty_cache: &mut FilledQtyCache,
     emitter: &ExecutionEventEmitter,
     state: &WsDispatchState,
     ts_init: UnixNanos,
@@ -3143,7 +3280,7 @@ fn dispatch_spread_order_msg_as_report(
     msg: &OKXSpreadOrder,
     account_id: AccountId,
     instruments: &AHashMap<Ustr, InstrumentAny>,
-    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
+    filled_qty_cache: &mut FilledQtyCache,
     emitter: &ExecutionEventEmitter,
     state: &WsDispatchState,
     ts_init: UnixNanos,
@@ -3212,13 +3349,13 @@ fn update_spread_order_state_cache(
 fn update_spread_fill_cache(
     msg: &OKXSpreadOrder,
     instrument: &InstrumentAny,
-    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
+    filled_qty_cache: &mut FilledQtyCache,
 ) {
     if !msg.acc_fill_sz.is_empty()
         && msg.acc_fill_sz != "0"
         && let Ok(qty) = parse_quantity(&msg.acc_fill_sz, instrument.size_precision())
     {
-        filled_qty_cache.insert(msg.ord_id, qty);
+        filled_qty_cache.record(msg.ord_id, qty, is_terminal_order_state(msg.state));
     }
 }
 
@@ -3357,17 +3494,17 @@ fn emit_send_failed_modify(
                 now,
             ));
         }
-    }
-}
-
-fn format_order_response_reason(s_code: &str, s_msg: &str, sub_code: &str) -> String {
-    match (s_msg.is_empty(), sub_code.is_empty(), s_code.is_empty()) {
-        (false, true, _) => s_msg.to_string(),
-        (false, false, _) => format!("{s_msg} (subCode={sub_code})"),
-        (true, false, false) => format!("sCode={s_code} subCode={sub_code}"),
-        (true, false, true) => format!("subCode={sub_code}"),
-        (true, true, false) => format!("sCode={s_code}"),
-        (true, true, true) => String::new(),
+    } else if !state.protection_sources.is_bound() && matches!(failure, CommandFailure::NotSent(_))
+    {
+        // Standalone dispatch retains the upstream definite-not-sent behavior
+        emitter.emit_order_modify_rejected_event(
+            ident.strategy_id,
+            ident.instrument_id,
+            client_order_id,
+            None,
+            reason,
+            clock.get_time_ns(),
+        );
     }
 }
 
@@ -3417,13 +3554,14 @@ pub fn emit_algo_cancel_rejections(
         }
 
         if let Some(ctx) = contexts.get(i) {
+            let reason = format_order_response_reason(code, msg, "");
             let ts = clock.get_time_ns();
             emitter.emit_order_cancel_rejected_event(
                 ctx.strategy_id,
                 ctx.instrument_id,
                 ctx.client_order_id,
                 ctx.venue_order_id,
-                msg,
+                &reason,
                 ts,
             );
         } else {
@@ -3450,6 +3588,19 @@ pub fn emit_batch_cancel_failure(
     }
 }
 
+pub(crate) fn format_order_response_reason(s_code: &str, s_msg: &str, sub_code: &str) -> String {
+    match (s_code.is_empty(), s_msg.is_empty(), sub_code.is_empty()) {
+        (false, false, true) => format!("OKX error {s_code}: {s_msg}"),
+        (false, false, false) => format!("OKX error {s_code}: {s_msg} (subCode={sub_code})"),
+        (false, true, true) => format!("OKX error {s_code}"),
+        (false, true, false) => format!("OKX error {s_code} (subCode={sub_code})"),
+        (true, false, true) => s_msg.to_string(),
+        (true, false, false) => format!("{s_msg} (subCode={sub_code})"),
+        (true, true, false) => format!("subCode={sub_code}"),
+        (true, true, true) => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -3459,13 +3610,16 @@ mod tests {
     use nautilus_model::{
         enums::{AccountType, OrderSide, OrderType, TimeInForce, TriggerType},
         identifiers::Symbol,
-        instruments::CryptoPerpetual,
-        types::Price,
+        instruments::{CryptoPerpetual, CurrencyPair},
+        types::{Price, Quantity},
     };
     use rstest::rstest;
 
     use super::*;
-    use crate::websocket::{error::OKXWsError, messages::OKXWsFrame};
+    use crate::{
+        common::enums::{OKXInstrumentType, OKXSide, OKXTargetCurrency},
+        websocket::{error::OKXWsError, messages::OKXWsFrame},
+    };
 
     #[test]
     fn checkpoint_restore_retains_fifo_dedup_and_rejects_duplicate_sources() {
@@ -3593,9 +3747,10 @@ mod tests {
             emitter,
             state,
             AccountId::from("OKX-001"),
+            AccountType::Margin,
             instruments,
-            &mut AHashMap::new(),
-            &mut AHashMap::new(),
+            &mut FeeCache::new(),
+            &mut FilledQtyCache::new(),
             &mut AHashMap::new(),
             get_atomic_clock_realtime(),
         );
@@ -3612,6 +3767,208 @@ mod tests {
     }
 
     #[rstest]
+    #[case::single_fill(false, false)]
+    #[case::partial_fill(true, false)]
+    #[case::status_only(true, true)]
+    fn short_final_fill_dispatches_terminal_status(
+        #[values(false, true)] tracked: bool,
+        #[values(OKXTargetCurrency::BaseCcy, OKXTargetCurrency::QuoteCcy)]
+        target: OKXTargetCurrency,
+        #[case] partial_first: bool,
+        #[case] status_only: bool,
+    ) {
+        let mut msg = load_regular_order_messages("ws_orders.json").remove(0);
+        msg.inst_id = Ustr::from("BTC-USDC");
+        msg.inst_type = OKXInstrumentType::Spot;
+        msg.ord_type = OKXOrderType::Market;
+        msg.side = OKXSide::Buy;
+        msg.tgt_ccy = Some(target);
+        msg.sz = match target {
+            OKXTargetCurrency::BaseCcy => "0.00296487",
+            OKXTargetCurrency::QuoteCcy => "296.487",
+        }
+        .to_string();
+
+        msg.acc_fill_sz = Some("0.00296475".to_string());
+
+        let last_qty = if partial_first {
+            "0.00196475"
+        } else {
+            "0.00296475"
+        };
+
+        msg.fill_sz = last_qty.to_string();
+        msg.fill_px = "100000".to_string();
+        msg.avg_px = "100000".to_string();
+        msg.px.clear();
+        msg.state = OKXOrderStatus::Filled;
+        let client_order_id = ClientOrderId::new(msg.cl_ord_id.as_str());
+        let instrument_id = InstrumentId::from("BTC-USDC.OKX");
+        let instrument = CurrencyPair::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::from("BTC-USDC"))
+            .base_currency(Currency::BTC())
+            .quote_currency(Currency::USDC())
+            .price_precision(2)
+            .size_precision(8)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.00000001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        let instruments = AtomicMap::new();
+        instruments.insert(msg.inst_id, InstrumentAny::CurrencyPair(instrument));
+        let state = WsDispatchState::default();
+
+        if tracked {
+            state.order_identities.insert(
+                client_order_id,
+                OrderIdentity {
+                    client_order_id,
+                    strategy_id: StrategyId::from("STRATEGY-001"),
+                    instrument_id,
+                    order_side: OrderSide::Buy,
+                    order_type: OrderType::Market,
+                },
+            );
+        }
+
+        let (emitter, mut receiver) = test_execution_emitter();
+        let mut fee_cache = FeeCache::new();
+        let mut filled_qty_cache = FilledQtyCache::new();
+        let mut order_state_cache = AHashMap::new();
+        let clock = get_atomic_clock_realtime();
+
+        if partial_first {
+            let mut partial = msg.clone();
+            partial.state = OKXOrderStatus::PartiallyFilled;
+
+            if status_only {
+                partial.fill_sz = "0.00296475".to_string();
+                msg.fill_sz = "0".to_string();
+            } else {
+                partial.acc_fill_sz = Some("0.001".to_string());
+                partial.fill_sz = "0.001".to_string();
+                partial.trade_id = "prior-trade".to_string();
+            }
+
+            dispatch_ws_message(
+                OKXWsMessage::Orders(vec![partial]),
+                &emitter,
+                &state,
+                emitter.account_id(),
+                AccountType::Cash,
+                &instruments,
+                &mut fee_cache,
+                &mut filled_qty_cache,
+                &mut order_state_cache,
+                clock,
+            );
+            let events = drain_execution_events(&mut receiver);
+            assert_eq!(events.len(), if tracked { 2 } else { 1 });
+            assert!(!state.contains_terminal(&client_order_id));
+        }
+
+        dispatch_ws_message(
+            OKXWsMessage::Orders(vec![msg.clone()]),
+            &emitter,
+            &state,
+            emitter.account_id(),
+            AccountType::Cash,
+            &instruments,
+            &mut fee_cache,
+            &mut filled_qty_cache,
+            &mut order_state_cache,
+            clock,
+        );
+
+        let events = drain_execution_events(&mut receiver);
+        let fill_index = usize::from(tracked && !partial_first);
+        assert_eq!(events.len(), if status_only { 1 } else { fill_index + 2 });
+
+        if !status_only {
+            match &events[fill_index] {
+                ExecutionEvent::Order(OrderEventAny::Filled(fill)) => {
+                    assert!(tracked);
+                    assert_eq!(fill.last_qty, Quantity::from(last_qty));
+                }
+                ExecutionEvent::Report(CommonExecutionReport::Fill(fill)) => {
+                    assert!(!tracked);
+                    assert_eq!(fill.last_qty, Quantity::from(last_qty));
+                }
+                other => panic!("Expected fill before terminal status, was {other:?}"),
+            }
+        }
+
+        let report_index = if status_only { 0 } else { fill_index + 1 };
+
+        let ExecutionEvent::Report(CommonExecutionReport::Order(report)) = &events[report_index]
+        else {
+            panic!("Expected terminal order status report");
+        };
+
+        assert_eq!(report.client_order_id, Some(client_order_id));
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.quantity, Quantity::from("0.00296475"));
+        assert_eq!(report.filled_qty, Quantity::from("0.00296475"));
+        assert!(state.contains_terminal(&client_order_id));
+        assert!(!state.order_identities.contains_key(&client_order_id));
+        assert!(!state.contains_accepted(&client_order_id));
+        assert!(!order_state_cache.contains_key(&client_order_id));
+
+        dispatch_ws_message(
+            OKXWsMessage::Orders(vec![msg]),
+            &emitter,
+            &state,
+            emitter.account_id(),
+            AccountType::Cash,
+            &instruments,
+            &mut fee_cache,
+            &mut filled_qty_cache,
+            &mut order_state_cache,
+            clock,
+        );
+        assert!(drain_execution_events(&mut receiver).is_empty());
+    }
+
+    #[rstest]
+    #[case::margin(AccountType::Margin)]
+    #[case::cash(AccountType::Cash)]
+    fn account_updates_report_the_configured_account_type(#[case] account_type: AccountType) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data")
+            .join("http_get_account_balance.json");
+        let content = std::fs::read_to_string(path).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let instruments = AtomicMap::new();
+        let (emitter, mut receiver) = test_execution_emitter();
+
+        dispatch_ws_message(
+            OKXWsMessage::Account(payload["data"].clone()),
+            &emitter,
+            &WsDispatchState::default(),
+            AccountId::from("OKX-001"),
+            account_type,
+            &instruments,
+            &mut FeeCache::new(),
+            &mut FilledQtyCache::new(),
+            &mut AHashMap::new(),
+            get_atomic_clock_realtime(),
+        );
+
+        let events = drain_execution_events(&mut receiver);
+        assert_eq!(events.len(), 1);
+
+        let ExecutionEvent::Account(state) = &events[0] else {
+            panic!("expected an account state event");
+        };
+
+        assert_eq!(state.account_type, account_type);
+        assert_eq!(state.account_id, AccountId::from("OKX-001"));
+    }
+
+    #[rstest]
     fn tracked_algo_live_and_pause_emit_one_parent_acceptance() {
         let mut messages = load_algo_order_messages("ws_orders_algo.json");
         let live = messages.remove(0);
@@ -3620,7 +3977,10 @@ mod tests {
         pause.u_time += 1;
         let client_order_id = ClientOrderId::new(live.algo_cl_ord_id.as_str());
         let state = WsDispatchState::default();
-        state.track_order_context(test_algo_context(client_order_id));
+        let mut context = test_algo_context(client_order_id);
+        context.identity.order_type = OrderType::StopMarket;
+        context.price = None;
+        state.track_order_context(context);
         let instruments = test_algo_instruments();
         let (emitter, mut receiver) = test_execution_emitter();
 
@@ -3642,6 +4002,191 @@ mod tests {
                 );
             }
             other => panic!("Expected tracked algo acceptance, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::after_acceptance(false)]
+    #[case::first_acceptance(true)]
+    fn tracked_algo_amend_emits_updated_terms_once(#[case] first_acceptance: bool) {
+        let live = load_algo_order_messages("ws_orders_algo.json").remove(1);
+        let client_order_id = ClientOrderId::new(live.algo_cl_ord_id.as_str());
+        let state = WsDispatchState::default();
+        let mut context = test_algo_context(client_order_id);
+        context.identity.order_side = OrderSide::Buy;
+        context.quantity = Quantity::from("0.02");
+        context.price = Some(Price::from("106000.00"));
+        context.trigger_price = Some(Price::from("105000.00"));
+        context.trigger_type = Some(TriggerType::MarkPrice);
+        state.track_order_context(context);
+        let instruments = test_algo_instruments();
+        let (emitter, mut receiver) = test_execution_emitter();
+
+        if !first_acceptance {
+            dispatch_test_message(
+                OKXWsMessage::AlgoOrders(vec![live.clone()]),
+                &emitter,
+                &state,
+                &instruments,
+            );
+            let events = drain_execution_events(&mut receiver);
+            assert_eq!(events.len(), 1);
+            assert!(matches!(
+                &events[0],
+                ExecutionEvent::Order(OrderEventAny::Accepted(_))
+            ));
+        }
+
+        let mut amended = live.clone();
+        amended.sz = "0.03".into();
+        amended.trigger_px = "104000".into();
+        amended.ord_px = "103000".into();
+        amended.u_time += 2;
+        dispatch_test_message(
+            OKXWsMessage::AlgoOrders(vec![amended.clone(), amended, live]),
+            &emitter,
+            &state,
+            &instruments,
+        );
+        let events = drain_execution_events(&mut receiver);
+        assert_eq!(events.len(), if first_acceptance { 2 } else { 1 });
+
+        if first_acceptance {
+            assert!(matches!(
+                &events[0],
+                ExecutionEvent::Order(OrderEventAny::Accepted(_))
+            ));
+        }
+
+        let ExecutionEvent::Order(OrderEventAny::Updated(updated)) = events.last().unwrap() else {
+            panic!("expected OrderUpdated");
+        };
+
+        assert_eq!(updated.client_order_id, client_order_id);
+        assert_eq!(
+            updated.venue_order_id,
+            Some(VenueOrderId::from("706620792746729473"))
+        );
+        assert_eq!(updated.instrument_id, context.identity.instrument_id);
+        assert_eq!(updated.strategy_id, context.identity.strategy_id);
+        assert_eq!(updated.account_id, Some(AccountId::from("OKX-001")));
+        assert_eq!(updated.quantity, Quantity::from("0.03"));
+        assert_eq!(updated.price, Some(Price::from("103000.00")));
+        assert_eq!(updated.trigger_price, Some(Price::from("104000.00")));
+        let final_context = state.order_context(client_order_id).unwrap();
+        assert_eq!(final_context.quantity, updated.quantity);
+        assert_eq!(final_context.price, updated.price);
+        assert_eq!(final_context.trigger_price, updated.trigger_price);
+        assert_eq!(final_context.trigger_type, Some(TriggerType::MarkPrice));
+    }
+
+    #[rstest]
+    fn tracked_algo_trailing_acceptance_does_not_emit_update() {
+        let message = load_algo_order_messages("ws_orders_algo_states.json").remove(2);
+        let client_order_id = ClientOrderId::new(message.algo_cl_ord_id.as_str());
+        let state = WsDispatchState::default();
+        let mut context = test_algo_context(client_order_id);
+        context.identity.order_type = OrderType::TrailingStopMarket;
+        context.price = None;
+        state.track_order_context(context);
+        let instruments = test_algo_instruments();
+        let (emitter, mut receiver) = test_execution_emitter();
+
+        dispatch_test_message(
+            OKXWsMessage::AlgoOrders(vec![message]),
+            &emitter,
+            &state,
+            &instruments,
+        );
+
+        let events = drain_execution_events(&mut receiver);
+        assert_eq!(events.len(), 1);
+
+        let ExecutionEvent::Order(OrderEventAny::Accepted(accepted)) = &events[0] else {
+            panic!("expected OrderAccepted");
+        };
+
+        assert_eq!(accepted.client_order_id, client_order_id);
+        assert_eq!(
+            accepted.venue_order_id,
+            VenueOrderId::from("706620792746729482")
+        );
+        assert_eq!(
+            state.order_context(client_order_id).unwrap().trigger_price,
+            None
+        );
+    }
+
+    #[rstest]
+    #[case::live(OKXAlgoOrderStatus::Live)]
+    #[case::canceled(OKXAlgoOrderStatus::Canceled)]
+    #[case::failed(OKXAlgoOrderStatus::OrderFailed)]
+    fn tracked_algo_malformed_terms_preserve_lifecycle(#[case] status: OKXAlgoOrderStatus) {
+        let mut message = load_algo_order_messages("ws_orders_algo.json").remove(1);
+        let client_order_id = ClientOrderId::new(message.algo_cl_ord_id.as_str());
+        let state = WsDispatchState::default();
+        let context = test_algo_context(client_order_id);
+        state.track_order_context(context);
+        let instruments = test_algo_instruments();
+        let (emitter, mut receiver) = test_execution_emitter();
+        message.state = status;
+        message.trigger_px = "invalid".into();
+        message.fail_code = "51008".into();
+
+        dispatch_test_message(
+            OKXWsMessage::AlgoOrders(vec![message]),
+            &emitter,
+            &state,
+            &instruments,
+        );
+
+        let events = drain_execution_events(&mut receiver);
+        assert_eq!(
+            events.len(),
+            if status == OKXAlgoOrderStatus::Canceled {
+                2
+            } else {
+                1
+            }
+        );
+
+        match status {
+            OKXAlgoOrderStatus::Live => {
+                assert!(
+                    matches!(&events[0], ExecutionEvent::Order(OrderEventAny::Accepted(event))
+                    if event.client_order_id == client_order_id
+                        && event.venue_order_id == VenueOrderId::from("706620792746729473"))
+                );
+                let retained = state.order_context(client_order_id).unwrap();
+                assert_eq!(retained.quantity, context.quantity);
+                assert_eq!(retained.price, context.price);
+                assert_eq!(retained.trigger_price, context.trigger_price);
+                assert_eq!(retained.trigger_type, context.trigger_type);
+                assert!(!state.contains_terminal(&client_order_id));
+            }
+            OKXAlgoOrderStatus::Canceled => {
+                assert!(matches!(
+                    &events[0],
+                    ExecutionEvent::Order(OrderEventAny::Accepted(_))
+                ));
+                assert!(
+                    matches!(&events[1], ExecutionEvent::Order(OrderEventAny::Canceled(event))
+                    if event.client_order_id == client_order_id
+                        && event.venue_order_id == Some(VenueOrderId::from("706620792746729473")))
+                );
+                assert!(state.contains_terminal(&client_order_id));
+                assert!(state.order_context(client_order_id).is_none());
+            }
+            OKXAlgoOrderStatus::OrderFailed => {
+                assert!(
+                    matches!(&events[0], ExecutionEvent::Order(OrderEventAny::Rejected(event))
+                    if event.client_order_id == client_order_id
+                        && event.reason == Ustr::from("OKX error 51008"))
+                );
+                assert!(state.contains_terminal(&client_order_id));
+                assert!(state.order_context(client_order_id).is_none());
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -4345,16 +4890,23 @@ mod tests {
             &events[0],
             ExecutionEvent::Order(OrderEventAny::Rejected(rejected))
                 if rejected.client_order_id == client_order_id
-                    && rejected.reason == Ustr::from("51008")
+                    && rejected.reason == Ustr::from("OKX error 51008")
         ));
         assert!(state.contains_terminal(&client_order_id));
     }
 
     #[rstest]
-    #[case("51000", "Rejected", "", "Rejected")]
-    #[case("51000", "Rejected", "51004", "Rejected (subCode=51004)")]
-    #[case("51000", "", "51004", "sCode=51000 subCode=51004")]
-    #[case("51000", "", "", "sCode=51000")]
+    #[case("51000", "Rejected", "", "OKX error 51000: Rejected")]
+    #[case(
+        "51000",
+        "Rejected",
+        "51004",
+        "OKX error 51000: Rejected (subCode=51004)"
+    )]
+    #[case("51000", "", "", "OKX error 51000")]
+    #[case("51000", "", "51004", "OKX error 51000 (subCode=51004)")]
+    #[case("", "Rejected", "", "Rejected")]
+    #[case("", "Rejected", "51004", "Rejected (subCode=51004)")]
     #[case("", "", "51004", "subCode=51004")]
     #[case("", "", "", "")]
     fn test_format_order_response_reason(
@@ -4476,7 +5028,7 @@ mod tests {
         let events = drain_execution_events(&mut receiver);
         assert_eq!(events.len(), 1);
         let rejected_id = ClientOrderId::from("ORPI002");
-        let reason = response["data"]
+        let s_msg = response["data"]
             .as_array()
             .unwrap()
             .iter()
@@ -4484,6 +5036,7 @@ mod tests {
             .unwrap()["sMsg"]
             .as_str()
             .unwrap();
+        let reason = format!("OKX error 54051: {s_msg}");
 
         match &events[0] {
             ExecutionEvent::Order(OrderEventAny::Rejected(event)) if !amend => {
@@ -4546,6 +5099,124 @@ mod tests {
     }
 
     #[rstest]
+    #[case::standalone_missing(true, false, true, true, None, 1)]
+    #[case::bound_missing(false, false, true, true, None, 0)]
+    #[case::standalone_ambiguous(true, false, true, false, None, 0)]
+    #[case::bound_matching(false, true, true, true, None, 1)]
+    #[case::bound_matching_ambiguous(false, true, true, false, None, 0)]
+    #[case::standalone_stale(true, true, false, true, None, 0)]
+    #[case::bound_stale(false, true, false, true, None, 0)]
+    #[case::foreign_trader(false, true, true, true, Some("trader"), 0)]
+    #[case::foreign_strategy(false, true, true, true, Some("strategy"), 0)]
+    #[case::foreign_instrument(false, true, true, true, Some("instrument"), 0)]
+    fn modify_send_failure_preserves_original_request_boundary(
+        #[case] standalone: bool,
+        #[case] pending: bool,
+        #[case] matching: bool,
+        #[case] not_sent: bool,
+        #[case] foreign: Option<&str>,
+        #[case] expected_events: usize,
+    ) {
+        let state = WsDispatchState::default();
+        let client_order_id = ClientOrderId::from("O-modify-send-boundary");
+        let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
+        let strategy_id = StrategyId::from("STRATEGY-001");
+        let command_id = UUID4::new();
+        let command = nautilus_common::messages::execution::ModifyOrder::new(
+            if foreign == Some("trader") {
+                TraderId::from("FOREIGN-001")
+            } else {
+                TraderId::from("TRADER-001")
+            },
+            None,
+            if foreign == Some("strategy") {
+                StrategyId::from("FOREIGN-001")
+            } else {
+                strategy_id
+            },
+            if foreign == Some("instrument") {
+                InstrumentId::from("BTC-USDT-SWAP.OKX")
+            } else {
+                instrument_id
+            },
+            client_order_id,
+            None,
+            Some(Quantity::from("2")),
+            Some(Price::from("2001.0")),
+            None,
+            command_id,
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        state.order_identities.insert(
+            client_order_id,
+            OrderIdentity {
+                client_order_id,
+                instrument_id,
+                strategy_id,
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
+        );
+        if pending {
+            state.pending_amends.insert(
+                client_order_id.to_string(),
+                PendingOrderInfo::from_modification(&command),
+            );
+        }
+        let (data_sender, _data_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<nautilus_common::messages::DataEvent>();
+        if !standalone {
+            state.protection_sources.bind(data_sender.into());
+        }
+        let (emitter, mut receiver) = test_execution_emitter();
+        dispatch_test_message(
+            OKXWsMessage::SendFailed {
+                request_id: if matching {
+                    command_id.to_string().replace('-', "")
+                } else {
+                    "stale-request".into()
+                },
+                client_order_ids: vec![client_order_id],
+                op: Some(OKXWsOperation::AmendOrder),
+                error: if not_sent {
+                    OKXWsError::HandlerUnavailable("channel closed".into())
+                } else {
+                    OKXWsError::SendFailed("connection reset".into())
+                },
+            },
+            &emitter,
+            &state,
+            &AtomicMap::new(),
+        );
+        let events = drain_execution_events(&mut receiver);
+        assert_eq!(events.len(), expected_events);
+        if let Some(event) = events.first() {
+            let ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)) = event else {
+                panic!("Expected modify rejection, received {event:?}");
+            };
+            assert_eq!(rejected.client_order_id, client_order_id);
+            assert_eq!(rejected.trader_id, command.trader_id);
+            assert_eq!(rejected.strategy_id, strategy_id);
+            assert_eq!(rejected.instrument_id, instrument_id);
+            assert_eq!(rejected.account_id, Some(AccountId::from("OKX-001")));
+            assert_eq!(rejected.causation_id, pending.then_some(command_id));
+        }
+        assert!(state.order_identities.contains_key(&client_order_id));
+        assert_eq!(
+            state.pending_amends.contains_key(client_order_id.as_str()),
+            pending && (!matching || !not_sent || foreign.is_some()),
+        );
+        if let Some(original) = state.pending_amends.get(client_order_id.as_str()) {
+            assert_eq!(original.command_id, Some(command_id));
+            assert_eq!(original.trader_id, command.trader_id);
+            assert_eq!(original.strategy_id, command.strategy_id);
+            assert_eq!(original.instrument_id, command.instrument_id);
+        }
+    }
+
+    #[rstest]
     #[case::ambiguous(OKXWsError::SendFailed("connection reset".to_string()), true)]
     #[case::not_sent(OKXWsError::NoActiveClient, false)]
     fn send_failure_preserves_only_ambiguous_pending_orders(
@@ -4590,11 +5261,11 @@ mod tests {
             AccountType::Margin,
             None,
         );
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
         emitter.set_sender(sender);
         let instruments = AtomicMap::new();
-        let mut fee_cache = AHashMap::new();
-        let mut filled_qty_cache = AHashMap::new();
+        let mut fee_cache = FeeCache::new();
+        let mut filled_qty_cache = FilledQtyCache::new();
         let mut order_state_cache = AHashMap::new();
 
         dispatch_ws_message(
@@ -4607,6 +5278,7 @@ mod tests {
             &emitter,
             &state,
             AccountId::from("OKX-001"),
+            AccountType::Margin,
             &instruments,
             &mut fee_cache,
             &mut filled_qty_cache,

@@ -23,21 +23,26 @@ fn node_dispatch_runner_inputs_use_observer_and_preserve_incomplete_coverage() {
     });
     node.set_dispatch_observer(observer.clone()).unwrap();
     assert!(node.set_dispatch_observer(observer.clone()).is_err());
-    node.process_runner_event(PendingRunnerEvent::TimeEvent(stub_time_event_handler()));
-    node.process_runner_event(PendingRunnerEvent::DataEvent(stub_data_event()));
-    node.process_runner_event(PendingRunnerEvent::DataCommand(stub_data_command()));
-    node.process_runner_event(PendingRunnerEvent::SystemCommand(stub_system_command()));
-    node.process_runner_event(PendingRunnerEvent::SystemEvent(SystemEvent::SocketState(
-        SocketStateChange::new(
+    node.process_runner_event(PendingRunnerEvent::TimeEvent(
+        stub_time_event_handler().into(),
+    ));
+    node.process_runner_event(PendingRunnerEvent::DataEvent(stub_data_event().into()));
+    node.process_runner_event(PendingRunnerEvent::DataCommand(stub_data_command().into()));
+    node.process_runner_event(PendingRunnerEvent::SystemCommand(
+        stub_system_command().into(),
+    ));
+    node.process_runner_event(PendingRunnerEvent::SystemEvent(
+        SystemEvent::SocketState(SocketStateChange::new(
             ClientId::from("BINANCE"),
             Some(Venue::from("BINANCE")),
             "fixture".into(),
             SocketState::Disconnected,
-        ),
-    )));
-    node.process_runner_event(PendingRunnerEvent::ExecEvent(stub_exec_event()));
+        ))
+        .into(),
+    ));
+    node.process_runner_event(PendingRunnerEvent::ExecEvent(stub_exec_event().into()));
     node.process_runner_event(PendingRunnerEvent::ExecCommand(
-        stub_trading_command_message(),
+        stub_trading_command_message().into(),
     ));
     node.process_reconciliation_events(&[]);
     let sources: Vec<_> = records
@@ -341,24 +346,33 @@ fn final_drain_records_each_discarded_system_input() {
     }))
     .unwrap();
 
-    let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-    let (system_evt_tx, system_evt_rx) = tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
-    let (system_cmd_tx, system_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
-    let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    let (_time_tx, time_rx) =
+        tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
+    let (system_evt_tx, system_evt_rx) =
+        tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemEvent>>();
+    let (system_cmd_tx, system_cmd_rx) =
+        tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemCommand>>();
+    let (_exec_evt_tx, exec_evt_rx) =
+        tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
     let (_exec_cmd_tx, exec_cmd_rx) =
-        tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
-    let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-    let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+        tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
+    let (_data_evt_tx, data_evt_rx) =
+        tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
+    let (_data_cmd_tx, data_cmd_rx) =
+        tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
 
     system_evt_tx
-        .send(SystemEvent::SocketState(SocketStateChange::new(
-            ClientId::from("BINANCE"),
-            Some(Venue::from("BINANCE")),
-            "fixture".into(),
-            SocketState::Disconnected,
-        )))
+        .send(
+            SystemEvent::SocketState(SocketStateChange::new(
+                ClientId::from("BINANCE"),
+                Some(Venue::from("BINANCE")),
+                "fixture".into(),
+                SocketState::Disconnected,
+            ))
+            .into(),
+        )
         .unwrap();
-    system_cmd_tx.send(stub_system_command()).unwrap();
+    system_cmd_tx.send(stub_system_command().into()).unwrap();
 
     let mut time_rx = crate::runner::SnapshotReceiver::from(time_rx);
     let mut system_evt_rx = crate::runner::SnapshotReceiver::from(system_evt_rx);
@@ -425,25 +439,33 @@ fn final_drain_discard_record_failure_contains_node_and_stops_remaining_inputs()
         ))
         .unwrap();
 
-        let (_time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (system_evt_tx, system_evt_rx) = tokio::sync::mpsc::unbounded_channel::<SystemEvent>();
+        let (_time_tx, time_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
+        let (system_evt_tx, system_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemEvent>>();
         let (system_cmd_tx, system_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<SystemCommand>();
-        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemCommand>>();
+        let (_exec_evt_tx, exec_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
         let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
-        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
+        let (_data_evt_tx, data_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
+        let (_data_cmd_tx, data_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
 
         system_evt_tx
-            .send(SystemEvent::SocketState(SocketStateChange::new(
-                ClientId::from("BINANCE"),
-                Some(Venue::from("BINANCE")),
-                "fixture".into(),
-                SocketState::Disconnected,
-            )))
+            .send(
+                SystemEvent::SocketState(SocketStateChange::new(
+                    ClientId::from("BINANCE"),
+                    Some(Venue::from("BINANCE")),
+                    "fixture".into(),
+                    SocketState::Disconnected,
+                ))
+                .into(),
+            )
             .unwrap();
-        system_cmd_tx.send(stub_system_command()).unwrap();
+        system_cmd_tx.send(stub_system_command().into()).unwrap();
 
         let mut time_rx = crate::runner::SnapshotReceiver::from(time_rx);
         let mut system_evt_rx = crate::runner::SnapshotReceiver::from(system_evt_rx);
@@ -556,11 +578,11 @@ async fn final_drain_attached_native_trace_refuses_discard_and_retains_original_
     let mut runner = node.runner.take().unwrap();
     runner
         .system_event_sender_clone()
-        .send(original_event)
+        .send(original_event.into())
         .unwrap();
     runner
         .system_command_sender_clone()
-        .send(original_command)
+        .send(original_command.into())
         .unwrap();
     let channels = runner.startup_channels_mut();
     assert_eq!(channels.system_evt_rx.len(), 1);
@@ -633,7 +655,7 @@ async fn final_drain_attached_native_trace_refuses_discard_and_retains_original_
     assert_eq!(first.channel_ordinal, 1);
     assert!(first.caused_by.is_none());
     let retained_command = channels.system_cmd_rx.try_recv().unwrap();
-    assert_eq!(retained_command, original_command);
+    assert_eq!(retained_command.message(), &original_command);
     let second = scope::take_ingress(NativeInputSource::SystemCommand)
         .unwrap()
         .unwrap();

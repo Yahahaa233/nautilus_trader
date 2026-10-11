@@ -27,7 +27,7 @@ use indexmap::IndexMap;
 use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
-    clock::{Clock, TestClock},
+    clock::{Clock, VirtualClock},
     messages::execution::{ModifyOrder, TradingCommand},
     msgbus::{self, MessagingSwitchboard, TypedHandler, switchboard},
 };
@@ -50,7 +50,7 @@ use nautilus_model::{
     accounts::{Account, AccountAny, margin_model::MarginModelHandle},
     data::{
         Bar, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus, OrderBookDelta,
-        OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
     },
     enums::{AccountType, AggressorSide, BookType, OmsType, OrderStatus, PositionAdjustmentType},
     events::{FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionEvent},
@@ -669,6 +669,10 @@ impl SimulatedExchange {
     ///
     /// Returns whether the adjustment was applied successfully.
     pub fn adjust_account(&mut self, adjustment: Money) -> bool {
+        self.adjust_account_balance(adjustment, false)
+    }
+
+    fn adjust_account_balance(&self, adjustment: Money, lock_margins: bool) -> bool {
         if self.frozen_account {
             // Nothing to adjust
             return true;
@@ -678,7 +682,7 @@ impl SimulatedExchange {
             log::debug!("Adjusting account for venue {}", exec_client.venue());
         }
 
-        match self.try_adjust_account(adjustment) {
+        match self.try_adjust_account_balance(adjustment, lock_margins) {
             Ok(()) => true,
             Err(e) => {
                 log::error!("{e}");
@@ -694,6 +698,16 @@ impl SimulatedExchange {
     /// Returns an error if the account or currency balance is unavailable, the
     /// resulting balance exceeds [`Money`] bounds, or account state generation fails.
     pub fn try_adjust_account(&mut self, adjustment: Money) -> Result<(), AccountAdjustmentError> {
+        self.try_adjust_account_balance(adjustment, false)
+    }
+
+    // With `lock_margins`, a margin account that calculates its own state locks its margins the
+    // way `MarginAccount::recalculate_balance` does, capped at the new total.
+    fn try_adjust_account_balance(
+        &self,
+        adjustment: Money,
+        lock_margins: bool,
+    ) -> Result<(), AccountAdjustmentError> {
         if self.frozen_account {
             // Nothing to adjust
             return Ok(());
@@ -709,22 +723,39 @@ impl SimulatedExchange {
                         let Some(total) = current_balance.total.checked_add(adjustment) else {
                             return Err(AccountAdjustmentError::TotalOverflow(adjustment.currency));
                         };
-                        let Some(free) = current_balance.free.checked_add(adjustment) else {
-                            return Err(AccountAdjustmentError::FreeBalanceOverflow(
-                                adjustment.currency,
-                            ));
-                        };
-                        current_balance.total = total;
-                        current_balance.free = free;
 
+                        match &*account {
+                            AccountAny::Margin(margin_account)
+                                if lock_margins && margin_account.calculate_account_state =>
+                            {
+                                current_balance = margin_account.balance_locking_margins(total);
+                            }
+                            _ => {
+                                let Some(free) = current_balance.free.checked_add(adjustment)
+                                else {
+                                    return Err(AccountAdjustmentError::FreeBalanceOverflow(
+                                        adjustment.currency,
+                                    ));
+                                };
+                                current_balance.total = total;
+                                current_balance.free = free;
+                            }
+                        }
+
+                        // Carry account-wide margins too, applying the state replaces both sets
                         let margins = match &*account {
-                            AccountAny::Margin(margin_account) => margin_account.margins.clone(),
-                            _ => IndexMap::new(),
+                            AccountAny::Margin(margin_account) => margin_account
+                                .margins
+                                .values()
+                                .chain(margin_account.account_margins.values())
+                                .copied()
+                                .collect(),
+                            _ => Vec::new(),
                         };
 
                         Some((
                             vec![current_balance],
-                            margins.values().copied().collect(),
+                            margins,
                             self.clock.borrow().timestamp_ns(),
                         ))
                     } else {
@@ -827,13 +858,13 @@ impl SimulatedExchange {
     ///
     /// # Panics
     ///
-    /// Panics if the clock is not a [`TestClock`].
+    /// Panics if the clock is not a [`VirtualClock`].
     pub fn set_clock_time(&self, ts_now: UnixNanos) {
         let mut clock_ref = self.clock.borrow_mut();
         let test_clock = clock_ref
             .as_any_mut()
-            .downcast_mut::<TestClock>()
-            .expect("SimulatedExchange requires TestClock");
+            .downcast_mut::<VirtualClock>()
+            .expect("SimulatedExchange requires VirtualClock");
         test_clock.set_time(ts_now);
     }
 
@@ -961,8 +992,8 @@ impl SimulatedExchange {
     /// # Errors
     ///
     /// Returns an error if module pre-processing or matching engine processing fails.
-    pub fn process_order_book_depth10(&mut self, depth: &OrderBookDepth10) -> anyhow::Result<()> {
-        self.pre_process_modules(&Data::BookDepth10(Box::new(*depth)))?;
+    pub fn process_order_book_depth(&mut self, depth: &OrderBookDepth) -> anyhow::Result<()> {
+        self.pre_process_modules(&Data::BookDepth(Box::new(depth.clone())))?;
 
         if !self.matching_engines.contains_key(&depth.instrument_id) {
             let instrument = {
@@ -981,7 +1012,7 @@ impl SimulatedExchange {
         }
 
         if let Some(matching_engine) = self.matching_engines.get_mut(&depth.instrument_id) {
-            matching_engine.process_order_book_depth10(depth)?;
+            matching_engine.process_order_book_depth(depth)?;
         } else {
             anyhow::bail!("Matching engine should be initialized");
         }
@@ -1311,6 +1342,8 @@ impl SimulatedExchange {
             }
         }
 
+        // Snapshots without history: valuation reads only position state, and the snapshot is the
+        // rollback point if settlement fails after the cached positions are adjusted in place
         let open_positions: Vec<Position> = {
             let cache = self.cache.borrow();
             cache
@@ -1322,7 +1355,7 @@ impl SimulatedExchange {
                     None,
                 )
                 .into_iter()
-                .map(|position| position.cloned())
+                .map(|position| position.clone_without_events())
                 .collect()
         };
 
@@ -1481,13 +1514,12 @@ impl SimulatedExchange {
         );
         let mut adjusted_positions = Vec::with_capacity(valued_positions.len());
         for (original, pnl_change) in valued_positions {
-            let mut adjusted = original.clone();
             let adjustment = PositionAdjusted::new(
                 settlement.trader_id,
-                adjusted.strategy_id,
-                adjusted.instrument_id,
-                adjusted.id,
-                adjusted.account_id,
+                original.strategy_id,
+                original.instrument_id,
+                original.id,
+                original.account_id,
                 PositionAdjustmentType::Funding,
                 None,
                 Some(pnl_change),
@@ -1499,47 +1531,36 @@ impl SimulatedExchange {
                 settlement.ts_event,
                 settlement.ts_init,
             );
-            adjusted.apply_adjustment(adjustment);
-            adjusted_positions.push((original, adjusted, adjustment));
+            adjusted_positions.push((original, adjustment));
         }
 
         {
             let mut cache = self.cache.borrow_mut();
 
-            for (index, (_, adjusted, _)) in adjusted_positions.iter().enumerate() {
-                if let Err(e) = cache.update_position(adjusted) {
+            for (index, (original, adjustment)) in adjusted_positions.iter().enumerate() {
+                if let Err(e) = cache.update_position_from_adjustment(original.id, *adjustment) {
                     log::error!(
                         "Cannot update position {} after funding settlement: {e}",
-                        adjusted.id
+                        original.id
                     );
 
-                    // Inclusive of `index`: the failed update commits the adjusted position
-                    // to the cache before attempting to persist it, so the position whose
-                    // update returned the error also needs restoring.
-                    for (original, _, _) in adjusted_positions[..=index].iter().rev() {
-                        if let Err(rollback_error) = cache.update_position(original) {
-                            log::error!(
-                                "Cannot roll back position {} after failed funding settlement: {rollback_error}",
-                                original.id
-                            );
-                        }
-                    }
+                    // Inclusive of `index`: the failed update applies the adjustment to the
+                    // cached position before attempting to persist it, so the position whose
+                    // update returned the error also needs reverting.
+                    revert_funding_adjustments(
+                        &mut cache,
+                        &adjusted_positions[..=index],
+                        "funding settlement",
+                    );
                     return false;
                 }
             }
         }
 
         for adjustment in &account_adjustments {
-            if !self.adjust_account(*adjustment) {
+            if !self.adjust_account_balance(*adjustment, true) {
                 let mut cache = self.cache.borrow_mut();
-                for (original, _, _) in adjusted_positions.iter().rev() {
-                    if let Err(e) = cache.update_position(original) {
-                        log::error!(
-                            "Cannot roll back position {} after failed account adjustment: {e}",
-                            original.id
-                        );
-                    }
-                }
+                revert_funding_adjustments(&mut cache, &adjusted_positions, "account adjustment");
                 return false;
             }
         }
@@ -1548,7 +1569,7 @@ impl SimulatedExchange {
         let settlement_topic = switchboard::get_funding_settlement_topic(settlement.instrument_id);
         msgbus::publish_any(settlement_topic, &settlement);
 
-        for (_, _, adjustment) in adjusted_positions {
+        for (_, adjustment) in adjusted_positions {
             let event = PositionEvent::PositionAdjusted(adjustment);
             let PositionEvent::PositionAdjusted(adjustment) = &event else {
                 continue;
@@ -1593,7 +1614,7 @@ impl SimulatedExchange {
     ///
     /// # Panics
     ///
-    /// Panics if the exchange clock is not a [`TestClock`] or popping an inflight command fails
+    /// Panics if the exchange clock is not a [`VirtualClock`] or popping an inflight command fails
     /// during processing.
     pub fn process(&mut self, ts_now: UnixNanos) {
         self.process_commands(ts_now, SettlementScope::All);
@@ -2104,11 +2125,31 @@ impl Drop for DeferEventsGuard {
     }
 }
 
+// Reverts funding adjustments applied in place, newest first, restoring and persisting each
+// position from the snapshot taken before settlement
+fn revert_funding_adjustments(
+    cache: &mut Cache,
+    adjusted: &[(Position, PositionAdjusted)],
+    failed_step: &str,
+) {
+    for (original, _) in adjusted.iter().rev() {
+        if let Err(e) = cache.revert_position_adjustment(original) {
+            log::error!(
+                "Cannot roll back position {} after failed {failed_step}: {e}",
+                original.id
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_common::messages::execution::{QueryAccount, QueryOrder, SubmitOrder};
     use nautilus_core::DurationNanos;
-    use nautilus_execution::models::latency::{LatencyModelHandle, StaticLatencyModel};
+    use nautilus_execution::models::{
+        fee::{FeeModelAny, MakerTakerFeeModel},
+        latency::{LatencyModelHandle, StaticLatencyModel},
+    };
     use nautilus_model::{
         accounts::MarginAccount,
         enums::{AccountType, BookType, OrderSide, OrderType},
@@ -2136,13 +2177,14 @@ mod tests {
 
     fn setup_exchange(dispatch: Dispatch) -> SimulatedExchange {
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let mut config = SimulatedVenueConfig::builder()
             .venue(Venue::new("SIM"))
             .oms_type(OmsType::Netting)
             .account_type(AccountType::Margin)
             .book_type(BookType::L2_MBP)
             .starting_balances(vec![Money::new(1_000.0, Currency::USD())])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
 
@@ -2167,7 +2209,7 @@ mod tests {
     #[case(true)]
     fn test_liquidation_enabled(#[case] expected: bool) {
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let config = SimulatedVenueConfig::builder()
             .venue(Venue::new("SIM"))
             .oms_type(OmsType::Netting)
@@ -2175,6 +2217,7 @@ mod tests {
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::new(1_000.0, Currency::USD())])
             .liquidation_enabled(expected)
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
         let exchange = SimulatedExchange::new(config, cache, clock).unwrap();
@@ -2195,10 +2238,11 @@ mod tests {
             .account_type(account_type)
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::from("1_000 USD")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
         let cache = Rc::new(RefCell::new(Cache::default()));
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
 
         let exchange = SimulatedExchange::new(config, cache, clock).unwrap();
 

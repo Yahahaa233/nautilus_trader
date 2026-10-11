@@ -51,8 +51,11 @@ impl OKXExecutionClient {
         self.verify_paused_recovery_inventory()?;
         let source: Inventory = serde_json::from_value(inventory.clone())?;
         ensure!(
-            source.profile == "okx_connected_execution_quiescent_retained_inputs.v1"
-                && source.account_id == self.core.account_id
+            matches!(
+                source.profile.as_str(),
+                "okx_connected_execution_quiescent_retained_inputs.v1"
+                    | "okx_connected_execution_quiescent_retained_inputs.v2"
+            ) && source.account_id == self.core.account_id
                 && source.client_id == self.core.client_id
                 && source.configuration == self.checkpoint_configuration()?
                 && !source.execution_authorized

@@ -121,8 +121,7 @@ or native cost currency.
 | `snapshots(account_id)`                        | Recorded account snapshots in emission order.          |
 | `missing_price_instruments(venue, account_id)` | Instruments currently flagged as unpriceable.          |
 
-Longs contribute positive notional, shorts contribute negative notional. Flat
-positions are skipped.
+Longs contribute their notional and shorts its negation. Flat positions are skipped.
 
 An account-scoped `equity()` query returns `{}` for an unknown account. For a known account, it
 raises `RuntimeError` if exact snapshot valuation fails instead of presenting the failure as empty
@@ -130,21 +129,41 @@ equity.
 
 ### Equity formula
 
-Equity combines the account balance with open-position valuation, using a different
-second term depending on account type:
+Equity starts with `balances_total` and adds open-position values per currency:
 
-- **Cash accounts without a base currency and Wallet accounts**: Start with `balances_total`. For
-  positions owned by that account, do not add a base-asset mark value when the balance already holds
-  that asset and the instrument's cost currency differs from its base currency. Add mark values for
-  inverse instruments and positions not represented by a credited balance asset.
-- **Cash accounts with a base currency and betting accounts**:
-  `balances_total + Σ mark_value(open positions)`.
-- **Margin accounts**: `balances_total + Σ unrealized_pnl(open positions)`.
+| Account type                            | Values added to the balance                              |
+| --------------------------------------- | -------------------------------------------------------- |
+| Cash without a base currency, or Wallet | Position marks, with balance exceptions below            |
+| Cash with a base currency, or betting   | All open-position marks                                  |
+| Calculated margin                       | Signed premium marks + unrealized PnL of other positions |
+| Reported margin                         | Unrealized PnL of all open positions                     |
 
-`mark_values()` always returns gross open-position values, including assets already present in a
-multi-currency Cash or Wallet balance. The value-once rule means `equity()` and equity snapshots
-count each non-inverse base asset either as a balance or a mark value, not both. The margin path uses
-the same cached unrealized PnL pipeline that powers `unrealized_pnls()`.
+#### Cash and Wallet valuation
+
+For positions owned by Cash accounts without a base currency or Wallet accounts, exclude a
+non-inverse base asset's mark when the balance already holds that asset and the instrument's cost
+currency differs from its base currency. Inverse instruments and uncredited assets retain their marks.
+
+`mark_values()` always returns gross open-position values, including credited assets. `equity()` and
+snapshots count each non-inverse base asset once, through its balance or its mark.
+
+#### Margin valuation
+
+Calculated margin accounts (`calculate_account_state=true`) update cash from fills; reported accounts
+use venue balances. Venue-scoped margin queries apply each position owner's rule. See
+[accounting](accounting.md) for balance updates.
+
+Premium-based instruments, including options and binary options, exchange notional cash on fill.
+Their signed marks represent assets or liabilities. Futures and perpetuals exchange no notional cash
+and use the unrealized PnL pipeline.
+
+:::note
+Venue totals may represent cash or include position value. Portfolio uses them without normalization,
+so reported-account equity may differ from venue equity.
+:::
+
+- Snapshots report unrealized PnL separately for all positions, including options.
+- Spread combos create no portfolio positions and do not update calculated balances; legs carry their value.
 
 ### Price fallback
 
@@ -156,6 +175,12 @@ Valuation asks `Cache` for a price in this order, stopping at the first match:
 4. Most recent cached bar close (populated when `bar_updates=true`).
 
 Set `use_mark_prices=false` to skip the mark tier and begin with the side-appropriate quote.
+
+A price at or below zero counts as a current price only for instruments that allow negative prices
+(futures, option, futures spread and option spread instruments, and spot commodities), except inverse
+instruments whose notional divides by price because they are not premium based. A quote side at or
+below zero also needs a non-zero size, since an empty side can arrive as a zero price with zero
+size. Otherwise the Portfolio skips the price and moves to the next source.
 
 If none of the four yield a current price, the Portfolio carries the last valid price
 for that instrument and position side. The next snapshot lists the instrument in
@@ -225,6 +250,10 @@ earlier unfiltered result resolved. It has two observable behaviors:
 - When a venue goes flat (no open positions), its tracker entry is cleared so stale
   instruments do not remain flagged.
 
+`build_snapshot(account_id)` updates that account's scope. Snapshots recorded by the equity
+curve or `snapshot_interval_ms` do not update the tracker; they report unpriced positions in
+`unpriced_instruments`.
+
 Call `missing_price_instruments(venue)` to inspect the current set.
 
 :::tip
@@ -236,8 +265,12 @@ price is excluded from the total and appears in the missing-price tracker.
 ### Venue and account scope
 
 Python collection queries accept optional `venue` and `account_id` scopes. If both are provided,
-they must resolve to the same account or the query raises `ValueError`. With `account_id=None`, a
-venue query aggregates across every account on that venue.
+the account must be issued under the venue or hold a position there, or the query raises
+`ValueError`. With `account_id=None`, a venue query aggregates across every account on that venue.
+
+`balances_locked`, `instrument_initial_margins`, and `instrument_maintenance_margins` read a single
+account instead. Without `account_id`, they resolve only when exactly one account is issued under
+the venue and return `None` otherwise.
 
 An account-filtered valuation reconciles only that account's observation, so
 flags raised by other accounts on the same venue survive.

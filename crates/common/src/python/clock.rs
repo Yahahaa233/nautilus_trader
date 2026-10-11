@@ -17,19 +17,19 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use jiff::{SignedDuration, Timestamp};
+use jiff::{SignedDuration, Span, Timestamp, Zoned};
 use nautilus_core::{
     DurationNanos, UnixNanos, datetime::try_datetime_to_unix_nanos, python::to_pyvalue_err,
 };
 use pyo3::prelude::*;
 
 use crate::{
-    clock::{Clock, TestClock},
+    clock::{Clock, ClockApi, VirtualClock},
     live::clock::LiveClock,
     timer::TimeEventCallback,
 };
 
-/// Unified PyO3 interface over both [`TestClock`] and [`LiveClock`].
+/// Unified PyO3 interface over both [`VirtualClock`] and [`LiveClock`].
 ///
 /// A `PyClock` instance owns a boxed trait object implementing [`Clock`].  It
 /// delegates method calls to this inner clock, allowing a single Python class
@@ -55,7 +55,7 @@ impl PyClock {
     #[staticmethod]
     #[pyo3(name = "new_test")]
     fn py_new_test() -> Self {
-        Self(Rc::new(RefCell::new(TestClock::default())))
+        Self(Rc::new(RefCell::new(VirtualClock::default())))
     }
 
     /// Returns the current UNIX timestamp in nanoseconds (ns).
@@ -91,8 +91,10 @@ impl PyClock {
     #[pyo3(name = "set_time")]
     fn py_set_time(&mut self, to_time_ns: u64) -> PyResult<()> {
         let mut clock = self.0.borrow_mut();
-        let Some(test_clock) = clock.as_any_mut().downcast_mut::<TestClock>() else {
-            return Err(to_pyvalue_err("set_time is only supported by test clocks"));
+        let Some(test_clock) = clock.as_any_mut().downcast_mut::<VirtualClock>() else {
+            return Err(to_pyvalue_err(
+                "set_time is only supported by virtual clocks",
+            ));
         };
 
         test_clock.set_time(to_time_ns.into());
@@ -250,6 +252,85 @@ impl PyClock {
             .map_err(to_pyvalue_err)
     }
 
+    /// Sets a recurring timer anchored to a timezone-aware start datetime.
+    ///
+    /// Days, weeks, months, and years follow the local calendar; hour and shorter units measure
+    /// elapsed time. At 09:30 in New York, ``"1d"`` events are 23 hours apart when DST starts
+    /// and 25 when it ends; ``"24h"`` always spans 24 hours. ``zoneinfo.ZoneInfo`` follows DST,
+    /// while fixed offsets stay constant.
+    ///
+    /// Recurrence uses the original start, so month-end clamping and DST adjustments do not
+    /// shift later deadlines. Later gaps shift forward by the gap; folds use the first occurrence.
+    ///
+    /// Parameters
+    /// ----------
+    /// name : str
+    ///     The timer name. Replaces any existing timer with the same name on this clock.
+    /// interval : str
+    ///     A positive span string, such as ``"1d"``, ``"24h"``, or ``"P1M"``.
+    /// start_time : datetime.datetime
+    ///     Timezone-aware start at an existing local time. DST gaps at the start are not validated;
+    ///     ``fold`` selects an ambiguous start's occurrence.
+    /// stop_time : datetime.datetime, optional
+    ///     Inclusive, timezone-aware stop after the start, and after now if ``allow_past=False``.
+    ///     If omitted, runs until cancellation or no further deadline is representable.
+    /// callback : Callable[[TimeEvent], None], optional
+    ///     The event handler. If omitted, uses the clock's named or default handler.
+    /// allow_past : bool, optional
+    ///     Whether the first event may be in the past. Defaults to ``True``.
+    /// fire_immediately : bool, optional
+    ///     Include the start as the first event. Defaults to ``False``: one interval after it.
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     If the name, span, or timestamps are invalid, no callback is available, or a first
+    ///     event or stop time violates ``allow_past=False``.
+    ///
+    /// Notes
+    /// -----
+    /// Live clocks fire the next pending occurrence immediately if overdue, using its scheduled
+    /// timestamp, then resume at the first deadline after now, skipping intervening missed
+    /// occurrences. Virtual clocks emit every due occurrence during advancement.
+    /// Event timestamps remain UTC UNIX nanoseconds.
+    #[expect(
+        clippy::doc_markdown,
+        reason = "Python API docstrings use NumPy parameter and exception sections"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::needless_pass_by_value,
+        reason = "PyO3 extracts the aware datetime as an owned Zoned"
+    )]
+    #[pyo3(
+        name = "set_timer_zoned",
+        signature = (name, interval, start_time, stop_time=None, callback=None, allow_past=None, fire_immediately=None)
+    )]
+    fn py_set_timer_zoned(
+        &mut self,
+        name: &str,
+        interval: &str,
+        start_time: Zoned,
+        stop_time: Option<Timestamp>,
+        callback: Option<Py<PyAny>>,
+        allow_past: Option<bool>,
+        fire_immediately: Option<bool>,
+    ) -> PyResult<()> {
+        let interval = interval.parse::<Span>().map_err(to_pyvalue_err)?;
+
+        ClockApi::new(self.0.as_ref())
+            .set_timer_zoned(
+                name,
+                interval,
+                &start_time,
+                stop_time,
+                callback.map(TimeEventCallback::from),
+                allow_past,
+                fire_immediately,
+            )
+            .map_err(to_pyvalue_err)
+    }
+
     #[pyo3(name = "next_time_ns")]
     fn py_next_time_ns(&self, name: &str) -> Option<u64> {
         self.0.borrow().next_time_ns(name).map(|t| t.as_u64())
@@ -279,10 +360,10 @@ impl PyClock {
         Rc::clone(&self.0)
     }
 
-    /// Creates a clock backed by [`TestClock`].
+    /// Creates a clock backed by [`VirtualClock`].
     #[must_use]
     pub fn new_test() -> Self {
-        Self(Rc::new(RefCell::new(TestClock::default())))
+        Self(Rc::new(RefCell::new(VirtualClock::default())))
     }
 
     /// Creates a clock backed by [`LiveClock`].
@@ -314,7 +395,7 @@ mod tests {
     use rstest::*;
 
     use crate::{
-        clock::{Clock, TestClock},
+        clock::{Clock, VirtualClock},
         python::clock::PyClock,
         runner::{TimeEventMessage, TimeEventSender, set_time_event_sender},
         timer::TimeEventCallback,
@@ -335,8 +416,8 @@ mod tests {
     }
 
     #[fixture]
-    pub fn test_clock() -> TestClock {
-        TestClock::new()
+    pub fn test_clock() -> VirtualClock {
+        VirtualClock::new()
     }
 
     pub(super) fn test_callback() -> TimeEventCallback {
@@ -359,7 +440,7 @@ mod tests {
     }
 
     ////////////////////////////////////////////////////////////////////////////////
-    // TestClock_Py
+    // VirtualClock_Py
     ////////////////////////////////////////////////////////////////////////////////
 
     #[rstest]
@@ -477,7 +558,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_clock_raw_set_timer_ns(mut test_clock: TestClock) {
+    fn test_test_clock_raw_set_timer_ns(mut test_clock: VirtualClock) {
         Python::initialize();
         Python::attach(|_py| {
             let callback = test_callback();
@@ -502,7 +583,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_clock_cancel_timer(mut test_clock: TestClock) {
+    fn test_test_clock_cancel_timer(mut test_clock: VirtualClock) {
         Python::initialize();
         Python::attach(|_py| {
             let callback = test_callback();
@@ -528,7 +609,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_clock_cancel_timers(mut test_clock: TestClock) {
+    fn test_test_clock_cancel_timers(mut test_clock: VirtualClock) {
         Python::initialize();
         Python::attach(|_py| {
             let callback = test_callback();
@@ -554,7 +635,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_clock_advance_within_stop_time_py(mut test_clock: TestClock) {
+    fn test_test_clock_advance_within_stop_time_py(mut test_clock: VirtualClock) {
         Python::initialize();
         Python::attach(|_py| {
             let callback = test_callback();
@@ -580,7 +661,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_clock_advance_time_to_stop_time_with_set_time_true(mut test_clock: TestClock) {
+    fn test_test_clock_advance_time_to_stop_time_with_set_time_true(mut test_clock: VirtualClock) {
         Python::initialize();
         Python::attach(|_py| {
             let callback = test_callback();
@@ -606,7 +687,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_clock_advance_time_to_stop_time_with_set_time_false(mut test_clock: TestClock) {
+    fn test_test_clock_advance_time_to_stop_time_with_set_time_false(mut test_clock: VirtualClock) {
         Python::initialize();
         Python::attach(|_py| {
             let callback = test_callback();
@@ -662,7 +743,7 @@ mod tests {
 
             assert_eq!(
                 result.unwrap_err().to_string(),
-                "ValueError: set_time is only supported by test clocks",
+                "ValueError: set_time is only supported by virtual clocks",
             );
         });
     }

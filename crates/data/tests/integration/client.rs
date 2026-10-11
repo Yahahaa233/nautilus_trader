@@ -22,7 +22,7 @@ use std::{cell::RefCell, num::NonZeroUsize, rc::Rc};
 
 use nautilus_common::{
     cache::Cache,
-    clock::TestClock,
+    clock::VirtualClock,
     messages::{
         SubscribeCommand, UnsubscribeCommand,
         data::{
@@ -41,7 +41,7 @@ use nautilus_common::{
             // Subscription commands
             SubscribeBars,
             SubscribeBookDeltas,
-            SubscribeBookDepth10,
+            SubscribeBookDepth,
             SubscribeCustomData,
             SubscribeFundingRates,
             SubscribeIndexPrices,
@@ -54,7 +54,7 @@ use nautilus_common::{
             SubscribeTrades,
             UnsubscribeBars,
             UnsubscribeBookDeltas,
-            UnsubscribeBookDepth10,
+            UnsubscribeBookDepth,
             UnsubscribeCustomData,
             UnsubscribeFundingRates,
             UnsubscribeIndexPrices,
@@ -90,8 +90,8 @@ use {
 use crate::common::mocks::MockDataClient;
 
 #[fixture]
-fn clock() -> Rc<RefCell<TestClock>> {
-    Rc::new(RefCell::new(TestClock::new()))
+fn clock() -> Rc<RefCell<VirtualClock>> {
+    Rc::new(RefCell::new(VirtualClock::new()))
 }
 
 #[fixture]
@@ -115,7 +115,7 @@ fn venue() -> Venue {
 
 #[rstest]
 fn test_checkpoint_subscription_restore_preserves_actual_acquisitions_and_owners(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -190,7 +190,7 @@ fn test_checkpoint_subscription_restore_preserves_actual_acquisitions_and_owners
 
 #[rstest]
 fn test_custom_data_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -239,7 +239,7 @@ fn test_custom_data_subscription(
 
 #[rstest]
 fn test_custom_data_subscription_retries_after_client_failure(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -251,7 +251,7 @@ fn test_custom_data_subscription_retries_after_client_failure(
             cache,
             client_id,
             Some(venue),
-            Some(recorder.clone()),
+            Some(Rc::clone(&recorder)),
         )
         .with_custom_subscribe_failure(),
     );
@@ -296,7 +296,7 @@ fn test_custom_data_subscription_retries_after_client_failure(
 #[case::retry(false)]
 #[case::reacquire(true)]
 fn test_custom_data_unsubscription_retries_after_client_failure(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -309,7 +309,7 @@ fn test_custom_data_unsubscription_retries_after_client_failure(
             cache,
             client_id,
             Some(venue),
-            Some(recorder.clone()),
+            Some(Rc::clone(&recorder)),
         )
         .with_custom_unsubscribe_failure(),
     );
@@ -378,7 +378,7 @@ fn test_custom_data_unsubscription_retries_after_client_failure(
 
 #[rstest]
 fn test_instrument_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -420,7 +420,7 @@ fn test_instrument_subscription(
 
 #[rstest]
 fn test_instruments_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -457,7 +457,7 @@ fn test_instruments_subscription(
 
 #[rstest]
 fn test_book_deltas_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -502,8 +502,8 @@ fn test_book_deltas_subscription(
 }
 
 #[rstest]
-fn test_book_depth10_subscription(
-    clock: Rc<RefCell<TestClock>>,
+fn test_book_depth_subscription(
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -515,7 +515,7 @@ fn test_book_depth10_subscription(
     let inst_id = instrument.id;
     let depth = NonZeroUsize::new(10);
 
-    let sub = SubscribeCommand::BookDepth10(SubscribeBookDepth10::new(
+    let sub = SubscribeCommand::BookDepth(SubscribeBookDepth::new(
         inst_id,
         BookType::L2_MBP,
         Some(client_id),
@@ -528,13 +528,13 @@ fn test_book_depth10_subscription(
         None,
     ));
     adapter.execute_subscribe(sub.clone());
-    assert!(adapter.subscriptions_book_depth10.contains(&inst_id));
+    assert!(adapter.subscriptions_book_depth.contains(&inst_id));
 
     // Idempotency check
     adapter.execute_subscribe(sub.clone());
-    assert_eq!(adapter.subscriptions_book_depth10.len(), 1);
+    assert_eq!(adapter.subscriptions_book_depth.len(), 1);
 
-    let unsub = UnsubscribeCommand::BookDepth10(UnsubscribeBookDepth10::new(
+    let unsub = UnsubscribeCommand::BookDepth(UnsubscribeBookDepth::new(
         inst_id,
         Some(client_id),
         Some(venue),
@@ -544,12 +544,12 @@ fn test_book_depth10_subscription(
         None,
     ));
     adapter.execute_unsubscribe(&unsub);
-    assert!(!adapter.subscriptions_book_depth10.contains(&inst_id));
+    assert!(!adapter.subscriptions_book_depth.contains(&inst_id));
 }
 
 #[rstest]
 fn test_quote_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -591,7 +591,7 @@ fn test_quote_subscription(
 
 #[rstest]
 fn test_trades_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -633,7 +633,7 @@ fn test_trades_subscription(
 
 #[rstest]
 fn test_mark_price_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -675,7 +675,7 @@ fn test_mark_price_subscription(
 
 #[rstest]
 fn test_index_price_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -717,7 +717,7 @@ fn test_index_price_subscription(
 
 #[rstest]
 fn test_funding_rate_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -759,7 +759,7 @@ fn test_funding_rate_subscription(
 
 #[rstest]
 fn test_bars_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -800,7 +800,7 @@ fn test_bars_subscription(
 
 #[rstest]
 fn test_instrument_status_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -842,7 +842,7 @@ fn test_instrument_status_subscription(
 
 #[rstest]
 fn test_instrument_close_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -884,7 +884,7 @@ fn test_instrument_close_subscription(
 
 #[rstest]
 fn test_custom_data_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -911,7 +911,7 @@ fn test_custom_data_unsubscribe_noop(
 
 #[rstest]
 fn test_custom_data_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -948,7 +948,7 @@ fn test_custom_data_unsubscribe_idempotent(
 
 #[rstest]
 fn test_custom_data_unsubscribe_keeps_client_subscription_when_subscribers_remain(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -959,7 +959,7 @@ fn test_custom_data_unsubscribe_keeps_client_subscription_when_subscribers_remai
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(&recorder)),
     ));
     let mut adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
     let data_type = DataType::new("SharedType", None, None);
@@ -1029,7 +1029,7 @@ fn test_custom_data_unsubscribe_keeps_client_subscription_when_subscribers_remai
 
 #[rstest]
 fn test_instrument_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1056,7 +1056,7 @@ fn test_instrument_unsubscribe_noop(
 
 #[rstest]
 fn test_instrument_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1092,7 +1092,7 @@ fn test_instrument_unsubscribe_idempotent(
 
 #[rstest]
 fn test_instruments_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1115,7 +1115,7 @@ fn test_instruments_unsubscribe_noop(
 
 #[rstest]
 fn test_instruments_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1149,7 +1149,7 @@ fn test_instruments_unsubscribe_idempotent(
 }
 #[rstest]
 fn test_book_deltas_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1174,7 +1174,7 @@ fn test_book_deltas_unsubscribe_noop(
 
 #[rstest]
 fn test_book_deltas_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1213,8 +1213,8 @@ fn test_book_deltas_unsubscribe_idempotent(
 }
 
 #[rstest]
-fn test_book_depth10_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+fn test_book_depth_unsubscribe_noop(
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1222,7 +1222,7 @@ fn test_book_depth10_unsubscribe_noop(
     let client = Box::new(MockDataClient::new(clock, cache, client_id, Some(venue)));
     let mut adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
     let inst_id = audusd_sim().id;
-    let unsub = UnsubscribeCommand::BookDepth10(UnsubscribeBookDepth10::new(
+    let unsub = UnsubscribeCommand::BookDepth(UnsubscribeBookDepth::new(
         inst_id,
         Some(client_id),
         Some(venue),
@@ -1232,12 +1232,12 @@ fn test_book_depth10_unsubscribe_noop(
         None,
     ));
     adapter.execute_unsubscribe(&unsub);
-    assert!(adapter.subscriptions_book_depth10.is_empty());
+    assert!(adapter.subscriptions_book_depth.is_empty());
 }
 
 #[rstest]
-fn test_book_depth10_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+fn test_book_depth_unsubscribe_idempotent(
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1245,7 +1245,7 @@ fn test_book_depth10_unsubscribe_idempotent(
     let client = Box::new(MockDataClient::new(clock, cache, client_id, Some(venue)));
     let mut adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
     let inst_id = audusd_sim().id;
-    let sub = SubscribeCommand::BookDepth10(SubscribeBookDepth10::new(
+    let sub = SubscribeCommand::BookDepth(SubscribeBookDepth::new(
         inst_id,
         BookType::L2_MBP,
         Some(client_id),
@@ -1258,7 +1258,7 @@ fn test_book_depth10_unsubscribe_idempotent(
         None,
     ));
     adapter.execute_subscribe(sub.clone());
-    let unsub = UnsubscribeCommand::BookDepth10(UnsubscribeBookDepth10::new(
+    let unsub = UnsubscribeCommand::BookDepth(UnsubscribeBookDepth::new(
         inst_id,
         Some(client_id),
         Some(venue),
@@ -1269,12 +1269,12 @@ fn test_book_depth10_unsubscribe_idempotent(
     ));
     adapter.execute_unsubscribe(&unsub);
     adapter.execute_unsubscribe(&unsub);
-    assert!(adapter.subscriptions_book_depth10.is_empty());
+    assert!(adapter.subscriptions_book_depth.is_empty());
 }
 
 #[rstest]
 fn test_quotes_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1297,7 +1297,7 @@ fn test_quotes_unsubscribe_noop(
 
 #[rstest]
 fn test_quotes_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1331,7 +1331,7 @@ fn test_quotes_unsubscribe_idempotent(
 
 #[rstest]
 fn test_trades_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1354,7 +1354,7 @@ fn test_trades_unsubscribe_noop(
 
 #[rstest]
 fn test_trades_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1388,7 +1388,7 @@ fn test_trades_unsubscribe_idempotent(
 
 #[rstest]
 fn test_bars_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1411,7 +1411,7 @@ fn test_bars_unsubscribe_noop(
 
 #[rstest]
 fn test_bars_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1445,7 +1445,7 @@ fn test_bars_unsubscribe_idempotent(
 
 #[rstest]
 fn test_mark_prices_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1468,7 +1468,7 @@ fn test_mark_prices_unsubscribe_noop(
 
 #[rstest]
 fn test_mark_prices_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1502,7 +1502,7 @@ fn test_mark_prices_unsubscribe_idempotent(
 
 #[rstest]
 fn test_index_prices_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1525,7 +1525,7 @@ fn test_index_prices_unsubscribe_noop(
 
 #[rstest]
 fn test_index_prices_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1559,7 +1559,7 @@ fn test_index_prices_unsubscribe_idempotent(
 
 #[rstest]
 fn test_funding_rates_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1583,7 +1583,7 @@ fn test_funding_rates_unsubscribe_noop(
 
 #[rstest]
 fn test_funding_rates_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1622,7 +1622,7 @@ fn test_funding_rates_unsubscribe_idempotent(
 
 #[rstest]
 fn test_instrument_status_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1645,7 +1645,7 @@ fn test_instrument_status_unsubscribe_noop(
 
 #[rstest]
 fn test_instrument_status_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1679,7 +1679,7 @@ fn test_instrument_status_unsubscribe_idempotent(
 
 #[rstest]
 fn test_instrument_close_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1702,7 +1702,7 @@ fn test_instrument_close_unsubscribe_noop(
 
 #[rstest]
 fn test_instrument_close_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1742,7 +1742,7 @@ fn test_instrument_close_unsubscribe_idempotent(
 
 #[rstest]
 fn test_request_data(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1753,7 +1753,7 @@ fn test_request_data(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(&recorder)),
     ));
     let adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
 
@@ -1777,7 +1777,7 @@ fn test_request_data(
 
 #[rstest]
 fn test_request_instrument(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1788,7 +1788,7 @@ fn test_request_instrument(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(&recorder)),
     ));
     let adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
 
@@ -1814,7 +1814,7 @@ fn test_request_instrument(
 
 #[rstest]
 fn test_request_instruments(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1826,7 +1826,7 @@ fn test_request_instruments(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(&recorder)),
     ));
     let adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
 
@@ -1851,7 +1851,7 @@ fn test_request_instruments(
 
 #[rstest]
 fn test_request_book_snapshot(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1862,7 +1862,7 @@ fn test_request_book_snapshot(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(&recorder)),
     ));
     let adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
 
@@ -1887,7 +1887,7 @@ fn test_request_book_snapshot(
 
 #[rstest]
 fn test_request_quotes(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1898,7 +1898,7 @@ fn test_request_quotes(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(&recorder)),
     ));
     let adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
 
@@ -1922,7 +1922,7 @@ fn test_request_quotes(
 
 #[rstest]
 fn test_request_trades(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1933,7 +1933,7 @@ fn test_request_trades(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(&recorder)),
     ));
     let adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
 
@@ -1957,7 +1957,7 @@ fn test_request_trades(
 
 #[rstest]
 fn test_request_funding_rates(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -1968,7 +1968,7 @@ fn test_request_funding_rates(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(&recorder)),
     ));
     let adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
 
@@ -1995,7 +1995,7 @@ fn test_request_funding_rates(
 
 #[rstest]
 fn test_request_bars(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -2006,7 +2006,7 @@ fn test_request_bars(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(&recorder)),
     ));
     let adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
 
@@ -2030,7 +2030,7 @@ fn test_request_bars(
 
 #[rstest]
 fn test_request_order_book_depth(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -2041,7 +2041,7 @@ fn test_request_order_book_depth(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(&recorder)),
     ));
     let adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
 
@@ -2071,7 +2071,7 @@ fn test_request_order_book_depth(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_defi_blocks_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -2109,7 +2109,7 @@ fn test_defi_blocks_subscription(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_defi_pool_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -2120,7 +2120,7 @@ fn test_defi_pool_subscription(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(&recorder)),
     ));
     let mut adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
     let instrument_id =
@@ -2156,7 +2156,7 @@ fn test_defi_pool_subscription(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_defi_blocks_release_after_final_owner(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -2167,7 +2167,7 @@ fn test_defi_blocks_release_after_final_owner(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(&recorder)),
     ));
     let mut adapter = DataClientAdapter::new(client_id, Some(venue), false, false, client);
     let chain = Blockchain::Arbitrum;
@@ -2221,7 +2221,7 @@ fn test_defi_blocks_release_after_final_owner(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_defi_blocks_subscription_retries_after_client_failure(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -2233,7 +2233,7 @@ fn test_defi_blocks_subscription_retries_after_client_failure(
             cache,
             client_id,
             Some(venue),
-            Some(recorder.clone()),
+            Some(Rc::clone(&recorder)),
         )
         .with_blocks_subscribe_failure(),
     );
@@ -2275,7 +2275,7 @@ fn test_defi_blocks_subscription_retries_after_client_failure(
 #[case::retry(false)]
 #[case::reacquire(true)]
 fn test_defi_blocks_unsubscription_retries_after_client_failure(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -2288,7 +2288,7 @@ fn test_defi_blocks_unsubscription_retries_after_client_failure(
             cache,
             client_id,
             Some(venue),
-            Some(recorder.clone()),
+            Some(Rc::clone(&recorder)),
         )
         .with_blocks_unsubscribe_failure(),
     );
@@ -2352,7 +2352,7 @@ fn test_defi_blocks_unsubscription_retries_after_client_failure(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_defi_pool_swaps_subscription(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -2391,7 +2391,7 @@ fn test_defi_pool_swaps_subscription(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_defi_blocks_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -2416,7 +2416,7 @@ fn test_defi_blocks_unsubscribe_noop(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_defi_blocks_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -2452,7 +2452,7 @@ fn test_defi_blocks_unsubscribe_idempotent(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_defi_pool_swaps_unsubscribe_noop(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,
@@ -2479,7 +2479,7 @@ fn test_defi_pool_swaps_unsubscribe_noop(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_defi_pool_swaps_unsubscribe_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     client_id: ClientId,
     venue: Venue,

@@ -42,9 +42,64 @@ pub(crate) mod tests;
 
 // Re-exports
 pub use data_actor::{DataActor, DataActorConfig, DataActorCore, DataActorNative};
-pub(crate) use dispatch::ChainContext;
+#[doc(hidden)]
+pub use dispatch::DispatchError as CallbackDispatchError;
+#[doc(hidden)]
+pub use dispatch::{
+    CallbackAncestryState, CallbackContextRef, RestoredCallbackContext, RestoredChannelContexts,
+    capture_channel_contexts, restore_channel_contexts,
+};
+pub(crate) use dispatch::{ChainContext, PublicationScope};
+#[cfg(feature = "live")]
+pub(crate) use dispatch::{SendChainContext, collect_command_contexts};
 
 pub use crate::component::Component;
+
+/// Drains at most `budget` callback slots at a caller-established safe boundary.
+///
+/// Returns whether queued slots remain after exhausting the budget. Retained roots alone do not
+/// require another drain. Callers must release component, engine, and cache borrows before entry.
+///
+/// # Errors
+///
+/// Returns an error if a fatal dispatch failure has been recorded, delivery cannot safely enter, or
+/// delivery encounters an unfinished reservation. Returns the first fatal dispatch error, or an
+/// active-work error for unsafe entry or unfinished reservations. A busy head latches a fatal
+/// stalled-delivery error. An otherwise successful drain entered during panic unwinding latches a
+/// fatal error on exit; its result remains successful, and [`callback_failure`] reports the
+/// failure.
+#[doc(hidden)]
+pub fn drain_callbacks(budget: usize) -> Result<bool, CallbackDispatchError> {
+    let result = dispatch::drain_at_boundary(budget)?;
+    Ok(result.status == dispatch::DrainStatus::BudgetExhausted)
+}
+
+/// Returns the first fatal callback dispatch error on this thread.
+#[doc(hidden)]
+#[must_use]
+pub fn callback_failure() -> Option<CallbackDispatchError> {
+    dispatch::failure()
+}
+
+/// Returns whether the owner dispatcher still retains unfinished callback work.
+#[doc(hidden)]
+#[must_use]
+pub fn callbacks_pending() -> bool {
+    dispatch::has_pending()
+}
+
+/// Releases queued callback captures and resets dispatch accounting at a safe boundary.
+/// Clearing also resets the latched fatal failure.
+///
+/// # Errors
+///
+/// Returns an error if access, reservations, or externally retained roots remain. The error reports
+/// active work. Callers must release queued commands and other retained work before clearing
+/// callbacks.
+#[doc(hidden)]
+pub fn clear_callbacks() -> Result<(), CallbackDispatchError> {
+    dispatch::clear()
+}
 
 pub trait Actor: Any + Debug {
     /// The unique identifier for the actor.

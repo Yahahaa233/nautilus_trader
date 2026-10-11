@@ -188,7 +188,7 @@ impl LiveNodeHandle {
     pub fn request_running_checkpoint(&self) {
         let _ =
             self.checkpoint_requested
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                     value.checked_add(1)
                 });
     }

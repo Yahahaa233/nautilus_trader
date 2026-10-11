@@ -15,10 +15,17 @@
 
 //! Instrument definitions the trading domain model.
 
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
+
 use jiff::Timestamp;
 use nautilus_core::{
     correctness::check_in_range_inclusive_usize,
-    python::{serialization::from_dict_pyo3, to_pyvalue_err},
+    python::{
+        IntoPyObjectNautilusExt, serialization::from_dict_pyo3, to_pyruntime_err, to_pyvalue_err,
+    },
 };
 use pyo3::{
     IntoPyObjectExt, Py, PyAny, PyResult, Python,
@@ -33,11 +40,69 @@ use crate::{
     instruments::{
         BettingInstrument, BinaryOption, Cfd, Commodity, CryptoFuture, CryptoFuturesSpread,
         CryptoOptionSpread, CryptoPerpetual, CurrencyPair, Equity, FuturesContract, FuturesSpread,
-        IndexInstrument, Instrument, InstrumentAny, OptionContract, OptionSpread,
-        PerpetualContract, TokenizedAsset, crypto_option::CryptoOption,
+        IndexInstrument, Instrument, InstrumentAny, NautilusInstrumentType, OptionContract,
+        OptionSpread, PerpetualContract, TokenizedAsset, crypto_option::CryptoOption,
     },
     types::{Currency, Money, Price, Quantity},
 };
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[pyo3::pyclass(
+    frozen,
+    name = "NautilusInstrumentType",
+    module = "nautilus_trader.model",
+    skip_from_py_object
+)]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")]
+pub struct PyNautilusInstrumentType {
+    inner: NautilusInstrumentType,
+}
+
+impl PyNautilusInstrumentType {
+    #[must_use]
+    pub const fn new(inner: NautilusInstrumentType) -> Self {
+        Self { inner }
+    }
+
+    #[must_use]
+    pub const fn inner(&self) -> NautilusInstrumentType {
+        self.inner
+    }
+}
+
+#[pyo3::pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl PyNautilusInstrumentType {
+    #[new]
+    fn py_new(value: &str) -> PyResult<Self> {
+        value
+            .parse::<NautilusInstrumentType>()
+            .map(Self::new)
+            .map_err(to_pyruntime_err)
+    }
+
+    fn __str__(&self) -> String {
+        self.inner.to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("NautilusInstrumentType.{}", self.inner)
+    }
+
+    fn __richcmp__(&self, other: &Self, op: pyo3::pyclass::CompareOp, py: Python<'_>) -> Py<PyAny> {
+        match op {
+            pyo3::pyclass::CompareOp::Eq => (self.inner == other.inner).into_py_any_unwrap(py),
+            pyo3::pyclass::CompareOp::Ne => (self.inner != other.inner).into_py_any_unwrap(py),
+            _ => py.NotImplemented(),
+        }
+    }
+
+    fn __hash__(&self) -> isize {
+        let mut hasher = DefaultHasher::new();
+        self.inner.hash(&mut hasher);
+        hasher.finish() as isize
+    }
+}
 
 const MAX_PRICE_LIST_TICKS: usize = 100_000;
 
@@ -50,7 +115,7 @@ const MAX_PRICE_LIST_TICKS: usize = 100_000;
 ///
 /// Callers must only pass fields that are guaranteed to hold crypto assets (the
 /// underlying of a derivative); `quote_currency` and `settlement_currency` can
-/// legitimately be fiat (e.g. inverse perps on BitMEX quoted in USD) and must
+/// legitimately be fiat (e.g. inverse perpetuals quoted in USD) and must
 /// stay on the strict deserialization path.
 ///
 /// Codes are trimmed before lookup; empty or whitespace-only values are skipped
@@ -155,7 +220,7 @@ macro_rules! impl_instrument_common_pymethods {
             ///
             /// # Errors
             ///
-            /// Returns a Python `ValueError` if `num_ticks` exceeds the supported range.
+            /// Returns an error if `num_ticks` exceeds the supported range.
             #[pyo3(name = "next_bid_prices")]
             #[pyo3(signature = (value, num_ticks=100))]
             fn py_next_bid_prices(
@@ -177,7 +242,7 @@ macro_rules! impl_instrument_common_pymethods {
             ///
             /// # Errors
             ///
-            /// Returns a Python `ValueError` if `num_ticks` exceeds the supported range.
+            /// Returns an error if `num_ticks` exceeds the supported range.
             #[pyo3(name = "next_ask_prices")]
             #[pyo3(signature = (value, num_ticks=100))]
             fn py_next_ask_prices(
@@ -421,13 +486,6 @@ impl_instrument_getter!(
     IndexInstrument,
 );
 impl_instrument_getter!(
-    "maker_fee",
-    py_maker_fee,
-    Decimal,
-    maker_fee,
-    IndexInstrument
-);
-impl_instrument_getter!(
     "margin_init",
     py_margin_init,
     Decimal,
@@ -519,13 +577,6 @@ impl_instrument_getter!(
     OptionContract,
     OptionSpread,
 );
-impl_instrument_getter!(
-    "taker_fee",
-    py_taker_fee,
-    Decimal,
-    taker_fee,
-    IndexInstrument
-);
 
 pub mod betting;
 pub mod binary_option;
@@ -545,13 +596,14 @@ pub mod option_contract;
 pub mod option_spread;
 pub mod perpetual_contract;
 pub mod synthetic;
+pub mod tick_scheme;
 pub mod tokenized_asset;
 
 /// Converts an [`InstrumentAny`] into a Python object.
 ///
 /// # Errors
 ///
-/// Returns a `PyErr` if conversion to a Python object fails.
+/// Returns an error if conversion to a Python object fails.
 pub fn instrument_any_to_pyobject(py: Python, instrument: InstrumentAny) -> PyResult<Py<PyAny>> {
     match instrument {
         InstrumentAny::Betting(inst) => inst.into_py_any(py),
@@ -579,7 +631,7 @@ pub fn instrument_any_to_pyobject(py: Python, instrument: InstrumentAny) -> PyRe
 ///
 /// # Errors
 ///
-/// Returns a `PyErr` if extraction fails or the instrument type is unsupported.
+/// Returns an error if extraction fails or the instrument type is unsupported.
 #[expect(clippy::needless_pass_by_value)]
 pub fn pyobject_to_instrument_any(py: Python, instrument: Py<PyAny>) -> PyResult<InstrumentAny> {
     match instrument.getattr(py, "type_name")?.extract::<&str>(py)? {

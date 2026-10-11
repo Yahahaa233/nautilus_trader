@@ -18,7 +18,9 @@
 //! Serialized records describe the source. They do not establish a current node phase,
 //! prove a successful replay or authorize a venue command.
 
-use anyhow::{Context, Result, ensure};
+#[cfg(feature = "live")]
+use anyhow::Context;
+use anyhow::{Result, ensure};
 use nautilus_core::UUID4;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -166,6 +168,40 @@ pub(crate) fn encode_native_ingress(
                 .and_then(|current| current.clone())
         })
         .context("native derived queue codec absent or busy")?;
+    // Admission envelopes carry callback ancestry, but original queue evidence
+    // encodes only the unchanged domain payload.
+    use crate::live::dispatch::DispatchMessage;
+    let input: &dyn std::any::Any = if let Some(envelope) =
+        input.downcast_ref::<DispatchMessage<crate::messages::DataEvent>>()
+    {
+        envelope.message()
+    } else if let Some(envelope) =
+        input.downcast_ref::<DispatchMessage<crate::messages::ExecutionEvent>>()
+    {
+        envelope.message()
+    } else if let Some(envelope) =
+        input.downcast_ref::<DispatchMessage<crate::messages::SystemEvent>>()
+    {
+        envelope.message()
+    } else if let Some(envelope) =
+        input.downcast_ref::<DispatchMessage<crate::messages::SystemCommand>>()
+    {
+        envelope.message()
+    } else if let Some(envelope) =
+        input.downcast_ref::<DispatchMessage<crate::messages::data::DataCommand>>()
+    {
+        envelope.message()
+    } else if let Some(envelope) =
+        input.downcast_ref::<DispatchMessage<crate::runner::TradingCommandMessage>>()
+    {
+        envelope.message()
+    } else if let Some(envelope) =
+        input.downcast_ref::<DispatchMessage<crate::runner::TimeEventMessage>>()
+    {
+        envelope.message()
+    } else {
+        input
+    };
     encode(source, input)
 }
 
@@ -890,9 +926,21 @@ pub mod historical {
         activity_at: Option<crate::live::dst::time::Instant>,
         queued_outputs: Vec<super::NativeQueuedOutput>,
         next_queued: usize,
+        #[cfg(feature = "live")]
+        queue_retention: Option<crate::live::ingress::HistoricalQueueRetention>,
         native_risk_state: Option<serde_json::Value>,
     }
     impl Frame {
+        fn fail(&mut self, reason: &str) {
+            let first = self.failure.get_or_insert_with(|| reason.into());
+            #[cfg(feature = "live")]
+            if let Some(retention) = &self.queue_retention {
+                retention.fail(first);
+            }
+            #[cfg(not(feature = "live"))]
+            let _ = first;
+        }
+
         fn source_context(&self) -> String {
             match &self.input {
                 NativeTraceRecord::Begin {
@@ -1066,6 +1114,8 @@ pub mod historical {
                 activity_at,
                 queued_outputs,
                 next_queued: 0,
+                #[cfg(feature = "live")]
+                queue_retention: None,
                 native_risk_state,
             }));
             CURRENT.with(|current| {
@@ -1125,6 +1175,32 @@ pub mod historical {
                 finished: false,
             })
         }
+
+        /// Binds this current input to an actual healthy frozen native queue owner.
+        /// The native reader must already admit the source and historical phase.
+        /// Unbound historical scopes retain their original verification-only behavior.
+        ///
+        /// # Errors
+        /// Refuses a foreign/currently borrowed frame, failed source, or late binding.
+        #[cfg(feature = "live")]
+        #[doc(hidden)]
+        pub fn bind_native_queue_retention(
+            &self,
+            frozen: &crate::live::ingress::FrozenIngress,
+        ) -> Result<()> {
+            CURRENT.with(|current| {
+                let frames = current
+                    .try_borrow()
+                    .context("historical queue binding busy")?;
+                ensure!(
+                    frames
+                        .last()
+                        .is_some_and(|frame| Rc::ptr_eq(frame, &self.frame)),
+                    "historical queue binding input changed"
+                );
+                bind_queue_retention(&self.frame, frozen)
+            })
+        }
         /// Verifies every actual archived callback was consumed exactly once.
         /// # Errors
         /// Refuses an unsupported/mismatched/missing route or a failed hook.
@@ -1176,21 +1252,80 @@ pub mod historical {
             Ok(())
         }
     }
+
+    #[cfg(feature = "live")]
+    fn bind_queue_retention(
+        frame: &Rc<RefCell<Frame>>,
+        frozen: &crate::live::ingress::FrozenIngress,
+    ) -> Result<()> {
+        let retention = frozen.historical_queue_retention()?;
+        let mut frame = frame
+            .try_borrow_mut()
+            .context("historical queue binding input busy")?;
+        ensure!(
+            frame.failure.is_none(),
+            "historical queue binding input failed"
+        );
+        let NativeTraceRecord::Begin {
+            source,
+            root_sequence,
+            input_sequence,
+            ..
+        } = &frame.input
+        else {
+            anyhow::bail!("historical queue binding has no source Begin")
+        };
+        source.validate()?;
+        ensure!(
+            *root_sequence > 0 && *input_sequence > 0,
+            "historical queue binding source frontier absent"
+        );
+        if let Some(existing) = &frame.queue_retention {
+            ensure!(
+                existing.same_binding(&retention),
+                "historical queue binding owner/epoch changed"
+            );
+        } else {
+            ensure!(
+                frame.next_queued == 0,
+                "historical queue binding follows consumed effects"
+            );
+            frame.queue_retention = Some(retention);
+        }
+        Ok(())
+    }
+
+    /// Binds the current reader-entered input after native phase/source admission.
+    /// No JSON record or ordinary callback may use this as execution authorization.
+    ///
+    /// # Errors
+    /// Refuses a missing, failed, busy or late current historical input.
+    #[cfg(feature = "live")]
+    #[doc(hidden)]
+    pub fn bind_current_native_queue_retention(
+        frozen: &crate::live::ingress::FrozenIngress,
+    ) -> Result<()> {
+        CURRENT.with(|current| {
+            let frames = current
+                .try_borrow()
+                .context("historical queue binding busy")?;
+            let frame = frames
+                .last()
+                .context("historical queue binding input absent")?;
+            bind_queue_retention(frame, frozen)
+        })
+    }
     impl Drop for HistoricalInputScope {
         fn drop(&mut self) {
             if !self.finished {
                 if let Ok(mut frame) = self.frame.try_borrow_mut() {
-                    frame
-                        .failure
-                        .get_or_insert_with(|| "historical input interrupted".into());
+                    frame.fail("historical input interrupted");
                 }
                 let _ = CURRENT.try_with(|current| {
                     if let Ok(mut current) = current.try_borrow_mut() {
                         for frame in current.iter() {
                             if let Ok(mut frame) = frame.try_borrow_mut() {
-                                frame.failure.get_or_insert_with(|| {
-                                    "historical descendant interrupted".into()
-                                });
+                                frame.fail("historical descendant interrupted");
                             }
                         }
                         if current
@@ -1209,7 +1344,7 @@ pub mod historical {
             if let Ok(current) = current.try_borrow() {
                 if let Some(source) = current.last() {
                     if let Ok(mut source) = source.try_borrow_mut() {
-                        source.failure.get_or_insert_with(|| reason.into());
+                        source.fail(reason);
                     }
                 }
             }
@@ -1402,11 +1537,23 @@ pub mod historical {
         })
     }
 
-    /// Consumes the exact old local queue effect without enqueueing it twice.
+    #[cfg(feature = "live")]
+    #[derive(Debug)]
+    pub(crate) enum Queued {
+        Verified(bool),
+        #[cfg(feature = "live")]
+        Retain {
+            receipt: super::NativeIngressReceipt,
+            retention: crate::live::ingress::HistoricalQueueRetention,
+        },
+    }
+
+    /// Consumes an exact old local queue effect, retaining only explicitly bound admission.
+    #[cfg(feature = "live")]
     pub(crate) fn queued(
         source: super::NativeInputSource,
         payload: &serde_json::Value,
-    ) -> Result<Option<bool>> {
+    ) -> Result<Option<Queued>> {
         CURRENT.with(|current| {
             let frames = current
                 .try_borrow()
@@ -1417,6 +1564,7 @@ pub mod historical {
             let mut frame = frame
                 .try_borrow_mut()
                 .context("historical queue input busy")?;
+            ensure!(frame.failure.is_none(), "historical queued input failed");
             let output = frame
                 .queued_outputs
                 .get(frame.next_queued)
@@ -1426,8 +1574,42 @@ pub mod historical {
                 "historical queued intent changed source or payload"
             );
             let accepted = output.accepted;
+            #[cfg(feature = "live")]
+            let retained = if let Some(retention) = &frame.queue_retention {
+                retention.verify()?;
+                let NativeTraceRecord::Begin {
+                    source,
+                    root_sequence,
+                    input_sequence,
+                    ..
+                } = &frame.input
+                else {
+                    anyhow::bail!("historical queued source Begin absent")
+                };
+                ensure!(
+                    output.receipt.channel_ordinal == 0
+                        && output.receipt.caused_by
+                            == Some(super::NativeInputCause {
+                                process_incarnation: source.process_incarnation,
+                                journal_run: source.journal_run.clone(),
+                                root_sequence: *root_sequence,
+                                input_sequence: *input_sequence,
+                            }),
+                    "historical queued source cause or original receipt changed"
+                );
+                accepted.then(|| Queued::Retain {
+                    receipt: output.receipt.clone(),
+                    retention: retention.clone(),
+                })
+            } else {
+                None
+            };
             frame.next_queued += 1;
-            Ok(Some(accepted))
+            #[cfg(feature = "live")]
+            if let Some(retained) = retained {
+                return Ok(Some(retained));
+            }
+            Ok(Some(Queued::Verified(accepted)))
         })
     }
 
@@ -1505,7 +1687,7 @@ pub mod historical {
         })();
         if let Err(error) = outcome {
             if let Ok(mut frame) = source.try_borrow_mut() {
-                frame.failure.get_or_insert_with(|| format!("{error:#}"));
+                frame.fail(&format!("{error:#}"));
             }
         }
         true

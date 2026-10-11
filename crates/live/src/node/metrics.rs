@@ -19,6 +19,7 @@ use std::{
 };
 
 use nautilus_common::{
+    live::dispatch::DispatchMessage,
     messages::{DataEvent, ExecutionEvent, data::DataCommand},
     runner::{SystemChannel, TimeEventMessage, TradingCommandMessage},
 };
@@ -356,11 +357,11 @@ pub(crate) struct RunnerChannelQueueDepths {
 
 impl RunnerChannelQueueDepths {
     pub(crate) fn from_receivers(
-        time_events: &crate::runner::SnapshotReceiver<TimeEventMessage>,
-        exec_events: &crate::runner::SnapshotReceiver<ExecutionEvent>,
-        exec_commands: &crate::runner::SnapshotReceiver<TradingCommandMessage>,
-        data_events: &crate::runner::SnapshotReceiver<DataEvent>,
-        data_commands: &crate::runner::SnapshotReceiver<DataCommand>,
+        time_events: &crate::runner::SnapshotReceiver<DispatchMessage<TimeEventMessage>>,
+        exec_events: &crate::runner::SnapshotReceiver<DispatchMessage<ExecutionEvent>>,
+        exec_commands: &crate::runner::SnapshotReceiver<DispatchMessage<TradingCommandMessage>>,
+        data_events: &crate::runner::SnapshotReceiver<DispatchMessage<DataEvent>>,
+        data_commands: &crate::runner::SnapshotReceiver<DispatchMessage<DataCommand>>,
     ) -> Self {
         Self {
             time_events: time_events.len(),
@@ -426,6 +427,7 @@ mod tests {
     use std::time::Duration;
 
     use nautilus_common::{
+        live::dispatch::DispatchMessage,
         messages::{
             data::{SubscribeCommand, subscribe::SubscribeInstruments},
             execution::{QueryAccount, TradingCommand},
@@ -837,12 +839,16 @@ mod tests {
 
     #[rstest]
     fn test_runner_metrics_queue_depths_use_receiver_lengths() {
-        let (time_tx, time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
-        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        let (time_tx, time_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
+        let (exec_evt_tx, exec_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
         let (exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<TradingCommandMessage>();
-        let (data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let (data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
+        let (data_evt_tx, data_evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
+        let (data_cmd_tx, data_cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
         let mut time_rx = crate::runner::SnapshotReceiver::from(time_rx);
         let mut exec_evt_rx = crate::runner::SnapshotReceiver::from(exec_evt_rx);
         let mut exec_cmd_rx = crate::runner::SnapshotReceiver::from(exec_cmd_rx);
@@ -850,27 +856,30 @@ mod tests {
         let mut data_cmd_rx = crate::runner::SnapshotReceiver::from(data_cmd_rx);
         let metrics = RunnerMetrics::default();
 
-        time_tx.send(stub_time_event_handler()).unwrap();
+        time_tx.send(stub_time_event_handler().into()).unwrap();
 
         for _ in 0..2 {
-            exec_evt_tx.send(stub_exec_event()).unwrap();
+            exec_evt_tx.send((stub_exec_event()).into()).unwrap();
         }
 
         for _ in 0..3 {
             exec_cmd_tx
-                .send(TradingCommandMessage::new(
-                    MessagingSwitchboard::exec_engine_execute(),
-                    stub_trading_command(),
-                ))
+                .send(
+                    TradingCommandMessage::new(
+                        MessagingSwitchboard::exec_engine_execute(),
+                        stub_trading_command(),
+                    )
+                    .into(),
+                )
                 .unwrap();
         }
 
         for _ in 0..4 {
-            data_evt_tx.send(stub_data_event()).unwrap();
+            data_evt_tx.send((stub_data_event()).into()).unwrap();
         }
 
         for _ in 0..5 {
-            data_cmd_tx.send(stub_data_command()).unwrap();
+            data_cmd_tx.send(stub_data_command().into()).unwrap();
         }
 
         // Move actual messages out of Tokio storage: metrics must count the

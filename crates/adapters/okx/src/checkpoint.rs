@@ -27,16 +27,13 @@ use anyhow::{Context as _, Result, ensure};
 use nautilus_common::{
     cache::quote::QuoteCache, clients::RunningAdapterCheckpoint, live::checkpoint::FrozenCallbacks,
 };
-use nautilus_model::{
-    identifiers::ClientOrderId,
-    types::{Money, Quantity},
-};
+use nautilus_model::identifiers::ClientOrderId;
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, error::TryRecvError};
 use tokio_tungstenite::tungstenite::Message;
 use ustr::Ustr;
 
-use crate::websocket::parse::OrderStateSnapshot;
+use crate::websocket::parse::{FeeCache, FilledQtyCache, OrderStateSnapshot};
 
 #[derive(Debug)]
 struct Inbox<T> {
@@ -356,8 +353,9 @@ impl RetainedInbox<Message> {
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ExecutionStreamState {
-    pub(crate) fee_cache: AHashMap<Ustr, Money>,
-    pub(crate) filled_qty_cache: AHashMap<Ustr, Quantity>,
+    pub(crate) fee_cache: FeeCache,
+    #[serde(default)]
+    pub(crate) filled_qty_cache: FilledQtyCache,
     pub(crate) order_state_cache: AHashMap<ClientOrderId, OrderStateSnapshot>,
 }
 

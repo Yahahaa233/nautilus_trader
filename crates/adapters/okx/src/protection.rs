@@ -2,7 +2,7 @@
 //! These are custom data, not order state, command acknowledgements, or authorization.
 use std::{any::Any, sync::Arc};
 
-use nautilus_common::{live::ingress::IngressSender, messages::DataEvent};
+use nautilus_common::{live::sender::EventSender, messages::DataEvent};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{CustomData, CustomDataTrait, Data, HasTsInit},
@@ -147,11 +147,16 @@ impl OrderProtectionSource {
 pub(crate) struct ProtectionSourceEmitter(Arc<Mutex<SourcePublicationState>>);
 #[derive(Debug, Default)]
 struct SourcePublicationState {
-    sender: Option<IngressSender<DataEvent>>,
+    sender: Option<EventSender<DataEvent>>,
     first_failure: Option<String>,
 }
 impl ProtectionSourceEmitter {
-    pub(crate) fn bind(&self, sender: IngressSender<DataEvent>) {
+    /// Whether the actual source publisher has been bound by its runtime owner.
+    pub(crate) fn is_bound(&self) -> bool {
+        self.0.lock().sender.is_some()
+    }
+
+    pub(crate) fn bind(&self, sender: EventSender<DataEvent>) {
         let mut state = self.0.lock();
         if state.first_failure.is_some() {
             sender.fail("original operation ACK source persistence failed");

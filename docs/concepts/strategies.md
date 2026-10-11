@@ -125,12 +125,12 @@ from nautilus_trader.model import OptionGreeks
 from nautilus_trader.model import OrderBook
 from nautilus_trader.model import OrderBookDelta
 from nautilus_trader.model import OrderBookDeltas
-from nautilus_trader.model import OrderBookDepth10
+from nautilus_trader.model import OrderBookDepth
 from nautilus_trader.model import QuoteTick
 from nautilus_trader.model import TradeTick
 
 def on_book_deltas(self, deltas: OrderBookDeltas) -> None:
-def on_book_depth(self, depth: OrderBookDepth10) -> None:
+def on_book_depth(self, depth: OrderBookDepth) -> None:
 def on_book(self, order_book: OrderBook) -> None:
 def on_quote(self, tick: QuoteTick) -> None:
 def on_trade(self, tick: TradeTick) -> None:
@@ -145,7 +145,7 @@ def on_option_greeks(self, greeks: OptionGreeks) -> None:
 def on_option_chain(self, chain: OptionChainSlice) -> None:
 def on_historical_data(self, data: CustomData | Sequence[CustomData]) -> None:
 def on_historical_book_deltas(self, deltas: Sequence[OrderBookDelta]) -> None:
-def on_historical_book_depth(self, depths: Sequence[OrderBookDepth10]) -> None:
+def on_historical_book_depth(self, depths: Sequence[OrderBookDepth]) -> None:
 def on_historical_quotes(self, quotes: Sequence[QuoteTick]) -> None:
 def on_historical_trades(self, trades: Sequence[TradeTick]) -> None:
 def on_historical_bars(self, bars: Sequence[Bar]) -> None:
@@ -339,9 +339,57 @@ self.clock.set_timer(
 )
 ```
 
+Live fixed-duration timers move an overdue first event to the current time, except at an inclusive
+stop boundary, then catch up ticks delayed by the runtime.
+
 Pass a `callback` to route `TimeEvent` objects to your own method rather than `on_time_event`. Timer
 names share the clock namespace, so use names unique to the component. See
 [Actors: timers and alerts](actors.md#timers-and-alerts).
+
+#### Calendar timers
+
+Use `set_timer_zoned()` for recurring local times. Pass a positive span string, such as `"1d"` or
+`"P1M"`, and a timezone-aware start datetime. `zoneinfo.ZoneInfo` follows DST changes;
+`datetime.timezone` keeps a fixed offset. This example fires at 09:30 in New York, starting tomorrow:
+
+```python
+from datetime import timedelta
+from zoneinfo import ZoneInfo
+
+start = self.clock.utc_now().astimezone(ZoneInfo("America/New_York"))
+start = start.replace(hour=9, minute=30, second=0, microsecond=0) + timedelta(days=1)
+
+self.clock.set_timer_zoned(
+    name="NewYorkMorning",
+    interval="1d",
+    start_time=start,
+    allow_past=False,
+    fire_immediately=True,
+)
+```
+
+The first event defaults to one interval after `start_time`; `fire_immediately=True` includes the start.
+With `allow_past=False`, the first event must not be in the past. Stop times are inclusive; cancellation
+stops subsequent events.
+
+Days, weeks, months, and years follow the local calendar; hour and shorter units measure elapsed time.
+At 09:30 in New York, `"1d"` events are 23 hours apart when DST starts and 25 hours apart when it ends.
+With `"24h"`, events stay 24 hours apart and their local time changes by an hour.
+
+Choose an existing local start; DST gaps at the start are not validated. For an ambiguous start, `fold`
+selects the occurrence. Recurrence stays anchored to that start, so month-end clamping and DST
+adjustments do not shift later deadlines. Later gaps shift forward by the gap; folds use the first occurrence.
+
+In live trading, `set_timer_zoned()` fires the next pending occurrence immediately if overdue, using
+its scheduled timestamp, then resumes at the first deadline after now. Virtual clocks emit every due
+occurrence during advancement.
+Event timestamps remain UTC UNIX nanoseconds.
+
+:::info Rust implementation
+Use `ClockApi::set_timer_zoned()` in Rust strategies. With a raw `Clock`, pass
+`Arc::new(CalendarSchedule::new(&start_time, span)?)` to `set_timer_schedule()`. The schedule implements
+`TimerSchedule` and supplies UTC deadlines; clocks and timers own delivery and cancellation.
+:::
 
 ### Cache access
 
@@ -574,7 +622,8 @@ Routing depends on the command and on the state of each order:
   relevant `ExecutionAlgorithm` when the order has an `exec_algorithm_id` and is still active within
   the local system, and to the `ExecutionEngine` otherwise.
 - `cancel_all_orders(...)` cancels each matching order associated with the strategy by default. Each
-  order follows the same routing as `cancel_order(...)`.
+  order follows the same routing as `cancel_order(...)`. If individual cancellations fail, the method
+  attempts the remaining orders, then raises `RuntimeError` containing all cancellation errors.
 - `cancel_orders(...)` always goes to the `ExecutionEngine` as a single `BatchCancelOrders` command.
 
 :::info
@@ -623,11 +672,13 @@ rules.
 
 Orders can be modified individually when emulated, or *open* on a venue (if supported).
 
-If the order is already *closed* or already pending cancel, then a warning will be logged.
+For a valid modification, an order that is already *closed* or pending cancel logs a warning.
 If the order is currently *open* then the status will become `PENDING_UPDATE`.
 
 :::warning
-At least one value must differ from the original order for the command to be valid.
+`modify_order(...)` raises `RuntimeError` when all supplied values are absent or unchanged.
+A strategy can resend the same quantity while the order is `PENDING_UPDATE`.
+These checks run before the closed-order and pending-cancel checks.
 :::
 
 The component a `ModifyOrder` command will flow to for execution depends on the following:

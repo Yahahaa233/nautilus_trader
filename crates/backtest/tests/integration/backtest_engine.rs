@@ -28,18 +28,24 @@ use nautilus_backtest::{
         AccountAdjustmentOutcome, ExchangeContext, SimulationModule, SimulationModuleHandle,
         SimulationModuleResult,
     },
+    result::CanonicalBacktestResult,
 };
 use nautilus_common::{
     actor::{
-        DataActor, DataActorCore, data_actor::DataActorConfig, registry::try_get_actor_unchecked,
+        CallbackDispatchError, DataActor, DataActorCore, callback_failure,
+        data_actor::DataActorConfig, drain_callbacks, registry::try_get_actor_unchecked,
     },
     component::Component,
     enums::ComponentState,
-    msgbus, nautilus_actor,
-    timer::TimeEvent,
+    msgbus::{self, TypedHandler},
+    nautilus_actor,
+    timer::{TimeEvent, TimeEventCallback},
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos};
-use nautilus_execution::models::latency::{LatencyModelHandle, StaticLatencyModel};
+use nautilus_execution::models::{
+    fee::{FeeModelAny, FeeModelHandle, MakerTakerFeeModel},
+    latency::{LatencyModelHandle, StaticLatencyModel},
+};
 use nautilus_indicators::{
     average::ema::ExponentialMovingAverage,
     indicator::{Indicator, MovingAverage},
@@ -54,23 +60,26 @@ use nautilus_model::{
     },
     enums::{
         AccountType, AggregationSource, AggressorSide, AssetClass, BarAggregation, BookAction,
-        BookType, ContingencyType, InstrumentCloseType, OmsType, OptionKind, OrderSide,
-        OrderStatus, PositionAdjustmentType, PriceType, TimeInForce, TrailingOffsetType,
+        BookType, ContingencyType, InstrumentCloseType, LiquiditySide, OmsType, OptionKind,
+        OrderSide, OrderStatus, PositionAdjustmentType, PriceType, TimeInForce, TrailingOffsetType,
         TriggerType,
     },
-    events::{OrderEventAny, OrderFilled},
+    events::{
+        AccountState, OrderEventAny, OrderEventType, OrderFilled, OrderModifyRejected, OrderUpdated,
+    },
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId,
         StrategyId, Symbol, TradeId, Venue,
     },
     instruments::{
         CryptoPerpetual, Equity, IndexInstrument, Instrument, InstrumentAny, OptionContract,
-        stubs::{crypto_perpetual_ethusdt, default_fx_ccy},
+        stubs::{betting, crypto_perpetual_ethusdt, default_fx_ccy},
     },
     orders::{Order, OrderAny},
     position::Position,
     types::{Currency, Money, Price, Quantity},
 };
+use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_system::trader::Trader;
 use nautilus_trading::{
     ExecutionAlgorithm, ExecutionAlgorithmConfig, ExecutionAlgorithmCore, Strategy, StrategyConfig,
@@ -79,6 +88,7 @@ use nautilus_trading::{
 };
 use rstest::*;
 use rust_decimal::{Decimal, prelude::ToPrimitive};
+use rust_decimal_macros::dec;
 use ustr::Ustr;
 struct EmptyStrategy {
     core: StrategyCore,
@@ -109,10 +119,11 @@ impl DataActor for EmptyStrategy {}
 
 struct FailingStartStrategy {
     core: StrategyCore,
+    fail_dispatch: bool,
 }
 
 impl FailingStartStrategy {
-    fn new() -> Self {
+    fn new(fail_dispatch: bool) -> Self {
         let config = StrategyConfig {
             strategy_id: Some(StrategyId::from("FAILING-START-001")),
             order_id_tag: Some("001".to_string()),
@@ -120,6 +131,7 @@ impl FailingStartStrategy {
         };
         Self {
             core: StrategyCore::new(config),
+            fail_dispatch,
         }
     }
 }
@@ -134,6 +146,16 @@ impl Debug for FailingStartStrategy {
 
 impl DataActor for FailingStartStrategy {
     fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_quotes("ETHUSDT-PERP.BINANCE".into(), None, None);
+        anyhow::ensure!(
+            !nautilus_common::runner::data_cmd_queue_is_empty(),
+            "Expected startup subscription to remain queued",
+        );
+
+        if self.fail_dispatch {
+            latch_callback_failure();
+        }
+
         anyhow::bail!("simulated backtest strategy start failure")
     }
 }
@@ -1054,7 +1076,17 @@ fn test_add_strategy_while_running_registers_strategy_and_market_exit_control() 
 }
 
 fn create_engine() -> BacktestEngine {
-    let config = BacktestEngineConfig::default();
+    create_engine_with_fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+}
+
+fn create_engine_with_fee_model(fee_model: FeeModelHandle) -> BacktestEngine {
+    create_engine_with_config(BacktestEngineConfig::default(), fee_model)
+}
+
+fn create_engine_with_config(
+    config: BacktestEngineConfig,
+    fee_model: FeeModelHandle,
+) -> BacktestEngine {
     let mut engine = BacktestEngine::new(config).unwrap();
     let venue_config = SimulatedVenueConfig::builder()
         .venue(Venue::from("BINANCE"))
@@ -1062,6 +1094,7 @@ fn create_engine() -> BacktestEngine {
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(fee_model)
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1125,6 +1158,7 @@ fn test_add_custom_data_bypasses_market_setup_and_replays_in_order(
         .account_type(AccountType::Margin)
         .book_type(BookType::L2_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1157,6 +1191,7 @@ fn create_eur_base_margin_engine() -> BacktestEngine {
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("1_000_000 EUR")])
         .base_currency(Currency::EUR())
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1363,6 +1398,7 @@ fn test_run_rejects_depth_book_without_book_data(crypto_perpetual_ethusdt: Crypt
         .account_type(AccountType::Margin)
         .book_type(BookType::L2_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1524,6 +1560,7 @@ fn test_run_with_depth_venue_and_typed_book_batch_succeeds(
         .account_type(AccountType::Margin)
         .book_type(BookType::L2_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1554,6 +1591,7 @@ fn test_run_with_depth_venue_and_book_data_succeeds(crypto_perpetual_ethusdt: Cr
         .account_type(AccountType::Margin)
         .book_type(BookType::L2_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1585,6 +1623,7 @@ fn test_run_depth_check_fires_on_validate_false_path(crypto_perpetual_ethusdt: C
         .account_type(AccountType::Margin)
         .book_type(BookType::L2_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1688,6 +1727,7 @@ fn test_add_strategies_stops_at_first_error() {
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -1732,7 +1772,9 @@ fn test_run_processes_quote_ticks(crypto_perpetual_ethusdt: CryptoPerpetual) {
 
 #[rstest]
 fn test_run_processes_scheduled_funding_settlement(crypto_perpetual_ethusdt: CryptoPerpetual) {
-    let mut engine = create_engine();
+    let mut engine = create_engine_with_fee_model(
+        FeeModelAny::MakerTaker(MakerTakerFeeModel::new(dec!(0.0002), dec!(0.0004))).into(),
+    );
     let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
     let instrument_id = instrument.id();
     engine.add_instrument(&instrument).unwrap();
@@ -1867,6 +1909,102 @@ fn test_run_processes_scheduled_funding_settlement(crypto_perpetual_ethusdt: Cry
         result.summary["account.BINANCE.balance.USDT.locked"],
         balance.locked.to_string(),
     );
+}
+
+#[rstest]
+fn test_funding_settlement_generates_one_account_state(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    // Same setup as `test_run_processes_scheduled_funding_settlement`, so the balance after the
+    // funding payment matches the one asserted there
+    let mut engine = create_engine_with_fee_model(
+        FeeModelAny::MakerTaker(MakerTakerFeeModel::new(dec!(0.0002), dec!(0.0004))).into(),
+    );
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+    engine
+        .add_strategy(SnapshotNettingFlip::new(
+            instrument_id,
+            Quantity::from("1.000"),
+        ))
+        .unwrap();
+
+    let settlement_ns = UnixNanos::from(4_000_000_000);
+    let data = vec![
+        quote(instrument_id, "1000.00", "1001.00", 1_000_000_000),
+        quote(instrument_id, "1000.00", "1001.00", 2_000_000_000),
+        Data::MarkPrice(MarkPriceUpdate::new(
+            instrument_id,
+            Price::from("1000.00"),
+            UnixNanos::from(2_500_000_000),
+            UnixNanos::from(2_500_000_000),
+        )),
+        Data::FundingRate(FundingRateUpdate::new(
+            instrument_id,
+            "0.001".parse().unwrap(),
+            Some(480),
+            Some(settlement_ns),
+            UnixNanos::from(3_000_000_000),
+            UnixNanos::from(3_000_000_000),
+        )),
+        quote(instrument_id, "1000.00", "1001.00", 5_000_000_000),
+    ];
+    engine.add_data(data, None, true, true).unwrap();
+    let published = Rc::new(RefCell::new(Vec::<AccountState>::new()));
+    let handler = TypedHandler::from({
+        let published = Rc::clone(&published);
+        move |state: &AccountState| published.borrow_mut().push(state.clone())
+    });
+    msgbus::subscribe_account_state("events.account.*".into(), handler, None);
+    engine.run(None, None, None, false).unwrap();
+
+    let cache = engine.kernel().cache.borrow();
+    let positions = cache.positions_open(None, Some(&instrument_id), None, None, None);
+    let [position] = positions.as_slice() else {
+        panic!("expected one open position");
+    };
+    let [adjustment] = position.adjustments.as_slice() else {
+        panic!("expected one position adjustment");
+    };
+    assert_eq!(adjustment.adjustment_type, PositionAdjustmentType::Funding);
+
+    let account = cache.account(&position.account_id).unwrap();
+    let settlement_states: Vec<_> = account
+        .events()
+        .into_iter()
+        .filter(|state| state.ts_event == settlement_ns)
+        .collect();
+
+    // The funding payment changes the balance once and leaves the margins unchanged
+    assert_eq!(
+        settlement_states.len(),
+        1,
+        "funding settlement generated {} account states; identical balances and margins: {}",
+        settlement_states.len(),
+        settlement_states
+            .windows(2)
+            .all(|pair| pair[0].balances == pair[1].balances && pair[0].margins == pair[1].margins),
+    );
+
+    let state = &settlement_states[0];
+    let prior_state = account
+        .events()
+        .into_iter()
+        .rfind(|state| state.ts_event < settlement_ns)
+        .expect("expected an account state before the funding settlement");
+    let [balance] = state.balances.as_slice() else {
+        panic!("expected one balance");
+    };
+    assert_eq!(balance.total, Money::from("999998.5996 USDT"));
+    assert_eq!(state.margins, prior_state.margins);
+
+    // Account state subscribers see the settlement's state once
+    let published_ids: Vec<_> = published
+        .borrow()
+        .iter()
+        .filter(|published| published.ts_event == settlement_ns)
+        .map(|published| published.event_id)
+        .collect();
+    assert_eq!(published_ids, vec![state.event_id]);
 }
 
 #[rstest]
@@ -2144,15 +2282,16 @@ fn test_reset_cancels_funding_timer() {
 
 fn create_inverse_funding_engine() -> (BacktestEngine, InstrumentId) {
     let instrument =
-        InstrumentAny::CryptoPerpetual(nautilus_model::instruments::stubs::xbtusd_bitmex());
+        InstrumentAny::CryptoPerpetual(nautilus_model::instruments::stubs::btcusd_bybit());
     let instrument_id = instrument.id();
     let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
     let venue = SimulatedVenueConfig::builder()
-        .venue(Venue::from("BITMEX"))
+        .venue(Venue::from("BYBIT"))
         .oms_type(OmsType::Netting)
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("100 BTC")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue).unwrap();
@@ -2164,6 +2303,312 @@ fn create_inverse_funding_engine() -> (BacktestEngine, InstrumentId) {
         ))
         .unwrap();
     (engine, instrument_id)
+}
+
+fn create_spot_engine(
+    account_type: AccountType,
+    base_currency: Option<Currency>,
+    starting_balance: &str,
+    taker_fee: Decimal,
+    allow_cash_borrowing: bool,
+    latency_model: Option<LatencyModelHandle>,
+) -> (BacktestEngine, InstrumentId) {
+    let instrument = option_underlying_equity(Venue::from("SIM"));
+    let instrument_id = instrument.id();
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    let venue = SimulatedVenueConfig::builder()
+        .venue(Venue::from("SIM"))
+        .oms_type(OmsType::Netting)
+        .account_type(account_type)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::from(starting_balance)])
+        .maybe_base_currency(base_currency)
+        .allow_cash_borrowing(allow_cash_borrowing)
+        .maybe_latency_model(latency_model)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::new(taker_fee, taker_fee)).into())
+        .build()
+        .unwrap();
+    engine.add_venue(venue).unwrap();
+    engine.add_instrument(&instrument).unwrap();
+    engine
+        .add_strategy(OpenOnEveryQuote::new(instrument_id, Quantity::from(2500)))
+        .unwrap();
+    (engine, instrument_id)
+}
+
+fn order_fills(engine: &BacktestEngine) -> Vec<(Quantity, Price)> {
+    let cache = engine.kernel().cache.borrow();
+    let orders = cache.orders(None, None, None, None, None);
+    let [order] = orders.as_slice() else {
+        panic!("expected one order");
+    };
+    order
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some((fill.last_qty, fill.last_px)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn expected_equity_fills(ask_size: &str) -> Vec<(Quantity, Price)> {
+    if ask_size == "250" {
+        vec![
+            (Quantity::from(250), Price::from("100.00")),
+            (Quantity::from(2250), Price::from("100.01")),
+        ]
+    } else {
+        vec![(Quantity::from(2500), Price::from("100.00"))]
+    }
+}
+
+fn account_total(engine: &BacktestEngine, venue: &str, currency: Currency) -> Option<Money> {
+    engine
+        .kernel()
+        .cache
+        .borrow()
+        .account_for_venue(&Venue::from(venue))
+        .unwrap()
+        .balance_total(Some(currency))
+}
+
+#[rstest]
+#[case::slippage_multi_currency(
+    AccountType::Cash,
+    None,
+    "250_001 USD",
+    Decimal::ZERO,
+    "250",
+    "Cash account balance would become negative: -21.50 USD",
+    "225_001 USD"
+)]
+#[case::slippage_single_currency(
+    AccountType::Cash,
+    Some(Currency::USD()),
+    "250_001 USD",
+    Decimal::ZERO,
+    "250",
+    "Cash account balance would become negative: -21.50 USD",
+    "225_001 USD"
+)]
+#[case::commission_multi_currency(
+    AccountType::Cash,
+    None,
+    "250_001 USD",
+    dec!(0.0001),
+    "2500",
+    "Cash account balance would become negative: -24.00 USD",
+    "250_001 USD"
+)]
+#[case::commission_single_currency(
+    AccountType::Cash,
+    Some(Currency::USD()),
+    "250_001 USD",
+    dec!(0.0001),
+    "2500",
+    "Cash account balance would become negative: -24.00 USD",
+    "250_001 USD"
+)]
+#[case::commission_partial_fill(
+    AccountType::Cash,
+    None,
+    "250_030 USD",
+    dec!(0.0001),
+    "250",
+    "Cash account balance would become negative: -17.50 USD",
+    "225_027.50 USD"
+)]
+#[case::wallet_slippage(
+    AccountType::Wallet,
+    None,
+    "250_001 USD",
+    Decimal::ZERO,
+    "250",
+    "Wallet account balance total was negative",
+    "225_001 USD"
+)]
+fn test_run_fails_when_fill_cost_exceeds_account_balance(
+    #[case] account_type: AccountType,
+    #[case] base_currency: Option<Currency>,
+    #[case] starting_balance: &str,
+    #[case] taker_fee: Decimal,
+    #[case] ask_size: &str,
+    #[case] expected_error: &str,
+    #[case] booked_total: &str,
+) {
+    let (mut engine, instrument_id) = create_spot_engine(
+        account_type,
+        base_currency,
+        starting_balance,
+        taker_fee,
+        false,
+        None,
+    );
+    let data = vec![quote_with_size(
+        instrument_id,
+        "99.99",
+        "100.00",
+        ask_size,
+        1_000_000_000,
+    )];
+    engine.add_data(data, None, true, true).unwrap();
+
+    let error = engine.run(None, None, None, false).unwrap_err();
+    let retry_error = engine.run(None, None, None, false).unwrap_err();
+
+    assert!(
+        error.to_string().contains(expected_error),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(retry_error.to_string(), error.to_string());
+    assert!(engine.kernel().trader.borrow().is_stopped());
+    assert_eq!(order_fills(&engine), expected_equity_fills(ask_size));
+    assert_eq!(
+        account_total(&engine, "SIM", Currency::USD()),
+        Some(Money::from(booked_total))
+    );
+    let canonical = engine.get_canonical_result().unwrap().to_bytes().unwrap();
+    CanonicalBacktestResult::from_slice(&canonical).unwrap();
+    let canonical: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+    assert_eq!(canonical["run"]["outcome"], "failed");
+    assert_eq!(
+        canonical["diagnostics"],
+        serde_json::json!([{"code": "account-balance-rejected"}])
+    );
+
+    engine.reset().unwrap();
+
+    assert_eq!(engine.kernel().portfolio.borrow().balance_error(), None);
+}
+
+#[rstest]
+#[case::multi_currency(None)]
+#[case::single_currency(Some(Currency::GBP()))]
+fn test_run_fails_when_betting_fill_cost_exceeds_balance(#[case] base_currency: Option<Currency>) {
+    let instrument = InstrumentAny::Betting(betting());
+    let instrument_id = instrument.id();
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    let venue = SimulatedVenueConfig::builder()
+        .venue(Venue::from("BETFAIR"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Betting)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::from("200.50 GBP")])
+        .maybe_base_currency(base_currency)
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+        .build()
+        .unwrap();
+    engine.add_venue(venue).unwrap();
+    engine.add_instrument(&instrument).unwrap();
+    engine
+        .add_strategy(OpenOnEveryQuote::new(
+            instrument_id,
+            Quantity::from("100.00"),
+        ))
+        .unwrap();
+    let data = vec![quote_with_size(
+        instrument_id,
+        "1.99",
+        "2.00",
+        "10.00",
+        1_000_000_000,
+    )];
+    engine.add_data(data, None, true, true).unwrap();
+
+    let error = engine.run(None, None, None, false).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("Betting account balance would become negative: -0.40 GBP"),
+        "unexpected error: {error:#}"
+    );
+    assert!(engine.kernel().trader.borrow().is_stopped());
+    assert_eq!(
+        order_fills(&engine),
+        vec![
+            (Quantity::from("10.00"), Price::from("2.00")),
+            (Quantity::from("90.00"), Price::from("2.01")),
+        ]
+    );
+    assert_eq!(
+        account_total(&engine, "BETFAIR", Currency::GBP()),
+        Some(Money::from("180.50 GBP"))
+    );
+}
+
+#[rstest]
+fn test_end_fails_when_latent_fill_cost_exceeds_cash_balance() {
+    let latency_model = LatencyModelHandle::new(StaticLatencyModel::new(
+        DurationNanos::default(),
+        DurationNanos::new(1),
+        DurationNanos::default(),
+        DurationNanos::default(),
+    ));
+    let (mut engine, instrument_id) = create_spot_engine(
+        AccountType::Cash,
+        None,
+        "250_001 USD",
+        Decimal::ZERO,
+        false,
+        Some(latency_model),
+    );
+    let data = vec![quote_with_size(
+        instrument_id,
+        "99.99",
+        "100.00",
+        "250",
+        1_000_000_000,
+    )];
+    engine.add_data(data, None, true, true).unwrap();
+    engine.run(None, None, None, true).unwrap();
+
+    let error = engine.end().unwrap_err();
+    let retry_error = engine.end().unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("balance would become negative: -21.50 USD"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(retry_error.to_string(), error.to_string());
+    assert!(engine.kernel().trader.borrow().is_stopped());
+}
+
+#[rstest]
+#[case::affordable(false, "2500", "1.00 USD")]
+#[case::borrowing_enabled(true, "250", "-21.50 USD")]
+fn test_run_books_cash_fill_allowed_by_balance_or_borrowing(
+    #[case] allow_cash_borrowing: bool,
+    #[case] ask_size: &str,
+    #[case] expected_total: &str,
+) {
+    let (mut engine, instrument_id) = create_spot_engine(
+        AccountType::Cash,
+        None,
+        "250_001 USD",
+        Decimal::ZERO,
+        allow_cash_borrowing,
+        None,
+    );
+    let data = vec![quote_with_size(
+        instrument_id,
+        "99.99",
+        "100.00",
+        ask_size,
+        1_000_000_000,
+    )];
+    engine.add_data(data, None, true, true).unwrap();
+
+    engine.run(None, None, None, false).unwrap();
+
+    assert_eq!(order_fills(&engine), expected_equity_fills(ask_size));
+    assert_eq!(
+        account_total(&engine, "SIM", Currency::USD()),
+        Some(Money::from(expected_total))
+    );
 }
 
 #[rstest]
@@ -2184,6 +2629,7 @@ fn test_instrument_close_precedes_expiration_timer_at_same_timestamp(
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("1_000_000 USD")])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -2193,6 +2639,7 @@ fn test_instrument_close_precedes_expiration_timer_at_same_timestamp(
         .add_strategy(OpenOptionOnQuote::new(option_id, Quantity::from(1)))
         .unwrap();
 
+    // Out of the money, so the close fills at `close_price` and a timer-first expiry at zero
     let mut data = vec![
         quote_with_size(
             option_id,
@@ -2203,7 +2650,7 @@ fn test_instrument_close_precedes_expiration_timer_at_same_timestamp(
         ),
         trade(
             underlying_id,
-            "160.00",
+            "140.00",
             "100",
             expiration_ns.as_u64() - 1_000,
         ),
@@ -2258,6 +2705,7 @@ fn test_option_expiry_uses_same_timestamp_index_price(
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -2421,6 +2869,52 @@ fn expiration_fill_price(
         .expect("expected expiration fill");
 
     expiration_fill.last_px
+}
+
+#[rstest]
+#[case::lower("1")]
+#[case::equal("1.000")]
+fn test_strategy_order_representable_quantity_precision(
+    #[case] quantity: &str,
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+    engine
+        .add_strategy(SnapshotNettingFlip::new(
+            instrument_id,
+            Quantity::from(quantity),
+        ))
+        .unwrap();
+    engine
+        .add_data(
+            vec![
+                quote(instrument_id, "1000.00", "1001.00", 1_000_000_000),
+                quote(instrument_id, "1000.00", "1001.00", 2_000_000_000),
+                quote(instrument_id, "1000.00", "1001.00", 3_000_000_000),
+            ],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+    engine.run(None, None, None, false).unwrap();
+
+    let cache = engine.kernel().cache.borrow();
+    let orders = cache.orders(None, Some(&instrument_id), None, None, None);
+    assert_eq!(orders.len(), 1);
+    let order = &orders[0];
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.quantity().as_decimal(), Decimal::ONE);
+    assert_eq!(order.filled_qty().as_decimal(), Decimal::ONE);
+    assert_eq!(order.leaves_qty().as_decimal(), Decimal::ZERO);
+    let OrderEventAny::Filled(fill) = order.last_event() else {
+        panic!("Expected fill");
+    };
+    assert_eq!(fill.last_qty.as_decimal(), Decimal::ONE);
+    assert_eq!(fill.last_px.as_decimal(), Decimal::from(1001));
 }
 
 #[rstest]
@@ -2681,12 +3175,19 @@ fn test_run_with_strategy(crypto_perpetual_ethusdt: CryptoPerpetual) {
 }
 
 #[rstest]
-fn test_run_propagates_strategy_start_failure(crypto_perpetual_ethusdt: CryptoPerpetual) {
+#[case(false)]
+#[case(true)]
+fn test_run_propagates_strategy_start_failure(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] fail_dispatch: bool,
+) {
     let mut engine = create_engine();
     let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
     let instrument_id = instrument.id();
     engine.add_instrument(&instrument).unwrap();
-    engine.add_strategy(FailingStartStrategy::new()).unwrap();
+    engine
+        .add_strategy(FailingStartStrategy::new(fail_dispatch))
+        .unwrap();
     engine
         .add_data(
             vec![quote(instrument_id, "1000.00", "1000.10", 1_000_000_000)],
@@ -2700,6 +3201,9 @@ fn test_run_propagates_strategy_start_failure(crypto_perpetual_ethusdt: CryptoPe
         .run(None, None, None, false)
         .expect_err("strategy start should fail");
     let trader_stopped = engine.kernel().trader.borrow().is_stopped();
+    let data_queue_empty = nautilus_common::runner::data_cmd_queue_is_empty();
+    let data_command_count = engine.kernel().data_engine.borrow().command_count();
+    let dispatch_error = callback_failure();
     engine.dispose();
 
     assert!(
@@ -2708,8 +3212,153 @@ fn test_run_propagates_strategy_start_failure(crypto_perpetual_ethusdt: CryptoPe
         "unexpected error: {err:#}"
     );
     assert!(trader_stopped);
+    assert_eq!(
+        err.to_string().matches("Callback dispatch failed:").count(),
+        usize::from(fail_dispatch)
+    );
+    assert_eq!(
+        err.to_string().contains("Callback delivery unwound"),
+        fail_dispatch
+    );
+    assert_eq!(dispatch_error, None);
+    assert!(data_queue_empty);
+    assert_eq!(data_command_count, 0);
     assert!(engine.kernel().trader.borrow().is_disposed());
     assert_eq!(engine.kernel().trader.borrow().component_count(), 0);
+}
+
+#[rstest]
+#[case("run")]
+#[case("end")]
+#[case("reset")]
+fn test_latched_callback_failure_stops_backtest(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] operation: &str,
+) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    engine.add_instrument(&instrument).unwrap();
+    engine.add_strategy(EmptyStrategy::new()).unwrap();
+    engine
+        .add_data(
+            vec![quote(instrument.id(), "1000.00", "1000.10", 1_000_000_000)],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+    engine.run(None, None, None, true).unwrap();
+    assert!(engine.kernel().trader.borrow().is_running());
+    latch_callback_failure();
+
+    let error = match operation {
+        "run" => engine.run(None, None, None, true),
+        "end" => engine.end(),
+        "reset" => engine.reset(),
+        _ => unreachable!(),
+    }
+    .unwrap_err();
+    let trader_running = engine.kernel().trader.borrow().is_running();
+    let dispatch_error = callback_failure();
+    let data_queue_empty = nautilus_common::runner::data_cmd_queue_is_empty();
+    let trading_queue_empty = nautilus_common::runner::trading_cmd_queue_is_empty();
+    engine.dispose();
+
+    assert_eq!(
+        error.downcast_ref::<CallbackDispatchError>(),
+        Some(&CallbackDispatchError::DeliveryUnwound)
+    );
+    assert!(!trader_running);
+    assert_eq!(dispatch_error, None);
+    assert!(data_queue_empty);
+    assert!(trading_queue_empty);
+}
+
+#[rstest]
+fn test_timer_callback_failure_prevents_later_work(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    engine.add_instrument(&instrument).unwrap();
+    engine.add_strategy(EmptyStrategy::new()).unwrap();
+    engine
+        .add_data(
+            vec![quote(instrument.id(), "1000.00", "1000.10", 1_000_000_000)],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+    engine.run(None, None, None, true).unwrap();
+    engine.clear_data();
+    engine
+        .add_data(
+            vec![quote(instrument.id(), "1001.00", "1001.10", 2_000_000_000)],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+    let fired = Rc::new(RefCell::new(Vec::new()));
+
+    for (name, timestamp, fail) in [
+        ("failure", 1_500_000_000, true),
+        ("later", 1_500_000_000, false),
+    ] {
+        let fired = fired.clone();
+        let callback = TimeEventCallback::RustLocal(Rc::new(move |_| {
+            fired.borrow_mut().push(name);
+
+            if fail {
+                latch_callback_failure();
+            }
+        }));
+        engine
+            .kernel()
+            .clock
+            .borrow_mut()
+            .set_time_alert_ns(name, timestamp.into(), Some(callback), None)
+            .unwrap();
+    }
+
+    let error = engine
+        .run(Some(UnixNanos::from(1_000_000_000)), None, None, true)
+        .unwrap_err();
+    let timestamp = engine.kernel().clock.borrow().timestamp_ns();
+    let data_count = engine.kernel().data_engine.borrow().data_count();
+    let trader_stopped = engine.kernel().trader.borrow().is_stopped();
+    let dispatch_error = callback_failure();
+    engine.dispose();
+
+    assert_eq!(
+        error.downcast_ref::<CallbackDispatchError>(),
+        Some(&CallbackDispatchError::DeliveryUnwound)
+    );
+    assert_eq!(*fired.borrow(), ["failure"]);
+    assert_eq!(timestamp, UnixNanos::from(1_500_000_000));
+    assert_eq!(data_count, 2);
+    assert!(trader_stopped);
+    assert_eq!(dispatch_error, None);
+}
+
+fn latch_callback_failure() {
+    struct DrainOnDrop;
+
+    impl Drop for DrainOnDrop {
+        fn drop(&mut self) {
+            assert_eq!(drain_callbacks(1), Ok(false));
+        }
+    }
+
+    let result = std::panic::catch_unwind(|| {
+        let _drain = DrainOnDrop;
+        panic!("simulated callback unwind");
+    });
+
+    assert!(result.is_err());
+    assert_eq!(
+        callback_failure(),
+        Some(CallbackDispatchError::DeliveryUnwound)
+    );
 }
 
 #[rstest]
@@ -3554,6 +4203,7 @@ fn test_multi_venue_data_routing(crypto_perpetual_ethusdt: CryptoPerpetual) {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USDT")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -3562,11 +4212,12 @@ fn test_multi_venue_data_routing(crypto_perpetual_ethusdt: CryptoPerpetual) {
     engine
         .add_venue(
             SimulatedVenueConfig::builder()
-                .venue(Venue::from("BITMEX"))
+                .venue(Venue::from("BYBIT"))
                 .oms_type(OmsType::Netting)
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -3576,13 +4227,13 @@ fn test_multi_venue_data_routing(crypto_perpetual_ethusdt: CryptoPerpetual) {
     let eth_id = eth.id();
     engine.add_instrument(&eth).unwrap();
 
-    let btc = InstrumentAny::CryptoPerpetual(nautilus_model::instruments::stubs::xbtusd_bitmex());
+    let btc = InstrumentAny::CryptoPerpetual(nautilus_model::instruments::stubs::btcusd_bybit());
     let btc_id = btc.id();
     engine.add_instrument(&btc).unwrap();
 
     // Interleave quotes from both venues (respecting instrument precision)
     // ETHUSDT-PERP.BINANCE: price_prec=2, size_prec=3
-    // BTCUSDT.BITMEX: price_prec=1, size_prec=0
+    // BTCUSD.BYBIT: price_prec=1, size_prec=0
     let quotes = vec![
         quote(eth_id, "1000.00", "1000.10", 1_000_000_000),
         quote_with_size(btc_id, "50000.5", "50001.0", "1", 2_000_000_000),
@@ -3901,6 +4552,241 @@ fn test_cascading_stop_loss_on_fill_settled_same_tick(crypto_perpetual_ethusdt: 
         "Expected 2 orders (entry + cascading stop-loss), was {}",
         bt_result.total_orders
     );
+}
+
+#[rstest]
+#[case::venue_update(true, false, 20, OrderStatus::Accepted)]
+#[case::control(false, false, 10, OrderStatus::Accepted)]
+#[case::pending_cancel(true, true, 20, OrderStatus::Canceled)]
+fn test_stop_modify_rejection_reaches_strategy(
+    #[case] add_entry: bool,
+    #[case] cancel_on_update: bool,
+    #[case] expected_quantity: u64,
+    #[case] expected_status: OrderStatus,
+) {
+    let instrument = option_underlying_equity(Venue::from("SIM"));
+    let instrument_id = instrument.id();
+
+    let bar_type = BarType::new(
+        instrument_id,
+        BarSpecification::new(1, BarAggregation::Hour, PriceType::Last),
+        AggregationSource::External,
+    );
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    engine
+        .add_venue(
+            SimulatedVenueConfig::builder()
+                .venue(instrument_id.venue)
+                .oms_type(OmsType::Netting)
+                .account_type(AccountType::Cash)
+                .book_type(BookType::L1_MBP)
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+                .starting_balances(vec![Money::from("100_000 USD")])
+                .use_reduce_only(true)
+                .latency_model(LatencyModelHandle::new(StaticLatencyModel::new(
+                    DurationNanos::from_secs(1),
+                    DurationNanos::default(),
+                    DurationNanos::default(),
+                    DurationNanos::default(),
+                )))
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+    engine.add_instrument(&instrument).unwrap();
+    let rejections = Rc::new(RefCell::new(Vec::new()));
+    let stop_id = ClientOrderId::from("STOP-001");
+    engine
+        .add_strategy(StopModifyRejection {
+            core: StrategyCore::new(StrategyConfig {
+                strategy_id: Some(StrategyId::from("STOP-MODIFY-001")),
+                order_id_tag: Some("001".to_string()),
+                ..Default::default()
+            }),
+            bar_type,
+            bar_count: 0,
+            stop_id,
+            add_entry,
+            cancel_on_update,
+            rejections: Rc::clone(&rejections),
+        })
+        .unwrap();
+
+    let bars = (1..=8)
+        .map(|i| {
+            let ts = UnixNanos::new(i * 3_600_000_000_000);
+            Data::Bar(Bar::new(
+                bar_type,
+                Price::from("103.00"),
+                Price::from("104.00"),
+                Price::from("102.00"),
+                Price::from("103.00"),
+                Quantity::from(1_000_000),
+                ts,
+                ts,
+            ))
+        })
+        .collect();
+
+    engine.add_data(bars, None, true, true).unwrap();
+    engine.run(None, None, None, false).unwrap();
+
+    let cache = engine.kernel().cache.borrow();
+    let stop = cache.order(&stop_id).unwrap();
+    let events = stop.events();
+
+    let request_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                OrderEventAny::PendingUpdate(_)
+                    | OrderEventAny::Updated(_)
+                    | OrderEventAny::PendingCancel(_)
+                    | OrderEventAny::ModifyRejected(_)
+                    | OrderEventAny::Canceled(_)
+            )
+        })
+        .collect();
+
+    let expected_kinds = match (add_entry, cancel_on_update) {
+        (false, _) => vec![
+            OrderEventType::PendingUpdate,
+            OrderEventType::ModifyRejected,
+        ],
+        (true, false) => vec![
+            OrderEventType::PendingUpdate,
+            OrderEventType::Updated,
+            OrderEventType::ModifyRejected,
+        ],
+        (true, true) => vec![
+            OrderEventType::PendingUpdate,
+            OrderEventType::Updated,
+            OrderEventType::PendingCancel,
+            OrderEventType::ModifyRejected,
+            OrderEventType::Canceled,
+        ],
+    };
+
+    let actual_kinds: Vec<_> = request_events
+        .iter()
+        .map(|event| event.event_type())
+        .collect();
+    assert_eq!(actual_kinds, expected_kinds);
+    assert_eq!(stop.status(), expected_status);
+    assert_eq!(stop.quantity(), Quantity::from(expected_quantity));
+    assert_eq!(stop.trigger_price(), Some(Price::from("99.00")));
+    let rejections = rejections.borrow();
+    assert_eq!(rejections.len(), 1);
+    assert_eq!(rejections[0].0.client_order_id, stop_id);
+    assert_eq!(
+        rejections[0].0.reason,
+        Ustr::from(
+            "STOP_MARKET SELL order new stop px of 110.00 was in the market: bid=103.00, ask=103.00"
+        ),
+    );
+    assert_eq!(
+        rejections[0].1,
+        if cancel_on_update {
+            OrderStatus::PendingCancel
+        } else {
+            OrderStatus::Accepted
+        },
+    );
+    assert_eq!(
+        request_events.iter().find_map(|event| match event {
+            OrderEventAny::ModifyRejected(rejection) => Some(rejection),
+            _ => None,
+        }),
+        Some(&rejections[0].0),
+    );
+}
+
+#[derive(Debug)]
+struct StopModifyRejection {
+    core: StrategyCore,
+    bar_type: BarType,
+    bar_count: usize,
+    stop_id: ClientOrderId,
+    add_entry: bool,
+    cancel_on_update: bool,
+    rejections: Rc<RefCell<Vec<(OrderModifyRejected, OrderStatus)>>>,
+}
+
+nautilus_strategy!(StopModifyRejection, {
+    fn on_order_updated(&mut self, event: OrderUpdated) {
+        if self.cancel_on_update && event.client_order_id == self.stop_id {
+            self.cancel_order(self.stop_id, None, None).unwrap();
+        }
+    }
+
+    fn on_order_modify_rejected(&mut self, event: OrderModifyRejected) {
+        let status = self.cache().order(&self.stop_id).unwrap().status();
+        self.rejections.borrow_mut().push((event, status));
+    }
+});
+
+impl DataActor for StopModifyRejection {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_bars(self.bar_type, None, None);
+        Ok(())
+    }
+
+    fn on_bar(&mut self, _bar: &Bar) -> anyhow::Result<()> {
+        self.bar_count += 1;
+
+        match self.bar_count {
+            1 | 4 if self.bar_count == 1 || self.add_entry => {
+                let order = self.order().market(
+                    self.bar_type.instrument_id(),
+                    OrderSide::Buy,
+                    Quantity::from(10),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                self.submit_order(order, None, None, None)?;
+            }
+            3 => {
+                let order = self.order().stop_market(
+                    self.bar_type.instrument_id(),
+                    OrderSide::Sell,
+                    Quantity::from(10),
+                    Price::from("99.00"),
+                    None,
+                    None,
+                    None,
+                    Some(true),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(self.stop_id),
+                );
+                self.submit_order(order, None, None, None)?;
+            }
+            5 => {
+                self.modify_order(
+                    self.stop_id,
+                    Some(Quantity::from(10)),
+                    None,
+                    Some(Price::from("110.00")),
+                    None,
+                    None,
+                )?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
 }
 
 struct EmulatedStopEntryOnQuote {
@@ -4736,6 +5622,7 @@ fn test_list_venues_multiple() {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USDT")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -4744,11 +5631,12 @@ fn test_list_venues_multiple() {
     engine
         .add_venue(
             SimulatedVenueConfig::builder()
-                .venue(Venue::from("BITMEX"))
+                .venue(Venue::from("BYBIT"))
                 .oms_type(OmsType::Netting)
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -4757,7 +5645,7 @@ fn test_list_venues_multiple() {
     let venues = engine.list_venues();
     assert_eq!(venues.len(), 2);
     assert_eq!(venues[0], Venue::from("BINANCE"));
-    assert_eq!(venues[1], Venue::from("BITMEX"));
+    assert_eq!(venues[1], Venue::from("BYBIT"));
 }
 
 #[rstest]
@@ -4793,6 +5681,7 @@ fn test_option_expiry_timer_closes_position_without_data_at_expiration() {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -4908,6 +5797,7 @@ fn test_instruments_with_same_expiration_share_expiry_timer() {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -4954,6 +5844,7 @@ fn test_instrument_update_cancels_previous_expiry_timer() {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -4998,6 +5889,7 @@ fn run_call_option_expiry_timer(
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec![Money::from("1_000_000 USD")])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -5055,6 +5947,7 @@ fn test_add_venue_with_queue_position(crypto_perpetual_ethusdt: CryptoPerpetual)
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::from("1_000_000 USDT")])
             .queue_position(true)
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap(),
     );
@@ -5273,6 +6166,7 @@ fn test_end_reports_simulation_module_diagnostics_error() {
         .modules(vec![SimulationModuleHandle::new(
             FailingDiagnosticsSimulationModule,
         )])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -5310,6 +6204,7 @@ fn test_end_does_not_double_run_modules_at_same_timestamp(
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("1_000_000 USDT")])
         .modules(vec![SimulationModuleHandle::new(module)])
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -5884,6 +6779,7 @@ fn test_streaming_end_settles_due_open_before_on_stop(crypto_perpetual_ethusdt: 
                     DurationNanos::default(),
                     DurationNanos::default(),
                 )))
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -5955,6 +6851,7 @@ fn test_close_all_positions_in_on_stop_is_processed_with_latency(
             DurationNanos::default(),
             DurationNanos::default(),
         )))
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -6247,6 +7144,7 @@ fn test_latency_order_settles_on_instrument_data_or_timer(
                     DurationNanos::default(),
                     DurationNanos::default(),
                 )))
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -6325,11 +7223,193 @@ fn test_latency_order_settles_on_instrument_data_or_timer(
 }
 
 #[rstest]
-fn test_trailing_final_tick_order_settles_with_latency(crypto_perpetual_ethusdt: CryptoPerpetual) {
+#[case::same_day(true, DurationNanos::from_hours(1), None, false, "3950.00")]
+#[case::overnight(true, DurationNanos::from_hours(4), None, false, "3950.00")]
+#[case::weekend(true, DurationNanos::from_mins(2941), None, false, "3950.00")]
+#[case::equity_curve_disabled(false, DurationNanos::from_mins(2941), None, false, "3950.00")]
+#[case::data_at_midnight(true, DurationNanos::from_hours(2), None, false, "3950.00")]
+#[case::other_data_at_midnight(true, DurationNanos::from_mins(2941), None, true, "3950.00")]
+#[case::strategy_timer_at_midnight(
+    true,
+    DurationNanos::from_mins(2941),
+    Some(DurationNanos::from_hours(2)),
+    false,
+    "3904.00"
+)]
+#[case::strategy_timer_after_midnight(
+    true,
+    DurationNanos::from_mins(2941),
+    Some(DurationNanos::from_hours(3)),
+    false,
+    "3904.00"
+)]
+#[case::strategy_timer_with_data(
+    true,
+    DurationNanos::from_hours(2),
+    Some(DurationNanos::from_hours(2)),
+    false,
+    "3950.00"
+)]
+fn test_latency_order_settles_across_equity_curve_timers(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] equity_curve: bool,
+    #[case] reopen_after: DurationNanos,
+    #[case] settlement_after: Option<DurationNanos>,
+    #[case] other_data_at_midnight: bool,
+    #[case] expected_price: &str,
+) {
+    let instrument_id = crypto_perpetual_ethusdt.id;
+
+    let bar_type = BarType::new(
+        instrument_id,
+        BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
+        AggregationSource::External,
+    );
+    let friday = UnixNanos::from(1_673_042_400_000_000_000);
+    let reopen = friday + reopen_after;
+    let settlement_timer = settlement_after.map(|after| friday + after);
+
+    let data = [(friday, "3904.00"), (reopen, "3950.00")]
+        .into_iter()
+        .map(|(timestamp, value)| {
+            let price = Price::from(value);
+            Data::Bar(Bar::new(
+                bar_type,
+                price,
+                price,
+                price,
+                price,
+                Quantity::from("100.000"),
+                timestamp,
+                timestamp,
+            ))
+        })
+        .collect();
+
+    let mut engine = BacktestEngine::new(BacktestEngineConfig {
+        portfolio: Some(PortfolioConfig {
+            equity_curve,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+
+    engine
+        .add_venue(
+            SimulatedVenueConfig::builder()
+                .venue(instrument_id.venue)
+                .oms_type(OmsType::Netting)
+                .account_type(AccountType::Margin)
+                .book_type(BookType::L1_MBP)
+                .starting_balances(vec![Money::from("1_000_000 USDT")])
+                .latency_model(LatencyModelHandle::new(StaticLatencyModel::new(
+                    DurationNanos::new(1_000_000),
+                    DurationNanos::default(),
+                    DurationNanos::default(),
+                    DurationNanos::default(),
+                )))
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+
+    if other_data_at_midnight {
+        let mut other = crypto_perpetual_ethusdt.clone();
+        other.id = InstrumentId::new(Symbol::from("BTCUSDT"), instrument_id.venue);
+        other.raw_symbol = Symbol::from("BTCUSDT");
+        let other_id = other.id;
+        engine
+            .add_instrument(&InstrumentAny::CryptoPerpetual(other))
+            .unwrap();
+        let midnight = friday.floor(DurationNanos::from_days(1)) + DurationNanos::from_days(1);
+        engine
+            .add_data(
+                vec![quote(other_id, "5000.00", "5001.00", midnight.as_u64())],
+                None,
+                true,
+                true,
+            )
+            .unwrap();
+    }
+
+    engine
+        .add_instrument(&InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt))
+        .unwrap();
+    engine.add_data(data, None, true, true).unwrap();
+    engine
+        .add_strategy(OpenOnFirstBar::new(
+            instrument_id,
+            bar_type,
+            settlement_timer,
+        ))
+        .unwrap();
+    engine.run(None, None, None, false).unwrap();
+
+    let cache_rc = engine.kernel().cache();
+    let cache = cache_rc.borrow();
+    let positions = cache.positions_open(None, Some(&instrument_id), None, None, None);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].quantity, Quantity::from("1.000"));
+    assert_eq!(positions[0].events.len(), 1);
+    assert_eq!(
+        (
+            positions[0].events[0].last_px,
+            positions[0].events[0].ts_event,
+        ),
+        (
+            Price::from(expected_price),
+            settlement_timer.unwrap_or(reopen),
+        ),
+    );
+
+    let snapshots = engine
+        .kernel()
+        .portfolio()
+        .snapshots(&positions[0].account_id);
+    let mut expected_snapshots = Vec::new();
+
+    if equity_curve {
+        expected_snapshots.push(friday);
+        let day = DurationNanos::from_days(1);
+        let mut midnight = friday.floor(day) + day;
+        while midnight <= reopen {
+            expected_snapshots.push(midnight);
+            midnight += day;
+        }
+
+        expected_snapshots.push(reopen);
+    }
+
+    assert_eq!(
+        snapshots
+            .iter()
+            .map(|snapshot| snapshot.ts_event)
+            .collect::<Vec<_>>(),
+        expected_snapshots,
+    );
+}
+
+#[rstest]
+#[case::without_snapshots(None, 3_000_000_000)]
+#[case::with_snapshots(Some(500), 5_000_000_000)]
+fn test_trailing_final_tick_order_settles_with_latency(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] snapshot_interval_ms: Option<u64>,
+    #[case] final_quote_ts: u64,
+) {
     // The shutdown advance also covers commands emitted on the final data tick
     // (not just on_stop). Without it, the order submitted at the last quote sits
     // inflight past ts_now and never fills, leaving the position one fill short.
-    let config = BacktestEngineConfig::default();
+    let config = BacktestEngineConfig {
+        portfolio: Some(PortfolioConfig {
+            snapshot_interval_ms,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
     let mut engine = BacktestEngine::new(config).unwrap();
     let venue_config = SimulatedVenueConfig::builder()
         .venue(Venue::from("BINANCE"))
@@ -6343,6 +7423,7 @@ fn test_trailing_final_tick_order_settles_with_latency(crypto_perpetual_ethusdt:
             DurationNanos::default(),
             DurationNanos::default(),
         )))
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -6361,7 +7442,7 @@ fn test_trailing_final_tick_order_settles_with_latency(crypto_perpetual_ethusdt:
     let quotes = vec![
         quote(instrument_id, "1000.00", "1001.00", 1_000_000_000),
         quote(instrument_id, "1000.00", "1001.00", 2_000_000_000),
-        quote(instrument_id, "1000.00", "1001.00", 3_000_000_000),
+        quote(instrument_id, "2000.00", "2001.00", final_quote_ts),
     ];
     engine.add_data(quotes, None, true, true).unwrap();
 
@@ -6381,6 +7462,41 @@ fn test_trailing_final_tick_order_settles_with_latency(crypto_perpetual_ethusdt:
         Quantity::from("3.000"),
         "expected all three quotes (including the trailing one) to fill",
     );
+    let end_ns = UnixNanos::from(final_quote_ts) + DurationNanos::from_secs(1);
+    assert_eq!(
+        open[0]
+            .events
+            .iter()
+            .map(|event| (event.last_px, event.ts_event))
+            .collect::<Vec<_>>(),
+        vec![
+            (Price::from("1001.00"), UnixNanos::from(2_000_000_000)),
+            (Price::from("2001.00"), UnixNanos::from(final_quote_ts)),
+            (Price::from("2001.00"), end_ns),
+        ],
+    );
+
+    if snapshot_interval_ms.is_some() {
+        let snapshots = engine.kernel().portfolio().snapshots(&open[0].account_id);
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.ts_event)
+                .collect::<Vec<_>>(),
+            [
+                1_000_000_000,
+                2_500_000_000,
+                3_000_000_000,
+                3_500_000_000,
+                4_000_000_000,
+                4_500_000_000,
+                5_000_000_000,
+                6_000_000_000,
+            ]
+            .map(UnixNanos::from)
+            .to_vec(),
+        );
+    }
 
     let bt_result = engine.get_result();
     assert_eq!(
@@ -6389,7 +7505,7 @@ fn test_trailing_final_tick_order_settles_with_latency(crypto_perpetual_ethusdt:
     );
     assert_eq!(
         engine.backtest_end(),
-        Some(UnixNanos::from(4_000_000_000)),
+        Some(end_ns),
         "expected backtest_end to advance to the trailing inflight arrival",
     );
 }
@@ -6415,6 +7531,7 @@ fn test_cancel_all_orders_in_on_stop_is_processed_with_latency(
             DurationNanos::default(),
             DurationNanos::from_millis(1_500),
         )))
+        .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
         .build()
         .unwrap();
     engine.add_venue(venue_config).unwrap();
@@ -6578,6 +7695,7 @@ fn test_close_all_positions_on_stop_multi_venue_latency_aggregates(
                     DurationNanos::default(),
                     DurationNanos::default(),
                 )))
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -6596,6 +7714,7 @@ fn test_close_all_positions_on_stop_multi_venue_latency_aggregates(
                     DurationNanos::default(),
                     DurationNanos::default(),
                 )))
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
                 .build()
                 .unwrap(),
         )
@@ -6666,6 +7785,7 @@ fn test_add_venue_with_oto_full_trigger(crypto_perpetual_ethusdt: CryptoPerpetua
             .book_type(BookType::L1_MBP)
             .starting_balances(vec![Money::from("1_000_000 USDT")])
             .oto_full_trigger(true)
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap(),
     );
@@ -6679,4 +7799,367 @@ fn test_add_venue_with_oto_full_trigger(crypto_perpetual_ethusdt: CryptoPerpetua
     engine.add_data(quotes, None, true, true).unwrap();
     engine.run(None, None, None, false).unwrap();
     assert_eq!(engine.get_result().iterations, 1);
+}
+
+#[cfg(feature = "streaming")]
+#[rstest]
+fn test_end_returns_streaming_write_error() {
+    use nautilus_common::msgbus::{self, switchboard};
+    use nautilus_model::types::ERROR_PRICE;
+    use nautilus_system::config::{RotationConfig, StreamingConfig};
+
+    let directory = tempfile::tempdir().unwrap();
+    let catalog_path = directory.path().to_string_lossy().into_owned();
+    let instance_id = UUID4::new();
+
+    let config = BacktestEngineConfig {
+        instance_id: Some(instance_id),
+        streaming: Some(StreamingConfig::new(
+            catalog_path.clone(),
+            None,
+            1_000,
+            false,
+            RotationConfig::NoRotation,
+        )),
+        ..Default::default()
+    };
+
+    let mut engine = BacktestEngine::new(config).unwrap();
+
+    // An error price cannot be encoded, so the writer records the failure for its close
+    let instrument_id = InstrumentId::from("AUD/USD.SIM");
+
+    let invalid = QuoteTick::new(
+        instrument_id,
+        ERROR_PRICE,
+        ERROR_PRICE,
+        Quantity::from("1"),
+        Quantity::from("1"),
+        UnixNanos::from(1),
+        UnixNanos::from(1),
+    );
+    msgbus::publish_quote(switchboard::get_quotes_topic(instrument_id), &invalid);
+
+    let error = engine.end().unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to close streaming writer at {catalog_path}/backtest/{instance_id}: Invalid \
+             argument error: Metadata 'price_precision' is 255, maximum supported catalog scale \
+             is 16"
+        ),
+    );
+}
+
+mod serial_tests {
+    use super::*;
+
+    #[rstest]
+    fn test_reset_run_with_shutdown_on_error_replays_data(
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let config = BacktestEngineConfig {
+            shutdown_on_error: true,
+            ..Default::default()
+        };
+
+        let fee_model = FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into();
+        let mut engine = create_engine_with_config(config, fee_model);
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+        let instrument_id = instrument.id();
+        engine.add_instrument(&instrument).unwrap();
+        let quotes = vec![
+            quote(instrument_id, "2500.00", "2500.50", 5_000_000_000),
+            quote(instrument_id, "2501.00", "2501.50", 6_000_000_000),
+            quote(instrument_id, "2502.00", "2502.50", 7_000_000_000),
+        ];
+        engine.add_data(quotes, None, true, true).unwrap();
+        engine.run(None, None, None, false).unwrap();
+        let first_iterations = engine.get_result().iterations;
+        engine.reset().unwrap();
+
+        engine.run(None, None, None, false).unwrap();
+        let second_iterations = engine.get_result().iterations;
+
+        assert_eq!(first_iterations, 3);
+        assert_eq!(second_iterations, 3);
+        assert!(!engine.kernel().is_shutdown_requested());
+    }
+}
+
+#[rstest]
+#[case::buy_through(OrderSide::Buy, "49500.00", "49995.00", "49400.00")]
+#[case::buy_touch(OrderSide::Buy, "49500.00", "49995.00", "49500.00")]
+#[case::sell_through(OrderSide::Sell, "50500.00", "50005.00", "50600.00")]
+#[case::sell_touch(OrderSide::Sell, "50500.00", "50005.00", "50500.00")]
+fn test_trade_budget_survives_callback_settlement(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] side: OrderSide,
+    #[case] entry_price: &str,
+    #[case] child_price: &str,
+    #[case] final_price: &str,
+    #[values(0, 50_000_000)] latency: u64,
+    #[values(false, true)] use_message_queue: bool,
+) {
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    engine
+        .add_venue(
+            SimulatedVenueConfig::builder()
+                .venue(instrument_id.venue)
+                .oms_type(OmsType::Netting)
+                .account_type(AccountType::Margin)
+                .book_type(BookType::L1_MBP)
+                .starting_balances(vec![Money::from("1_000_000 USDT")])
+                .bar_execution(false)
+                .trade_execution(true)
+                .liquidity_consumption(true)
+                .use_message_queue(use_message_queue)
+                .latency_model(LatencyModelHandle::new(StaticLatencyModel::new(
+                    DurationNanos::new(latency),
+                    DurationNanos::default(),
+                    DurationNanos::default(),
+                    DurationNanos::default(),
+                )))
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+    engine.add_instrument(&instrument).unwrap();
+    let fills = Rc::new(RefCell::new(Vec::new()));
+    engine
+        .add_strategy(TradeFillChain::new(
+            instrument_id,
+            side,
+            Price::from(entry_price),
+            Price::from(child_price),
+            Rc::clone(&fills),
+        ))
+        .unwrap();
+    let aggressor = if side == OrderSide::Buy {
+        AggressorSide::Sell
+    } else {
+        AggressorSide::Buy
+    };
+    let opposite = if side == OrderSide::Buy {
+        AggressorSide::Buy
+    } else {
+        AggressorSide::Sell
+    };
+    let first_ts = 1_000_000_000_u64;
+    let data = [
+        ("50000.00", "1.000", opposite),
+        (entry_price, "0.010", aggressor),
+        ("50000.00", "0.010", opposite),
+        (final_price, "0.010", aggressor),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, (price, size, aggressor))| {
+        let ts = UnixNanos::from(first_ts + i as u64 * (latency + 1));
+        Data::Trade(TradeTick::new(
+            instrument_id,
+            Price::from(price),
+            Quantity::from(size),
+            aggressor,
+            TradeId::new(format!("T-{i}")),
+            ts,
+            ts,
+        ))
+    })
+    .collect();
+    engine.add_data(data, None, true, true).unwrap();
+    engine.run(None, None, None, false).unwrap();
+
+    let fills = fills.borrow();
+    let actual: Vec<_> = fills
+        .iter()
+        .map(|fill| {
+            (
+                fill.client_order_id,
+                fill.order_side,
+                fill.last_qty,
+                fill.last_px,
+                fill.liquidity_side,
+                fill.ts_event,
+            )
+        })
+        .collect();
+    let child_side = if side == OrderSide::Buy {
+        OrderSide::Sell
+    } else {
+        OrderSide::Buy
+    };
+    let expected_child_price = if latency == 0 || !use_message_queue {
+        child_price
+    } else {
+        "50000.00"
+    };
+    let expected_child_liquidity = if latency == 0 || !use_message_queue {
+        LiquiditySide::Maker
+    } else {
+        LiquiditySide::Taker
+    };
+    assert_eq!(
+        actual,
+        vec![
+            (
+                ClientOrderId::from("O-ENTRY"),
+                side,
+                Quantity::from("0.010"),
+                Price::from(entry_price),
+                expected_child_liquidity,
+                UnixNanos::from(first_ts + latency + 1)
+            ),
+            (
+                ClientOrderId::from("O-CHAIN-1"),
+                child_side,
+                Quantity::from("0.010"),
+                Price::from(expected_child_price),
+                expected_child_liquidity,
+                UnixNanos::from(first_ts + 2 * (latency + 1))
+            ),
+            (
+                ClientOrderId::from("O-ENTRY"),
+                side,
+                Quantity::from("0.010"),
+                Price::from(entry_price),
+                LiquiditySide::Maker,
+                UnixNanos::from(first_ts + 3 * (latency + 1))
+            ),
+        ]
+    );
+    let cache = engine.kernel().cache();
+    let cache = cache.borrow();
+    assert_eq!(
+        cache
+            .order(&ClientOrderId::from("O-ENTRY"))
+            .unwrap()
+            .leaves_qty(),
+        Quantity::from("0.000")
+    );
+    assert_eq!(
+        cache
+            .order(&ClientOrderId::from("O-CHAIN-1"))
+            .unwrap()
+            .leaves_qty(),
+        Quantity::from("0.000")
+    );
+    assert_eq!(
+        cache
+            .order(&ClientOrderId::from("O-CHAIN-2"))
+            .unwrap()
+            .leaves_qty(),
+        Quantity::from("0.010")
+    );
+}
+
+struct TradeFillChain {
+    core: StrategyCore,
+    instrument_id: InstrumentId,
+    side: OrderSide,
+    entry_price: Price,
+    child_price: Price,
+    submitted: bool,
+    fills: Rc<RefCell<Vec<OrderFilled>>>,
+}
+
+impl TradeFillChain {
+    fn new(
+        instrument_id: InstrumentId,
+        side: OrderSide,
+        entry_price: Price,
+        child_price: Price,
+        fills: Rc<RefCell<Vec<OrderFilled>>>,
+    ) -> Self {
+        Self {
+            core: StrategyCore::new(StrategyConfig {
+                strategy_id: Some(StrategyId::from("TRADE-CHAIN-001")),
+                order_id_tag: Some("001".to_string()),
+                ..Default::default()
+            }),
+            instrument_id,
+            side,
+            entry_price,
+            child_price,
+            submitted: false,
+            fills,
+        }
+    }
+
+    fn submit_limit(
+        &mut self,
+        side: OrderSide,
+        quantity: Quantity,
+        price: Price,
+        id: ClientOrderId,
+    ) -> anyhow::Result<()> {
+        let order = self.order().limit(
+            self.instrument_id,
+            side,
+            quantity,
+            price,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(id),
+        );
+        self.submit_order(order, None, None, None)
+    }
+}
+
+nautilus_strategy!(TradeFillChain, {
+    fn on_order_filled(&mut self, event: &OrderFilled) {
+        self.fills.borrow_mut().push(event.clone());
+        let side = if event.order_side == OrderSide::Buy {
+            OrderSide::Sell
+        } else {
+            OrderSide::Buy
+        };
+        let price = if side == self.side {
+            self.entry_price
+        } else {
+            self.child_price
+        };
+        let id = ClientOrderId::new(format!("O-CHAIN-{}", self.fills.borrow().len()));
+        self.submit_limit(side, Quantity::from("0.010"), price, id)
+            .unwrap();
+    }
+});
+
+impl Debug for TradeFillChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(TradeFillChain)).finish()
+    }
+}
+
+impl DataActor for TradeFillChain {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_trades(self.instrument_id, None, None);
+        Ok(())
+    }
+
+    fn on_trade(&mut self, _tick: &TradeTick) -> anyhow::Result<()> {
+        if !self.submitted {
+            self.submitted = true;
+            self.submit_limit(
+                self.side,
+                Quantity::from("0.020"),
+                self.entry_price,
+                ClientOrderId::from("O-ENTRY"),
+            )?;
+        }
+        Ok(())
+    }
 }

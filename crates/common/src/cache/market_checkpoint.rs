@@ -258,7 +258,7 @@ mod tests {
 
     fn append(cache: &mut Cache, ordinal: u64) {
         let id = crypto_perpetual_ethusdt().id();
-        // Deliberately equal timestamps: deque order must not be inferred by sorting.
+        // Deliberately equal tick timestamps: deque order must not be inferred by sorting.
         let time = UnixNanos::from(100);
         let price = Price::new(1_000.0 + ordinal as f64, 2);
         let mut quote = quote_ethusdt_binance();
@@ -295,8 +295,10 @@ mod tests {
         bar.high = price;
         bar.low = price;
         bar.close = price;
-        bar.ts_event = time;
-        bar.ts_init = time;
+        // Time bars replace the front at equal ts_event; use distinct native bar times.
+        let bar_time = UnixNanos::from(100 + ordinal);
+        bar.ts_event = bar_time;
+        bar.ts_init = bar_time;
         cache.add_bar(bar).unwrap();
     }
 
@@ -310,6 +312,19 @@ mod tests {
         let histories = source.native_market_checkpoint().unwrap();
         assert_eq!(histories[0]["quotes"].as_array().unwrap().len(), 3);
         assert_eq!(histories[0]["bars"][0]["bars"].as_array().unwrap().len(), 2);
+        let bar_type = BarType::from("ETHUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL");
+        assert_eq!(
+            source
+                .bars(&bar_type)
+                .unwrap()
+                .iter()
+                .map(|bar| (bar.ts_event, bar.close))
+                .collect::<Vec<_>>(),
+            vec![
+                (UnixNanos::from(104), Price::new(1_004.0, 2)),
+                (UnixNanos::from(103), Price::new(1_003.0, 2)),
+            ]
+        );
         let mut target = empty();
         target
             .restore_native_market_checkpoint(&config, &histories)
@@ -327,6 +342,62 @@ mod tests {
             target
                 .restore_native_market_checkpoint(&config, &histories)
                 .is_err()
+        );
+    }
+
+    #[rstest::rstest]
+    fn native_market_checkpoint_same_time_bar_replacement_preserves_continuation() {
+        let mut source = empty();
+        append(&mut source, 1);
+        append(&mut source, 2);
+        let bar_type = BarType::from("ETHUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL");
+        let older = *source.bar_at_index(&bar_type, 1).unwrap();
+        let mut replacement = *source.bar(&bar_type).unwrap();
+        let price = Price::new(2_000.0, 2);
+        replacement.open = price;
+        replacement.high = price;
+        replacement.low = price;
+        replacement.close = price;
+        // Keep the latest ts_event: official time-bar insertion replaces instead of appending.
+        assert_eq!(replacement.ts_event, UnixNanos::from(102));
+        source.add_bar(replacement).unwrap();
+        assert_eq!(source.bars(&bar_type).unwrap(), vec![replacement, older]);
+
+        let config = serde_json::to_value(source.native_market_checkpoint_config()).unwrap();
+        let histories = source.native_market_checkpoint().unwrap();
+        let mut target = empty();
+        target
+            .restore_native_market_checkpoint(&config, &histories)
+            .unwrap();
+        assert_eq!(target.bars(&bar_type).unwrap(), vec![replacement, older]);
+        assert_eq!(target.native_market_checkpoint().unwrap(), histories);
+
+        // Revise that same bar after the cut on both actual caches.
+        let price = Price::new(3_000.0, 2);
+        replacement.open = price;
+        replacement.high = price;
+        replacement.low = price;
+        replacement.close = price;
+        for cache in [&mut source, &mut target] {
+            cache.add_bar(replacement).unwrap();
+            assert_eq!(cache.bars(&bar_type).unwrap(), vec![replacement, older]);
+        }
+        assert_eq!(
+            target.native_market_checkpoint().unwrap(),
+            source.native_market_checkpoint().unwrap()
+        );
+
+        // A newer bar evicts the old back entry and retains the revised latest bar.
+        append(&mut source, 3);
+        append(&mut target, 3);
+        let newest = *source.bar(&bar_type).unwrap();
+        assert_eq!(newest.ts_event, UnixNanos::from(103));
+        assert_eq!(newest.close, Price::new(1_003.0, 2));
+        assert_eq!(source.bars(&bar_type).unwrap(), vec![newest, replacement]);
+        assert_eq!(target.bars(&bar_type).unwrap(), vec![newest, replacement]);
+        assert_eq!(
+            target.native_market_checkpoint().unwrap(),
+            source.native_market_checkpoint().unwrap()
         );
     }
 

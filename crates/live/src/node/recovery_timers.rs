@@ -568,7 +568,9 @@ impl RetainedNodeTimers {
     }
     pub(super) fn handoff_after_start(
         &mut self,
-        receiver: &mut SnapshotReceiver<TimeEventMessage>,
+        receiver: &mut SnapshotReceiver<
+            nautilus_common::live::dispatch::DispatchMessage<TimeEventMessage>,
+        >,
     ) -> Result<()> {
         self.verify()?;
         // Reserve before moving any owned callback. Old source events form the
@@ -951,12 +953,12 @@ mod tests {
         timers.handoff_after_start(&mut receiver).unwrap();
         for original in &source_messages {
             let message = receiver.try_recv().unwrap();
-            assert_eq!(message.event(), original.event());
+            assert_eq!(message.message().event(), original.event());
             assert_eq!(
-                message.native_input_callback_binding(),
+                message.message().native_input_callback_binding(),
                 original.checkpoint_callback_binding()
             );
-            assert!(message.dispatch());
+            assert!(message.dispatch(|message| message.dispatch()));
         }
         assert_eq!(
             *calls.borrow(),
@@ -1011,12 +1013,17 @@ mod tests {
             native_continuation: None,
             progress: progress.clone(),
         };
-        let (tail_sender, tail_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (tail_sender, tail_receiver) = tokio::sync::mpsc::unbounded_channel::<
+            nautilus_common::live::dispatch::DispatchMessage<TimeEventMessage>,
+        >();
         tail_sender
-            .send(TimeEventMessage::new(
-                TimeEvent::new("tail".into(), UUID4::new(), actual_now, actual_now),
-                TimeEventCallback::RustLocal(Rc::new(|_| {})),
-            ))
+            .send(
+                TimeEventMessage::new(
+                    TimeEvent::new("tail".into(), UUID4::new(), actual_now, actual_now),
+                    TimeEventCallback::RustLocal(Rc::new(|_| {})),
+                )
+                .into(),
+            )
             .unwrap();
         let mut receiver = SnapshotReceiver::from(tail_receiver);
         timers.handoff_after_start(&mut receiver).unwrap();
@@ -1032,19 +1039,22 @@ mod tests {
             "queued"
         );
         let actual = receiver.try_recv().unwrap();
-        assert_eq!(actual.event(), &event);
-        timers.received(&actual).unwrap();
+        assert_eq!(actual.message().event(), &event);
+        timers.received(actual.message()).unwrap();
         assert_eq!(
             progress.progress().unwrap()["events"][event.event_id.to_string()]["phase"],
             "received"
         );
-        assert!(actual.dispatch());
+        assert!(actual.dispatch(|actual| actual.dispatch()));
         timers.processed(event.event_id).unwrap();
         assert_eq!(calls.get(), 1);
         assert_eq!(
             progress.progress().unwrap()["events"][event.event_id.to_string()]["phase"],
             "processed"
         );
-        assert_eq!(receiver.try_recv().unwrap().event().name.as_str(), "tail");
+        assert_eq!(
+            receiver.try_recv().unwrap().message().event().name.as_str(),
+            "tail"
+        );
     }
 }

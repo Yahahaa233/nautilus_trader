@@ -959,6 +959,10 @@ async fn run_actual_registered_framework_tail(
                 second.open = second.close;
                 second.high = second.close;
                 second.low = second.close;
+                // Official time-bar history replaces equal-timestamp revisions.
+                // This restore fixture requires two actual historical members.
+                second.ts_event = UnixNanos::from(time.as_u64() + 1);
+                second.ts_init = second.ts_event;
                 DataResponse::Bars(BarsResponse::new(
                     correlation_id,
                     ClientId::from("BINANCE"),
@@ -1043,6 +1047,26 @@ async fn run_actual_registered_framework_tail(
                     .native_trace_cut()
                     .context("actual trace absent")?
                     .clone();
+                if saved.borrow().is_empty() {
+                    let ancestry = read_callback_ancestry(&cut, &cut.pending_inputs)?
+                        .context("new producer omitted its explicit callback ancestry sidecar")?;
+                    assert_eq!(&ancestry, boundary.inventory().callback_ancestry());
+                    let mut missing = cut.clone();
+                    missing
+                        .native_effects
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("callback_ancestry");
+                    assert!(read_callback_ancestry(&missing, &missing.pending_inputs).is_err());
+                    let mut changed = cut.clone();
+                    changed.native_effects["callback_ancestry_profile"] =
+                        "unsupported-profile".into();
+                    assert!(read_callback_ancestry(&changed, &changed.pending_inputs).is_err());
+                    let mut changed = cut.clone();
+                    changed.native_effects["callback_ancestry"]["state"]["entry_chains"] =
+                        serde_json::json!([null]);
+                    assert!(read_callback_ancestry(&changed, &changed.pending_inputs).is_err());
+                }
                 boundary.persist_native_checkpoint(
                     serde_json::json!({"actual_registered_framework":true}),
                 )?;
@@ -1097,7 +1121,8 @@ async fn run_actual_registered_framework_tail(
     let produced = async move {
         ready.notified().await;
         if complete_gtd {
-            data.send(DataEvent::Data(Data::Quote(quote))).unwrap();
+            data.send(DataEvent::Data(Data::Quote(quote)).into())
+                .unwrap();
             let initialized = loop {
                 progress.notified().await;
                 let actual =
@@ -1139,7 +1164,7 @@ async fn run_actual_registered_framework_tail(
                     false,
                 )),
             ] {
-                exec.send(ExecutionEvent::Order(event)).unwrap();
+                exec.send(ExecutionEvent::Order(event).into()).unwrap();
                 progress.notified().await;
             }
             loop {
@@ -1197,7 +1222,7 @@ async fn run_actual_registered_framework_tail(
                     OrderStatus::Accepted,
                 ),
             ] {
-                exec.send(ExecutionEvent::Order(event)).unwrap();
+                exec.send(ExecutionEvent::Order(event).into()).unwrap();
                 loop {
                     progress.notified().await;
                     let actual = get_actor_unchecked::<FrameworkStrategy>(
@@ -1212,7 +1237,8 @@ async fn run_actual_registered_framework_tail(
                     }
                 }
             }
-            data.send(DataEvent::Data(Data::Quote(quote))).unwrap();
+            data.send(DataEvent::Data(Data::Quote(quote)).into())
+                .unwrap();
             loop {
                 progress.notified().await;
                 let actual =
@@ -1250,8 +1276,8 @@ async fn run_actual_registered_framework_tail(
                 }
             }
             let received = nautilus_core::time::get_atomic_clock_realtime().get_time_ns();
-            exec.send(ExecutionEvent::Order(OrderEventAny::Canceled(
-                OrderCanceled::new(
+            exec.send(
+                ExecutionEvent::Order(OrderEventAny::Canceled(OrderCanceled::new(
                     managed_order.trader_id(),
                     managed_order.strategy_id(),
                     managed_order.instrument_id(),
@@ -1263,8 +1289,9 @@ async fn run_actual_registered_framework_tail(
                     Some(VenueOrderId::from("V-MANAGED-ACTUAL")),
                     Some(account),
                     None,
-                ),
-            )))
+                )))
+                .into(),
+            )
             .unwrap();
             let queued_before_dispatch =
                 original_cuts.borrow().last().unwrap().0.last_input_sequence;
@@ -1364,7 +1391,7 @@ async fn run_actual_registered_framework_tail(
         .into_iter()
         .enumerate()
         {
-            data.send(event).unwrap();
+            data.send(event.into()).unwrap();
             loop {
                 progress.notified().await;
                 let actual =
@@ -1378,7 +1405,7 @@ async fn run_actual_registered_framework_tail(
             }
         }
         let original_denied = denied.clone();
-        exec.send(ExecutionEvent::Order(denied)).unwrap();
+        exec.send(ExecutionEvent::Order(denied).into()).unwrap();
         loop {
             progress.notified().await;
             let actual =

@@ -19,6 +19,7 @@ struct ActualCaller {
     client: OKXWebSocketClient,
     actual_stream: Option<std::pin::Pin<Box<dyn futures_util::Stream<Item = OKXWsMessage>>>>,
     dispatch: WsDispatchState,
+    stream_state: crate::checkpoint::ExecutionStreamState,
     emitter: ExecutionEventEmitter,
     receiver: tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
     data_receiver: tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
@@ -187,6 +188,7 @@ impl ActualCaller {
             client,
             actual_stream,
             dispatch,
+            stream_state: Default::default(),
             emitter,
             receiver,
             data_receiver,
@@ -246,10 +248,11 @@ impl ActualCaller {
             &self.emitter,
             &self.dispatch,
             AccountId::from("OKX-001"),
+            AccountType::Margin,
             &self.instruments,
-            &mut AHashMap::new(),
-            &mut AHashMap::new(),
-            &mut AHashMap::new(),
+            &mut self.stream_state.fee_cache,
+            &mut self.stream_state.filled_qty_cache,
+            &mut self.stream_state.order_state_cache,
             get_atomic_clock_realtime(),
         );
     }
@@ -756,9 +759,15 @@ async fn actual_raw_ack_capture_failure_latches_original_gate_and_cannot_resolve
     let mut caller = ActualCaller::new().await?;
     caller.events();
     let gate = nautilus_common::live::ingress::IngressGate::new();
-    let (sender, receiver) = gate.channel::<DataEvent>();
+    let (sender, receiver) = gate
+        .native_channel::<nautilus_common::live::dispatch::DispatchMessage<DataEvent>>(
+            nautilus_common::recovery_trace::NativeInputSource::DataEvent,
+        );
     drop(receiver);
-    caller.dispatch.protection_sources.bind(sender.clone());
+    caller
+        .dispatch
+        .protection_sources
+        .bind(sender.clone().into());
     let req = caller.wire["id"].as_str().unwrap().to_owned();
     caller.dispatch_raw_ack(caller.raw_ack(&req, "0")).await;
     assert!(caller.events().is_empty());

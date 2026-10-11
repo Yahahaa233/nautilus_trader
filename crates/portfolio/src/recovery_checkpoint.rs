@@ -295,7 +295,7 @@ mod tests {
     use super::*;
     use nautilus_common::{
         cache::Cache,
-        clock::{Clock, TestClock},
+        clock::{Clock, VirtualClock},
     };
     use nautilus_core::UnixNanos;
     use nautilus_model::{
@@ -310,7 +310,7 @@ mod tests {
     fn source() -> (Portfolio, Value) {
         let account = AccountAny::default();
         let event = account.last_event().unwrap();
-        let concrete = Rc::new(RefCell::new(TestClock::new()));
+        let concrete = Rc::new(RefCell::new(VirtualClock::new()));
         let clock: Rc<RefCell<dyn Clock>> = concrete.clone();
         let cache = Rc::new(RefCell::new(Cache::default()));
         cache.borrow_mut().add_account(account).unwrap();
@@ -334,7 +334,7 @@ mod tests {
     }
 
     fn target(source: &Portfolio) -> Portfolio {
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let cache = Rc::new(RefCell::new(Cache::default()));
         for account in source.cache.borrow().accounts_all_owned() {
             cache.borrow_mut().add_account(account).unwrap();

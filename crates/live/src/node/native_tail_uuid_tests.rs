@@ -474,7 +474,8 @@ async fn command_run_case(changed: bool, startup: u8, changed_portfolio: bool) {
     quote.ts_init = now;
     let producer = async move {
         ready.notified().await;
-        data.send(DataEvent::Data(Data::Quote(quote))).unwrap();
+        data.send(DataEvent::Data(Data::Quote(quote)).into())
+            .unwrap();
         loop {
             progressed.notified().await;
             if observed
@@ -812,21 +813,25 @@ fn queue_original_startup_batch(node: &mut LiveNode, now: UnixNanos) {
     let commands = runner.data_command_sender_clone();
     let execution = runner.execution_event_sender_clone();
     for _ in 0..2 {
-        data.send(DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
-            crypto_perpetual_ethusdt(),
-        )))
+        data.send(
+            DataEvent::Instrument(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()))
+                .into(),
+        )
         .unwrap();
         commands
-            .send(nautilus_common::messages::data::DataCommand::Subscribe(
-                SubscribeCommand::Instruments(SubscribeInstruments::new(
-                    None,
-                    Venue::from("BINANCE"),
-                    UUID4::new(),
-                    now,
-                    None,
-                    None,
-                )),
-            ))
+            .send(
+                nautilus_common::messages::data::DataCommand::Subscribe(
+                    SubscribeCommand::Instruments(SubscribeInstruments::new(
+                        None,
+                        Venue::from("BINANCE"),
+                        UUID4::new(),
+                        now,
+                        None,
+                        None,
+                    )),
+                )
+                .into(),
+            )
             .unwrap();
     }
     let mut submitted = Vec::new();
@@ -871,40 +876,42 @@ fn queue_original_startup_batch(node: &mut LiveNode, now: UnixNanos) {
             .unwrap();
     }
     execution
-        .send(ExecutionEvent::OrderSubmittedBatch(
-            OrderSubmittedBatch::new(submitted),
-        ))
+        .send(ExecutionEvent::OrderSubmittedBatch(OrderSubmittedBatch::new(submitted)).into())
         .unwrap();
     execution
-        .send(ExecutionEvent::Account(AccountState::new(
-            AccountId::from("BINANCE-001"),
-            AccountType::Margin,
-            vec![],
-            vec![],
-            true,
-            UUID4::new(),
-            now,
-            now,
-            None,
-        )))
+        .send(
+            ExecutionEvent::Account(AccountState::new(
+                AccountId::from("BINANCE-001"),
+                AccountType::Margin,
+                vec![],
+                vec![],
+                true,
+                UUID4::new(),
+                now,
+                now,
+                None,
+            ))
+            .into(),
+        )
         .unwrap();
     execution
-        .send(ExecutionEvent::OrderAcceptedBatch(OrderAcceptedBatch::new(
-            accepted,
-        )))
+        .send(ExecutionEvent::OrderAcceptedBatch(OrderAcceptedBatch::new(accepted)).into())
         .unwrap();
     execution
-        .send(ExecutionEvent::Account(AccountState::new(
-            AccountId::from("BINANCE-001"),
-            AccountType::Margin,
-            vec![],
-            vec![],
-            true,
-            UUID4::new(),
-            now,
-            now,
-            None,
-        )))
+        .send(
+            ExecutionEvent::Account(AccountState::new(
+                AccountId::from("BINANCE-001"),
+                AccountType::Margin,
+                vec![],
+                vec![],
+                true,
+                UUID4::new(),
+                now,
+                now,
+                None,
+            ))
+            .into(),
+        )
         .unwrap();
 }
 fn cache_from_actual_cut(effects: &serde_json::Value) -> Cache {
@@ -1026,23 +1033,27 @@ async fn actual_native_trace_startup_codec_failure_fences_and_retains_without_cl
     let runner = source.runner.as_ref().unwrap();
     runner
         .data_event_sender_clone()
-        .send(DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
-            crypto_perpetual_ethusdt(),
-        )))
+        .send(
+            DataEvent::Instrument(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()))
+                .into(),
+        )
         .unwrap();
     for _ in 0..2 {
         runner
             .data_command_sender_clone()
-            .send(nautilus_common::messages::data::DataCommand::Subscribe(
-                SubscribeCommand::Instruments(SubscribeInstruments::new(
-                    None,
-                    Venue::from("BINANCE"),
-                    UUID4::new(),
-                    UnixNanos::default(),
-                    None,
-                    None,
-                )),
-            ))
+            .send(
+                nautilus_common::messages::data::DataCommand::Subscribe(
+                    SubscribeCommand::Instruments(SubscribeInstruments::new(
+                        None,
+                        Venue::from("BINANCE"),
+                        UUID4::new(),
+                        UnixNanos::default(),
+                        None,
+                        None,
+                    )),
+                )
+                .into(),
+            )
             .unwrap();
     }
     let trace = source

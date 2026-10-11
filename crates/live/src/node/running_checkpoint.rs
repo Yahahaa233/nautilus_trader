@@ -18,7 +18,11 @@
 use std::{any::Any, collections::BTreeMap, fmt::Debug, rc::Rc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
-use nautilus_common::{cache::Cache, live::dst};
+use nautilus_common::{
+    cache::Cache,
+    live::{dispatch::DispatchMessage, dst},
+    messages::{ExecutionEvent, SystemCommand, SystemEvent},
+};
 use nautilus_system::trader::CollectedComponentState;
 #[cfg(feature = "native-tail-replay")]
 use nautilus_system::trader::Trader;
@@ -514,11 +518,48 @@ mod tests {
         let completed_heartbeats = heartbeats.clone();
         let stop_cut_persisted = Rc::new(Cell::new(false));
         let completed_cut = stop_cut_persisted.clone();
+        let captured_pending_chain = Rc::new(Cell::new(false));
+        let actual_pending_chain = captured_pending_chain.clone();
         node.set_running_checkpoint_handler(
             Rc::new(registry.seal().unwrap()),
             RunningCheckpointSchedule::EveryCompletedRoot,
-            |boundary| {
+            move |boundary| {
                 boundary.verify()?;
+                let pending = boundary.pending();
+                if pending
+                    .entries()
+                    .iter()
+                    .filter(|entry| {
+                        entry.channel
+                            == crate::runner_recovery::RunnerRecoveryChannel::ExecutionCommand
+                    })
+                    .count()
+                    == 4
+                {
+                    let ancestry = pending
+                        .callback_ancestry()
+                        .context("actual FIFO ancestry missing")?;
+                    assert!(
+                        nautilus_common::actor::callbacks_pending(),
+                        "original queued official ancestry disappeared"
+                    );
+                    assert_eq!(ancestry.state.entry_chains.len(), pending.entries().len());
+                    let chains = pending
+                        .entries()
+                        .iter()
+                        .zip(&ancestry.state.entry_chains)
+                        .filter(|(entry, _)| {
+                            entry.channel
+                                == crate::runner_recovery::RunnerRecoveryChannel::ExecutionCommand
+                        })
+                        .map(|(_, chain)| {
+                            chain.expect("actual command lost its official callback root")
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(chains, vec![chains[0]; 4]);
+                    assert_eq!(ancestry.receipts.len(), pending.entries().len());
+                    actual_pending_chain.set(true);
+                }
                 Ok((
                     boundary.completion_proof().root_sequence(),
                     boundary.inventory().is_terminal_cut(),
@@ -608,6 +649,10 @@ mod tests {
         assert!(captures.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert!(captures.last().is_some_and(|(_, terminal)| *terminal));
         assert!(!retained.get());
+        assert!(
+            captured_pending_chain.get(),
+            "original pending command FIFO was never captured"
+        );
         assert!(!node.kernel.exec_engine.borrow().submissions_fenced());
         assert!(trace.borrow().contains(&"seal"));
     }
@@ -1235,6 +1280,7 @@ pub struct RunningCheckpointInventory {
     profile: &'static str,
     node_state: &'static str,
     runner_counts: BTreeMap<String, u64>,
+    callback_ancestry: crate::runner_recovery::RunnerCallbackAncestry,
     timer_counts: BTreeMap<String, u64>,
     timers: BTreeMap<String, serde_json::Value>,
     synchronous_queue_counts: BTreeMap<String, u64>,
@@ -1318,6 +1364,10 @@ impl RunningCheckpointInventory {
     #[must_use]
     pub const fn data_client_state(&self) -> &BTreeMap<String, serde_json::Value> {
         &self.data_client_state
+    }
+    #[must_use]
+    pub const fn callback_ancestry(&self) -> &crate::runner_recovery::RunnerCallbackAncestry {
+        &self.callback_ancestry
     }
 }
 
@@ -1605,16 +1655,22 @@ impl LiveNode {
                     );
                     Ok(())
                 });
-                take!(system_evt_rx, |node: &mut Self, input| -> Result<()> {
-                    node.process_system_event(input);
+                take!(system_evt_rx, |node: &mut Self,
+                                      input: DispatchMessage<SystemEvent>|
+                 -> Result<()> {
+                    input.dispatch(|domain| node.process_system_event(domain));
                     Ok(())
                 });
-                take!(system_cmd_rx, |node: &mut Self, input| -> Result<()> {
-                    node.process_system_command(input);
+                take!(system_cmd_rx, |node: &mut Self,
+                                      input: DispatchMessage<SystemCommand>|
+                 -> Result<()> {
+                    input.dispatch(|domain| node.process_system_command(domain));
                     Ok(())
                 });
-                take!(exec_evt_rx, |node: &mut Self, input| -> Result<()> {
-                    node.process_exec_event(input);
+                take!(exec_evt_rx, |node: &mut Self,
+                                    input: DispatchMessage<ExecutionEvent>|
+                 -> Result<()> {
+                    input.dispatch(|domain| node.process_exec_event(domain));
                     Ok(())
                 });
                 take!(exec_cmd_rx, |node: &mut Self, input| -> Result<()> {
@@ -1724,6 +1780,10 @@ impl LiveNode {
         let ingress = self.handle.ingress_gate();
         let capture_state = self.state();
         let capture = || -> Result<CaptureDisposition> {
+            ensure!(
+                nautilus_common::actor::callback_failure().is_none(),
+                "native checkpoint cannot capture failed actor callbacks"
+            );
             ensure!(
                 !pending_report_tasks,
                 "venue reconciliation HTTP is in flight"
@@ -1860,6 +1920,10 @@ impl LiveNode {
                     nautilus_common::msgbus::with_local_only_recovery_inventory(|bus| {
                         nautilus_common::runner::with_empty_sync_command_queues(|| {
                             let mut pending = receivers.snapshot(&ingress, &guard, &registry)?;
+                            let callback_ancestry = pending
+                                .callback_ancestry()
+                                .context("native callback ancestry inventory missing")?
+                                .clone();
                             let retained_timers = self
                                 .recovery_timers
                                 .as_ref()
@@ -1914,6 +1978,7 @@ impl LiveNode {
                                     "running"
                                 },
                                 runner_counts,
+                                callback_ancestry: callback_ancestry.clone(),
                                 timer_counts: timers.clone(),
                                 timers: timer_state.clone(),
                                 synchronous_queue_counts: BTreeMap::from([
@@ -1965,6 +2030,10 @@ impl LiveNode {
                                 guard.verify()?;
                                 bus.verify()?;
                                 proof.verify()?;
+                                ensure!(
+                                    receivers.callback_ancestry()? == callback_ancestry,
+                                    "native physical FIFO callback ancestry changed during checkpoint"
+                                );
                                 ensure!(
                                     observer.coverage()? == coverage,
                                     "dispatch inventory changed during checkpoint"
@@ -2031,6 +2100,10 @@ impl LiveNode {
                                 let digest = nautilus_event_store::native_trace::native_inventory_digest(&value)?;
                                 let mut cut = trace.checkpoint_cut_at(proof.root_sequence(), proof.input_sequence(), digest, receipts, now, inventory.captured_at_ns)?;
                                 cut.pending_inputs = original_inputs;
+                                ensure!(callback_ancestry.receipts.iter().map(Option::as_ref).eq(cut.pending.iter().map(Some)),
+                                    "native callback ancestry does not bind the original physical FIFO receipts");
+                                cut.native_effects["callback_ancestry_profile"] = crate::runner_recovery::CALLBACK_ANCESTRY_PROFILE.into();
+                                cut.native_effects["callback_ancestry"] = serde_json::to_value(&callback_ancestry)?;
                                 cut.registered_timers = inventory.timers.clone();
                                 cut.native_effects["registered_timers"] = serde_json::to_value(&inventory.timers)?;
                                 cut.native_effects["execution_manager"] = self.exec_manager.trace_effects_inventory(now)?;

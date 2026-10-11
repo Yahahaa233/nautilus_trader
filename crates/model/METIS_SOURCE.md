@@ -1,3 +1,6 @@
+> Current synchronization batch: official `develop` at `021f9d6642c1fbaff7590b5609ebc59d0ed9ee32`, Rust 1.99.0.
+> The rc5 source and validation statements below are preserved historical provenance. They do not establish this candidate's consumer, installation, or runtime acceptance.
+
 > Current fork base: NautilusTrader v2.0.0rc5, upstream commit 1b0a49d2792a9432a3aca3fcb617ce7a630d905e.
 > Imported from Metis vendor manifest; earlier versions below are historical provenance.
 

@@ -261,6 +261,9 @@ mod tests {
             checkpoint_sequence: 8,
             dispatch_watermark: 12,
         };
+        // The official live builder has one actual node owner per thread.
+        // Original manager/data bytes remain owned after dropping the source.
+        drop(source);
         let mut target = node();
         assert!(
             target

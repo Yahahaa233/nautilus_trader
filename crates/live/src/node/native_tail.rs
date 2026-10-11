@@ -144,6 +144,8 @@ impl LiveNode {
         })
         .and_then(|result| result);
         self.historical_replay = None;
+        // An incomplete historical transaction must poison its same physical ingress.
+        self.historical_ingress = None;
         self.historical_timer_admissions.clear();
         if let Err(error) = &outcome {
             self.fail_native_dispatch(&format!("native tail replay failed: {error:#}"));
@@ -168,6 +170,7 @@ impl LiveNode {
                 && !self.handle.should_stop()
                 && !self.dispatch_failure.get()
                 && self.historical_replay.is_none()
+                && self.historical_ingress.is_none()
                 && self.recovery_cache_installed
                 && self.recovery_restored_components.is_some()
                 && self.recovery_native_frontier.as_ref() == Some(watermark)
@@ -317,9 +320,68 @@ impl LiveNode {
                 .all(|count| *count == 0),
             "native history has unowned target ingress; retain source pending until replay completes"
         );
-        let frozen = runner.freeze_ingress()?;
+        self.historical_ingress = Some(runner.freeze_ingress()?);
         Trader::prepare_native_recovery(&self.kernel.trader, trace)?;
         self.verify_native_cut_business_state(trace, mapped_cut)?;
+        // Restore the original callback owner/frontier before the first historical
+        // input can publish or allocate another command context.
+        let initial = &trace.cut().pending_inputs;
+        let initial_ancestry = read_callback_ancestry(trace.cut(), initial)?;
+        self.admit_historical_native_timers(
+            &trace.cut().registered_timers,
+            trace.cut().captured_at_ns,
+        )?;
+        let mut decoded = Vec::with_capacity(initial.len());
+        for original in initial {
+            decoded.push((
+                self.decode_original_pending(trace, original, decode_pending)?,
+                original.receipt.clone(),
+            ));
+        }
+        let mut contexts = initial_ancestry
+            .as_ref()
+            .map(|ancestry| nautilus_common::actor::restore_channel_contexts(&ancestry.state))
+            .transpose()?;
+        for (index, (event, receipt)) in decoded.into_iter().enumerate() {
+            let context = contexts
+                .as_mut()
+                .map(|bank| bank.take(index))
+                .transpose()?
+                .flatten();
+            self.runner
+                .as_mut()
+                .context("initial source FIFO receiver missing")?
+                .install_native_retained_input(
+                    self.historical_ingress
+                        .as_ref()
+                        .context("initial source ingress missing")?,
+                    event,
+                    receipt,
+                    context,
+                )?;
+        }
+        drop(contexts);
+        let frontiers = original_channel_frontiers(trace)?;
+        self.runner
+            .as_mut()
+            .context("initial source FIFO receiver missing")?
+            .bind_historical_source_frontiers(
+                self.historical_ingress
+                    .as_ref()
+                    .context("initial source ingress missing")?,
+                &frontiers,
+            )?;
+        if let Some(ancestry) = initial_ancestry.as_ref() {
+            self.runner
+                .as_mut()
+                .context("initial source FIFO receiver missing")?
+                .verify_native_callback_ancestry(
+                    self.historical_ingress
+                        .as_ref()
+                        .context("initial source ingress missing")?,
+                    ancestry,
+                )?;
+        }
 
         let mut historical_receipts = Vec::new();
         historical_receipts.try_reserve(trace.roots().len())?;
@@ -358,7 +420,10 @@ impl LiveNode {
             final_input = receipt.final_input_sequence();
             historical_receipts.push(receipt);
             self.historical_replay = None;
-            frozen.verify()?;
+            self.historical_ingress
+                .as_ref()
+                .context("historical native ingress missing")?
+                .verify()?;
         }
         // Unresolved original requests are evidence, never a processed acknowledgement.
         let pending_report_contexts =
@@ -368,47 +433,64 @@ impl LiveNode {
             &final_cut.registered_timers,
             final_cut.captured_at_ns,
         )?;
-        for original in trace.final_pending()? {
-            let event = if original.receipt.input_source == NativeInputSource::Time {
-                let timers = self
-                    .recovery_timers
-                    .as_mut()
-                    .context("final source owner timers missing")?;
-                let event_id: nautilus_core::UUID4 = serde_json::from_value(
-                    original
-                        .timer_event
-                        .as_ref()
-                        .context("final source timer headers absent")?["event_id"]
-                        .clone(),
-                )?;
-                RunnerRecoveryEvent::TimeEvent(timers.take_historical_retained(event_id)?)
-            } else {
-                decode_pending(trace, original)?
-            };
-            let (source, any) = original_event_ref(&event);
-            ensure!(
-                source == original.receipt.input_source,
-                "final source decoder changed its channel"
-            );
-            let encoded = self
-                .dispatch_observer
+        let originals = trace.final_pending()?;
+        let callback_ancestry = read_callback_ancestry(final_cut, originals)?;
+        let (actual, _) = self.actual_historical_pending()?;
+        let mut matched = 0;
+        for (index, original) in originals.iter().enumerate() {
+            if actual
+                .get(matched)
+                .is_some_and(|input| input.receipt == original.receipt)
+            {
+                ensure!(
+                    actual[matched] == *original,
+                    "actual retained domain or original callback lease changed"
+                );
+                matched += 1;
+                continue;
+            }
+            ensure!(actual.get(matched).is_none_or(|input| input.receipt.input_source != original.receipt.input_source),
+                "sealed final source FIFO would overtake an actual native message");
+            let ancestry = callback_ancestry
                 .as_ref()
-                .context("final source codec absent")?
-                .encode_historical_source(
-                    crate::node::dispatch::source_dispatch(source)?,
-                    "native_enqueue",
-                    any,
-                )?;
+                .context("final external source needs explicit callback ancestry")?;
             ensure!(
-                encoded.payload == original.payload,
-                "final source decoder changed the original input"
+                original.receipt.caused_by.is_none()
+                    && ancestry.state.entry_chains[index].is_none()
+                    && ancestry.state.entry_context_ids[index].is_none(),
+                "missing derived original FIFO input cannot be manufactured from final source metadata"
             );
+            let event = self.decode_original_pending(trace, original, decode_pending)?;
             self.runner
                 .as_mut()
-                .context("final original FIFO receiver missing")?
-                .install_native_retained_input(&frozen, event, original.receipt.clone())?;
+                .context("final external source FIFO missing")?
+                .install_historical_external_input(
+                    self.historical_ingress
+                        .as_ref()
+                        .context("final source ingress missing")?,
+                    event,
+                    original.receipt.clone(),
+                )?;
         }
-        frozen.verify()?;
+        ensure!(
+            matched == actual.len(),
+            "actual historical FIFO has inputs absent from the sealed source"
+        );
+        let (actual, actual_ancestry) = self.actual_historical_pending()?;
+        ensure!(
+            actual == originals,
+            "actual historical final FIFO differs from the sealed original source"
+        );
+        if let Some(expected) = callback_ancestry.as_ref() {
+            ensure!(
+                actual_ancestry == *expected,
+                "actual historical callback ancestry or owner frontier differs from the sealed source"
+            );
+        }
+        self.historical_ingress
+            .as_ref()
+            .context("historical native ingress missing")?
+            .verify()?;
         let trace_continuation = if let Some(observer) = &self.dispatch_observer
             && let Some(recorder) = observer.native_trace()
         {
@@ -424,12 +506,18 @@ impl LiveNode {
             );
             let acknowledgment = prepared.commit()?;
             completed.verify()?;
-            frozen.verify()?;
+            self.historical_ingress
+                .as_ref()
+                .context("historical native ingress missing")?
+                .verify()?;
             Some(acknowledgment)
         } else {
             None
         };
-        frozen.finish()?;
+        self.historical_ingress
+            .take()
+            .context("historical native ingress disappeared")?
+            .finish()?;
         let mut final_watermark = cut.clone();
         final_watermark.dispatch_watermark = final_input;
         self.recovery_native_frontier = Some(final_watermark.clone());
@@ -462,6 +550,94 @@ impl LiveNode {
         })
     }
 
+    fn actual_historical_pending(
+        &mut self,
+    ) -> Result<(
+        Vec<NativePendingInput>,
+        crate::runner_recovery::RunnerCallbackAncestry,
+    )> {
+        let observer = self
+            .dispatch_observer
+            .as_ref()
+            .context("historical FIFO codec absent")?;
+        self.runner
+            .as_mut()
+            .context("historical FIFO receiver absent")?
+            .historical_pending_inputs(
+                self.historical_ingress
+                    .as_ref()
+                    .context("historical ingress owner absent")?,
+                &|source, input| {
+                    Ok(observer
+                        .encode_historical_source(
+                            super::dispatch::source_dispatch(source)?,
+                            "native_enqueue",
+                            input,
+                        )?
+                        .payload)
+                },
+            )
+    }
+
+    fn decode_original_pending(
+        &mut self,
+        trace: &VerifiedNativeTrace,
+        original: &NativePendingInput,
+        decode_pending: &mut impl FnMut(
+            &VerifiedNativeTrace,
+            &NativePendingInput,
+        ) -> Result<RunnerRecoveryEvent>,
+    ) -> Result<RunnerRecoveryEvent> {
+        let event = if original.receipt.input_source == NativeInputSource::Time {
+            let event_id = serde_json::from_value(
+                original
+                    .timer_event
+                    .as_ref()
+                    .context("original source timer headers absent")?["event_id"]
+                    .clone(),
+            )?;
+            RunnerRecoveryEvent::TimeEvent(
+                self.recovery_timers
+                    .as_ref()
+                    .context("original source owner timers missing")?
+                    .take_historical_retained(event_id)?,
+            )
+        } else {
+            decode_pending(trace, original)?
+        };
+        let (source, any) = original_event_ref(&event);
+        ensure!(
+            source == original.receipt.input_source,
+            "original source decoder changed its channel"
+        );
+        let encoded = self
+            .dispatch_observer
+            .as_ref()
+            .context("original source codec absent")?
+            .encode_historical_source(
+                super::dispatch::source_dispatch(source)?,
+                "native_enqueue",
+                any,
+            )?;
+        ensure!(
+            encoded.payload == original.payload,
+            "original source decoder changed its domain payload"
+        );
+        if let RunnerRecoveryEvent::TimeEvent(message) = &event {
+            let time = message.event();
+            ensure!(
+                original.callback_binding.as_ref()
+                    == Some(&message.native_input_callback_binding())
+                    && original.timer_event.as_ref()
+                        == Some(
+                            &serde_json::json!({"name":time.name,"event_id":time.event_id,"ts_event":time.ts_event,"ts_init":time.ts_init})
+                        ),
+                "original source timer decoder changed its owner lease or event headers"
+            );
+        }
+        Ok(event)
+    }
+
     fn dispatch_historical_source(
         &mut self,
         root: &VerifiedNativeRoot,
@@ -478,66 +654,97 @@ impl LiveNode {
             anyhow::bail!("original source Begin absent")
         };
         match input_source {
-            NativeInputSource::Time => {
-                let NativeTraceRecord::Begin { read_witnesses, .. } = begin else {
-                    unreachable!()
-                };
-                let witnesses = read_witnesses
-                    .iter()
-                    .filter(|witness| witness.component_id == "native:timers")
-                    .collect::<Vec<_>>();
-                ensure!(
-                    witnesses.len() == 1,
-                    "original native timer witness missing or duplicated"
-                );
-                let message = self
-                    .recovery_timers
-                    .as_mut()
-                    .context("original owner timers not installed")?
-                    .historical_time_message(witnesses[0])?;
-                ensure!(
-                    self.process_time_event_result(message)?,
-                    "original owner callback rejected historical event"
-                );
-            }
-            NativeInputSource::SystemEvent
+            NativeInputSource::Time
+            | NativeInputSource::SystemEvent
             | NativeInputSource::SystemCommand
             | NativeInputSource::ExecutionEvent
             | NativeInputSource::TradingCommand
             | NativeInputSource::DataEvent
-            | NativeInputSource::DataCommand => match decode(root, begin)? {
-                RunnerRecoveryEvent::SystemEvent(event)
-                    if *input_source == NativeInputSource::SystemEvent =>
-                {
-                    self.process_system_event(event)
+            | NativeInputSource::DataCommand => {
+                use crate::runner::PendingRunnerEvent;
+                let NativeTraceRecord::Begin { receipt, .. } = begin else {
+                    unreachable!()
+                };
+                let ingress = receipt
+                    .ingress
+                    .as_ref()
+                    .context("original physical Begin has no ingress receipt")?;
+                let mut event = self
+                    .runner
+                    .as_mut()
+                    .context("historical physical FIFO missing")?
+                    .take_historical_native_input(
+                        self.historical_ingress
+                            .as_ref()
+                            .context("historical ingress owner missing")?,
+                        ingress,
+                    )?;
+                if event.is_none() {
+                    ensure!(
+                        ingress.caused_by.is_none(),
+                        "derived original Begin is missing its actual retained native envelope"
+                    );
+                    let decoded = if *input_source == NativeInputSource::Time {
+                        let NativeTraceRecord::Begin { read_witnesses, .. } = begin else {
+                            unreachable!()
+                        };
+                        let witnesses = read_witnesses
+                            .iter()
+                            .filter(|witness| witness.component_id == "native:timers")
+                            .collect::<Vec<_>>();
+                        ensure!(
+                            witnesses.len() == 1,
+                            "original native timer witness missing or duplicated"
+                        );
+                        RunnerRecoveryEvent::TimeEvent(
+                            self.recovery_timers
+                                .as_mut()
+                                .context("original owner timers not installed")?
+                                .historical_time_message(witnesses[0])?,
+                        )
+                    } else {
+                        decode(root, begin)?
+                    };
+                    self.runner
+                        .as_mut()
+                        .context("external original FIFO missing")?
+                        .install_historical_external_input(
+                            self.historical_ingress
+                                .as_ref()
+                                .context("historical ingress owner missing")?,
+                            decoded,
+                            ingress.clone(),
+                        )?;
+                    event = self
+                        .runner
+                        .as_mut()
+                        .context("external original FIFO missing")?
+                        .take_historical_native_input(
+                            self.historical_ingress
+                                .as_ref()
+                                .context("historical ingress owner missing")?,
+                            ingress,
+                        )?;
                 }
-                RunnerRecoveryEvent::SystemCommand(command)
-                    if *input_source == NativeInputSource::SystemCommand =>
-                {
-                    self.process_system_command(command)
+                match event.context("original native FIFO envelope disappeared")? {
+                    PendingRunnerEvent::TimeEvent(message) => ensure!(
+                        self.process_time_event_result(message)?,
+                        "original owner callback rejected historical event"
+                    ),
+                    PendingRunnerEvent::SystemEvent(event) => {
+                        event.dispatch(|event| self.process_system_event(event))
+                    }
+                    PendingRunnerEvent::SystemCommand(command) => {
+                        command.dispatch(|command| self.process_system_command(command))
+                    }
+                    PendingRunnerEvent::ExecEvent(event) => {
+                        event.dispatch(|event| self.process_exec_event(event))
+                    }
+                    PendingRunnerEvent::ExecCommand(command) => self.process_exec_command(command),
+                    PendingRunnerEvent::DataEvent(event) => self.process_data_event(event),
+                    PendingRunnerEvent::DataCommand(command) => self.process_data_command(command),
                 }
-                RunnerRecoveryEvent::ExecutionEvent(event)
-                    if *input_source == NativeInputSource::ExecutionEvent =>
-                {
-                    self.process_exec_event(event)
-                }
-                RunnerRecoveryEvent::ExecutionCommand(command)
-                    if *input_source == NativeInputSource::TradingCommand =>
-                {
-                    self.process_exec_command(command)
-                }
-                RunnerRecoveryEvent::DataEvent(event)
-                    if *input_source == NativeInputSource::DataEvent =>
-                {
-                    self.process_data_event(event)
-                }
-                RunnerRecoveryEvent::DataCommand(command)
-                    if *input_source == NativeInputSource::DataCommand =>
-                {
-                    self.process_data_command(command)
-                }
-                _ => anyhow::bail!("native source decoder changed its channel"),
-            },
+            }
             NativeInputSource::QueryResult => {
                 let input = NativeMutationInput::from_verified(root, begin)?;
                 let guard = self
@@ -740,6 +947,129 @@ impl LiveNode {
             self.exec_manager.prune_order_local_activity();
         }
         Ok(())
+    }
+}
+
+fn original_channel_frontiers(
+    trace: &VerifiedNativeTrace,
+) -> Result<Vec<(NativeInputSource, nautilus_core::UUID4, u64)>> {
+    use std::collections::HashMap;
+    // Per-channel original ordinal sequence only; this is not a global dispatch order.
+    let mut first = HashMap::<NativeInputSource, (nautilus_core::UUID4, u64)>::new();
+    let mut last = HashMap::<NativeInputSource, u64>::new();
+    let mut initial_last = HashMap::<NativeInputSource, u64>::new();
+    let mut seen = HashMap::<
+        nautilus_core::UUID4,
+        nautilus_common::recovery_trace::NativeIngressReceipt,
+    >::new();
+    let mut observe =
+        |receipt: &nautilus_common::recovery_trace::NativeIngressReceipt| -> Result<()> {
+            ensure!(
+                receipt.channel_ordinal > 0,
+                "original source channel frontier is not physically numbered"
+            );
+            if let Some(previous) = seen.get(&receipt.message_id) {
+                ensure!(
+                    previous == receipt,
+                    "original source message receipt changed between cut and Begin"
+                );
+                return Ok(());
+            }
+            if let Some((channel, _)) = first.get(&receipt.input_source) {
+                ensure!(
+                    *channel == receipt.channel_id
+                        && last[&receipt.input_source].checked_add(1)
+                            == Some(receipt.channel_ordinal),
+                    "original source channel frontier is foreign or has an ordinal gap"
+                );
+            } else {
+                first.insert(
+                    receipt.input_source,
+                    (receipt.channel_id, receipt.channel_ordinal),
+                );
+            }
+            last.insert(receipt.input_source, receipt.channel_ordinal);
+            seen.insert(receipt.message_id, receipt.clone());
+            Ok(())
+        };
+    for pending in &trace.cut().pending_inputs {
+        observe(&pending.receipt)?;
+        initial_last.insert(
+            pending.receipt.input_source,
+            pending.receipt.channel_ordinal,
+        );
+    }
+    for root in trace.roots() {
+        for record in root.inputs() {
+            if let NativeTraceRecord::Begin { receipt, .. } = record
+                && let Some(ingress) = &receipt.ingress
+            {
+                observe(ingress)?;
+            }
+        }
+    }
+    for pending in trace.final_pending()? {
+        observe(&pending.receipt)?;
+    }
+    let mut result = Vec::with_capacity(first.len());
+    for (source, (channel, first_ordinal)) in first {
+        let next = initial_last
+            .get(&source)
+            .map_or(Ok(first_ordinal), |ordinal| {
+                ordinal
+                    .checked_add(1)
+                    .context("initial source frontier exhausted")
+            })?;
+        result.push((source, channel, next));
+    }
+    Ok(result)
+}
+
+fn read_callback_ancestry(
+    cut: &nautilus_event_store::native_trace::NativeTraceCheckpointCut,
+    originals: &[NativePendingInput],
+) -> Result<Option<crate::runner_recovery::RunnerCallbackAncestry>> {
+    ensure!(
+        originals
+            .iter()
+            .map(|input| &input.receipt)
+            .eq(cut.pending.iter()),
+        "original source sidecar input inventory differs from its sealed physical receipt table"
+    );
+    let profile = cut.native_effects.get("callback_ancestry_profile");
+    let metadata = cut.native_effects.get("callback_ancestry");
+    match (profile, metadata) {
+        // Historical producers predate owner callback ancestry. Their original
+        // independent-input profile remains readable without rewriting bytes.
+        (None, None) => {
+            ensure!(
+                originals.is_empty(),
+                "legacy original pending FIFO callback ancestry is unsupported without its source sidecar"
+            );
+            Ok(None)
+        }
+        (Some(profile), Some(metadata)) => {
+            ensure!(
+                profile.as_str() == Some(crate::runner_recovery::CALLBACK_ANCESTRY_PROFILE),
+                "unsupported original physical FIFO callback ancestry profile"
+            );
+            let ancestry: crate::runner_recovery::RunnerCallbackAncestry =
+                serde_json::from_value(metadata.clone())?;
+            ancestry.state.validate()?;
+            ensure!(
+                ancestry.profile == crate::runner_recovery::CALLBACK_ANCESTRY_PROFILE
+                    && ancestry
+                        .receipts
+                        .iter()
+                        .map(Option::as_ref)
+                        .eq(originals.iter().map(|input| Some(&input.receipt)))
+                    && ancestry.state.entry_chains.len() == originals.len()
+                    && ancestry.state.entry_context_ids.len() == originals.len(),
+                "original callback ancestry does not bind the exact retained physical FIFO"
+            );
+            Ok(Some(ancestry))
+        }
+        _ => anyhow::bail!("original physical FIFO callback ancestry sidecar missing"),
     }
 }
 
@@ -1214,7 +1544,9 @@ mod tests {
         let handle = source.handle();
         let produced = async move {
             initial.notified().await;
-            sender.send(DataEvent::Instrument(instrument)).unwrap();
+            sender
+                .send(DataEvent::Instrument(instrument).into())
+                .unwrap();
             progressed.notified().await;
             handle.stop();
         };
@@ -1386,8 +1718,11 @@ mod tests {
                         };
                         let mut original: InstrumentAny = serde_json::from_value(payload.clone())?;
                         if changed {
+                            // Official removed the BitMEX stub; its BTC inverse
+                            // perpetual equivalent remains distinct from this
+                            // source's linear ETH payload, so mismatch must fail.
                             original = InstrumentAny::CryptoPerpetual(
-                                nautilus_model::instruments::stubs::xbtusd_bitmex(),
+                                nautilus_model::instruments::stubs::btcusd_bybit(),
                             );
                         }
                         Ok(RunnerRecoveryEvent::DataEvent(DataEvent::Instrument(
@@ -1450,9 +1785,12 @@ mod tests {
                         .as_ref()
                         .unwrap()
                         .data_event_sender_clone()
-                        .send(DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
-                            nautilus_model::instruments::stubs::xbtusd_bitmex(),
-                        )))
+                        .send(
+                            DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
+                                nautilus_model::instruments::stubs::btcusd_bybit(),
+                            ))
+                            .into(),
+                        )
                         .unwrap();
                     let fresh = target
                         .runner
@@ -1698,10 +2036,13 @@ mod tests {
         let produced = async move {
             initial.notified().await;
             sender
-                .send(TradingCommandMessage::new(
-                    MessagingSwitchboard::exec_engine_execute(),
-                    command,
-                ))
+                .send(
+                    TradingCommandMessage::new(
+                        MessagingSwitchboard::exec_engine_execute(),
+                        command,
+                    )
+                    .into(),
+                )
                 .unwrap();
             loop {
                 progress.notified().await;

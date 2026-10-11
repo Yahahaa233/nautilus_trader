@@ -100,11 +100,12 @@ impl TardisMachineClient {
         extract_bbo_as_quotes: bool,
     ) -> PyResult<Self> {
         let output = match book_snapshot_output {
-            "depth10" => BookSnapshotOutput::Depth10,
+            // "depth10" is the legacy spelling written by configs predating the canonical rename
+            "depth" | "depth10" => BookSnapshotOutput::Depth,
             "deltas" => BookSnapshotOutput::Deltas,
             _ => {
                 return Err(to_pyruntime_err(anyhow::anyhow!(
-                    "Invalid book_snapshot_output: '{book_snapshot_output}'. Expected 'depth10' or 'deltas'"
+                    "Invalid book_snapshot_output: '{book_snapshot_output}'. Expected 'depth' or 'deltas'"
                 )));
             }
         };
@@ -291,7 +292,7 @@ impl TardisMachineClient {
 ///
 /// # Errors
 ///
-/// Returns a `PyErr` if reading the config file or replay execution fails.
+/// Returns an error if reading the config file or replay execution fails.
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.tardis")]
 #[pyo3(name = "run_tardis_machine_replay")]

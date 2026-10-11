@@ -46,7 +46,7 @@ fn amendment_acknowledgement_and_order_result_are_separate() {
         let clock = get_atomic_clock_realtime();
         let mut emitter =
             ExecutionEventEmitter::new(clock, trader, account, AccountType::Margin, None);
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
         emitter.set_sender(sender);
         let instruments = AtomicMap::new();
         let mut instrument = crypto_perpetual_ethusdt();
@@ -56,8 +56,8 @@ fn amendment_acknowledgement_and_order_result_are_separate() {
             Ustr::from("ETH-USDT-SWAP"),
             InstrumentAny::CryptoPerpetual(instrument),
         );
-        let mut fees = AHashMap::new();
-        let mut fills = AHashMap::new();
+        let mut fees = crate::websocket::parse::FeeCache::new();
+        let mut fills = crate::websocket::parse::FilledQtyCache::new();
         let mut orders = AHashMap::new();
         let mut dispatch = |message| {
             dispatch_ws_message(
@@ -65,6 +65,7 @@ fn amendment_acknowledgement_and_order_result_are_separate() {
                 &emitter,
                 &state,
                 account,
+                AccountType::Margin,
                 &instruments,
                 &mut fees,
                 &mut fills,
@@ -193,7 +194,7 @@ fn algo_amendment_correlates_result_and_preserves_pending_on_unknown() {
         let clock = get_atomic_clock_realtime();
         let mut emitter =
             ExecutionEventEmitter::new(clock, trader, account, AccountType::Margin, None);
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
         emitter.set_sender(sender);
         let instruments = AtomicMap::new();
         let mut instrument = crypto_perpetual_ethusdt();
@@ -203,8 +204,8 @@ fn algo_amendment_correlates_result_and_preserves_pending_on_unknown() {
             Ustr::from("ETH-USDT-SWAP"),
             InstrumentAny::CryptoPerpetual(instrument),
         );
-        let mut fees = AHashMap::new();
-        let mut fills = AHashMap::new();
+        let mut fees = crate::websocket::parse::FeeCache::new();
+        let mut fills = crate::websocket::parse::FilledQtyCache::new();
         let mut orders = AHashMap::new();
         let mut dispatch = |message| {
             dispatch_ws_message(
@@ -212,6 +213,7 @@ fn algo_amendment_correlates_result_and_preserves_pending_on_unknown() {
                 &emitter,
                 &state,
                 account,
+                AccountType::Margin,
                 &instruments,
                 &mut fees,
                 &mut fills,

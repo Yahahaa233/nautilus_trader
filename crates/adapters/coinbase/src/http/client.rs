@@ -30,7 +30,6 @@ use arc_swap::ArcSwap;
 use jiff::{Timestamp, tz::Offset};
 use nautilus_core::{
     AtomicMap, UnixNanos,
-    consts::NAUTILUS_USER_AGENT,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
@@ -42,7 +41,10 @@ use nautilus_model::{
     types::{MarginBalance, Price, Quantity},
 };
 use nautilus_network::{
-    http::{HttpClient, HttpClientError, HttpResponse, Method, USER_AGENT},
+    http::{
+        HttpClient, HttpClientError, HttpRedirectPolicy, HttpResponse, Method,
+        create_standard_nautilus_headers,
+    },
     ratelimiter::quota::Quota,
     retry::{RetryConfig, RetryManager},
 };
@@ -196,6 +198,7 @@ impl CoinbaseRawHttpClient {
     ) -> std::result::Result<Self, HttpClientError> {
         Ok(Self {
             client: HttpClient::builder()
+                .redirect_policy(HttpRedirectPolicy::Reject)
                 .headers(Self::default_headers())
                 .default_quota(*COINBASE_REST_QUOTA)
                 .timeout_secs(timeout_secs)
@@ -213,7 +216,7 @@ impl CoinbaseRawHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Auth`] if required environment variables are not set.
+    /// Returns an error if required environment variables are not set.
     pub fn from_env(environment: CoinbaseEnvironment) -> Result<Self> {
         let credential = CoinbaseCredential::from_env()
             .map_err(|e| Error::auth(format!("Missing credentials in environment: {e}")))?;
@@ -225,7 +228,7 @@ impl CoinbaseRawHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Auth`] if credentials are invalid.
+    /// Returns an error if credentials are invalid.
     pub fn from_credentials(
         api_key: &str,
         api_secret: &str,
@@ -271,10 +274,10 @@ impl CoinbaseRawHttpClient {
     }
 
     fn default_headers() -> HashMap<String, String> {
-        HashMap::from([
-            (USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string()),
-            ("Content-Type".to_string(), "application/json".to_string()),
-        ])
+        let mut headers: HashMap<String, String> =
+            create_standard_nautilus_headers().into_iter().collect();
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        headers
     }
 
     fn build_url(&self, path: &str) -> String {
@@ -845,7 +848,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Auth`] if required environment variables are not set.
+    /// Returns an error if required environment variables are not set.
     pub fn from_env(environment: CoinbaseEnvironment) -> Result<Self> {
         let raw = CoinbaseRawHttpClient::from_env(environment)?;
         Ok(Self::from_raw(raw))
@@ -855,7 +858,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Auth`] if credentials are invalid.
+    /// Returns an error if credentials are invalid.
     pub fn from_credentials(
         api_key: &str,
         api_secret: &str,
@@ -1016,8 +1019,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot be
-    /// deserialized.
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn request_instruments(
         &self,
         product_type: Option<CoinbaseProductType>,
@@ -1062,8 +1064,8 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails, deserialization fails,
-    /// or the product cannot be parsed into a supported instrument.
+    /// Returns an error if the HTTP request fails, deserialization fails, or the product cannot be
+    /// parsed into a supported instrument.
     pub async fn request_instrument(&self, product_id: &str) -> anyhow::Result<InstrumentAny> {
         let json = self
             .inner
@@ -1088,8 +1090,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot
-    /// be deserialized.
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn request_raw_product(
         &self,
         product_id: &str,
@@ -1111,8 +1112,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot
-    /// be parsed.
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
     pub async fn request_account_state(
         &self,
         account_id: AccountId,
@@ -1134,8 +1134,8 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails, the order cannot be found,
-    /// or the response cannot be parsed.
+    /// Returns an error if the HTTP request fails, the order cannot be found, or the response
+    /// cannot be parsed.
     pub async fn request_order_status_report(
         &self,
         account_id: AccountId,
@@ -1187,8 +1187,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or when any response cannot
-    /// be deserialized.
+    /// Returns an error if the HTTP request fails or when any response cannot be deserialized.
     pub async fn request_order_status_reports(
         &self,
         account_id: AccountId,
@@ -1239,8 +1238,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot be
-    /// deserialized.
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn request_fill_reports(
         &self,
         account_id: AccountId,
@@ -1352,9 +1350,8 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the order parameters cannot be mapped to a
-    /// supported Coinbase configuration, when the HTTP request fails, or
-    /// when the response cannot be parsed.
+    /// Returns an error if the order parameters cannot be mapped to a supported Coinbase
+    /// configuration, when the HTTP request fails, or when the response cannot be parsed.
     #[allow(clippy::too_many_arguments)]
     pub async fn submit_order(
         &self,
@@ -1409,8 +1406,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot
-    /// be parsed.
+    /// Returns an error if the HTTP request fails or the response cannot be parsed.
     pub async fn cancel_orders(
         &self,
         venue_order_ids: &[VenueOrderId],
@@ -1431,8 +1427,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot be
-    /// deserialized.
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn request_cfm_balance_summary(&self) -> anyhow::Result<CfmBalanceSummary> {
         let response = self
             .inner
@@ -1446,8 +1441,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the summary cannot be fetched or when a balance
-    /// cannot be constructed.
+    /// Returns an error if the summary cannot be fetched or when a balance cannot be constructed.
     pub async fn request_cfm_margin_balances(&self) -> anyhow::Result<Vec<MarginBalance>> {
         let summary = self.request_cfm_balance_summary().await?;
         parse_cfm_margin_balances(&summary)
@@ -1457,8 +1451,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the summary cannot be fetched or when balances
-    /// cannot be constructed.
+    /// Returns an error if the summary cannot be fetched or when balances cannot be constructed.
     pub async fn request_cfm_account_state(
         &self,
         account_id: AccountId,
@@ -1472,8 +1465,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or a position cannot be
-    /// parsed.
+    /// Returns an error if the HTTP request fails or a position cannot be parsed.
     pub async fn request_position_status_reports(
         &self,
         account_id: AccountId,
@@ -1510,8 +1502,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the position cannot be
-    /// parsed.
+    /// Returns an error if the HTTP request fails or the position cannot be parsed.
     pub async fn request_position_status_report(
         &self,
         account_id: AccountId,
@@ -1542,8 +1533,7 @@ impl CoinbaseHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the HTTP request fails or the response cannot
-    /// be deserialized.
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn modify_order(
         &self,
         venue_order_id: VenueOrderId,
@@ -1582,8 +1572,8 @@ pub fn map_order_side(side: OrderSide) -> CoinbaseOrderSide {
 ///
 /// # Errors
 ///
-/// Returns an error when the requested combination is not supported by
-/// Coinbase (e.g. STOP_MARKET, IOC LIMIT, missing required field).
+/// Returns an error if the requested combination is not supported by Coinbase (e.g. STOP_MARKET,
+/// IOC LIMIT, missing required field).
 #[allow(clippy::too_many_arguments)]
 pub fn build_order_configuration(
     order_type: OrderType,
@@ -1720,9 +1710,32 @@ pub fn build_order_configuration(
 
 #[cfg(test)]
 mod tests {
+    use nautilus_testkit::http::assert_http_redirect_rejected;
     use rstest::rstest;
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_authenticated_client_rejects_redirects() {
+        let client = CoinbaseRawHttpClient::with_credentials(
+            CoinbaseCredential::new("key".into(), "secret".into()),
+            CoinbaseEnvironment::Sandbox,
+            3,
+            None,
+            None,
+        )
+        .unwrap()
+        .client;
+        assert_http_redirect_rejected(|url| async move {
+            client
+                .get(url, None, None, Some(3), None)
+                .await
+                .unwrap()
+                .status
+                .as_u16()
+        })
+        .await;
+    }
 
     #[rstest]
     fn test_raw_client_construction_live() {

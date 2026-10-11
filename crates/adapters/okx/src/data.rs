@@ -28,8 +28,8 @@ use nautilus_common::{
     clients::DataClient,
     live::{
         dst::time::{self, Duration, Instant},
-        ingress::IngressSender,
         runner::get_data_event_sender,
+        sender::EventSender,
     },
     messages::{
         DataEvent,
@@ -38,22 +38,23 @@ use nautilus_common::{
             InstrumentsResponse, OptionChainReferencePriceResponse, RequestBars,
             RequestBookSnapshot, RequestFundingRates, RequestInstrument, RequestInstruments,
             RequestOptionChainReferencePrice, RequestTrades, SubscribeBars, SubscribeBookDeltas,
-            SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
+            SubscribeBookDepth, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
             SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices,
             SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, TradesResponse,
-            UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeFundingRates,
+            UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeFundingRates,
             UnsubscribeIndexPrices, UnsubscribeInstrument, UnsubscribeInstrumentStatus,
             UnsubscribeMarkPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
 };
 use nautilus_core::{
-    AtomicMap, Params, UnixNanos,
+    AtomicMap, AtomicSet, Params, UnixNanos,
     datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{
     SocketControl,
+    book::snapshot::snapshot_expired,
     task::{TaskGroup, TaskGroupGuard, TaskSpawner},
 };
 use nautilus_model::{
@@ -65,13 +66,15 @@ use nautilus_model::{
 use ustr::Ustr;
 
 use crate::{
-    book_sync::{
-        BookChannelScope, BookSequenceOutcome, BookSyncSignal, BookSyncSignalKind, BookSyncTracker,
+    book::{
+        BookChannelScope, BookSequenceOutcome,
+        recovery::{spawn_recovery_monitor, spawn_recovery_task, start_recovery},
+        sync::BookSyncTracker,
     },
     common::{
         consts::{
             OKX_VENUE, OKX_WS_HEARTBEAT_SECS, resolve_book_depth, resolve_instrument_families,
-            select_book_channel, should_retry_error_code,
+            select_book_channel,
         },
         enums::{
             OKXBookAction, OKXBookChannel, OKXContractType, OKXGreeksType, OKXInstrumentStatus,
@@ -93,13 +96,18 @@ use crate::{
     websocket::{
         client::OKXWebSocketClient,
         enums::OKXWsChannel,
+        error::OKXWsError,
+        handler::SnapshotGate,
         messages::{NautilusWsMessage, OKXBookMsg, OKXOptionSummaryMsg, OKXWsMessage},
         parse::{
-            extract_fees_from_cached_instrument, parse_book_msg_vec, parse_index_price_msg_vec,
-            parse_option_summary_greeks, parse_rpi_book_msg_vec, parse_ws_message_data,
+            extract_fees_from_cached_instrument, parse_book_depth_msg, parse_book_msg_vec,
+            parse_index_price_msg_vec, parse_option_summary_greeks, parse_rpi_book_msg_vec,
+            parse_ws_message_data,
         },
     },
 };
+
+const BOOK_SNAPSHOT_DEPTH: usize = 5;
 
 #[derive(Debug)]
 pub struct OKXDataClient {
@@ -116,7 +124,7 @@ pub struct OKXDataClient {
     checkpoint_gate: nautilus_common::live::checkpoint::CheckpointGate,
     public_stream_state: Arc<parking_lot::Mutex<crate::checkpoint::DataStreamState>>,
     business_stream_state: Arc<parking_lot::Mutex<crate::checkpoint::DataStreamState>>,
-    data_sender: IngressSender<DataEvent>,
+    data_sender: EventSender<DataEvent>,
     // Shared instrument cache keyed by raw symbol so stream tasks, reconciliation,
     // and request paths all read and write one source of truth
     instruments_by_symbol: Arc<AtomicMap<Ustr, InstrumentAny>>,
@@ -125,6 +133,8 @@ pub struct OKXDataClient {
     instrument_update_lock: Arc<InstrumentUpdateLock>,
     book_channels: Arc<AtomicMap<InstrumentId, OKXBookChannel>>,
     book_sync: BookSyncTracker,
+    book_deltas: Arc<AtomicSet<InstrumentId>>,
+    book_depths: Arc<AtomicMap<InstrumentId, usize>>,
     index_ticker_map: Arc<AtomicMap<Ustr, AHashSet<Ustr>>>,
     option_greeks_subs: Arc<AtomicMap<InstrumentId, AHashSet<OKXGreeksType>>>,
     // `Mutex<AHashMap>` so the spawned subscribe task can roll back the
@@ -258,6 +268,8 @@ impl OKXDataClient {
             instrument_update_lock: Arc::new(InstrumentUpdateLock::default()),
             book_channels: Arc::new(AtomicMap::new()),
             book_sync: BookSyncTracker::default(),
+            book_deltas: Arc::new(AtomicSet::new()),
+            book_depths: Arc::new(AtomicMap::new()),
             index_ticker_map: Arc::new(AtomicMap::new()),
             option_greeks_subs: Arc::new(AtomicMap::new()),
             option_summary_family_subs: Arc::new(parking_lot::Mutex::new(AHashMap::new())),
@@ -285,10 +297,218 @@ impl OKXDataClient {
             .context("business websocket client not available (credentials required)")
     }
 
-    fn send_data(sender: &IngressSender<DataEvent>, data: Data) {
+    fn send_data(sender: &EventSender<DataEvent>, data: Data) {
         if let Err(e) = sender.send(DataEvent::Data(data)) {
             log::error!("Failed to emit data event: {e}");
         }
+    }
+
+    fn send_book_depth(
+        messages: &mut [OKXBookMsg],
+        instrument: &InstrumentAny,
+        subscriptions: &AtomicMap<InstrumentId, usize>,
+        sender: &EventSender<DataEvent>,
+        ts_init: UnixNanos,
+        spread: bool,
+    ) {
+        let Some(limit) = subscriptions.get_cloned(&instrument.id()) else {
+            return;
+        };
+
+        let result = messages
+            .iter_mut()
+            .map(|message| {
+                if spread {
+                    for level in message.bids.iter_mut().chain(&mut message.asks) {
+                        level.orders_count = level.liquidated_orders_count.clone();
+                    }
+                }
+
+                let mut depth = parse_book_depth_msg(
+                    message,
+                    instrument.id(),
+                    instrument.price_precision(),
+                    instrument.size_precision(),
+                    ts_init,
+                )?;
+                depth.bids.truncate(limit);
+                depth.asks.truncate(limit);
+                depth.bid_counts.truncate(limit);
+                depth.ask_counts.truncate(limit);
+                Ok(Data::BookDepth(Box::new(depth)))
+            })
+            .collect::<anyhow::Result<Vec<_>>>();
+
+        match result {
+            Ok(data) => {
+                for item in data {
+                    Self::send_data(sender, item);
+                }
+            }
+            Err(e) => log::error!("Failed to parse book depth: {e}"),
+        }
+    }
+
+    fn book_channel(
+        &self,
+        instrument_id: InstrumentId,
+        depth: Option<std::num::NonZeroUsize>,
+        params: Option<&Params>,
+    ) -> OKXBookChannel {
+        if is_okx_spread_symbol(instrument_id.symbol.as_str()) {
+            // Spreads have no incremental book channel; sprd-books5 pushes a full
+            // 5-level snapshot, emitted as F_SNAPSHOT deltas to feed the book.
+            return OKXBookChannel::SprdBooks5;
+        }
+
+        let raw_depth = depth.map_or(0, std::num::NonZero::get);
+        let depth = resolve_book_depth(raw_depth);
+        if depth != raw_depth {
+            log::debug!("Clamped book depth {raw_depth} to {depth} (OKX supports 50 or 400)");
+        }
+
+        let rpi = params
+            .and_then(|params| params.get_bool("rpi"))
+            .unwrap_or(false);
+        let vip = self.vip_level().unwrap_or(OKXVipLevel::Vip0);
+
+        if rpi {
+            OKXBookChannel::BooksRpi
+        } else {
+            let channel = select_book_channel(depth, vip);
+            if depth == 50 && channel == OKXBookChannel::Book {
+                log::debug!(
+                    "VIP level {vip} insufficient for 50-depth channel, falling back to default"
+                );
+            }
+
+            channel
+        }
+    }
+
+    fn unsubscribe_book_channel(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        if is_okx_spread_symbol(instrument_id.symbol.as_str()) {
+            let ws = self.business_ws()?.clone();
+            self.book_channels.remove(&instrument_id);
+            self.book_sync.remove(instrument_id);
+            self.spawn_ws(
+                async move {
+                    ws.unsubscribe_spread_book(instrument_id)
+                        .await
+                        .context("spread book unsubscribe")
+                },
+                "spread book unsubscribe",
+            );
+
+            return Ok(());
+        }
+
+        let ws = self.public_ws()?.clone();
+        let channel = self.book_channels.get_cloned(&instrument_id);
+        self.book_channels.remove(&instrument_id);
+        self.book_sync.remove(instrument_id);
+
+        self.spawn_ws(
+            async move {
+                match channel {
+                    Some(OKXBookChannel::Books50L2Tbt) => ws
+                        .unsubscribe_book50_l2_tbt(instrument_id)
+                        .await
+                        .context("books50-l2-tbt unsubscribe")?,
+                    Some(OKXBookChannel::BookL2Tbt) => ws
+                        .unsubscribe_book_l2_tbt(instrument_id)
+                        .await
+                        .context("books-l2-tbt unsubscribe")?,
+                    Some(OKXBookChannel::Book) => ws
+                        .unsubscribe_book(instrument_id)
+                        .await
+                        .context("book unsubscribe")?,
+                    Some(OKXBookChannel::BooksRpi) => ws
+                        .unsubscribe_book_rpi(instrument_id)
+                        .await
+                        .context("books-rpi unsubscribe")?,
+                    Some(OKXBookChannel::SprdBooks5) => ws
+                        .unsubscribe_book(instrument_id)
+                        .await
+                        .context("book unsubscribe")?,
+                    None => {
+                        log::warn!(
+                            "Book channel not found for {instrument_id}; unsubscribing fallback channel"
+                        );
+                        ws.unsubscribe_book(instrument_id)
+                            .await
+                            .context("book fallback unsubscribe")?;
+                    }
+                }
+
+                Ok(())
+            },
+            "order book unsubscribe",
+        );
+
+        Ok(())
+    }
+
+    fn subscribe_book_channel(
+        &self,
+        instrument_id: InstrumentId,
+        channel: OKXBookChannel,
+    ) -> anyhow::Result<()> {
+        if let Some(active) = self.book_channels.get_cloned(&instrument_id) {
+            anyhow::ensure!(
+                active == channel,
+                "Conflicting OKX book channel for {instrument_id}: active {active:?}, requested {channel:?}"
+            );
+            return Ok(());
+        }
+
+        let ws = if channel == OKXBookChannel::SprdBooks5 {
+            self.business_ws()?.clone()
+        } else {
+            self.public_ws()?.clone()
+        };
+
+        let spawner = self.tasks.spawner()?;
+        let gate = SnapshotGate::default();
+        gate.lock().close();
+        self.book_channels.insert(instrument_id, channel);
+        let cancel =
+            self.book_sync
+                .record_subscription(instrument_id, Instant::now(), gate.clone());
+        let guard = cancel.clone().drop_guard();
+        let tracker = self.book_sync.clone();
+        let timeout = Duration::from_secs(self.config.book_snapshot_timeout_secs);
+        spawn_task(&spawner.clone(), async move {
+            let _guard = guard;
+            let result = ws
+                .subscribe_book_channel(instrument_id, channel, cancel.clone(), gate)
+                .await;
+
+            if cancel.is_cancelled() {
+                return;
+            }
+
+            match result {
+                Ok(()) => {
+                    if !snapshot_expired(&cancel, timeout).await {
+                        return;
+                    }
+
+                    log::warn!(
+                        "Initial book snapshot missing for {instrument_id}; requesting a fresh snapshot"
+                    );
+                }
+                Err(e) => {
+                    log::warn!("Initial book subscription send failed for {instrument_id}: {e}");
+                }
+            }
+
+            if let Some(recovery) = tracker.claim_subscription_recovery(instrument_id, &cancel) {
+                spawn_recovery_task(instrument_id, channel, recovery, ws, timeout, &spawner);
+            }
+        });
+
+        Ok(())
     }
 
     fn spawn_ws<F>(&self, fut: F, context: &'static str)
@@ -363,9 +583,9 @@ impl OKXDataClient {
                         break;
                     }
                     (_, _checkpoint_callback) = checkpoint_gate.callback(interval.tick()) => {
-                        handle_book_sync_signals(
-                            book_sync.stale_books(threshold, Instant::now())
-                        );
+                        for signal in book_sync.stale_books(threshold, Instant::now()) {
+                            signal.log();
+                        }
                     }
                 }
             }
@@ -376,13 +596,15 @@ impl OKXDataClient {
     #[expect(clippy::too_many_arguments)]
     fn handle_ws_message(
         message: OKXWsMessage,
-        data_sender: &IngressSender<DataEvent>,
+        data_sender: &EventSender<DataEvent>,
         instruments_by_symbol: &Arc<AtomicMap<Ustr, InstrumentAny>>,
         http_client: &OKXHttpClient,
         config: &OKXDataClientConfig,
         instrument_update_lock: &InstrumentUpdateLock,
         book_channels: &Arc<AtomicMap<InstrumentId, OKXBookChannel>>,
         book_sync: &BookSyncTracker,
+        book_depths: &AtomicMap<InstrumentId, usize>,
+        book_deltas: &AtomicSet<InstrumentId>,
         recovery_ws: Option<&OKXWebSocketClient>,
         business_ws: Option<&OKXWebSocketClient>,
         quote_cache: &mut QuoteCache,
@@ -403,7 +625,11 @@ impl OKXDataClient {
         };
 
         match message {
-            OKXWsMessage::BookData { arg, action, data } => {
+            OKXWsMessage::BookData {
+                arg,
+                action,
+                mut data,
+            } => {
                 let Some(inst_id) = arg.inst_id else {
                     log::warn!("Book data without inst_id");
                     return;
@@ -414,10 +640,35 @@ impl OKXDataClient {
                     return;
                 };
                 let ts_init = clock.get_time_ns();
+
+                if arg.channel == OKXWsChannel::Books5 {
+                    if action == OKXBookAction::Snapshot {
+                        Self::send_book_depth(
+                            &mut data,
+                            instrument,
+                            book_depths,
+                            data_sender,
+                            ts_init,
+                            false,
+                        );
+                    }
+
+                    return;
+                }
+
                 let sequences = data
                     .iter()
                     .map(|msg| (msg.prev_seq_id, msg.seq_id))
                     .collect::<Vec<_>>();
+
+                let data: Vec<_> = data
+                    .into_iter()
+                    .filter(|msg| {
+                        action == OKXBookAction::Snapshot
+                            || !msg.bids.is_empty()
+                            || !msg.asks.is_empty()
+                    })
+                    .collect();
 
                 match parse_book_msg_vec(
                     data,
@@ -433,7 +684,6 @@ impl OKXDataClient {
                             instrument.id(),
                             action == OKXBookAction::Snapshot,
                             &sequences,
-                            snapshot_timeout,
                             Instant::now(),
                         );
 
@@ -443,7 +693,6 @@ impl OKXDataClient {
                             book_channels,
                             book_sync,
                             recovery_ws,
-                            book_channel_scope,
                             snapshot_timeout,
                             tasks,
                         ) {
@@ -454,7 +703,17 @@ impl OKXDataClient {
                             Self::send_data(data_sender, data);
                         }
                     }
-                    Err(e) => log::error!("Failed to parse book data: {e}"),
+                    Err(e) => {
+                        log::error!("Failed to parse book data: {e}");
+                        start_recovery(
+                            instrument.id(),
+                            book_channels,
+                            book_sync,
+                            recovery_ws,
+                            snapshot_timeout,
+                            tasks,
+                        );
+                    }
                 }
             }
             OKXWsMessage::RpiBookData { arg, action, data } => {
@@ -473,6 +732,15 @@ impl OKXDataClient {
                     .map(|msg| (Some(msg.prev_seq_id), msg.seq_id))
                     .collect::<Vec<_>>();
 
+                let data: Vec<_> = data
+                    .into_iter()
+                    .filter(|msg| {
+                        action == OKXBookAction::Snapshot
+                            || !msg.bids.is_empty()
+                            || !msg.asks.is_empty()
+                    })
+                    .collect();
+
                 match parse_rpi_book_msg_vec(
                     data,
                     &instrument.id(),
@@ -487,7 +755,6 @@ impl OKXDataClient {
                             instrument.id(),
                             action == OKXBookAction::Snapshot,
                             &sequences,
-                            snapshot_timeout,
                             Instant::now(),
                         );
 
@@ -497,7 +764,6 @@ impl OKXDataClient {
                             book_channels,
                             book_sync,
                             recovery_ws,
-                            book_channel_scope,
                             snapshot_timeout,
                             tasks,
                         ) {
@@ -508,7 +774,17 @@ impl OKXDataClient {
                             Self::send_data(data_sender, data);
                         }
                     }
-                    Err(e) => log::error!("Failed to parse RPI book data: {e}"),
+                    Err(e) => {
+                        log::error!("Failed to parse RPI book data: {e}");
+                        start_recovery(
+                            instrument.id(),
+                            book_channels,
+                            book_sync,
+                            recovery_ws,
+                            snapshot_timeout,
+                            tasks,
+                        );
+                    }
                 }
             }
             OKXWsMessage::ChannelData {
@@ -584,7 +860,12 @@ impl OKXDataClient {
                         log::debug!("No subscribed instruments for index ticker: {inst_id}");
                         return;
                     };
-                    let symbols: Vec<Ustr> = subscribed_symbols.iter().copied().collect();
+
+                    let mut symbols: Vec<Ustr> = subscribed_symbols.iter().copied().collect();
+
+                    // Sort the fan-out; the subscribed set iterates in per-process hash order
+                    symbols.sort();
+
                     drop(map_guard);
 
                     let instruments_guard = instruments_by_symbol.load();
@@ -622,8 +903,24 @@ impl OKXDataClient {
                 let size_precision = instrument.size_precision();
                 let ts_init = clock.get_time_ns();
 
+                if channel == OKXWsChannel::Books5 {
+                    match serde_json::from_value::<Vec<OKXBookMsg>>(data) {
+                        Ok(mut messages) => Self::send_book_depth(
+                            &mut messages,
+                            instrument,
+                            book_depths,
+                            data_sender,
+                            ts_init,
+                            false,
+                        ),
+                        Err(e) => log::error!("Failed to deserialize book depth: {e}"),
+                    }
+
+                    return;
+                }
+
                 if matches!(channel, OKXWsChannel::SprdBooks5) {
-                    let msgs: Vec<OKXBookMsg> = match serde_json::from_value(data) {
+                    let mut msgs: Vec<OKXBookMsg> = match serde_json::from_value(data) {
                         Ok(m) => m,
                         Err(e) => {
                             log::error!("Failed to deserialize spread book data: {e}");
@@ -631,7 +928,15 @@ impl OKXDataClient {
                         }
                     };
 
-                    // sprd-books5 pushes a full 5-level snapshot each message.
+                    Self::send_book_depth(
+                        &mut msgs,
+                        instrument,
+                        book_depths,
+                        data_sender,
+                        ts_init,
+                        true,
+                    );
+
                     match parse_book_msg_vec(
                         msgs,
                         &instrument_id,
@@ -641,18 +946,33 @@ impl OKXDataClient {
                         ts_init,
                     ) {
                         Ok(data_vec) => {
-                            book_sync.record_update_if_subscribed(
+                            if !book_sync.record_snapshot_if_subscribed(
                                 book_channels,
                                 instrument_id,
-                                true,
                                 Instant::now(),
-                            );
+                            ) {
+                                return;
+                            }
 
-                            for d in data_vec {
-                                Self::send_data(data_sender, d);
+                            if !book_deltas.contains(&instrument_id) {
+                                return;
+                            }
+
+                            for data in data_vec {
+                                Self::send_data(data_sender, data);
                             }
                         }
-                        Err(e) => log::error!("Failed to parse spread book data: {e}"),
+                        Err(e) => {
+                            log::error!("Failed to parse spread book data: {e}");
+                            start_recovery(
+                                instrument_id,
+                                book_channels,
+                                book_sync,
+                                recovery_ws,
+                                snapshot_timeout,
+                                tasks,
+                            );
+                        }
                     }
 
                     return;
@@ -725,21 +1045,13 @@ impl OKXDataClient {
                 for okx_inst in okx_instruments {
                     let inst_key = okx_inst.inst_id;
                     let cached = instruments_by_symbol.get_cloned(&inst_key);
-                    let (margin_init, margin_maint, maker_fee, taker_fee) = cached
-                        .as_ref()
-                        .map_or((None, None, None, None), |instrument| {
+                    let (margin_init, margin_maint) =
+                        cached.as_ref().map_or((None, None), |instrument| {
                             extract_fees_from_cached_instrument(instrument)
                         });
                     let status_action = okx_status_to_market_action(okx_inst.state);
                     let is_live = matches!(okx_inst.state, OKXInstrumentStatus::Live);
-                    match parse_instrument_any(
-                        &okx_inst,
-                        margin_init,
-                        margin_maint,
-                        maker_fee,
-                        taker_fee,
-                        ts_init,
-                    ) {
+                    match parse_instrument_any(&okx_inst, margin_init, margin_maint, ts_init) {
                         Ok(Some(inst_any)) => {
                             let instrument_id = inst_any.id();
                             let is_new_or_changed = cached.is_none_or(|cached| {
@@ -814,41 +1126,57 @@ impl OKXDataClient {
                 code,
                 msg,
             } => {
-                log::error!(
-                    "OKX rejected {channel:?} subscription for {inst_id:?} \
-                     (code={code}, msg={msg}); no data will flow for this subscription"
+                let book_instrument_id = inst_id
+                    .filter(|_| channel.is_book())
+                    .and_then(|inst_id| instruments_by_symbol.get_cloned(&inst_id))
+                    .map(|instrument| instrument.id())
+                    .filter(|instrument_id| {
+                        book_channels
+                            .get_cloned(instrument_id)
+                            .is_some_and(|selected| {
+                                crate::websocket::client::ws_channel_for_book(selected) == channel
+                            })
+                    });
+
+                // Book recovery retries a rejected book subscription and reports its own failure
+                let Some(instrument_id) = book_instrument_id else {
+                    log::error!(
+                        "OKX rejected {channel:?} subscription for {inst_id:?} \
+                         (code={code}, msg={msg}); no data will flow for this subscription"
+                    );
+                    return;
+                };
+
+                log::warn!(
+                    "OKX rejected {channel:?} subscription for {instrument_id} (code={code}, \
+                     msg={msg}); recovering the book"
                 );
 
-                if let Some(inst_id) = inst_id
-                    && channel.is_book()
-                    && let Some(instrument) = instruments_by_symbol.get_cloned(&inst_id)
-                {
-                    spawn_book_recovery(
-                        instrument.id(),
-                        book_channels,
-                        book_sync,
-                        recovery_ws,
-                        book_channel_scope,
-                        snapshot_timeout,
-                        tasks,
-                    );
+                let error = OKXWsError::OkxError {
+                    error_code: code,
+                    message: msg,
+                };
+
+                if book_sync.reject_recovery(instrument_id, error) {
+                    return;
                 }
+
+                start_recovery(
+                    instrument_id,
+                    book_channels,
+                    book_sync,
+                    recovery_ws,
+                    snapshot_timeout,
+                    tasks,
+                );
             }
-            OKXWsMessage::Error(e) => {
-                if should_retry_error_code(&e.code) {
-                    log::warn!("OKX websocket error: {e:?}");
-                } else {
-                    log::error!("OKX websocket error: {e:?}");
-                }
-            }
+            OKXWsMessage::Error(_) => {}
             OKXWsMessage::Reconnected => {
                 log::info!("Websocket reconnected");
                 quote_cache.clear();
                 funding_cache.clear();
 
-                if book_channel_scope == BookChannelScope::Public {
-                    book_sync.reset_sequences(book_channels, book_channel_scope);
-                }
+                book_sync.reset_sequences(book_channels, book_channel_scope);
 
                 if !snapshot_timeout.is_zero() {
                     let pending_count = book_sync.seed_pending_snapshots(
@@ -859,7 +1187,7 @@ impl OKXDataClient {
                     );
 
                     if pending_count > 0 {
-                        spawn_book_recovery_monitor(
+                        spawn_recovery_monitor(
                             book_sync.clone(),
                             recovery_ws.cloned(),
                             Arc::clone(book_channels),
@@ -961,6 +1289,8 @@ impl OKXDataClient {
             let update_lock = self.instrument_update_lock.clone();
             let book_channels = self.book_channels.clone();
             let book_sync = self.book_sync.clone();
+            let book_depths = self.book_depths.clone();
+            let book_deltas = self.book_deltas.clone();
             let recovery_ws = ws.clone();
             let business_ws = self.ws_business.clone();
             let idx_map = self.index_ticker_map.clone();
@@ -1001,6 +1331,8 @@ impl OKXDataClient {
                                     &update_lock,
                                     &book_channels,
                                     &book_sync,
+                                    &book_depths,
+                                    &book_deltas,
                                     Some(&recovery_ws),
                                     business_ws.as_ref(),
                                     quote_cache,
@@ -1043,6 +1375,8 @@ impl OKXDataClient {
             let update_lock = self.instrument_update_lock.clone();
             let book_channels = self.book_channels.clone();
             let book_sync = self.book_sync.clone();
+            let book_depths = self.book_depths.clone();
+            let book_deltas = self.book_deltas.clone();
             let business_ws = ws.clone();
             let idx_map = self.index_ticker_map.clone();
             let greeks_subs = self.option_greeks_subs.clone();
@@ -1082,6 +1416,8 @@ impl OKXDataClient {
                                     &update_lock,
                                     &book_channels,
                                     &book_sync,
+                                    &book_depths,
+                                    &book_deltas,
                                     None,
                                     Some(&business_ws),
                                     quote_cache,
@@ -1213,6 +1549,8 @@ impl OKXDataClient {
             Ok(())
         };
 
+        self.book_deltas.store(AHashSet::new());
+        self.book_depths.store(AHashMap::new());
         self.book_channels.store(AHashMap::new());
         self.book_sync.clear();
         self.option_greeks_subs
@@ -1241,149 +1579,30 @@ impl OKXDataClient {
     }
 }
 
-/// Maximum book resubscription attempts claimed from the [`BookSyncTracker`]
-/// budget per recovery episode before the instrument is abandoned.
-const BOOK_RECOVERY_MAX_ATTEMPTS: u32 = 8;
-
-#[expect(clippy::too_many_arguments)]
 fn handle_book_sequence_outcome(
     outcome: BookSequenceOutcome,
     instrument_id: InstrumentId,
     book_channels: &Arc<AtomicMap<InstrumentId, OKXBookChannel>>,
     book_sync: &BookSyncTracker,
     recovery_ws: Option<&OKXWebSocketClient>,
-    scope: BookChannelScope,
     snapshot_timeout: Duration,
     tasks: &TaskSpawner,
 ) -> bool {
     match outcome {
         BookSequenceOutcome::Accept => true,
         BookSequenceOutcome::Suppress => false,
-        BookSequenceOutcome::Recover {
-            last_seq_id,
-            prev_seq_id,
-            seq_id,
-        } => {
-            log::warn!(
-                "Book sequence gap for {instrument_id}: last_seq_id={last_seq_id:?}, \
-                 prev_seq_id={prev_seq_id:?}, seq_id={seq_id}; requesting a fresh snapshot"
-            );
-
-            spawn_book_recovery(
+        BookSequenceOutcome::Recover => {
+            start_recovery(
                 instrument_id,
                 book_channels,
                 book_sync,
                 recovery_ws,
-                scope,
                 snapshot_timeout,
                 tasks,
             );
             false
         }
     }
-}
-
-/// Spawns a single budgeted book resubscription attempt for `instrument_id`.
-///
-/// Whether or not the send succeeds, a fresh snapshot deadline is armed so a
-/// lost, rejected, or snapshot-less resubscribe is retried by
-/// [`spawn_book_recovery_monitor`] when the deadline expires.
-fn spawn_book_recovery(
-    instrument_id: InstrumentId,
-    book_channels: &Arc<AtomicMap<InstrumentId, OKXBookChannel>>,
-    book_sync: &BookSyncTracker,
-    recovery_ws: Option<&OKXWebSocketClient>,
-    scope: BookChannelScope,
-    snapshot_timeout: Duration,
-    tasks: &TaskSpawner,
-) {
-    let Some(channel) = book_channels.get_cloned(&instrument_id) else {
-        log::warn!("Cannot recover book for unsubscribed {instrument_id}");
-        return;
-    };
-
-    let Some(ws) = recovery_ws.cloned() else {
-        log::error!("No websocket available to recover book for {instrument_id}");
-        return;
-    };
-
-    let channels = Arc::clone(book_channels);
-    let tracker = book_sync.clone();
-    let recovery_cancel = tasks.cancellation_token();
-    let spawner = tasks.clone();
-
-    spawn_task(tasks, async move {
-        if recovery_cancel.is_cancelled() || channels.get_cloned(&instrument_id) != Some(channel) {
-            return;
-        }
-
-        let Some(attempt) =
-            tracker.next_recovery_attempt(instrument_id, BOOK_RECOVERY_MAX_ATTEMPTS)
-        else {
-            log::error!(
-                "Book recovery for {instrument_id} abandoned after \
-                 {BOOK_RECOVERY_MAX_ATTEMPTS} attempts"
-            );
-            return;
-        };
-
-        if let Err(e) = ws.resubscribe_book_channel(instrument_id, channel).await {
-            log::warn!("Book recovery attempt {attempt} for {instrument_id} failed: {e}");
-        }
-
-        if !snapshot_timeout.is_zero() {
-            tracker.arm_pending_snapshot(instrument_id, snapshot_timeout, Instant::now());
-            spawn_book_recovery_monitor(
-                tracker,
-                Some(ws),
-                channels,
-                scope,
-                snapshot_timeout,
-                &spawner,
-            );
-        }
-    });
-}
-
-/// Spawns a one-shot monitor that retries recovery for every book instrument
-/// whose armed snapshot deadline expires on this socket's channels.
-fn spawn_book_recovery_monitor(
-    book_sync: BookSyncTracker,
-    recovery_ws: Option<OKXWebSocketClient>,
-    book_channels: Arc<AtomicMap<InstrumentId, OKXBookChannel>>,
-    scope: BookChannelScope,
-    snapshot_timeout: Duration,
-    tasks: &TaskSpawner,
-) {
-    let task_cancel = tasks.cancellation_token();
-    let spawner = tasks.clone();
-
-    spawn_task(tasks, async move {
-        tokio::select! {
-            biased;
-            () = task_cancel.cancelled() => {}
-            () = time::sleep(snapshot_timeout) => {
-                let expired = book_sync.expired_pending_snapshots(
-                    &book_channels,
-                    scope,
-                    Instant::now(),
-                );
-                handle_book_sync_signals(expired.clone());
-
-                for signal in expired {
-                    spawn_book_recovery(
-                        signal.instrument_id,
-                        &book_channels,
-                        &book_sync,
-                        recovery_ws.as_ref(),
-                        scope,
-                        snapshot_timeout,
-                        &spawner,
-                    );
-                }
-            }
-        }
-    });
 }
 
 /// Guards instrument definitions: serializes diff-update-publish sequences
@@ -1397,7 +1616,7 @@ struct InstrumentUpdateLock {
 
 fn dispatch_parsed_data(
     msg: NautilusWsMessage,
-    data_sender: &IngressSender<DataEvent>,
+    data_sender: &EventSender<DataEvent>,
     instruments_by_symbol: &Arc<AtomicMap<Ustr, InstrumentAny>>,
 ) {
     match msg {
@@ -1435,7 +1654,7 @@ fn dispatch_parsed_data(
     }
 }
 
-fn emit_funding_rates(sender: &IngressSender<DataEvent>, updates: Vec<FundingRateUpdate>) {
+fn emit_funding_rates(sender: &EventSender<DataEvent>, updates: Vec<FundingRateUpdate>) {
     for update in updates {
         if let Err(e) = sender.send(DataEvent::FundingRate(update)) {
             log::error!("Failed to emit funding rate event: {e}");
@@ -1444,7 +1663,7 @@ fn emit_funding_rates(sender: &IngressSender<DataEvent>, updates: Vec<FundingRat
 }
 
 fn emit_instrument_status(
-    sender: &IngressSender<DataEvent>,
+    sender: &EventSender<DataEvent>,
     instrument_id: InstrumentId,
     status_action: MarketStatusAction,
     is_live: bool,
@@ -1464,26 +1683,6 @@ fn emit_instrument_status(
 
     if let Err(e) = sender.send(DataEvent::InstrumentStatus(status)) {
         log::error!("Failed to emit instrument status event: {e}");
-    }
-}
-
-fn handle_book_sync_signals(signals: Vec<BookSyncSignal>) {
-    for signal in signals {
-        match signal.kind {
-            BookSyncSignalKind::Stale { elapsed } => {
-                log::warn!(
-                    "Book feed stale for {}: no update for {:.3}s",
-                    signal.instrument_id,
-                    elapsed.as_secs_f64()
-                );
-            }
-            BookSyncSignalKind::SnapshotMissing => {
-                log::warn!(
-                    "Book snapshot not received for {} after recovery request",
-                    signal.instrument_id
-                );
-            }
-        }
     }
 }
 
@@ -1548,7 +1747,7 @@ fn publish_instrument_updates(
     ws_public: Option<&OKXWebSocketClient>,
     ws_business: Option<&OKXWebSocketClient>,
     instrument_update_lock: &InstrumentUpdateLock,
-    data_sender: &IngressSender<DataEvent>,
+    data_sender: &EventSender<DataEvent>,
 ) {
     cache_instrument_updates(
         changed,
@@ -1768,7 +1967,7 @@ async fn reconcile_instruments(
     instrument_update_lock: &InstrumentUpdateLock,
     ws_public: Option<&OKXWebSocketClient>,
     ws_business: Option<&OKXWebSocketClient>,
-    data_sender: &IngressSender<DataEvent>,
+    data_sender: &EventSender<DataEvent>,
 ) -> anyhow::Result<InstrumentReconciliation> {
     let seq_before = instrument_update_lock.write_seq.load(Ordering::SeqCst);
     let fetched = fetch_configured_instruments(http_client, config).await?;
@@ -1965,6 +2164,8 @@ impl DataClient for OKXDataClient {
             .store(false, std::sync::atomic::Ordering::Release);
         log::debug!("Resetting {id}", id = self.client_id);
         self.begin_generation_shutdown();
+        self.book_deltas.store(AHashSet::new());
+        self.book_depths.store(AHashMap::new());
         self.book_channels.store(AHashMap::new());
         self.book_sync.clear();
         self.option_greeks_subs
@@ -2101,87 +2302,73 @@ impl DataClient for OKXDataClient {
     fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
         self.recovery_pristine
             .store(false, std::sync::atomic::Ordering::Release);
-        if cmd.book_type != BookType::L2_MBP {
-            anyhow::bail!("OKX only supports L2_MBP order book deltas");
+        anyhow::ensure!(
+            cmd.book_type == BookType::L2_MBP,
+            "OKX only supports L2_MBP order books"
+        );
+        let channel = self.book_channel(cmd.instrument_id, cmd.depth, cmd.params.as_ref());
+        let was_subscribed = self.book_deltas.contains(&cmd.instrument_id);
+        self.book_deltas.insert(cmd.instrument_id);
+
+        if let Err(e) = self.subscribe_book_channel(cmd.instrument_id, channel) {
+            if !was_subscribed {
+                self.book_deltas.remove(&cmd.instrument_id);
+            }
+
+            return Err(e);
         }
 
-        if is_okx_spread_symbol(cmd.instrument_id.symbol.as_str()) {
-            // Spreads have no incremental book channel; sprd-books5 pushes a full
-            // 5-level snapshot, emitted as F_SNAPSHOT deltas to feed the book.
-            let instrument_id = cmd.instrument_id;
-            let ws = self.business_ws()?.clone();
-            let book_channels = Arc::clone(&self.book_channels);
-            let book_sync = self.book_sync.clone();
-            self.spawn_ws(
-                async move {
-                    ws.subscribe_spread_book(instrument_id)
-                        .await
-                        .context("spread book subscription")?;
-                    book_channels.insert(instrument_id, OKXBookChannel::SprdBooks5);
-                    book_sync.record_subscription(instrument_id, Instant::now());
-                    Ok(())
-                },
-                "spread book subscription",
+        Ok(())
+    }
+
+    fn subscribe_book_depth(&mut self, cmd: SubscribeBookDepth) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            cmd.book_type == BookType::L2_MBP,
+            "OKX only supports L2_MBP order books"
+        );
+        let depth = cmd
+            .depth
+            .map_or(BOOK_SNAPSHOT_DEPTH, std::num::NonZero::get);
+        anyhow::ensure!(
+            depth <= BOOK_SNAPSHOT_DEPTH,
+            "OKX depth snapshots support at most {BOOK_SNAPSHOT_DEPTH} levels"
+        );
+        anyhow::ensure!(
+            !cmd.params
+                .as_ref()
+                .and_then(|params| params.get_bool("rpi"))
+                .unwrap_or(false),
+            "OKX native depth snapshots do not support RPI"
+        );
+
+        if let Some(active) = self.book_depths.get_cloned(&cmd.instrument_id) {
+            anyhow::ensure!(
+                active == depth,
+                "Conflicting OKX snapshot depth for {}",
+                cmd.instrument_id
             );
             return Ok(());
         }
 
-        let raw_depth = cmd.depth.map_or(0, std::num::NonZero::get);
-        let depth = resolve_book_depth(raw_depth);
-        if depth != raw_depth {
-            log::debug!("Clamped book depth {raw_depth} to {depth} (OKX supports 50 or 400)");
-        }
-
-        let rpi = cmd
-            .params
-            .as_ref()
-            .and_then(|params| params.get_bool("rpi"))
-            .unwrap_or(false);
-        let vip = self.vip_level().unwrap_or(OKXVipLevel::Vip0);
-        let channel = if rpi {
-            OKXBookChannel::BooksRpi
-        } else {
-            let channel = select_book_channel(depth, vip);
-            if depth == 50 && channel == OKXBookChannel::Book {
-                log::debug!(
-                    "VIP level {vip} insufficient for 50-depth channel, falling back to default"
-                );
-            }
-            channel
-        };
-
         let instrument_id = cmd.instrument_id;
-        let ws = self.public_ws()?.clone();
-        let book_channels = Arc::clone(&self.book_channels);
-        let book_sync = self.book_sync.clone();
-
-        self.spawn_ws(
-            async move {
-                match channel {
-                    OKXBookChannel::Books50L2Tbt => ws
-                        .subscribe_book50_l2_tbt(instrument_id)
+        if is_okx_spread_symbol(instrument_id.symbol.as_str()) {
+            self.book_depths.insert(instrument_id, depth);
+            if let Err(e) = self.subscribe_book_channel(instrument_id, OKXBookChannel::SprdBooks5) {
+                self.book_depths.remove(&instrument_id);
+                return Err(e);
+            }
+        } else {
+            let ws = self.public_ws()?.clone();
+            self.book_depths.insert(instrument_id, depth);
+            self.spawn_ws(
+                async move {
+                    ws.subscribe_book_depth5(instrument_id)
                         .await
-                        .context("books50-l2-tbt subscription")?,
-                    OKXBookChannel::BookL2Tbt => ws
-                        .subscribe_book_l2_tbt(instrument_id)
-                        .await
-                        .context("books-l2-tbt subscription")?,
-                    OKXBookChannel::Book => ws
-                        .subscribe_books_channel(instrument_id)
-                        .await
-                        .context("books subscription")?,
-                    OKXBookChannel::BooksRpi => ws
-                        .subscribe_book_rpi(instrument_id)
-                        .await
-                        .context("books-rpi subscription")?,
-                    OKXBookChannel::SprdBooks5 => unreachable!(),
-                }
-                book_channels.insert(instrument_id, channel);
-                book_sync.record_subscription(instrument_id, Instant::now());
-                Ok(())
-            },
-            "order book delta subscription",
-        );
+                        .context("book depth subscription")
+                },
+                "book depth subscription",
+            );
+        }
 
         Ok(())
     }
@@ -2407,64 +2594,43 @@ impl DataClient for OKXDataClient {
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
         self.recovery_pristine
             .store(false, std::sync::atomic::Ordering::Release);
-        let instrument_id = cmd.instrument_id;
-
-        if is_okx_spread_symbol(instrument_id.symbol.as_str()) {
-            let ws = self.business_ws()?.clone();
-            self.book_channels.remove(&instrument_id);
-            self.book_sync.remove(instrument_id);
-            self.spawn_ws(
-                async move {
-                    ws.unsubscribe_spread_book(instrument_id)
-                        .await
-                        .context("spread book unsubscribe")
-                },
-                "spread book unsubscribe",
-            );
+        if !self.book_deltas.contains(&cmd.instrument_id) {
             return Ok(());
         }
 
-        let ws = self.public_ws()?.clone();
-        let channel = self.book_channels.get_cloned(&instrument_id);
-        self.book_channels.remove(&instrument_id);
-        self.book_sync.remove(instrument_id);
+        if !is_okx_spread_symbol(cmd.instrument_id.symbol.as_str())
+            || !self.book_depths.contains_key(&cmd.instrument_id)
+        {
+            self.unsubscribe_book_channel(cmd.instrument_id)?;
+        }
 
-        self.spawn_ws(
-            async move {
-                match channel {
-                    Some(OKXBookChannel::Books50L2Tbt) => ws
-                        .unsubscribe_book50_l2_tbt(instrument_id)
+        self.book_deltas.remove(&cmd.instrument_id);
+        Ok(())
+    }
+
+    fn unsubscribe_book_depth(&mut self, cmd: &UnsubscribeBookDepth) -> anyhow::Result<()> {
+        if !self.book_depths.contains_key(&cmd.instrument_id) {
+            return Ok(());
+        }
+
+        let instrument_id = cmd.instrument_id;
+        if is_okx_spread_symbol(instrument_id.symbol.as_str()) {
+            if !self.book_deltas.contains(&instrument_id) {
+                self.unsubscribe_book_channel(instrument_id)?;
+            }
+        } else {
+            let ws = self.public_ws()?.clone();
+            self.spawn_ws(
+                async move {
+                    ws.unsubscribe_book_depth5(instrument_id)
                         .await
-                        .context("books50-l2-tbt unsubscribe")?,
-                    Some(OKXBookChannel::BookL2Tbt) => ws
-                        .unsubscribe_book_l2_tbt(instrument_id)
-                        .await
-                        .context("books-l2-tbt unsubscribe")?,
-                    Some(OKXBookChannel::Book) => ws
-                        .unsubscribe_book(instrument_id)
-                        .await
-                        .context("book unsubscribe")?,
-                    Some(OKXBookChannel::BooksRpi) => ws
-                        .unsubscribe_book_rpi(instrument_id)
-                        .await
-                        .context("books-rpi unsubscribe")?,
-                    Some(OKXBookChannel::SprdBooks5) => ws
-                        .unsubscribe_book(instrument_id)
-                        .await
-                        .context("book unsubscribe")?,
-                    None => {
-                        log::warn!(
-                            "Book channel not found for {instrument_id}; unsubscribing fallback channel"
-                        );
-                        ws.unsubscribe_book(instrument_id)
-                            .await
-                            .context("book fallback unsubscribe")?;
-                    }
-                }
-                Ok(())
-            },
-            "order book unsubscribe",
-        );
+                        .context("book depth unsubscribe")
+                },
+                "book depth unsubscribe",
+            );
+        }
+
+        self.book_depths.remove(&cmd.instrument_id);
         Ok(())
     }
 
@@ -3234,7 +3400,7 @@ mod tests {
     use nautilus_core::UUID4;
     use nautilus_model::{
         identifiers::Symbol,
-        instruments::stubs::currency_pair_btcusdt,
+        instruments::{CurrencyPair, stubs::currency_pair_btcusdt},
         types::{Price, Quantity},
     };
     use nautilus_network::websocket::TransportBackend;
@@ -3300,6 +3466,109 @@ mod tests {
         websocket::{enums::OKXWsChannel, messages::OKXWsFrame},
     };
 
+    #[rstest]
+    #[case(1, false)]
+    #[case(5, false)]
+    #[case(1, true)]
+    #[case(5, true)]
+    fn native_depth_replaces_snapshots_and_ignores_unsubscribed_data(
+        currency_pair_btcusdt: CurrencyPair,
+        #[case] limit: usize,
+        #[case] spread: bool,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt);
+        let id = instrument.id();
+        let frame: OKXWsFrame =
+            serde_json::from_str(&load_test_json("ws_books_snapshot.json")).unwrap();
+
+        let OKXWsFrame::BookData { mut data, .. } = frame else {
+            panic!("expected book data");
+        };
+
+        if spread {
+            for message in &mut data {
+                for level in message.bids.iter_mut().chain(&mut message.asks) {
+                    level.liquidated_orders_count = level.orders_count.clone();
+                    level.orders_count = String::new();
+                }
+            }
+        }
+
+        let subscriptions = AtomicMap::new();
+        subscriptions.insert(id, limit);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let sender = sender.into();
+        OKXDataClient::send_book_depth(
+            &mut data,
+            &instrument,
+            &subscriptions,
+            &sender,
+            UnixNanos::from(103),
+            spread,
+        );
+
+        let DataEvent::Data(Data::BookDepth(initial)) = receiver.try_recv().unwrap() else {
+            panic!("expected depth");
+        };
+
+        assert_eq!(initial.instrument_id, id);
+        assert_eq!(initial.sequence, 123_456);
+        assert_eq!(initial.ts_event, UnixNanos::from(1_597_026_383_085_000_000));
+        assert_eq!(initial.ts_init, UnixNanos::from(103));
+        assert_eq!(initial.bids.len(), limit);
+        assert_eq!(initial.asks.len(), limit);
+        assert_eq!(initial.bid_counts.as_slice(), &[12, 1, 1, 1, 1][..limit]);
+        assert_eq!(initial.ask_counts.as_slice(), &[13, 2, 1, 1, 1][..limit]);
+
+        if spread {
+            data[0].bids[0].liquidated_orders_count = "invalid".to_string();
+        } else {
+            data[0].bids[0].orders_count = "invalid".to_string();
+        }
+
+        OKXDataClient::send_book_depth(
+            &mut data,
+            &instrument,
+            &subscriptions,
+            &sender,
+            UnixNanos::from(107),
+            spread,
+        );
+        assert!(receiver.try_recv().is_err());
+        data[0].bids.clear();
+        data[0].asks.clear();
+        data[0].seq_id = 17;
+        OKXDataClient::send_book_depth(
+            &mut data,
+            &instrument,
+            &subscriptions,
+            &sender,
+            UnixNanos::from(109),
+            spread,
+        );
+
+        let DataEvent::Data(Data::BookDepth(empty)) = receiver.try_recv().unwrap() else {
+            panic!("expected empty depth");
+        };
+
+        assert!(empty.bids.is_empty());
+        assert!(empty.asks.is_empty());
+        assert!(empty.bid_counts.is_empty());
+        assert!(empty.ask_counts.is_empty());
+        assert_eq!(empty.sequence, 17);
+        assert_eq!(empty.ts_init, UnixNanos::from(109));
+        subscriptions.remove(&id);
+        OKXDataClient::send_book_depth(
+            &mut data,
+            &instrument,
+            &subscriptions,
+            &sender,
+            UnixNanos::from(113),
+            spread,
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
     struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
 
     impl Drop for DropSignal {
@@ -3328,7 +3597,7 @@ mod tests {
     #[rstest]
     fn dispatch_parsed_data_emits_instrument_status() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let status = InstrumentStatus::new(
             InstrumentId::from("USDG-SGD.OKX"),
@@ -3344,7 +3613,7 @@ mod tests {
 
         dispatch_parsed_data(
             NautilusWsMessage::InstrumentStatus(status),
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
         );
 
@@ -3356,7 +3625,14 @@ mod tests {
     }
 
     #[rstest]
-    fn rejected_book_subscription_preserves_channel_and_sync_state() {
+    #[case::sent_permanent(false, "60018")]
+    #[case::unsent_permanent(true, "60018")]
+    #[case::sent_transient(false, "60014")]
+    #[case::unsent_transient(true, "60014")]
+    fn rejected_book_subscription_preserves_channel_and_sync_state(
+        #[case] sending: bool,
+        #[case] code: &str,
+    ) {
         let instrument_id = InstrumentId::from("OMI-USD.OKX");
         let mut pair = currency_pair_btcusdt();
         pair.id = instrument_id;
@@ -3371,9 +3647,14 @@ mod tests {
         let subscribed_at = Instant::now()
             .checked_sub(Duration::from_secs(6))
             .expect("subscription timestamp");
-        book_sync.record_subscription(instrument_id, subscribed_at);
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let gate = SnapshotGate::default();
+        if sending {
+            gate.lock().close();
+        }
+
+        let cancel = book_sync.record_subscription(instrument_id, subscribed_at, gate.clone());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let sender: EventSender<DataEvent> = sender.into();
         let http = offline_http_client();
         let update_lock = InstrumentUpdateLock::default();
         let mut quote_cache = QuoteCache::new();
@@ -3387,16 +3668,18 @@ mod tests {
             OKXWsMessage::SubscriptionFailed {
                 channel: OKXWsChannel::Books,
                 inst_id: Some(Ustr::from("OMI-USD")),
-                code: "60018".to_string(),
+                code: code.to_string(),
                 msg: "Channel does not exist".to_string(),
             },
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
             &update_lock,
             &book_channels,
             &book_sync,
+            &AtomicMap::new(),
+            &AtomicSet::new(),
             None,
             None,
             &mut quote_cache,
@@ -3421,6 +3704,16 @@ mod tests {
             1,
             "rejected subscription must keep book synchronization state for recovery"
         );
+        assert!(
+            !cancel.is_cancelled(),
+            "the initial snapshot wait keeps ownership until its deadline starts recovery"
+        );
+        gate.open();
+        assert_eq!(
+            book_sync.validate_sequence(instrument_id, true, &[(Some(-1), 42)], Instant::now()),
+            BookSequenceOutcome::Accept,
+            "a rejected subscription never suppresses a later snapshot"
+        );
     }
 
     #[rstest]
@@ -3436,7 +3729,7 @@ mod tests {
         let book_channels = Arc::new(AtomicMap::new());
         let book_sync = BookSyncTracker::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
         let http = offline_http_client();
         let update_lock = InstrumentUpdateLock::default();
         let mut quote_cache = QuoteCache::new();
@@ -3460,13 +3753,15 @@ mod tests {
 
         OKXDataClient::handle_ws_message(
             OKXWsMessage::Reconnected,
-            &sender,
+            &sender.clone().into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
             &update_lock,
             &book_channels,
             &book_sync,
+            &AtomicMap::new(),
+            &AtomicSet::new(),
             None,
             None,
             &mut quote_cache,
@@ -3504,13 +3799,15 @@ mod tests {
                     "ts": "3"
                 }]),
             },
-            &sender,
+            &sender.clone().into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
             &update_lock,
             &book_channels,
             &book_sync,
+            &AtomicMap::new(),
+            &AtomicSet::new(),
             None,
             None,
             &mut quote_cache,
@@ -3550,13 +3847,15 @@ mod tests {
                     "ts": "4"
                 }]),
             },
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
             &update_lock,
             &book_channels,
             &book_sync,
+            &AtomicMap::new(),
+            &AtomicSet::new(),
             None,
             None,
             &mut quote_cache,
@@ -3582,7 +3881,105 @@ mod tests {
     }
 
     #[rstest]
-    fn rpi_sequence_gap_suppresses_updates_until_fresh_snapshot() {
+    fn index_ticker_fan_out_emits_subscribed_symbols_in_sorted_order() {
+        // Five full symbols sharing one base pair, registered in non-sorted order
+        let symbols = [
+            "BTC-USDT-SWAP",
+            "BTC-USDT-241227",
+            "BTC-USDT-240628",
+            "BTC-USDT-250328",
+            "BTC-USDT-240906",
+        ];
+
+        let instruments_by_symbol = Arc::new(AtomicMap::new());
+
+        for symbol in symbols {
+            let mut pair = currency_pair_btcusdt();
+            let id = format!("{symbol}.OKX");
+            pair.id = InstrumentId::from(id.as_str());
+            pair.raw_symbol = Symbol::from(symbol);
+            instruments_by_symbol.insert(Ustr::from(symbol), InstrumentAny::CurrencyPair(pair));
+        }
+
+        let index_ticker_map = Arc::new(AtomicMap::new());
+        index_ticker_map.insert(
+            Ustr::from("BTC-USDT"),
+            AHashSet::from_iter(symbols.iter().map(|symbol| Ustr::from(symbol))),
+        );
+
+        let book_channels = Arc::new(AtomicMap::new());
+        let book_sync = BookSyncTracker::default();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let http = offline_http_client();
+        let update_lock = InstrumentUpdateLock::default();
+        let mut quote_cache = QuoteCache::new();
+        let mut funding_cache = AHashMap::new();
+        let option_greeks_subs = Arc::new(AtomicMap::new());
+        let task_group = TaskGroup::new();
+        let tasks = task_group.spawner().expect("task spawner");
+
+        OKXDataClient::handle_ws_message(
+            OKXWsMessage::ChannelData {
+                channel: OKXWsChannel::IndexTickers,
+                inst_id: Some(Ustr::from("BTC-USDT")),
+                data: json!([{
+                    "instId": "BTC-USDT",
+                    "idxPx": "65000.1",
+                    "high24h": "66000.0",
+                    "low24h": "64000.0",
+                    "open24h": "64500.0",
+                    "sodUtc0": "64500.0",
+                    "sodUtc8": "64600.0",
+                    "ts": "1710000000000"
+                }]),
+            },
+            &sender.into(),
+            &instruments_by_symbol,
+            &http,
+            &OKXDataClientConfig::default(),
+            &update_lock,
+            &book_channels,
+            &book_sync,
+            &AtomicMap::new(),
+            &AtomicSet::new(),
+            None,
+            None,
+            &mut quote_cache,
+            &mut funding_cache,
+            &index_ticker_map,
+            &option_greeks_subs,
+            BookChannelScope::Public,
+            Duration::ZERO,
+            &tasks,
+            get_atomic_clock_realtime(),
+        );
+
+        let mut instrument_ids = Vec::new();
+
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                DataEvent::Data(Data::IndexPrice(update)) => {
+                    instrument_ids.push(update.instrument_id);
+                }
+                other => panic!("Expected DataEvent::Data(Data::IndexPrice), was {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            instrument_ids,
+            [
+                "BTC-USDT-240628.OKX",
+                "BTC-USDT-240906.OKX",
+                "BTC-USDT-241227.OKX",
+                "BTC-USDT-250328.OKX",
+                "BTC-USDT-SWAP.OKX",
+            ]
+            .map(InstrumentId::from)
+        );
+    }
+
+    #[rstest]
+    fn rpi_missing_recovery_transport_restores_on_next_snapshot() {
         let instrument_id = InstrumentId::from("OMI-USD.OKX");
         let mut pair = currency_pair_btcusdt();
         pair.id = instrument_id;
@@ -3598,9 +3995,9 @@ mod tests {
         let book_channels = Arc::new(AtomicMap::new());
         book_channels.insert(instrument_id, OKXBookChannel::BooksRpi);
         let book_sync = BookSyncTracker::default();
-        book_sync.record_subscription(instrument_id, Instant::now());
+        book_sync.record_subscription(instrument_id, Instant::now(), SnapshotGate::default());
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
         let http = offline_http_client();
         let update_lock = InstrumentUpdateLock::default();
         let index_ticker_map = Arc::new(AtomicMap::new());
@@ -3621,13 +4018,15 @@ mod tests {
         let mut handle = |message| {
             OKXDataClient::handle_ws_message(
                 message,
-                &sender,
+                &sender.clone().into(),
                 &instruments_by_symbol,
                 &http,
                 &OKXDataClientConfig::default(),
                 &update_lock,
                 &book_channels,
                 &book_sync,
+                &AtomicMap::new(),
+                &AtomicSet::new(),
                 None,
                 None,
                 &mut quote_cache,
@@ -3660,6 +4059,14 @@ mod tests {
             unreachable!()
         };
         data[0].seq_id = 2_000;
+        handle(rpi_book_message("ws_books_rpi_snapshot.json"));
+        assert!(matches!(receiver.try_recv(), Ok(DataEvent::Data(_))));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        handle(OKXWsMessage::Reconnected);
         handle(recovered_snapshot);
         assert!(matches!(receiver.try_recv(), Ok(DataEvent::Data(_))));
         assert!(matches!(
@@ -3842,7 +4249,7 @@ mod tests {
     }
 
     fn handle_instruments_message(
-        sender: &IngressSender<DataEvent>,
+        sender: &EventSender<DataEvent>,
         instruments_by_symbol: &Arc<AtomicMap<Ustr, InstrumentAny>>,
         http_client: &OKXHttpClient,
         config: &OKXDataClientConfig,
@@ -3869,6 +4276,8 @@ mod tests {
             &update_lock,
             &book_channels,
             &book_sync,
+            &AtomicMap::new(),
+            &AtomicSet::new(),
             recovery_ws,
             business_ws,
             &mut quote_cache,
@@ -3885,14 +4294,14 @@ mod tests {
     #[rstest]
     fn ws_instruments_publishes_new_definition_and_status() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
         let ws_public = offline_ws_client();
         let ws_business = offline_ws_client();
 
         handle_instruments_message(
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -3944,13 +4353,13 @@ mod tests {
     #[rstest]
     fn ws_instruments_unchanged_definition_emits_status_only() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
 
         for _ in 0..2 {
             handle_instruments_message(
-                &sender,
+                &sender.clone().into(),
                 &instruments_by_symbol,
                 &http,
                 &OKXDataClientConfig::default(),
@@ -3987,12 +4396,12 @@ mod tests {
     #[rstest]
     fn ws_instruments_changed_definition_is_republished() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
 
         handle_instruments_message(
-            &sender,
+            &sender.clone().into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -4001,7 +4410,7 @@ mod tests {
             ws_instruments_message(swap_definition("0.1")),
         );
         handle_instruments_message(
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -4047,14 +4456,14 @@ mod tests {
     #[rstest]
     fn ws_instruments_invalid_definition_emits_status_only() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
         let mut definition = swap_definition("0.1");
         definition["uly"] = json!("");
 
         handle_instruments_message(
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -4085,7 +4494,7 @@ mod tests {
     #[rstest]
     fn ws_instruments_batch_publishes_each_valid_definition() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
         let mut eth_definition = swap_definition("0.01");
@@ -4098,7 +4507,7 @@ mod tests {
         ]);
 
         handle_instruments_message(
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -4140,7 +4549,7 @@ mod tests {
     #[rstest]
     fn ws_instruments_respects_contract_type_filter() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
         let config = OKXDataClientConfig::builder()
@@ -4148,7 +4557,7 @@ mod tests {
             .build();
 
         handle_instruments_message(
-            &sender,
+            &sender.clone().into(),
             &instruments_by_symbol,
             &http,
             &config,
@@ -4179,7 +4588,7 @@ mod tests {
         assert_eq!(inverse_item["instId"], json!("BTC-USD-SWAP"));
         assert_eq!(inverse_item["ctType"], json!("inverse"));
         handle_instruments_message(
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &config,
@@ -4204,7 +4613,7 @@ mod tests {
     #[rstest]
     fn ws_instruments_respects_family_filter() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let http = offline_http_client();
         let config = OKXDataClientConfig::builder()
@@ -4217,7 +4626,7 @@ mod tests {
         eth_definition["uly"] = json!("ETH-USDT");
 
         handle_instruments_message(
-            &sender,
+            &sender.clone().into(),
             &instruments_by_symbol,
             &http,
             &config,
@@ -4242,7 +4651,7 @@ mod tests {
         assert!(instruments_by_symbol.load().is_empty());
 
         handle_instruments_message(
-            &sender,
+            &sender.into(),
             &instruments_by_symbol,
             &http,
             &config,
@@ -4281,7 +4690,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
 
         let summary = reconcile_instruments(
             &http,
@@ -4290,7 +4699,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("reconcile");
@@ -4327,7 +4736,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
 
         let summary = reconcile_instruments(
             &http,
@@ -4336,7 +4745,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("reconcile");
@@ -4367,6 +4776,7 @@ mod tests {
             inst_family: Ustr::from(""),
             series_id: Some(Ustr::from("BTC-ABOVE-DAILY")),
             inst_category: Some(crate::common::enums::OKXInstrumentCategory::Crypto),
+            group_id: None,
             init_px_lmt_pct: String::new(),
             float_px_lmt_pct: String::new(),
             max_px_lmt_pct: String::new(),
@@ -4404,8 +4814,6 @@ mod tests {
             &okx_inst,
             None,
             None,
-            None,
-            None,
             UnixNanos::from(1u64),
         )
         .expect("parse events instrument");
@@ -4438,7 +4846,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
 
         reconcile_instruments(
             &http,
@@ -4447,7 +4855,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("reconcile");
@@ -4458,7 +4866,7 @@ mod tests {
         let rest_item = test_payload("http_get_instruments_swap.json")["data"][2].clone();
         assert_eq!(rest_item["instId"], json!("BTC-USDT-SWAP"));
         handle_instruments_message(
-            &sender,
+            &sender.clone().into(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -4486,26 +4894,12 @@ mod tests {
     fn definitions_match_ignores_event_timestamps() {
         let okx_instrument: OKXInstrument =
             serde_json::from_value(swap_definition("0.1")).expect("valid OKXInstrument");
-        let first = parse_instrument_any(
-            &okx_instrument,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::from(1u64),
-        )
-        .expect("parse")
-        .expect("instrument");
-        let second = parse_instrument_any(
-            &okx_instrument,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::from(2u64),
-        )
-        .expect("parse")
-        .expect("instrument");
+        let first = parse_instrument_any(&okx_instrument, None, None, UnixNanos::from(1u64))
+            .expect("parse")
+            .expect("instrument");
+        let second = parse_instrument_any(&okx_instrument, None, None, UnixNanos::from(2u64))
+            .expect("parse")
+            .expect("instrument");
 
         assert!(instrument_definitions_match(&first, &second));
     }
@@ -4687,7 +5081,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
 
         let summary = reconcile_instruments(
             &http,
@@ -4696,7 +5090,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("initial reconcile");
@@ -4713,7 +5107,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("unchanged reconcile");
@@ -4736,7 +5130,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("changed reconcile");
@@ -4764,7 +5158,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("new listing reconcile");
@@ -4789,7 +5183,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("removal reconcile");
@@ -4819,8 +5213,8 @@ mod tests {
         let config = OKXDataClientConfig::default();
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let sender: EventSender<DataEvent> = sender.into();
 
         let result = reconcile_instruments(
             &http,
@@ -4829,7 +5223,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await;
 
@@ -4858,7 +5252,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
 
         let summary = reconcile_instruments(
             &http,
@@ -4867,7 +5261,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("reconcile");
@@ -4916,7 +5310,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
 
         let summary = reconcile_instruments(
             &http,
@@ -4925,7 +5319,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("reconcile");
@@ -4959,7 +5353,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = InstrumentUpdateLock::default();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
 
         let summary = reconcile_instruments(
             &http,
@@ -4968,7 +5362,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("reconcile");
@@ -4993,7 +5387,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = Arc::new(InstrumentUpdateLock::default());
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
         let ws = offline_ws_client();
         let ws_business = offline_ws_client();
 
@@ -5011,7 +5405,7 @@ mod tests {
                 &update_lock_task,
                 Some(&ws_task),
                 Some(&ws_business_task),
-                &sender,
+                &sender.clone().into(),
             )
             .await
         });
@@ -5058,7 +5452,7 @@ mod tests {
         let instruments_by_symbol = Arc::new(AtomicMap::new());
         let update_lock = Arc::new(InstrumentUpdateLock::default());
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
 
         gate.add_permits(1);
         let summary = reconcile_instruments(
@@ -5068,7 +5462,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender,
+            &sender.clone().into(),
         )
         .await
         .expect("seed reconcile");
@@ -5089,7 +5483,7 @@ mod tests {
                     &update_lock,
                     None,
                     None,
-                    &sender,
+                    &sender.clone().into(),
                 )
                 .await
             })
@@ -5105,7 +5499,7 @@ mod tests {
         let mut v2_item = test_payload("http_get_instruments_spot.json")["data"][0].clone();
         v2_item["tickSz"] = json!("0.5");
         let v2: OKXInstrument = serde_json::from_value(v2_item).expect("valid OKXInstrument");
-        let v2 = parse_instrument_any(&v2, None, None, None, None, UnixNanos::from(1u64))
+        let v2 = parse_instrument_any(&v2, None, None, UnixNanos::from(1u64))
             .expect("parse")
             .expect("instrument");
         {
@@ -5117,7 +5511,7 @@ mod tests {
                 None,
                 None,
                 &update_lock,
-                &sender,
+                &sender.clone().into(),
             );
         }
 
@@ -5156,7 +5550,7 @@ mod tests {
 
     #[tokio::test]
     async fn paused_recovery_data_inventory_requires_pristine_adapter() {
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
         replace_data_event_sender(sender);
         let mut client =
             OKXDataClient::new(*OKX_CLIENT_ID, OKXDataClientConfig::default()).unwrap();
@@ -5195,8 +5589,8 @@ mod tests {
         let config = OKXDataClientConfig::builder()
             .update_instruments_interval_mins(0)
             .build();
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let sender: EventSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let client = OKXDataClient::new(*OKX_CLIENT_ID, config).expect("data client");
 
@@ -5210,8 +5604,8 @@ mod tests {
     #[case::repeated_stop(DataTaskBoundary::RepeatedStop)]
     #[tokio::test]
     async fn lifecycle_boundary_terminates_owned_data_task(#[case] boundary: DataTaskBoundary) {
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let sender: EventSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let mut client = OKXDataClient::new(*OKX_CLIENT_ID, OKXDataClientConfig::default())
             .expect("data client");
@@ -5254,8 +5648,8 @@ mod tests {
             ..spot_refresh_state()
         };
         let addr = start_refresh_server(state.clone()).await;
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let sender: EventSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let config = OKXDataClientConfig {
             instrument_types: vec![OKXInstrumentType::Spot],
@@ -5312,8 +5706,8 @@ mod tests {
         let config = OKXDataClientConfig::builder()
             .update_instruments_interval_mins(60)
             .build();
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let sender: EventSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let client = OKXDataClient::new(*OKX_CLIENT_ID, config).expect("data client");
 
@@ -5572,8 +5966,8 @@ mod tests {
     async fn reconnect_does_not_leak_refresh_tasks() {
         let state = spot_refresh_state();
         let addr = start_refresh_server(state).await;
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let sender: EventSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let config = OKXDataClientConfig {
             instrument_types: vec![OKXInstrumentType::Spot],
@@ -5615,8 +6009,8 @@ mod tests {
     async fn reset_drains_old_generation_before_reconnect() {
         let state = spot_refresh_state();
         let addr = start_refresh_server(state).await;
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let sender: EventSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let config = OKXDataClientConfig {
             instrument_types: vec![OKXInstrumentType::Spot],
@@ -5648,7 +6042,7 @@ mod tests {
         let state = spot_refresh_state();
         let addr = start_refresh_server(state.clone()).await;
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let sender: EventSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let config = OKXDataClientConfig {
             instrument_types: vec![OKXInstrumentType::Spot],
@@ -5700,8 +6094,8 @@ mod tests {
     async fn stop_cancels_refresh_task() {
         let state = spot_refresh_state();
         let addr = start_refresh_server(state).await;
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let sender: EventSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let config = OKXDataClientConfig {
             instrument_types: vec![OKXInstrumentType::Spot],
@@ -5733,8 +6127,8 @@ mod tests {
     #[tokio::test]
     async fn zero_interval_disables_refresh_on_connect() {
         let addr = start_refresh_server(spot_refresh_state()).await;
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let sender: IngressSender<DataEvent> = sender.into();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let sender: EventSender<DataEvent> = sender.into();
         replace_data_event_sender(sender);
         let config = OKXDataClientConfig {
             instrument_types: vec![OKXInstrumentType::Spot],
@@ -5762,3 +6156,7 @@ mod tests {
         client.disconnect().await.expect("disconnect");
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/integration/book_sync.rs"]
+mod book_sync_tests;

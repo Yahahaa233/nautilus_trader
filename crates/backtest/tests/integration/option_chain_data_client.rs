@@ -18,7 +18,7 @@ use std::{cell::RefCell, rc::Rc};
 use nautilus_backtest::data_client::BacktestDataClient;
 use nautilus_common::{
     cache::Cache,
-    clock::{Clock, TestClock},
+    clock::{Clock, VirtualClock},
     messages::data::{DataCommand, SubscribeCommand, SubscribeOptionChain},
     msgbus::MessageBus,
 };
@@ -77,7 +77,7 @@ fn test_atm_relative_subscription_unblocks_via_backtest_client() {
     let _ =
         MessageBus::new(TraderId::test_default(), UUID4::new(), None, None).register_message_bus();
 
-    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
     let cache = Rc::new(RefCell::new(Cache::default()));
 
     let data_engine = Rc::new(RefCell::new(DataEngine::new(
@@ -110,7 +110,7 @@ fn test_atm_relative_subscription_unblocks_via_backtest_client() {
             .add_instrument(make_btc_option(strike, OptionKind::Put));
     }
 
-    let series_id = OptionSeriesId::new(
+    let series_id = OptionSeriesId::new_derived(
         venue,
         Ustr::from("BTC"),
         Ustr::from("BTC"),

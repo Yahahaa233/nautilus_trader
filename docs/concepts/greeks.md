@@ -253,7 +253,10 @@ Filters:
 - `strategy_id`: restrict to a single strategy.
 - `side`: filter by position side, such as `LONG` or `SHORT`.
 - `greeks_filter`: callable that receives per-position `GreeksData` after `pnl`, `price`, and the
-  Greek values are scaled by signed position quantity; return `True` to include it.
+  Greek values are scaled by the contract multiplier, then signed position quantity; return `True`
+  to include it. Instrument context, including `multiplier` and `quantity`, stays unchanged.
+  Use these values directly: `to_portfolio_greeks()` or Python scalar multiplication applies the
+  multiplier again.
 
 ### GreeksData
 
@@ -287,31 +290,36 @@ Python surface does not expose that flag.
 | `rho`              | `float`        | Rho, set to zero by the local calculator.                           |
 | `itm_prob`         | `float`        | In-the-money probability.                                           |
 
-Internally, `portfolio_greeks()` multiplies `pnl`, `price`, and the Greek values by each position's
-signed quantity before adding them to the portfolio result. The intermediate `quantity` field
-remains `1` and is not part of `PortfolioGreeks`. The calculation **does not apply** the `multiplier`
-field, and the public Python types do not expose arithmetic operators for this aggregation.
-Rust callers can apply the same scaling with `quantity * &greeks_data`, which returns `GreeksData`
-with scaled `pnl`, `price`, and Greek values.
+`GreeksData.to_portfolio_greeks()` applies the contract multiplier once to `pnl`, `price`, and all
+five Greek values, including `rho`, and returns `PortfolioGreeks` with the same timestamps.
+It leaves position quantity scaling to the caller and preserves the per-unit `GreeksData`.
+In Python, `scalar * greeks_data` converts and scales the result, returning `PortfolioGreeks`.
+
+`portfolio_greeks()` uses this multiplier-first, quantity-second scaling before filtering and
+aggregation. The intermediate `quantity` field remains `1` and is not part of `PortfolioGreeks`.
+Rust callers use `quantity * &greeks_data.to_portfolio_greeks()` for the same result.
+The Rust expression `quantity * &greeks_data` retains quantity-only scaling and returns `GreeksData`.
 
 ### PortfolioGreeks
 
-`PortfolioGreeks` is the aggregated result from `portfolio_greeks()`:
+`PortfolioGreeks` is the result of conversion and portfolio aggregation.
 
-The Rust type implements `Add` to combine portfolio results. The Python type does not expose this
-operator.
+Rust and Python support addition of portfolio results, preserving the left operand's timestamps.
+Scalar-left multiplication scales `pnl`, `price`, and all five Greek values while preserving timestamps.
+Use `scalar * &portfolio_greeks` in Rust and `scalar * portfolio_greeks` in Python.
+The Python `GreeksData` and `PortfolioGreeks` types support scalar-left multiplication only.
 
-| Field      | Type    | Description                                          |
-| ---------- | ------- | ---------------------------------------------------- |
-| `ts_init`  | `int`   | Initialization timestamp in nanoseconds.             |
-| `ts_event` | `int`   | Event timestamp in nanoseconds.                      |
-| `pnl`      | `float` | Aggregate PnL after signed-quantity scaling.         |
-| `price`    | `float` | Aggregate model value after signed-quantity scaling. |
-| `delta`    | `float` | Portfolio delta.                                     |
-| `gamma`    | `float` | Portfolio gamma.                                     |
-| `vega`     | `float` | Portfolio vega.                                      |
-| `theta`    | `float` | Portfolio theta.                                     |
-| `rho`      | `float` | Portfolio rho, zero for local calculator results.    |
+| Field      | Type    | Description                                                         |
+| ---------- | ------- | ------------------------------------------------------------------- |
+| `ts_init`  | `int`   | Initialization timestamp in nanoseconds.                            |
+| `ts_event` | `int`   | Event timestamp in nanoseconds.                                     |
+| `pnl`      | `float` | Aggregate PnL after multiplier and signed-quantity scaling.         |
+| `price`    | `float` | Aggregate model value after multiplier and signed-quantity scaling. |
+| `delta`    | `float` | Portfolio delta.                                                    |
+| `gamma`    | `float` | Portfolio gamma.                                                    |
+| `vega`     | `float` | Portfolio vega.                                                     |
+| `theta`    | `float` | Portfolio theta.                                                    |
+| `rho`      | `float` | Portfolio rho, zero for local calculator results.                   |
 
 ### Yield curves
 

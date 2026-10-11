@@ -195,7 +195,7 @@ impl BusCaptureAdapter {
     ///
     /// # Errors
     ///
-    /// Returns:
+    /// Returns an error if:
     ///
     /// - [`CaptureError::Halted`] when a prior capture already observed an encoding or writer failure
     ///   and the adapter has fail-stopped.
@@ -222,7 +222,7 @@ impl BusCaptureAdapter {
     ///
     /// # Errors
     ///
-    /// See [`Self::capture`].
+    /// Returns an error if [`Self::capture`] fails.
     pub fn capture_any(
         &self,
         topic: Topic,

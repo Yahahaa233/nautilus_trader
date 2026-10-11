@@ -2618,7 +2618,9 @@ mod tests {
             messages::DataEvent,
             recovery_trace::{NativePendingInput, set_native_ingress_encoder},
         };
-        use nautilus_model::instruments::{InstrumentAny, stubs::xbtusd_bitmex};
+        use nautilus_model::instruments::{InstrumentAny, stubs::btcusd_bybit};
+        // Official develop retired the BitMEX stub; retain an actual inverse BTC perp
+        // on both source and historical replay sides of the exact payload proof.
 
         fn encode(input: &DataEvent) -> Value {
             match input {
@@ -2661,7 +2663,7 @@ mod tests {
         // The ordinary owned channel generates both admission and original parent cause.
         sender
             .send(DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
-                xbtusd_bitmex(),
+                btcusd_bybit(),
             )))
             .unwrap();
         original_root
@@ -2709,7 +2711,7 @@ mod tests {
         // Consumes the exact original queued output without physically sending it again.
         sender
             .send(DataEvent::Instrument(InstrumentAny::CryptoPerpetual(
-                xbtusd_bitmex(),
+                btcusd_bybit(),
             )))
             .unwrap();
         assert!(receiver.try_recv().is_err());

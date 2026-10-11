@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::runner::AsyncRunner;
-use nautilus_common::live::ingress::IngressSender;
+use nautilus_common::live::{dispatch::DispatchMessage, ingress::IngressSender};
 
 /// Current wire schema for a recovery input sent to a runner channel.
 pub const RUNNER_RECOVERY_ENVELOPE_SCHEMA_VERSION: u16 = 1;
@@ -662,12 +662,31 @@ pub struct RunnerPendingEntry {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RunnerPendingSnapshot {
     pub(crate) entries: Vec<RunnerPendingEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) callback_ancestry: Option<RunnerCallbackAncestry>,
 }
+
+/// Versioned callback metadata bound to the unchanged physical FIFO receipts.
+/// Serialized data is accepted only through the original verified native cut.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerCallbackAncestry {
+    pub(crate) profile: String,
+    pub(crate) receipts: Vec<Option<nautilus_common::recovery_trace::NativeIngressReceipt>>,
+    pub(crate) state: nautilus_common::actor::CallbackAncestryState,
+}
+pub(crate) const CALLBACK_ANCESTRY_PROFILE: &str = "actual_frozen_native_fifo_callback_ancestry.v1";
+
 impl RunnerPendingSnapshot {
     /// Borrows encoded entries without implying a global FIFO or execution grant.
     #[must_use]
     pub fn entries(&self) -> &[RunnerPendingEntry] {
         &self.entries
+    }
+    /// Original callback budgets and shared roots for the actual captured queues.
+    #[must_use]
+    pub const fn callback_ancestry(&self) -> Option<&RunnerCallbackAncestry> {
+        self.callback_ancestry.as_ref()
     }
 }
 
@@ -824,9 +843,14 @@ impl RunnerRecoveryCodecRegistry {
         );
         if let RunnerRecoveryEventRef::TimeEvent(message) = event {
             let binding = message.checkpoint_callback_binding();
-            ensure!(binding["owner_thread_matches"].as_bool() == Some(true)
-                && matches!(binding["kind"].as_str(), Some("registered_owner_thread" | "registered_cleanup")),
-                "timer message has no actual owner-bound callback identity");
+            ensure!(
+                binding["owner_thread_matches"].as_bool() == Some(true)
+                    && matches!(
+                        binding["kind"].as_str(),
+                        Some("registered_owner_thread" | "registered_cleanup")
+                    ),
+                "timer message has no actual owner-bound callback identity"
+            );
         }
         let codec = self
             .codecs
@@ -881,26 +905,26 @@ impl RunnerRecoveryCodecRegistry {
 pub struct RunnerRecoveryHandoff {
     available: Arc<AtomicBool>,
     progress: RunnerRecoveryProgressHandle,
-    time_evt_tx: IngressSender<TimeEventMessage>,
-    system_evt_tx: IngressSender<SystemEvent>,
-    system_cmd_tx: IngressSender<SystemCommand>,
-    exec_evt_tx: IngressSender<ExecutionEvent>,
-    exec_cmd_tx: IngressSender<TradingCommandMessage>,
-    data_evt_tx: IngressSender<DataEvent>,
-    data_cmd_tx: IngressSender<DataCommand>,
+    time_evt_tx: IngressSender<DispatchMessage<TimeEventMessage>>,
+    system_evt_tx: IngressSender<DispatchMessage<SystemEvent>>,
+    system_cmd_tx: IngressSender<DispatchMessage<SystemCommand>>,
+    exec_evt_tx: IngressSender<DispatchMessage<ExecutionEvent>>,
+    exec_cmd_tx: IngressSender<DispatchMessage<TradingCommandMessage>>,
+    data_evt_tx: IngressSender<DispatchMessage<DataEvent>>,
+    data_cmd_tx: IngressSender<DispatchMessage<DataCommand>>,
     last_dispatch_sequence: Option<u64>,
     watermark: Option<RunnerRecoveryWatermark>,
 }
 
 #[derive(Debug)]
 struct RunnerRecoverySenders {
-    time_event: IngressSender<TimeEventMessage>,
-    system_event: IngressSender<SystemEvent>,
-    system_command: IngressSender<SystemCommand>,
-    execution_event: IngressSender<ExecutionEvent>,
-    execution_command: IngressSender<TradingCommandMessage>,
-    data_event: IngressSender<DataEvent>,
-    data_command: IngressSender<DataCommand>,
+    time_event: IngressSender<DispatchMessage<TimeEventMessage>>,
+    system_event: IngressSender<DispatchMessage<SystemEvent>>,
+    system_command: IngressSender<DispatchMessage<SystemCommand>>,
+    execution_event: IngressSender<DispatchMessage<ExecutionEvent>>,
+    execution_command: IngressSender<DispatchMessage<TradingCommandMessage>>,
+    data_event: IngressSender<DispatchMessage<DataEvent>>,
+    data_command: IngressSender<DispatchMessage<DataCommand>>,
 }
 
 impl RunnerRecoveryHandoff {
@@ -1180,31 +1204,31 @@ impl RunnerRecoveryHandoff {
         match event {
             RunnerRecoveryEvent::TimeEvent(message) => self
                 .time_evt_tx
-                .send(message)
+                .send(message.into())
                 .map_err(|_| anyhow::anyhow!("runner time-event receiver is closed")),
             RunnerRecoveryEvent::SystemEvent(event) => self
                 .system_evt_tx
-                .send(event)
+                .send(event.into())
                 .map_err(|_| anyhow::anyhow!("runner system-event receiver is closed")),
             RunnerRecoveryEvent::SystemCommand(command) => self
                 .system_cmd_tx
-                .send(command)
+                .send(command.into())
                 .map_err(|_| anyhow::anyhow!("runner system-command receiver is closed")),
             RunnerRecoveryEvent::ExecutionEvent(event) => self
                 .exec_evt_tx
-                .send(event)
+                .send(event.into())
                 .map_err(|_| anyhow::anyhow!("runner execution-event receiver is closed")),
             RunnerRecoveryEvent::ExecutionCommand(command) => self
                 .exec_cmd_tx
-                .send(command)
+                .send(command.into())
                 .map_err(|_| anyhow::anyhow!("runner execution-command receiver is closed")),
             RunnerRecoveryEvent::DataEvent(event) => self
                 .data_evt_tx
-                .send(event)
+                .send(event.into())
                 .map_err(|_| anyhow::anyhow!("runner data-event receiver is closed")),
             RunnerRecoveryEvent::DataCommand(command) => self
                 .data_cmd_tx
-                .send(command)
+                .send(command.into())
                 .map_err(|_| anyhow::anyhow!("runner data-command receiver is closed")),
         }
     }
@@ -1335,8 +1359,8 @@ mod tests {
         let mut channels = runner.take_channels();
         let first = channels.system_cmd_rx.try_recv().unwrap();
         let second = channels.system_cmd_rx.try_recv().unwrap();
-        let SystemCommand::ReconnectSocket(first) = first;
-        let SystemCommand::ReconnectSocket(second) = second;
+        let SystemCommand::ReconnectSocket(first) = first.message();
+        let SystemCommand::ReconnectSocket(second) = second.message();
         assert_eq!(first.endpoint, Ustr::from("endpoint-1"));
         assert_eq!(second.endpoint, Ustr::from("endpoint-2"));
         assert!(
@@ -1507,8 +1531,8 @@ mod tests {
         assert_eq!(sent.received_watermark, None);
         assert_eq!(sent.processed_watermark, None);
         let mut channels = runner.take_channels();
-        let SystemCommand::ReconnectSocket(received_command) =
-            channels.system_cmd_rx.try_recv().unwrap();
+        let received = channels.system_cmd_rx.try_recv().unwrap();
+        let SystemCommand::ReconnectSocket(received_command) = received.message();
         assert_eq!(received_command.endpoint, Ustr::from("endpoint-4"));
         let received = binding.acknowledge_received().unwrap();
         assert_eq!(received.received_watermark, Some(4));

@@ -48,7 +48,7 @@ use nautilus_live::{ExecutionClientCore, SocketReconnectRegistry, SocketReconnec
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce, TriggerType},
-    events::{AccountState, OrderAccepted, OrderEventAny, OrderRejected},
+    events::{AccountState, OrderAccepted, OrderCanceled, OrderEventAny, OrderRejected},
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
     },
@@ -250,6 +250,102 @@ async fn test_exec_client_connect_aborts_when_fee_lookup_fails() {
 
 #[rstest]
 #[tokio::test]
+async fn test_exec_client_refreshes_fees_on_reconnect() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+    client.connect().await.unwrap();
+    client.disconnect().await.unwrap();
+    state
+        .whoami_fail
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let error = client.connect().await.unwrap_err();
+
+    assert_eq!(error.to_string(), "failed to resolve AX account fee rates");
+    assert!(!client.is_connected());
+}
+
+#[rstest]
+#[case::maker(false, false, "1000.00 USD")]
+#[case::taker(true, false, "12500.00 USD")]
+#[case::maker_reconnected(false, true, "3000.00 USD")]
+#[case::taker_reconnected(true, true, "6500.00 USD")]
+#[tokio::test]
+async fn test_exec_client_stream_fill_uses_account_fee_rates(
+    #[case] agg: bool,
+    #[case] reconnect: bool,
+    #[case] expected: &str,
+) {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+    let mut fill = load_test_data("ws_order_filled.json");
+    fill["o"]["aid"] = serde_json::json!("01JBXR-7QK2-0000");
+    fill["xs"]["aid"] = serde_json::json!("01JBXR-7QK2-0000");
+    fill["xs"]["agg"] = serde_json::json!(agg);
+    *state.order_fill_payload.lock().await = Some(fill);
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    if reconnect {
+        client.disconnect().await.unwrap();
+        let mut whoami = load_test_data("http_get_whoami.json");
+        whoami["accounts"][0]["maker_fee"] = serde_json::json!("0.0006");
+        whoami["accounts"][0]["taker_fee"] = serde_json::json!("0.0013");
+        *state.whoami_payload.lock().await = Some(whoami);
+        client.connect().await.unwrap();
+    }
+
+    drain_rx(&mut rx);
+    let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
+    let client_order_id = ClientOrderId::from("O-COMMISSION");
+    let mut builder = OrderTestBuilder::new(OrderType::Limit);
+    builder
+        .trader_id(TraderId::from("TESTER-001"))
+        .strategy_id(StrategyId::from("S-001"))
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("100"))
+        .price(Price::from("50000.0000"))
+        .time_in_force(TimeInForce::Gtc);
+    let order = builder.build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(*AX_CLIENT_ID), false)
+        .unwrap();
+
+    client.submit_order(make_submit_order_cmd(&order)).unwrap();
+
+    let fill = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(ExecutionEvent::Order(OrderEventAny::Filled(fill))) = rx.recv().await {
+                break fill;
+            }
+        }
+    })
+    .await
+    .expect("stream fill should arrive");
+
+    client.disconnect().await.unwrap();
+
+    assert_eq!(fill.commission, Some(Money::from(expected)));
+    assert_eq!(
+        state
+            .whoami_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        if reconnect { 2 } else { 1 }
+    );
+    assert_eq!(fill.client_order_id, client_order_id);
+    assert_eq!(fill.instrument_id, instrument_id);
+    assert_eq!(fill.account_id, AccountId::from("AX-001"));
+    assert_eq!(fill.last_qty.as_decimal(), dec!(100));
+    assert_eq!(fill.last_px.as_decimal(), dec!(50000));
+    assert_eq!(fill.trade_id.as_str(), "T-01ARZ3NDEKTSV4RRFFQ69G5FAV");
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_exec_client_emits_account_state_on_connect() {
     let (addr, _state) = start_test_server().await.unwrap();
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -375,9 +471,11 @@ fn add_open_order_to_cache(
     client_order_id: &str,
     venue_order_id: &str,
     instrument_id: InstrumentId,
+    side: OrderSide,
+    strategy_id: &str,
 ) {
     let trader_id = TraderId::from("TESTER-001");
-    let strategy_id = StrategyId::from("S-001");
+    let strategy_id = StrategyId::from(strategy_id);
     let coid = ClientOrderId::from(client_order_id);
 
     let order = LimitOrder::new(
@@ -385,7 +483,7 @@ fn add_open_order_to_cache(
         strategy_id,
         instrument_id,
         coid,
-        OrderSide::Buy,
+        side,
         Quantity::from("1"),
         Price::from("50000.00"),
         TimeInForce::Gtc,
@@ -445,8 +543,22 @@ async fn test_cancel_all_orders_uses_http_endpoint() {
     client.connect().await.expect("Failed to connect");
 
     let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
-    add_open_order_to_cache(&cache, "O-001", "VOI-001", instrument_id);
-    add_open_order_to_cache(&cache, "O-002", "VOI-002", instrument_id);
+    add_open_order_to_cache(
+        &cache,
+        "O-001",
+        "VOI-001",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
+    add_open_order_to_cache(
+        &cache,
+        "O-002",
+        "VOI-002",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
 
     let cmd = CancelAllOrders {
         trader_id: TraderId::from("TESTER-001"),
@@ -482,6 +594,222 @@ async fn test_cancel_all_orders_uses_http_endpoint() {
         .filter(|m| m.get("t").and_then(|v| v.as_str()) == Some("c"))
         .count();
     assert_eq!(ws_cancel_count, 0);
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[case::buy(OrderSide::Buy, vec!["VOI-BUY-1", "VOI-BUY-2"])]
+#[case::sell(OrderSide::Sell, vec!["VOI-SELL-1"])]
+#[tokio::test]
+async fn test_cancel_all_orders_with_side_cancels_matching_side_via_batch(
+    #[case] order_side: OrderSide,
+    #[case] expected_venue_order_ids: Vec<&str>,
+) {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+
+    let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
+    let other_instrument_id = InstrumentId::from("BTC-PERP.AX");
+
+    add_open_order_to_cache(
+        &cache,
+        "O-BUY-1",
+        "VOI-BUY-1",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
+    add_open_order_to_cache(
+        &cache,
+        "O-BUY-2",
+        "VOI-BUY-2",
+        instrument_id,
+        OrderSide::Buy,
+        "S-002",
+    );
+    add_open_order_to_cache(
+        &cache,
+        "O-SELL-1",
+        "VOI-SELL-1",
+        instrument_id,
+        OrderSide::Sell,
+        "S-001",
+    );
+    add_open_order_to_cache(
+        &cache,
+        "O-OTHER",
+        "VOI-OTHER",
+        other_instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
+
+    let cmd = CancelAllOrders {
+        trader_id: TraderId::from("TESTER-001"),
+        client_id: Some(*AX_CLIENT_ID),
+        strategy_id: StrategyId::from("S-001"),
+        instrument_id,
+        order_side: Some(order_side),
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    client
+        .cancel_all_orders(cmd)
+        .expect("cancel_all_orders should not error");
+
+    // Allow spawned fan-out tasks to complete
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert_eq!(
+        state
+            .cancel_all_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "Sided cancel-all must not hit the venue-wide HTTP cancel-all endpoint"
+    );
+
+    let messages = state.get_messages().await;
+    let mut canceled_oids: Vec<String> = messages
+        .iter()
+        .filter(|m| m.get("t").and_then(|v| v.as_str()) == Some("x"))
+        .filter_map(|m| m.get("oid").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect();
+
+    canceled_oids.sort();
+    let mut expected_oids: Vec<String> = expected_venue_order_ids
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    expected_oids.sort();
+
+    assert_eq!(
+        canceled_oids, expected_oids,
+        "Only matching-side open orders on the instrument should be canceled"
+    );
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cancel_all_orders_with_side_and_empty_cache_sends_nothing() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+
+    let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
+    // Open order on another instrument only; the sided cancel-all for
+    // `instrument_id` must not touch it.
+    let other_instrument_id = InstrumentId::from("BTC-PERP.AX");
+    add_open_order_to_cache(
+        &cache,
+        "O-OTHER",
+        "VOI-OTHER",
+        other_instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
+
+    let cmd = CancelAllOrders {
+        trader_id: TraderId::from("TESTER-001"),
+        client_id: Some(*AX_CLIENT_ID),
+        strategy_id: StrategyId::from("S-001"),
+        instrument_id,
+        order_side: Some(OrderSide::Buy),
+        command_id: UUID4::new(),
+        ts_init: UnixNanos::default(),
+        params: None,
+        correlation_id: None,
+        causation_id: None,
+    };
+
+    client
+        .cancel_all_orders(cmd)
+        .expect("cancel_all_orders should not error");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert_eq!(
+        state
+            .cancel_all_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "Empty sided cancel-all must not hit the HTTP cancel-all endpoint"
+    );
+
+    let messages = state.get_messages().await;
+    let ws_cancel_count = messages
+        .iter()
+        .filter(|m| m.get("t").and_then(|v| v.as_str()) == Some("x"))
+        .count();
+    assert_eq!(ws_cancel_count, 0, "No WS cancels should be sent");
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_declares_bounded_lookback_window() {
+    let (addr, state) = start_test_server().await.unwrap();
+    *state.open_orders_payload.lock().await = Some(serde_json::json!({ "orders": [] }));
+    *state.orders_payload.lock().await = Some(serde_json::json!({ "orders": [] }));
+    *state.fills_payload.lock().await = Some(serde_json::json!({ "fills": [] }));
+    *state.positions_payload.lock().await = Some(serde_json::json!({ "positions": [] }));
+
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+    drain_rx(&mut rx);
+
+    let before = nautilus_core::time::get_atomic_clock_realtime().get_time_ns();
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .unwrap()
+        .expect("mass status");
+
+    let lookback_start = mass_status
+        .lookback_start()
+        .expect("bounded lookback must be declared on the mass status");
+    let after = nautilus_core::time::get_atomic_clock_realtime().get_time_ns();
+
+    // A one-hour lookback must not be floored to the fills coverage cap
+    let hour_ns = 60 * 60 * 1_000_000_000;
+    assert!(lookback_start.as_i64() > after.as_i64() - hour_ns - 5_000_000_000);
+    assert!(lookback_start.as_i64() < before.as_i64());
+
+    // A lookback past the fills cap declares that cap
+    let mass_status = client
+        .generate_mass_status(Some(60 * 24 * 30))
+        .await
+        .unwrap()
+        .expect("mass status");
+
+    let lookback_start = mass_status
+        .lookback_start()
+        .expect("bounded lookback must be declared on the mass status");
+    let fills_cap_ns = 7 * 24 * 60 * 60 * 1_000_000_000;
+    assert!(
+        lookback_start.as_i64() > after.as_i64() - fills_cap_ns - 5_000_000_000,
+        "declared window must not precede the fills coverage floor"
+    );
 
     client.disconnect().await.expect("Failed to disconnect");
 }
@@ -845,7 +1173,7 @@ async fn test_generate_order_status_reports_filters() {
     let payload = serde_json::json!({
         "orders": [
             {
-                "tn": 1704067200,
+                "tn": 0,
                 "ts": 1704067200,
                 "d": "B",
                 "o": "ACCEPTED",
@@ -861,7 +1189,7 @@ async fn test_generate_order_status_reports_filters() {
                 "tag": null
             },
             {
-                "tn": 1704067201,
+                "tn": 0,
                 "ts": 1704067201,
                 "d": "S",
                 "o": "FILLED",
@@ -877,7 +1205,7 @@ async fn test_generate_order_status_reports_filters() {
                 "tag": null
             },
             {
-                "tn": 1704067203,
+                "tn": 0,
                 "ts": 1704067203,
                 "d": "B",
                 "o": "PENDING",
@@ -893,7 +1221,7 @@ async fn test_generate_order_status_reports_filters() {
                 "tag": null
             },
             {
-                "tn": 1704067202,
+                "tn": 0,
                 "ts": 1704067202,
                 "d": "B",
                 "o": "ACCEPTED",
@@ -1041,7 +1369,7 @@ async fn test_generate_order_status_reports_reads_all_partial_pages() {
     let orders = (0..101)
         .map(|index| {
             serde_json::json!({
-                "tn": 1_704_067_200 + index,
+                "tn": index,
                 "ts": 1_704_067_200 + index,
                 "d": "B",
                 "o": "ACCEPTED",
@@ -1097,7 +1425,7 @@ async fn test_generate_order_status_reports_reads_all_partial_pages() {
 async fn test_generate_order_status_reports_rejects_duplicate_order_ids() {
     let (addr, state) = start_test_server().await.unwrap();
     let order = serde_json::json!({
-        "tn": 1_704_067_200,
+        "tn": 0,
         "ts": 1_704_067_200,
         "d": "B",
         "o": "ACCEPTED",
@@ -1502,6 +1830,289 @@ async fn test_generate_fill_reports_rejects_ambiguous_fill_classification() {
     assert!(
         format!("{error:#}").contains("missing order_id and explicit special-fill classification"),
         "error was: {error:#}"
+    );
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_rounds_sub_cent_fee_to_usd_precision() {
+    let (addr, state) = start_test_server().await.unwrap();
+    *state.fills_payload.lock().await = Some(serde_json::json!({
+        "fills": [{
+            "trade_id": "T-SUBCENT",
+            "order_id": "OID-SUBCENT",
+            "fee": "0.012188",
+            "is_taker": true,
+            "is_block_trade": false,
+            "is_final_settlement": false,
+            "price": "1.08450",
+            "quantity": 100,
+            "side": "B",
+            "symbol": "EURUSD-PERP",
+            "timestamp": "2024-01-15T10:30:45Z",
+            "account_id": "u"
+        }]
+    }));
+
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+    drain_rx(&mut rx);
+
+    let reports = client
+        .generate_fill_reports(GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect("generate_fill_reports");
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].commission, Money::from("0.01 USD"));
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_rejects_unrepresentable_fee() {
+    let (addr, state) = start_test_server().await.unwrap();
+    *state.fills_payload.lock().await = Some(serde_json::json!({
+        "fills": [{
+            "trade_id": "T-OVERFLOW",
+            "order_id": "OID-OVERFLOW",
+            "fee": "9999999999999999999999999999",
+            "is_taker": true,
+            "is_block_trade": false,
+            "is_final_settlement": false,
+            "price": "1.08450",
+            "quantity": 100,
+            "side": "B",
+            "symbol": "EURUSD-PERP",
+            "timestamp": "2024-01-15T10:30:45Z",
+            "account_id": "u"
+        }]
+    }));
+
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+    drain_rx(&mut rx);
+
+    let error = client
+        .generate_fill_reports(GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect_err("unrepresentable fee must fail the fill request");
+    assert!(
+        format!("{error:#}").contains("Failed to convert fill.fee Decimal to Money"),
+        "error was: {error:#}"
+    );
+
+    let mass_error = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect_err("unrepresentable fee must fail mass status");
+    assert!(
+        format!("{mass_error:#}").contains("Failed to convert fill.fee Decimal to Money"),
+        "mass status error was: {mass_error:#}"
+    );
+
+    let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+    assert!(
+        event.is_err() || event.as_ref().is_ok_and(|msg| msg.is_none()),
+        "unrepresentable fee must not emit a fallback fill, was {event:?}"
+    );
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_transport_failure_emits_no_order_rejected() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+    drain_rx(&mut rx);
+
+    state
+        .disconnect_trigger
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let places_before = state
+        .get_messages()
+        .await
+        .iter()
+        .filter(|message| message.get("t").and_then(|value| value.as_str()) == Some("p"))
+        .count();
+
+    let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
+    let client_order_id = ClientOrderId::from("O-SUBMIT-TRANSPORT");
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from("TESTER-001"))
+        .strategy_id(StrategyId::from("S-001"))
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1"))
+        .price(Price::from("1.00"))
+        .time_in_force(TimeInForce::Gtc)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(*AX_CLIENT_ID), false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_order_cmd(&order))
+        .expect("submit_order should not error");
+
+    let mut saw_submitted = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(800);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
+            Ok(Some(ExecutionEvent::Order(OrderEventAny::Submitted(submitted)))) => {
+                assert_eq!(submitted.client_order_id, client_order_id);
+                saw_submitted = true;
+            }
+            Ok(Some(ExecutionEvent::Order(OrderEventAny::Rejected(rejected)))) => {
+                panic!(
+                    "transport failure must not emit OrderRejected, was {}",
+                    rejected.reason
+                );
+            }
+            Ok(Some(_) | None) | Err(_) => {}
+        }
+    }
+
+    assert!(
+        saw_submitted,
+        "expected OrderSubmitted before the failed send"
+    );
+    let places_after = state
+        .get_messages()
+        .await
+        .iter()
+        .filter(|message| message.get("t").and_then(|value| value.as_str()) == Some("p"))
+        .count();
+    assert_eq!(
+        places_after, places_before,
+        "place must not reach the dropped socket, before {places_before}, after {places_after}"
+    );
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cancel_already_terminal_order_is_forwarded() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+    drain_rx(&mut rx);
+
+    let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
+    let client_order_id = ClientOrderId::from("O-CANCEL-TWICE");
+    let venue_order_id = VenueOrderId::new("OID-CANCEL-TWICE");
+    client.register_external_order(
+        client_order_id,
+        venue_order_id,
+        instrument_id,
+        StrategyId::from("S-001"),
+        UnixNanos::default(),
+    );
+    add_open_order_to_cache(
+        &cache,
+        client_order_id.as_str(),
+        venue_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
+    cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::Canceled(OrderCanceled::new(
+            TraderId::from("TESTER-001"),
+            StrategyId::from("S-001"),
+            instrument_id,
+            client_order_id,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            false,
+            Some(venue_order_id),
+            Some(AccountId::from("AX-001")),
+            None,
+        )))
+        .expect("mark order canceled");
+
+    let cancel = || {
+        CancelOrder::new(
+            TraderId::from("TESTER-001"),
+            Some(*AX_CLIENT_ID),
+            StrategyId::from("S-001"),
+            instrument_id,
+            client_order_id,
+            Some(venue_order_id),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        )
+    };
+
+    client
+        .cancel_order(cancel())
+        .expect("first cancel should not error");
+    client
+        .cancel_order(cancel())
+        .expect("second cancel should not error");
+
+    wait_until_async(
+        || async {
+            state
+                .get_messages()
+                .await
+                .iter()
+                .filter(|message| message.get("t").and_then(|value| value.as_str()) == Some("x"))
+                .count()
+                >= 2
+        },
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+
+    let result = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await;
+    assert!(
+        !matches!(
+            result,
+            Ok(Some(ExecutionEvent::Order(OrderEventAny::CancelRejected(
+                _
+            ))))
+        ),
+        "a forwarded cancel must not invent OrderCancelRejected, was {result:?}"
     );
 
     client.disconnect().await.expect("Failed to disconnect");
@@ -2025,8 +2636,22 @@ async fn test_cancel_all_orders_http_failure_emits_no_cancel_rejected() {
     drain_rx(&mut rx);
 
     let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
-    add_open_order_to_cache(&cache, "O-CA-1", "VOI-CA-1", instrument_id);
-    add_open_order_to_cache(&cache, "O-CA-2", "VOI-CA-2", instrument_id);
+    add_open_order_to_cache(
+        &cache,
+        "O-CA-1",
+        "VOI-CA-1",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
+    add_open_order_to_cache(
+        &cache,
+        "O-CA-2",
+        "VOI-CA-2",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
 
     let cmd = CancelAllOrders {
         trader_id: TraderId::from("TESTER-001"),
@@ -2083,8 +2708,22 @@ async fn test_batch_cancel_orders_emits_one_ws_cancel_per_entry() {
     client.connect().await.expect("Failed to connect");
 
     let instrument_id = InstrumentId::from("EURUSD-PERP.AX");
-    add_open_order_to_cache(&cache, "O-BC-1", "VOI-BC-1", instrument_id);
-    add_open_order_to_cache(&cache, "O-BC-2", "VOI-BC-2", instrument_id);
+    add_open_order_to_cache(
+        &cache,
+        "O-BC-1",
+        "VOI-BC-1",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
+    add_open_order_to_cache(
+        &cache,
+        "O-BC-2",
+        "VOI-BC-2",
+        instrument_id,
+        OrderSide::Buy,
+        "S-001",
+    );
 
     let cancels = vec![
         CancelOrder {

@@ -9,6 +9,7 @@ import typing
 from nautilus_trader import common
 from nautilus_trader import core
 from nautilus_trader import model
+from nautilus_trader import persistence
 from nautilus_trader import portfolio
 from nautilus_trader import trading
 from nautilus_trader.live.providers import InstrumentProvider as InstrumentProvider
@@ -63,11 +64,12 @@ __all__ = [
     "RequestQuotes",
     "RequestTrades",
     "RoutingConfig",
+    "SubmissionRecoveryPolicy",
     "SubmitOrder",
     "SubmitOrderList",
     "SubscribeBars",
     "SubscribeBookDeltas",
-    "SubscribeBookDepth10",
+    "SubscribeBookDepth",
     "SubscribeCustomData",
     "SubscribeFundingRates",
     "SubscribeIndexPrices",
@@ -82,7 +84,7 @@ __all__ = [
     "TradesResponse",
     "UnsubscribeBars",
     "UnsubscribeBookDeltas",
-    "UnsubscribeBookDepth10",
+    "UnsubscribeBookDepth",
     "UnsubscribeCustomData",
     "UnsubscribeFundingRates",
     "UnsubscribeIndexPrices",
@@ -211,7 +213,7 @@ class BookDepthResponse:
     @property
     def instrument_id(self) -> model.InstrumentId: ...
     @property
-    def data(self) -> list[model.OrderBookDepth10]: ...
+    def data(self) -> list[model.OrderBookDepth]: ...
     @property
     def correlation_id(self) -> core.UUID4: ...
     @property
@@ -226,7 +228,7 @@ class BookDepthResponse:
         cls,
         client_id: model.ClientId,
         instrument_id: model.InstrumentId,
-        data: typing.Sequence[model.OrderBookDepth10],
+        data: typing.Sequence[model.OrderBookDepth],
         correlation_id: core.UUID4,
         ts_init: int,
         start: int | None = None,
@@ -597,6 +599,8 @@ class InstrumentProviderConfig:
 @typing.final
 class LiveDataEngineConfig:
     @property
+    def time_bars_time_zone(self) -> str | None: ...
+    @property
     def time_bars_build_with_no_updates(self) -> bool: ...
     @property
     def time_bars_timestamp_on_close(self) -> bool: ...
@@ -634,6 +638,7 @@ class LiveDataEngineConfig:
         emit_quotes_from_book_depths: bool | None = None,
         external_clients: typing.Sequence[model.ClientId] | None = None,
         debug: bool | None = None,
+        time_bars_time_zone: str | None = None,
     ) -> LiveDataEngineConfig: ...
 
 @typing.final
@@ -672,6 +677,8 @@ class LiveExecutionEngineConfig:
     def inflight_check_interval_ms(self) -> int: ...
     @property
     def inflight_check_threshold_ms(self) -> int: ...
+    @property
+    def submission_recovery_policy(self) -> SubmissionRecoveryPolicy: ...
     @property
     def inflight_check_retries(self) -> int: ...
     @property
@@ -751,6 +758,7 @@ class LiveExecutionEngineConfig:
         debug: bool | None = None,
         snapshot_orders: bool | None = None,
         snapshot_positions: bool | None = None,
+        submission_recovery_policy: SubmissionRecoveryPolicy | None = None,
     ) -> LiveExecutionEngineConfig: ...
 
 @typing.final
@@ -759,6 +767,10 @@ class LiveNodeConfig:
     def data_clients(self) -> dict: ...
     @property
     def exec_clients(self) -> dict: ...
+    @property
+    def streaming(self) -> persistence.StreamingConfig | None: ...
+    @property
+    def catalogs(self) -> list[persistence.DataCatalogConfig]: ...
     @property
     def environment(self) -> common.Environment: ...
     @property
@@ -830,6 +842,8 @@ class LiveNodeConfig:
         exec_engine: LiveExecutionEngineConfig | None = None,
         controller: trading.ImportableControllerConfig | None = None,
         plugins: typing.Sequence[PluginConfig] | None = None,
+        streaming: persistence.StreamingConfig | None = None,
+        catalogs: typing.Sequence[persistence.DataCatalogConfig] | None = None,
         *,
         data_clients: dict | None = None,
         exec_clients: dict | None = None,
@@ -1643,7 +1657,7 @@ class SubscribeBookDeltas:
     def managed(self) -> bool: ...
 
 @typing.final
-class SubscribeBookDepth10:
+class SubscribeBookDepth:
     @property
     def client_id(self) -> model.ClientId | None: ...
     @property
@@ -1915,7 +1929,7 @@ class UnsubscribeBookDeltas:
     def instrument_id(self) -> model.InstrumentId: ...
 
 @typing.final
-class UnsubscribeBookDepth10:
+class UnsubscribeBookDepth:
     @property
     def client_id(self) -> model.ClientId | None: ...
     @property
@@ -2123,3 +2137,8 @@ class NodeState(enum.Enum):
     RUNNING = ...
     SHUTTING_DOWN = ...
     STOPPED = ...
+
+@typing.final
+class SubmissionRecoveryPolicy(enum.Enum):
+    RESOLVE_LOCALLY = ...
+    RETAIN_UNRESOLVED = ...

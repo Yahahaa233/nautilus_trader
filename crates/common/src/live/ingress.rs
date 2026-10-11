@@ -14,6 +14,7 @@ use tokio::sync::mpsc::{
 pub struct NativeIngressMessage<T> {
     message: T,
     receipt: NativeIngressReceipt,
+    historical_epoch: Option<u64>,
 }
 impl<T> NativeIngressMessage<T> {
     /// Returns the original message and its inseparable native receipt.
@@ -29,6 +30,20 @@ struct TraceChannel {
     source: NativeInputSource,
     anchor_wall_ns: u64,
     anchor_instant: dst::time::Instant,
+    historical: Mutex<Option<HistoricalChannelBinding>>,
+}
+
+#[derive(Debug)]
+struct HistoricalChannelBinding {
+    channel_id: UUID4,
+    epoch: u64,
+}
+
+#[derive(Debug)]
+struct HistoricalSourceFrontier {
+    channel_id: UUID4,
+    epoch: u64,
+    next_ordinal: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -44,15 +59,149 @@ pub struct NativeIngressReceiver<T> {
     receiver: UnboundedReceiver<NativeIngressMessage<T>>,
     next_ordinal: Option<u64>,
     gate: IngressGate,
+    trace: Arc<TraceChannel>,
+    historical: Option<HistoricalSourceFrontier>,
 }
 impl<T> NativeIngressReceiver<T> {
     fn number(&mut self, mut message: NativeIngressMessage<T>) -> NativeIngressMessage<T> {
+        if let Some(epoch) = message.historical_epoch {
+            let retention = HistoricalQueueRetention {
+                gate: self.gate.clone(),
+                epoch,
+            };
+            let valid = retention.verify().is_ok()
+                && self.historical.as_ref().is_some_and(|frontier| {
+                    frontier.epoch == epoch
+                        && frontier.channel_id == message.receipt.channel_id
+                        && message.receipt.input_source == self.trace.source
+                        && message.receipt.channel_ordinal == 0
+                        && frontier.next_ordinal.is_some()
+                });
+            if !valid {
+                self.gate.fail("historical native FIFO frontier changed");
+                return message;
+            }
+            let frontier = self.historical.as_mut().expect("verified source frontier");
+            message.receipt.channel_ordinal =
+                frontier.next_ordinal.expect("verified source ordinal");
+            frontier.next_ordinal = frontier.next_ordinal.and_then(|value| value.checked_add(1));
+            if frontier.next_ordinal.is_none() {
+                self.gate.fail("historical native FIFO ordinal exhausted");
+            }
+            return message;
+        }
         message.receipt.channel_ordinal = self.next_ordinal.unwrap_or(0);
         self.next_ordinal = self.next_ordinal.and_then(|value| value.checked_add(1));
         if self.next_ordinal.is_none() {
             self.gate.invalidate();
         }
         message
+    }
+
+    /// Binds a reader-verified source frontier to this empty frozen native channel once.
+    /// The caller must prove the original channel and next ordinal from the admitted cut.
+    /// This does not authorize a source, a callback, or execution.
+    ///
+    /// # Errors
+    /// Refuses foreign or unhealthy epochs, occupied channels, and repeated bindings.
+    #[doc(hidden)]
+    pub fn bind_historical_source_frontier(
+        &mut self,
+        frozen: &FrozenIngress,
+        channel_id: UUID4,
+        next_ordinal: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            frozen.belongs_to(&self.gate),
+            "historical FIFO gate differs"
+        );
+        let state = self
+            .gate
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ingress mutex poisoned"))?;
+        verify_retention_state(&state, frozen.epoch)?;
+        anyhow::ensure!(
+            self.receiver.is_empty() && !self.receiver.is_closed(),
+            "historical FIFO is not empty and open"
+        );
+        anyhow::ensure!(
+            self.historical.is_none() && next_ordinal > 0,
+            "historical FIFO frontier is repeated or absent"
+        );
+        let mut binding = self
+            .trace
+            .historical
+            .lock()
+            .map_err(|_| anyhow::anyhow!("historical channel mutex poisoned"))?;
+        anyhow::ensure!(binding.is_none(), "historical native channel already bound");
+        *binding = Some(HistoricalChannelBinding {
+            channel_id,
+            epoch: frozen.epoch,
+        });
+        self.historical = Some(HistoricalSourceFrontier {
+            channel_id,
+            epoch: frozen.epoch,
+            next_ordinal: Some(next_ordinal),
+        });
+        Ok(())
+    }
+
+    /// Advances this empty native channel for one reader-admitted independent source input.
+    /// The reader must verify the exact original receipt and held FIFO before calling.
+    ///
+    /// # Errors
+    /// Refuses derived, foreign, duplicate, discontinuous, or exhausted source receipts.
+    #[doc(hidden)]
+    pub fn advance_historical_source_frontier(
+        &mut self,
+        frozen: &FrozenIngress,
+        receipt: &NativeIngressReceipt,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            frozen.belongs_to(&self.gate),
+            "historical FIFO gate differs"
+        );
+        let state = self
+            .gate
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ingress mutex poisoned"))?;
+        verify_retention_state(&state, frozen.epoch)?;
+        anyhow::ensure!(
+            self.receiver.is_empty() && !self.receiver.is_closed(),
+            "historical FIFO contains an unconsumed native entry"
+        );
+        let frontier = self
+            .historical
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("historical FIFO source frontier absent"))?;
+        anyhow::ensure!(
+            frontier.epoch == frozen.epoch
+                && frontier.channel_id == receipt.channel_id
+                && receipt.input_source == self.trace.source
+                && receipt.caused_by.is_none()
+                && frontier.next_ordinal == Some(receipt.channel_ordinal),
+            "historical independent FIFO receipt changed or is discontinuous"
+        );
+        let next = receipt
+            .channel_ordinal
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("historical FIFO ordinal exhausted"))?;
+        let mut binding = self
+            .trace
+            .historical
+            .lock()
+            .map_err(|_| anyhow::anyhow!("historical channel mutex poisoned"))?;
+        let binding = binding
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("historical native channel binding absent"))?;
+        anyhow::ensure!(
+            binding.epoch == frozen.epoch && binding.channel_id == receipt.channel_id,
+            "historical independent FIFO identity repeated or changed"
+        );
+        frontier.next_ordinal = Some(next);
+        Ok(())
     }
     /// Returns the real number of channel-resident messages.
     #[must_use]
@@ -153,16 +302,20 @@ impl IngressGate {
                 .try_into()
                 .expect("current Unix time exceeds native receipt range"),
             anchor_instant: dst::time::Instant::now(),
+            historical: Mutex::new(None),
         };
+        let trace = Arc::new(trace);
         (
             IngressSender {
-                sender: SenderKind::Native(sender, Arc::new(trace)),
+                sender: SenderKind::Native(sender, trace.clone()),
                 gate: self.clone(),
             },
             NativeIngressReceiver {
                 receiver,
                 next_ordinal: Some(1),
                 gate: self.clone(),
+                trace,
+                historical: None,
             },
         )
     }
@@ -345,8 +498,8 @@ impl<T> IngressSender<T> {
     where
         T: 'static,
     {
-        // History verifies the original intent before the admission mutex; it must
-        // not create a second physical FIFO entry while the real runner is frozen.
+        // History verifies source bytes before admission. Only an explicit frozen
+        // source binding retains the original envelope in this same physical FIFO.
         let trace_active = scope::capture_active() || crate::recovery_trace::historical::active();
         let encoded = if trace_active {
             let SenderKind::Native(_, trace) = &self.sender else {
@@ -366,8 +519,16 @@ impl<T> IngressSender<T> {
                 }
             };
             match crate::recovery_trace::historical::queued(trace.source, &payload) {
-                Ok(Some(true)) => return Ok(()),
-                Ok(Some(false)) => return Err(SendError(message)),
+                Ok(Some(crate::recovery_trace::historical::Queued::Verified(true))) => {
+                    return Ok(());
+                }
+                Ok(Some(crate::recovery_trace::historical::Queued::Verified(false))) => {
+                    return Err(SendError(message));
+                }
+                Ok(Some(crate::recovery_trace::historical::Queued::Retain {
+                    receipt,
+                    retention,
+                })) => return self.retain_historical(message, receipt, &retention),
                 Ok(None) => Some(payload),
                 Err(error) => {
                     crate::recovery_trace::historical_failure(&format!(
@@ -429,7 +590,11 @@ impl<T> IngressSender<T> {
                         accepted: false,
                     });
                 }
-                match sender.send(NativeIngressMessage { message, receipt }) {
+                match sender.send(NativeIngressMessage {
+                    message,
+                    receipt,
+                    historical_epoch: None,
+                }) {
                     Ok(()) => Ok(()),
                     Err(e) => Err(SendError(e.0.message)),
                 }
@@ -445,6 +610,59 @@ impl<T> IngressSender<T> {
             }
         }
         permit.finish(result.is_ok());
+        result
+    }
+
+    fn retain_historical(
+        &self,
+        message: T,
+        receipt: NativeIngressReceipt,
+        retention: &HistoricalQueueRetention,
+    ) -> Result<(), SendError<T>> {
+        let SenderKind::Native(sender, trace) = &self.sender else {
+            crate::recovery_trace::historical_failure(
+                "historical retention requires the native channel",
+            );
+            return Err(SendError(message));
+        };
+        let binding_matches = trace.historical.lock().is_ok_and(|binding| {
+            binding.as_ref().is_some_and(|binding| {
+                binding.epoch == retention.epoch
+                    && binding.channel_id == receipt.channel_id
+                    && receipt.input_source == trace.source
+                    && receipt.channel_ordinal == 0
+            })
+        });
+        if !binding_matches {
+            crate::recovery_trace::historical_failure(
+                "historical retention native source channel differs",
+            );
+            retention
+                .gate
+                .fail("historical retention native source channel differs");
+            return Err(SendError(message));
+        }
+        let permit = match retention.acquire(&self.gate) {
+            Ok(permit) => permit,
+            Err(e) => {
+                crate::recovery_trace::historical_failure(&format!(
+                    "historical retention gate refused: {e:#}"
+                ));
+                retention.gate.fail("historical retention gate refused");
+                return Err(SendError(message));
+            }
+        };
+        let result = sender
+            .send(NativeIngressMessage {
+                message,
+                receipt,
+                historical_epoch: Some(retention.epoch),
+            })
+            .map_err(|e| SendError(e.0.message));
+        permit.finish(result.is_ok());
+        if result.is_err() || retention.verify().is_err() {
+            crate::recovery_trace::historical_failure("historical accepted native enqueue failed");
+        }
         result
     }
     /// Permanently closes this sender's original admission boundary after a
@@ -522,6 +740,58 @@ impl Drop for EnqueuePermit<'_> {
     }
 }
 
+fn verify_retention_state(state: &State, epoch: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !state.poisoned
+            && !state.terminal
+            && !state.snapshot_stopped
+            && state.frozen
+            && state.in_flight == 0
+            && state.epoch == epoch,
+        "historical native queue epoch is not frozen and healthy"
+    );
+    Ok(())
+}
+
+/// Private proof of the actual owner's frozen epoch, never serialized admission.
+#[derive(Clone, Debug)]
+pub(crate) struct HistoricalQueueRetention {
+    gate: IngressGate,
+    epoch: u64,
+}
+impl HistoricalQueueRetention {
+    pub(crate) fn fail(&self, reason: &str) {
+        self.gate.fail(reason);
+    }
+    pub(crate) fn verify(&self) -> anyhow::Result<()> {
+        let state = self
+            .gate
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ingress mutex poisoned"))?;
+        verify_retention_state(&state, self.epoch)
+    }
+    pub(crate) fn same_binding(&self, other: &Self) -> bool {
+        self.gate.same_gate(&other.gate) && self.epoch == other.epoch
+    }
+    fn acquire<'a>(&self, gate: &'a IngressGate) -> anyhow::Result<EnqueuePermit<'a>> {
+        anyhow::ensure!(self.gate.same_gate(gate), "historical sender gate differs");
+        let mut state = gate
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ingress mutex poisoned"))?;
+        verify_retention_state(&state, self.epoch)?;
+        state.in_flight = state
+            .in_flight
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("historical enqueue count exhausted"))?;
+        Ok(EnqueuePermit {
+            gate,
+            completed: false,
+        })
+    }
+}
+
 /// Completion must be explicit; abandonment invalidates subsequent admission.
 #[derive(Debug)]
 #[must_use = "a frozen ingress boundary must be explicitly verified and finished"]
@@ -531,6 +801,14 @@ pub struct FrozenIngress {
     finished: bool,
 }
 impl FrozenIngress {
+    pub(crate) fn historical_queue_retention(&self) -> anyhow::Result<HistoricalQueueRetention> {
+        let retention = HistoricalQueueRetention {
+            gate: self.gate.clone(),
+            epoch: self.epoch,
+        };
+        retention.verify()?;
+        Ok(retention)
+    }
     /// Returns whether this handle belongs to the supplied boundary.
     #[must_use]
     pub fn belongs_to(&self, gate: &IngressGate) -> bool {
@@ -891,5 +1169,504 @@ mod tests {
         let frozen = gate.freeze().unwrap();
         gate.invalidate();
         assert!(frozen.finish().is_err());
+    }
+}
+
+#[cfg(test)]
+mod historical_tests {
+    use std::rc::Rc;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::{
+        actor::{PublicationScope, callbacks_pending, capture_channel_contexts, clear_callbacks},
+        live::{dispatch::DispatchMessage, sender::EventSender},
+        recovery_trace::{
+            NativeProcessingReceipt, NativeQueuedOutput, NativeTraceRecord, NativeTraceSource,
+            historical::{HistoricalInputScope, bind_current_native_queue_retention},
+            scope::NativeCaptureScope,
+            set_native_ingress_encoder,
+        },
+    };
+
+    fn install_codec() {
+        set_native_ingress_encoder(|source, message| {
+            anyhow::ensure!(
+                source == NativeInputSource::SystemEvent,
+                "unsupported fixture source"
+            );
+            let value = message
+                .downcast_ref::<DispatchMessage<u64>>()
+                .map(|message| *message.message())
+                .or_else(|| message.downcast_ref::<u64>().copied())
+                .ok_or_else(|| anyhow::anyhow!("unsupported fixture payload"))?;
+            Ok(json!(value))
+        });
+    }
+
+    fn original_outputs() -> (
+        NativeTraceRecord,
+        Vec<NativeQueuedOutput>,
+        Vec<NativeIngressReceipt>,
+    ) {
+        install_codec();
+        clear_callbacks().unwrap();
+        let source = NativeTraceSource {
+            schema_version: 1,
+            node_instance: UUID4::new(),
+            process_incarnation: UUID4::new(),
+            journal_run: "actual-native-history-fixture".into(),
+            logical_run: "actual-native-history-fixture".into(),
+            configuration_digest: "fixture-config".into(),
+            codec_profile: "fixture-native.v1".into(),
+            registered_profile_digest: "fixture-roster".into(),
+        };
+        let gate = IngressGate::new();
+        let (native, mut receiver) =
+            gate.native_channel::<DispatchMessage<u64>>(NativeInputSource::SystemEvent);
+        let sender = EventSender::<u64>::new(native);
+        let capture =
+            NativeCaptureScope::enter(&source, 11, 12, None, dst::time::Instant::now()).unwrap();
+        {
+            let _publication = PublicationScope::enter();
+            sender.send(10).unwrap();
+            sender.send(11).unwrap();
+        }
+        let outputs = capture.queued_outputs().unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert!(
+            outputs
+                .iter()
+                .all(|output| output.accepted && output.receipt.channel_ordinal == 0)
+        );
+        let originals: Vec<_> = (0..2).map(|_| receiver.try_recv().unwrap()).collect();
+        let ancestry = capture_channel_contexts(
+            &originals
+                .iter()
+                .map(|message| message.message.checkpoint_context())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(ancestry.entry_chains, [Some(0), Some(0)]);
+        let receipts = originals
+            .into_iter()
+            .map(|message| message.into_parts().1)
+            .collect();
+        capture.finish().unwrap();
+        assert!(!callbacks_pending());
+        clear_callbacks().unwrap();
+        let begin = NativeTraceRecord::Begin {
+            source,
+            root_sequence: 11,
+            input_sequence: 12,
+            stack_parent: None,
+            input_source: NativeInputSource::Maintenance,
+            phase: "original-running".into(),
+            receipt: NativeProcessingReceipt {
+                wall_ns: 100,
+                process_elapsed_ns: 100,
+                ingress: None,
+            },
+            payload: json!({"actual_source_fixture": true}),
+            read_witnesses: Vec::new(),
+        };
+        (begin, outputs, receipts)
+    }
+
+    fn enter(begin: NativeTraceRecord, outputs: Vec<NativeQueuedOutput>) -> HistoricalInputScope {
+        HistoricalInputScope::enter_with_outputs_at(
+            Rc::new(()),
+            begin,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            outputs,
+        )
+        .unwrap()
+    }
+
+    #[rstest::rstest]
+    fn historical_native_retention_keeps_actual_shared_context_receipts_and_target_identity() {
+        let (begin, outputs, original_receipts) = original_outputs();
+        let gate = IngressGate::new();
+        let (native, mut receiver) =
+            gate.native_channel::<DispatchMessage<u64>>(NativeInputSource::SystemEvent);
+        let sender = EventSender::<u64>::new(native);
+        let frozen = gate.freeze().unwrap();
+        receiver
+            .bind_historical_source_frontier(&frozen, original_receipts[0].channel_id, 1)
+            .unwrap();
+        assert!(
+            receiver
+                .bind_historical_source_frontier(&frozen, original_receipts[0].channel_id, 1)
+                .is_err()
+        );
+        let history = enter(begin, outputs);
+        history.bind_native_queue_retention(&frozen).unwrap();
+        bind_current_native_queue_retention(&frozen).unwrap();
+        {
+            let _publication = PublicationScope::enter();
+            sender.send(10).unwrap();
+            sender.send(11).unwrap();
+        }
+        assert_eq!(receiver.len(), 2);
+        history.finish().unwrap();
+        let retained: Vec<_> = (0..2).map(|_| receiver.try_recv().unwrap()).collect();
+        let ancestry = capture_channel_contexts(
+            &retained
+                .iter()
+                .map(|message| message.message.checkpoint_context())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(ancestry.entry_chains, [Some(0), Some(0)]);
+        assert_eq!(ancestry.chain_delivered, [0]);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|message| message.receipt.clone())
+                .collect::<Vec<_>>(),
+            original_receipts
+        );
+        assert_eq!(
+            retained
+                .iter()
+                .map(|message| *message.message.message())
+                .collect::<Vec<_>>(),
+            [10, 11]
+        );
+        drop(retained);
+        assert!(!callbacks_pending());
+        frozen.verify().unwrap();
+        frozen.finish().unwrap();
+        sender.send(12).unwrap();
+        let (message, receipt) = receiver.try_recv().unwrap().into_parts();
+        assert!(!message.is_rooted());
+        assert_eq!(receipt.channel_ordinal, 1);
+        assert_ne!(receipt.channel_id, original_receipts[0].channel_id);
+        assert!(receipt.caused_by.is_none());
+        drop(message);
+        clear_callbacks().unwrap();
+    }
+
+    #[rstest::rstest]
+    fn historical_unbound_scope_preserves_verification_only_and_refuses_late_binding() {
+        let (begin, outputs, _) = original_outputs();
+        let gate = IngressGate::new();
+        let (native, mut receiver) =
+            gate.native_channel::<DispatchMessage<u64>>(NativeInputSource::SystemEvent);
+        let sender = EventSender::<u64>::new(native);
+        let frozen = gate.freeze().unwrap();
+        let history = enter(begin, outputs);
+        sender.send(10).unwrap();
+        assert!(history.bind_native_queue_retention(&frozen).is_err());
+        sender.send(11).unwrap();
+        history.finish().unwrap();
+        assert!(receiver.try_recv().is_err());
+        frozen.finish().unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case("raw")]
+    #[case("foreign_gate")]
+    #[case("channel")]
+    #[case("payload")]
+    #[case("cause")]
+    #[case("codec")]
+    #[case("closed")]
+    #[case("failed")]
+    #[case("stale_epoch")]
+    fn historical_retention_refuses_unowned_changed_failed_and_stale_admission(#[case] mode: &str) {
+        let (begin, mut outputs, originals) = original_outputs();
+        outputs.truncate(1);
+        let gate = IngressGate::new();
+        let (native, mut receiver) =
+            gate.native_channel::<DispatchMessage<u64>>(NativeInputSource::SystemEvent);
+        let frozen = gate.freeze().unwrap();
+        receiver
+            .bind_historical_source_frontier(&frozen, originals[0].channel_id, 1)
+            .unwrap();
+        if mode == "cause" {
+            outputs[0].receipt.caused_by = None;
+        }
+        let history = enter(begin, outputs);
+        history.bind_native_queue_retention(&frozen).unwrap();
+        let (sender, raw_receiver, foreign_receiver, foreign_frozen) = if mode == "raw" {
+            let (raw, rx) = tokio::sync::mpsc::unbounded_channel::<DispatchMessage<u64>>();
+            (EventSender::<u64>::new(raw), Some(rx), None, None)
+        } else if mode == "foreign_gate" {
+            let other = IngressGate::new();
+            let (other_native, mut rx) =
+                other.native_channel::<DispatchMessage<u64>>(NativeInputSource::SystemEvent);
+            let other_frozen = other.freeze().unwrap();
+            rx.bind_historical_source_frontier(&other_frozen, originals[0].channel_id, 1)
+                .unwrap();
+            (
+                EventSender::<u64>::new(other_native),
+                None,
+                Some(rx),
+                Some(other_frozen),
+            )
+        } else if mode == "channel" {
+            let (other_native, rx) =
+                gate.native_channel::<DispatchMessage<u64>>(NativeInputSource::SystemEvent);
+            (EventSender::<u64>::new(other_native), None, Some(rx), None)
+        } else {
+            (EventSender::<u64>::new(native), None, None, None)
+        };
+        if mode == "closed" {
+            receiver.close();
+        }
+        if mode == "failed" {
+            gate.fail("original producer failure");
+        }
+        let frozen = if mode == "stale_epoch" {
+            frozen.finish().unwrap();
+            Some(gate.freeze().unwrap())
+        } else {
+            Some(frozen)
+        };
+        if mode == "codec" {
+            set_native_ingress_encoder(|_, _| {
+                anyhow::bail!("unsupported historical fixture codec")
+            });
+        }
+        let value = if mode == "payload" { 99 } else { 10 };
+        let error = sender.send(value).unwrap_err();
+        assert_eq!(*error.0.message(), value);
+        drop(error);
+        assert!(receiver.try_recv().is_err());
+        assert!(history.finish().is_err());
+        assert!(gate.verify().is_err());
+        if mode == "failed" {
+            assert!(
+                gate.verify()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("original producer failure")
+            );
+        }
+        drop(raw_receiver);
+        drop(foreign_receiver);
+        drop(foreign_frozen);
+        drop(frozen);
+        assert!(!callbacks_pending());
+        clear_callbacks().unwrap();
+    }
+
+    #[rstest::rstest]
+    fn historical_independent_frontier_advances_once_and_cannot_cover_resident_derived_entry() {
+        let (begin, outputs, originals) = original_outputs();
+        let gate = IngressGate::new();
+        let (native, mut receiver) =
+            gate.native_channel::<DispatchMessage<u64>>(NativeInputSource::SystemEvent);
+        let sender = EventSender::<u64>::new(native);
+        let frozen = gate.freeze().unwrap();
+        receiver
+            .bind_historical_source_frontier(&frozen, originals[0].channel_id, 4)
+            .unwrap();
+        let mut independent = originals[0].clone();
+        independent.channel_ordinal = 4;
+        independent.caused_by = None;
+        let other_gate = IngressGate::new();
+        let other_frozen = other_gate.freeze().unwrap();
+        assert!(
+            receiver
+                .advance_historical_source_frontier(&other_frozen, &independent)
+                .is_err()
+        );
+        other_frozen.finish().unwrap();
+        let mut foreign = independent.clone();
+        foreign.channel_id = UUID4::new();
+        assert!(
+            receiver
+                .advance_historical_source_frontier(&frozen, &foreign)
+                .is_err()
+        );
+        let mut gap = independent.clone();
+        gap.channel_ordinal = 5;
+        assert!(
+            receiver
+                .advance_historical_source_frontier(&frozen, &gap)
+                .is_err()
+        );
+        let mut derived = independent.clone();
+        derived.caused_by = originals[0].caused_by.clone();
+        assert!(
+            receiver
+                .advance_historical_source_frontier(&frozen, &derived)
+                .is_err()
+        );
+        receiver
+            .advance_historical_source_frontier(&frozen, &independent)
+            .unwrap();
+        assert!(
+            receiver
+                .advance_historical_source_frontier(&frozen, &independent)
+                .is_err()
+        );
+        let history = enter(begin, outputs);
+        history.bind_native_queue_retention(&frozen).unwrap();
+        sender.send(10).unwrap();
+        independent.channel_ordinal = 5;
+        assert!(
+            receiver
+                .advance_historical_source_frontier(&frozen, &independent)
+                .is_err()
+        );
+        let first = receiver.try_recv().unwrap();
+        assert_eq!(first.receipt.channel_ordinal, 5);
+        sender.send(11).unwrap();
+        assert_eq!(receiver.try_recv().unwrap().receipt.channel_ordinal, 6);
+        history.finish().unwrap();
+        drop(first);
+        frozen.finish().unwrap();
+        clear_callbacks().unwrap();
+    }
+
+    #[rstest::rstest]
+    fn historical_original_rejected_output_is_not_retained_or_successfully_rewritten() {
+        let (begin, mut outputs, originals) = original_outputs();
+        outputs.truncate(1);
+        outputs[0].accepted = false;
+        let gate = IngressGate::new();
+        let (native, mut receiver) =
+            gate.native_channel::<DispatchMessage<u64>>(NativeInputSource::SystemEvent);
+        let sender = EventSender::<u64>::new(native);
+        let frozen = gate.freeze().unwrap();
+        receiver
+            .bind_historical_source_frontier(&frozen, originals[0].channel_id, 1)
+            .unwrap();
+        let history = enter(begin, outputs);
+        history.bind_native_queue_retention(&frozen).unwrap();
+        assert_eq!(*sender.send(10).unwrap_err().0.message(), 10);
+        history.finish().unwrap();
+        assert!(receiver.try_recv().is_err());
+        frozen.finish().unwrap();
+    }
+
+    #[rstest::rstest]
+    fn historical_frontier_binding_refuses_occupied_foreign_and_zero_or_terminal_boundaries() {
+        let gate = IngressGate::new();
+        let (sender, mut receiver) =
+            gate.native_channel::<DispatchMessage<u64>>(NativeInputSource::SystemEvent);
+        sender.send(DispatchMessage::from(10)).unwrap();
+        let frozen = gate.freeze().unwrap();
+        assert!(
+            receiver
+                .bind_historical_source_frontier(&frozen, UUID4::new(), 1)
+                .is_err()
+        );
+        drop(receiver.try_recv().unwrap());
+        let other = IngressGate::new();
+        let foreign = other.freeze().unwrap();
+        assert!(
+            receiver
+                .bind_historical_source_frontier(&foreign, UUID4::new(), 1)
+                .is_err()
+        );
+        foreign.finish().unwrap();
+        assert!(
+            receiver
+                .bind_historical_source_frontier(&frozen, UUID4::new(), 0)
+                .is_err()
+        );
+        let epoch = frozen.epoch;
+        frozen.finish_terminal().unwrap();
+        let stale = HistoricalQueueRetention {
+            gate: gate.clone(),
+            epoch,
+        };
+        assert!(stale.verify().is_err());
+        clear_callbacks().unwrap();
+    }
+
+    #[rstest::rstest]
+    fn historical_retention_waker_observes_permit_without_mutex_or_inflight_rebinding() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct InspectWake {
+            gate: IngressGate,
+            epoch: u64,
+            observed: Arc<AtomicBool>,
+        }
+        impl std::task::Wake for InspectWake {
+            fn wake(self: Arc<Self>) {
+                let state = self.gate.0.lock().unwrap();
+                assert_eq!(state.in_flight, 1);
+                assert!(state.frozen && !state.poisoned);
+                drop(state);
+                assert!(
+                    HistoricalQueueRetention {
+                        gate: self.gate.clone(),
+                        epoch: self.epoch
+                    }
+                    .verify()
+                    .is_err()
+                );
+                self.observed.store(true, Ordering::Release);
+            }
+        }
+        let (begin, mut outputs, originals) = original_outputs();
+        outputs.truncate(1);
+        let gate = IngressGate::new();
+        let (native, mut receiver) =
+            gate.native_channel::<DispatchMessage<u64>>(NativeInputSource::SystemEvent);
+        let sender = EventSender::<u64>::new(native);
+        let frozen = gate.freeze().unwrap();
+        receiver
+            .bind_historical_source_frontier(&frozen, originals[0].channel_id, 1)
+            .unwrap();
+        let observed = Arc::new(AtomicBool::new(false));
+        let waker = std::task::Waker::from(Arc::new(InspectWake {
+            gate: gate.clone(),
+            epoch: frozen.epoch,
+            observed: observed.clone(),
+        }));
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(receiver.poll_recv(&mut context).is_pending());
+        let history = enter(begin, outputs);
+        history.bind_native_queue_retention(&frozen).unwrap();
+        sender.send(10).unwrap();
+        assert!(observed.load(Ordering::Acquire));
+        history.finish().unwrap();
+        assert_eq!(receiver.try_recv().unwrap().receipt, originals[0]);
+        frozen.verify().unwrap();
+        frozen.finish().unwrap();
+        clear_callbacks().unwrap();
+    }
+
+    #[rstest::rstest]
+    fn historical_incomplete_scope_fences_gate_without_dropping_accepted_native_evidence() {
+        let (begin, outputs, originals) = original_outputs();
+        let accepted = outputs[0].receipt.clone();
+        let gate = IngressGate::new();
+        let (native, mut receiver) =
+            gate.native_channel::<DispatchMessage<u64>>(NativeInputSource::SystemEvent);
+        let sender = EventSender::<u64>::new(native);
+        let frozen = gate.freeze().unwrap();
+        receiver
+            .bind_historical_source_frontier(&frozen, originals[0].channel_id, 1)
+            .unwrap();
+        let history = enter(begin, outputs);
+        history.bind_native_queue_retention(&frozen).unwrap();
+        {
+            let _publication = PublicationScope::enter();
+            sender.send(10).unwrap();
+        }
+        assert_eq!(receiver.len(), 1);
+        assert!(history.finish().is_err());
+        assert!(gate.verify().is_err());
+        let (message, receipt) = receiver.try_recv().unwrap().into_parts();
+        assert_eq!(receipt, accepted);
+        assert!(message.is_rooted());
+        assert_eq!(*message.message(), 10);
+        assert!(frozen.finish().is_err());
+        drop(message);
+        assert!(!callbacks_pending());
+        clear_callbacks().unwrap();
     }
 }

@@ -13,10 +13,10 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Real-time and test timers for use with `Clock` implementations.
+//! Real-time and virtual timers for use with `Clock` implementations.
 //!
 //! Defines [`TimeEvent`] values, callback and handler types, heap scheduling order, and the
-//! deterministic [`TestTimer`] iterator. The event and callback primitives are shared by test and
+//! deterministic [`VirtualTimer`] iterator. The event and callback primitives are shared by virtual and
 //! live clock implementations.
 
 use std::{
@@ -39,6 +39,60 @@ use ustr::Ustr;
 #[must_use]
 pub fn create_valid_interval(interval_ns: DurationNanos) -> NonZeroU64 {
     NonZeroU64::new(interval_ns.as_u64()).unwrap_or(NonZeroU64::MIN)
+}
+
+/// Supplies UTC deadlines for a recurring timer independently of its delivery mechanism.
+///
+/// Implementations are immutable and may be shared between timers. Each timer owns its own
+/// occurrence index. Live timers can skip missed occurrences, while virtual timers replay each
+/// deadline. The deadline calculation must not invoke callbacks or alter clock state.
+pub trait TimerSchedule: Debug + Send + Sync {
+    /// Returns the nominal start timestamp, including an explicit UNIX epoch start.
+    fn start_time_ns(&self) -> UnixNanos;
+
+    /// Returns the first deadline strictly after `time_ns`, updating the occurrence index.
+    ///
+    /// `index` is a hint from the preceding calculation, initially zero. A fresh hint must also
+    /// work after a timer restart. Returns `None` when no later deadline is representable.
+    fn next_after(&self, time_ns: UnixNanos, index: &mut u64) -> Option<UnixNanos>;
+}
+
+/// The spacing or deadline source for consecutive events of a recurring timer.
+#[derive(Debug, Clone)]
+pub enum TimerInterval {
+    /// A fixed interval in nanoseconds.
+    Fixed(NonZeroU64),
+    /// A source of absolute UTC deadlines.
+    Schedule(Arc<dyn TimerSchedule>),
+}
+
+impl TimerInterval {
+    // Fixed intervals retain their nominal grid; schedule sources supply absolute deadlines
+    pub(crate) fn next_time_after(
+        &self,
+        start_time_ns: UnixNanos,
+        time_ns: UnixNanos,
+        index: &mut u64,
+    ) -> Option<UnixNanos> {
+        match self {
+            Self::Fixed(interval_ns) => {
+                *index =
+                    time_ns.saturating_duration_since(start_time_ns).as_u64() / interval_ns.get();
+                *index = index.checked_add(1)?;
+                start_time_ns
+                    .checked_add(DurationNanos::new(interval_ns.get().checked_mul(*index)?))
+            }
+            Self::Schedule(schedule) => schedule
+                .next_after(time_ns, index)
+                .filter(|next| *next > time_ns),
+        }
+    }
+}
+
+impl From<NonZeroU64> for TimerInterval {
+    fn from(value: NonZeroU64) -> Self {
+        Self::Fixed(value)
+    }
 }
 
 #[repr(C)]
@@ -152,7 +206,9 @@ impl PythonTimeEventCallback {
     pub fn call(&self, event: TimeEvent) {
         Python::attach(|py| {
             if let Err(e) = self.callback.call1(py, (event,)) {
-                log::error!("Python time event callback raised exception: {e}");
+                let exception = crate::python::logging::format_exception(&e);
+
+                log::error!("Python time event callback raised exception:\n{exception}");
             }
         });
     }
@@ -185,7 +241,7 @@ impl Debug for PythonTimeEventCallback {
 /// - The callback captures `Rc<RefCell<...>>` for shared mutable state.
 /// - Thread safety constraints prevent using `Arc`.
 ///
-/// `RustLocal` works with `TestClock` and with `LiveClock` when its event channel
+/// `RustLocal` works with `VirtualClock` and with `LiveClock` when its event channel
 /// is drained on the callback's originating thread.
 ///
 /// # Automatic Conversion
@@ -230,7 +286,7 @@ impl TimeEventCallback {
     ///
     /// # Panics
     ///
-    /// Panics from Rust callbacks propagate to the caller.
+    /// Panics if a Rust callback panics. The panic propagates to the caller.
     pub fn call(&self, event: TimeEvent) {
         match self {
             #[cfg(feature = "python")]
@@ -301,7 +357,7 @@ impl TimeEventHandler {
     ///
     /// # Panics
     ///
-    /// Panics from the message-bus tap or a Rust callback propagate to the caller.
+    /// Panics if the message-bus tap or a Rust callback panics. The panic propagates to the caller.
     pub fn run(self) {
         let Self { event, callback } = self;
         crate::msgbus::dispatch_tap_time_event(&event);
@@ -342,16 +398,16 @@ pub(crate) trait Timer {
     fn cancel(&mut self);
 }
 
-/// A deterministic interval timer for use with a [`TestClock`](crate::clock::TestClock).
+/// A deterministic interval timer for use with a [`VirtualClock`](crate::clock::VirtualClock).
 ///
 /// The timer generates scheduled events through an optional inclusive stop time as its iterator is
 /// consumed.
 #[derive(Clone, Debug)]
-pub struct TestTimer {
+pub struct VirtualTimer {
     /// The name of the timer.
     pub name: Ustr,
-    /// The interval between timer events in nanoseconds.
-    pub interval_ns: NonZeroU64,
+    /// The fixed interval or source of UTC deadlines.
+    pub interval: TimerInterval,
     /// The start time of the timer in UNIX nanoseconds.
     pub start_time_ns: UnixNanos,
     /// The optional inclusive stop time of the timer in UNIX nanoseconds.
@@ -359,41 +415,47 @@ pub struct TestTimer {
     /// Whether the first event fires at the start time instead of after one interval.
     pub fire_immediately: bool,
     next_time_ns: UnixNanos,
+    next_index: u64,
     is_expired: bool,
 }
 
-impl TestTimer {
-    /// Creates a test timer with the supplied schedule.
+impl VirtualTimer {
+    /// Creates a virtual timer with the supplied schedule.
     ///
     /// # Panics
     ///
     /// Panics if:
     /// - `name` is not a valid string.
-    /// - `fire_immediately` is `false` and `start_time_ns + interval_ns` exceeds the
-    ///   [`UnixNanos`] range.
+    /// - `fire_immediately` is `false` and there is no valid deadline after `start_time_ns`.
     #[must_use]
     pub fn new(
         name: Ustr,
-        interval_ns: NonZeroU64,
+        interval: impl Into<TimerInterval>,
         start_time_ns: UnixNanos,
         stop_time_ns: Option<UnixNanos>,
         fire_immediately: bool,
     ) -> Self {
         check_valid_string_utf8(name, stringify!(name)).expect(FAILED);
 
+        let interval = interval.into();
+        let mut next_index = 0;
+
         let next_time_ns = if fire_immediately {
             start_time_ns
         } else {
-            start_time_ns + DurationNanos::new(interval_ns.get())
+            interval
+                .next_time_after(start_time_ns, start_time_ns, &mut next_index)
+                .expect("first timer event should be within the UnixNanos range")
         };
 
         Self {
             name,
-            interval_ns,
+            interval,
             start_time_ns,
             stop_time_ns,
             fire_immediately,
             next_time_ns,
+            next_index,
             is_expired: false,
         }
     }
@@ -415,14 +477,13 @@ impl TestTimer {
     /// Consuming the iterator advances the timer. Events at `to_time_ns` and at the configured stop
     /// time are included.
     pub fn advance(&mut self, to_time_ns: UnixNanos) -> impl Iterator<Item = TimeEvent> + '_ {
-        // Calculate how many events should fire up to and including to_time_ns
-        let advances = if self.next_time_ns <= to_time_ns {
-            ((to_time_ns - self.next_time_ns).as_u64() / self.interval_ns.get()).saturating_add(1)
-        } else {
-            0
-        };
+        std::iter::from_fn(move || {
+            if self.next_time_ns > to_time_ns {
+                return None;
+            }
 
-        self.take(advances as usize).map(|(event, _)| event)
+            self.next().map(|(event, _)| event)
+        })
     }
 
     /// Cancels the timer so it produces no further events.
@@ -431,7 +492,7 @@ impl TestTimer {
     }
 }
 
-impl Timer for TestTimer {
+impl Timer for VirtualTimer {
     fn is_expired(&self) -> bool {
         Self::is_expired(self)
     }
@@ -441,7 +502,7 @@ impl Timer for TestTimer {
     }
 }
 
-impl Iterator for TestTimer {
+impl Iterator for VirtualTimer {
     type Item = (TimeEvent, UnixNanos);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -470,7 +531,8 @@ impl Iterator for TestTimer {
         );
 
         if let Some(following_time_ns) =
-            event_time_ns.checked_add(DurationNanos::new(self.interval_ns.get()))
+            self.interval
+                .next_time_after(self.start_time_ns, event_time_ns, &mut self.next_index)
         {
             self.next_time_ns = following_time_ns;
         } else {
@@ -487,26 +549,34 @@ impl Iterator for TestTimer {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::BinaryHeap, num::NonZeroU64, rc::Rc};
+    use std::{cell::RefCell, collections::BinaryHeap, num::NonZeroU64, rc::Rc, sync::Arc};
 
-    use nautilus_core::{DurationNanos, UUID4, UnixNanos};
+    use jiff::{Span, Timestamp};
+    use nautilus_core::{DurationNanos, UUID4, UnixNanos, datetime::get_timezone};
     #[cfg(feature = "python")]
     use pyo3::{
         Bound, PyResult, Python,
+        ffi::c_str,
         types::{
-            PyAnyMethods, PyCFunction, PyDict, PyList, PyListMethods, PyTuple, PyTupleMethods,
-            PyTypeMethods,
+            PyAnyMethods, PyCFunction, PyDict, PyList, PyListMethods, PyModule, PyTuple,
+            PyTupleMethods, PyTypeMethods,
         },
     };
     use rstest::*;
     use ustr::Ustr;
 
     use super::{
-        ScheduledTimeEvent, TestTimer, TimeEvent, TimeEventCallback, TimeEventHandler,
-        create_valid_interval,
+        ScheduledTimeEvent, TimeEvent, TimeEventCallback, TimeEventHandler, TimerInterval,
+        VirtualTimer, create_valid_interval,
     };
-    use crate::msgbus::{
-        BusTap, Endpoint, MStr, MessagingSwitchboard, Topic, clear_bus_tap, set_bus_tap,
+    #[cfg(feature = "python")]
+    use crate::logging::{
+        arm_shutdown_on_error, disarm_shutdown_on_error, init_logging,
+        take_shutdown_on_error_trigger,
+    };
+    use crate::{
+        calendar::CalendarSchedule,
+        msgbus::{BusTap, Endpoint, MStr, MessagingSwitchboard, Topic, clear_bus_tap, set_bus_tap},
     };
 
     #[rstest]
@@ -520,9 +590,72 @@ mod tests {
         );
     }
 
+    fn utc_nanos(time: &str) -> UnixNanos {
+        UnixNanos::from(time.parse::<Timestamp>().unwrap())
+    }
+
     #[rstest]
-    fn test_test_timer_advance_within_next_time_ns() {
-        let mut timer = TestTimer::new(
+    #[case::next_interval(100, 100, 0, Some(110), 1)]
+    #[case::skips_elapsed_intervals(100, 135, 0, Some(140), 4)]
+    #[case::scheduled_time_equal_to_time_is_skipped(100, 140, 3, Some(150), 5)]
+    #[case::unrepresentable(u64::MAX - 5, u64::MAX - 5, 0, None, 1)]
+    fn test_timer_interval_fixed_next_time_after(
+        #[case] start_time_ns: u64,
+        #[case] time_ns: u64,
+        #[case] index: u64,
+        #[case] expected: Option<u64>,
+        #[case] expected_index: u64,
+    ) {
+        let interval = TimerInterval::Fixed(NonZeroU64::new(10).unwrap());
+        let mut index = index;
+
+        let next_time_ns = interval.next_time_after(
+            UnixNanos::from(start_time_ns),
+            UnixNanos::from(time_ns),
+            &mut index,
+        );
+
+        assert_eq!(next_time_ns, expected.map(UnixNanos::from));
+        assert_eq!(index, expected_index);
+    }
+
+    #[rstest]
+    fn test_virtual_timer_calendar_advance_keeps_local_time() {
+        let mut timer = VirtualTimer::new(
+            Ustr::from("TEST_TIMER"),
+            TimerInterval::Schedule(Arc::new(
+                CalendarSchedule::new(
+                    &utc_nanos("2026-10-23T07:00:00Z")
+                        .to_datetime_utc()
+                        .to_zoned(get_timezone("Europe/London").unwrap()),
+                    Span::new().days(1),
+                )
+                .unwrap(),
+            )),
+            utc_nanos("2026-10-23T07:00:00Z"),
+            None,
+            false,
+        );
+
+        let events: Vec<UnixNanos> = timer
+            .advance(utc_nanos("2026-10-26T08:00:00Z"))
+            .map(|event| event.ts_event)
+            .collect();
+
+        assert_eq!(
+            events,
+            vec![
+                utc_nanos("2026-10-24T07:00:00Z"),
+                utc_nanos("2026-10-25T08:00:00Z"),
+                utc_nanos("2026-10-26T08:00:00Z"),
+            ]
+        );
+        assert_eq!(timer.next_time_ns(), utc_nanos("2026-10-27T08:00:00Z"));
+    }
+
+    #[rstest]
+    fn test_virtual_timer_advance_within_next_time_ns() {
+        let mut timer = VirtualTimer::new(
             Ustr::from("TEST_TIMER"),
             NonZeroU64::new(5).unwrap(),
             UnixNanos::default(),
@@ -538,8 +671,8 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_timer_advance_up_to_next_time_ns() {
-        let mut timer = TestTimer::new(
+    fn test_virtual_timer_advance_up_to_next_time_ns() {
+        let mut timer = VirtualTimer::new(
             Ustr::from("TEST_TIMER"),
             NonZeroU64::new(1).unwrap(),
             UnixNanos::default(),
@@ -551,8 +684,8 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_timer_advance_up_to_next_time_ns_with_stop_time() {
-        let mut timer = TestTimer::new(
+    fn test_virtual_timer_advance_up_to_next_time_ns_with_stop_time() {
+        let mut timer = VirtualTimer::new(
             Ustr::from("TEST_TIMER"),
             NonZeroU64::new(1).unwrap(),
             UnixNanos::default(),
@@ -564,8 +697,8 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_timer_advance_beyond_next_time_ns() {
-        let mut timer = TestTimer::new(
+    fn test_virtual_timer_advance_beyond_next_time_ns() {
+        let mut timer = VirtualTimer::new(
             Ustr::from("TEST_TIMER"),
             NonZeroU64::new(1).unwrap(),
             UnixNanos::default(),
@@ -577,8 +710,8 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_timer_advance_beyond_stop_time() {
-        let mut timer = TestTimer::new(
+    fn test_virtual_timer_advance_beyond_stop_time() {
+        let mut timer = VirtualTimer::new(
             Ustr::from("TEST_TIMER"),
             NonZeroU64::new(1).unwrap(),
             UnixNanos::default(),
@@ -590,8 +723,8 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_timer_advance_exact_boundary() {
-        let mut timer = TestTimer::new(
+    fn test_virtual_timer_advance_exact_boundary() {
+        let mut timer = VirtualTimer::new(
             Ustr::from("TEST_TIMER"),
             NonZeroU64::new(5).unwrap(),
             UnixNanos::from(0),
@@ -611,8 +744,8 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_timer_fire_immediately_true() {
-        let mut timer = TestTimer::new(
+    fn test_virtual_timer_fire_immediately_true() {
+        let mut timer = VirtualTimer::new(
             Ustr::from("TEST_TIMER"),
             NonZeroU64::new(5).unwrap(),
             UnixNanos::from(10),
@@ -633,8 +766,8 @@ mod tests {
     }
 
     #[rstest]
-    fn test_test_timer_fire_immediately_false() {
-        let mut timer = TestTimer::new(
+    fn test_virtual_timer_fire_immediately_false() {
+        let mut timer = VirtualTimer::new(
             Ustr::from("TEST_TIMER"),
             NonZeroU64::new(5).unwrap(),
             UnixNanos::from(10),
@@ -790,6 +923,76 @@ mod tests {
         let popped = std::iter::from_fn(|| heap.pop().map(ScheduledTimeEvent::into_inner))
             .collect::<Vec<_>>();
         assert_eq!(popped, expected);
+    }
+
+    #[cfg(feature = "python")]
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_python_callback_exception_requests_shutdown(#[case] shutdown: bool) {
+        Python::initialize();
+        let _guard = init_logging(
+            "TRADER-001".into(),
+            UUID4::new(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                c_str!(
+                    r#"
+seen = []
+def callback(event):
+    seen.append(event.name)
+    raise RuntimeError("timer callback failure")
+"#
+                ),
+                c_str!("timer_callback.py"),
+                c_str!("timer_callback"),
+            )
+            .unwrap();
+            let callback = TimeEventCallback::from_python_time_event(
+                module.getattr("callback").unwrap().unbind(),
+            );
+
+            let event = TimeEvent::new(
+                Ustr::from("ALERT"),
+                UUID4::new(),
+                UnixNanos::from(10),
+                UnixNanos::from(11),
+            );
+            arm_shutdown_on_error(shutdown);
+            callback.call(event.clone());
+            let trigger = take_shutdown_on_error_trigger();
+            disarm_shutdown_on_error();
+            callback.call(event);
+            let seen = module
+                .getattr("seen")
+                .unwrap()
+                .extract::<Vec<String>>()
+                .unwrap();
+
+            assert_eq!(seen, ["ALERT", "ALERT"]);
+
+            if shutdown {
+                let trigger = trigger.expect("timer exception must request shutdown");
+                assert!(
+                    trigger
+                        .message
+                        .contains("Python time event callback raised exception:")
+                );
+                assert!(trigger.message.contains("in callback"));
+                assert!(
+                    trigger
+                        .message
+                        .contains("RuntimeError: timer callback failure")
+                );
+            } else {
+                assert_eq!(trigger, None);
+            }
+        });
     }
 
     #[cfg(feature = "python")]
@@ -954,7 +1157,7 @@ mod tests {
         operations: Vec<TimerOperation>,
         (interval_ns, start_time_ns, stop_time_ns, fire_immediately): (u64, u64, Option<u64>, bool),
     ) -> TestCaseResult {
-        let mut timer = TestTimer::new(
+        let mut timer = VirtualTimer::new(
             Ustr::from("PROP_TEST_TIMER"),
             NonZeroU64::new(interval_ns).unwrap(),
             UnixNanos::from(start_time_ns),
@@ -1078,7 +1281,7 @@ mod tests {
             fire_immediately in prop::bool::ANY,
             advance_count in 1u64..=20,
         ) {
-            let mut timer = TestTimer::new(
+            let mut timer = VirtualTimer::new(
                 Ustr::from("CONSISTENCY_TEST"),
                 NonZeroU64::new(interval_ns).unwrap(),
                 UnixNanos::from(start_time_ns),
@@ -1131,7 +1334,7 @@ mod tests {
             } else {
                 event_time_ns - interval_ns
             };
-            let mut timer = TestTimer::new(
+            let mut timer = VirtualTimer::new(
                 Ustr::from("TERMINAL_STOP_TEST"),
                 NonZeroU64::new(interval_ns).unwrap(),
                 UnixNanos::from(start_time_ns),

@@ -97,7 +97,7 @@ enum.
 
 The `OmsType` enum has three variants:
 
-- `UNSPECIFIED`: The strategy uses the venue's OMS type.
+- `UNSPECIFIED`: The strategy uses the owning execution client's OMS type.
 - `NETTING`: Positions combine into one position per instrument and strategy.
 - `HEDGING`: Multiple positions per instrument and strategy can remain open.
 
@@ -119,9 +119,17 @@ For reductions of inherited inventory, see [Reducing external positions](reconci
 
 ### OMS configuration
 
-When a strategy omits `oms_type` or uses `UNSPECIFIED`, the `ExecutionEngine` follows the venue's
-OMS type without overriding venue `position_id` values. Configure a backtest venue with the OMS
-type used by the venue being modeled.
+When a strategy omits `oms_type` or uses `UNSPECIFIED`, the `ExecutionEngine` uses the owning
+execution client's OMS type. An explicit `NETTING` or `HEDGING` strategy override takes precedence.
+Submission validation uses the client selected by command routing. Fill processing uses the cached
+order's client origin, or the one registered client that matches the fill's account and handles its
+instrument venue when that origin is unavailable. This account lookup also covers spread-leg fills
+without a cached order. For fills associated with an order, an existing cached position retains its
+recorded OMS type.
+
+If ownership is absent or ambiguous, fills use `NETTING` unless the strategy supplies an explicit
+override. Venue and default command routes do not select the fill's OMS type. Configure a backtest
+venue with the OMS type used by the venue being modeled.
 
 Venue position modes may require adapter-specific configuration. For example, see
 [Binance Futures hedge mode](../../integrations/binance.md#futures-hedge-mode).
@@ -180,12 +188,13 @@ execution components and do not pass through the `RiskEngine`.
 Unless bypassed in `RiskEngineConfig`, the engine validates:
 
 - Price and trigger-price precision for the instrument.
-- Positive prices, unless the instrument allows negative prices (options, futures spreads,
-  option spreads, and spot commodities).
+- Positive prices, unless the instrument allows negative prices (futures, options, futures
+  spreads, option spreads, and spot commodities). Inverse futures and futures spreads require positive prices.
 - Quantity precision and base-quantity minimum and maximum bounds.
 - GTD orders have not already expired.
 - `reduce_only` orders do not increase the referenced position.
-- Engine-level `max_notional_per_order` limits and the instrument's `min_notional` and `max_notional` fields.
+- Engine-level `max_notional_per_order` limits and the instrument's `min_notional` and `max_notional` fields,
+  compared by notional magnitude.
 - Cash-account balance impact for non-margin accounts.
 - Submit and modify rate limits.
 - Trading-state restrictions (`ACTIVE`, `HALTED`, `REDUCING`).
@@ -193,6 +202,27 @@ Unless bypassed in `RiskEngineConfig`, the engine validates:
 If a submit-time risk check fails, the system generates an `OrderDenied` event with a
 standardized [reason code](#order-denied-reasons). If a modify-time risk check fails, it
 generates an `OrderModifyRejected` event.
+
+### Account selection
+
+Balance, margin, and position checks use the account of the execution client that will run the
+command, before `OrderSubmitted` assigns the order's account. The risk engine selects the account
+in this order:
+
+1. An order that already has an account, such as an order being modified, uses that account.
+1. A command for an external client (`external_clients`) uses the venue's account only when exactly
+   one account is issued under the venue.
+1. A command `client_id` that names a registered execution client uses that client's account.
+1. Any other command uses the account of the client routed for the instrument's venue, then the
+   default client's account. This includes a command whose `client_id` names neither a registered
+   nor an external client, which the execution engine routes the same way.
+1. A command with no venue route or default client uses the venue's account only when exactly one
+   account is issued under the venue.
+
+An order list selects one account from the command's `client_id` and instrument. When no account
+resolves, or the selected client's account is not cached yet, the risk engine denies the order or
+rejects the modification with `VALIDATION_FAILED`. It never falls back to another account. Positions
+and open orders count toward position-reducing checks only when they belong to the selected account.
 
 ### Whole-position conditional exits
 
@@ -211,6 +241,7 @@ An order qualifies for the placeholder exemption only when all of these conditio
   `close_position=true`.
 - It has a positive placeholder quantity and sets `reduce_only=true`.
 - The command, order, and linked cached position use the same instrument and position ID.
+- The linked position belongs to the [selected account](#account-selection).
 - The linked position is open, the order side closes it, and the placeholder quantity does not
   exceed the position quantity.
 
@@ -249,9 +280,9 @@ The states become progressively more restrictive:
 
 In `REDUCING`, an individual `SubmitOrder` is eligible only when the order sets
 `reduce_only=true`, the command and order identify the same instrument, and the supplied position
-ID matches the order's cached open position. The order side must oppose the position, and the
-submitted quantity must not exceed the cached position quantity. Order lists and modifications are
-denied.
+ID matches the order's cached open position on the [selected account](#account-selection). The
+order side must oppose the position, and the submitted quantity must not exceed the cached position
+quantity. Order lists and modifications are denied.
 
 The risk engine applies these rules before forwarding commands to execution.
 
@@ -291,7 +322,7 @@ For a local execution client, the `ExecutionEngine` resolves the root command to
 in this order:
 
 1. The explicit `client_id`, when it identifies a registered local client.
-1. The client registered for the instrument's venue.
+1. The client routed for the instrument's venue.
 1. The default execution client.
 
 The engine then creates fresh child commands for the selected client and its account:
@@ -485,31 +516,40 @@ the order's current `filled_qty` plus the incoming `last_qty` against the origin
 
 The `allow_overfills` configuration option (default: `False`) controls how overfills are handled:
 
-| `allow_overfills` | Behavior                                                                   |
-| ----------------- | -------------------------------------------------------------------------- |
-| `False`           | Logs and rejects the fill, preserving the order's current state.           |
-| `True`            | Logs a warning, applies the fill, and tracks the excess in `overfill_qty`. |
+| `allow_overfills` | Behavior                                                                              |
+| ----------------- | ------------------------------------------------------------------------------------- |
+| `False`           | Logs and rejects the fill. A standalone reconciliation fill may raise quantity first. |
+| `True`            | Logs a warning, applies the fill, and tracks the excess in `overfill_qty`.            |
+
+When `allow_overfills` is false and the execution client allows that overfill, the engine raises
+the order quantity to the filled quantity plus that fill, then applies the fill. An already filled
+order is not raised. Adapter fill events, fills bundled with an order report, and live-manager
+projected fills do not use this raise.
 
 When overfills are allowed, the order's `overfill_qty` field tracks the excess quantity.
 The order transitions to `FILLED` status and `leaves_qty` is clamped to zero.
 
 ### Duplicate fill detection
 
-The `Order` model enforces one applied fill per `trade_id`. `Order.apply()` returns an error when
-the same ID already exists on the order.
+The `Order` model enforces one quantity-bearing fill per `trade_id`. A repeated fill at the
+latest recorded price for that trade is rejected as a duplicate. A repeated fill at a new price
+restates the price that trade contributes to `avg_px` without changing quantity, status, or the
+original stored fill.
 
 #### Core engine path
 
-Before applying a fill, the `ExecutionEngine` calls `Order.is_duplicate_fill()`, which compares:
+Before applying a fill, the `ExecutionEngine` calls `Order.is_duplicate_fill()`, which compares
+the latest fill for the `trade_id` on:
 
 - `trade_id`
 - `order_side`
 - `last_px`
 - `last_qty`
 
-An exact match is skipped with a warning. If the `trade_id` matches but another field differs, the
-four-field check does not classify the fill as an exact duplicate. `Order.apply()` then rejects the
-reused ID, and the engine logs and drops the fill.
+An exact match is skipped with a warning. If the `trade_id` matches but the price differs, the
+fill is a price restatement: the order restates its average price and the engine restates the
+open position's average without applying quantity. If another field differs, `Order.apply()`
+rejects the reused ID, and the engine logs and drops the fill.
 
 #### Reconciliation path
 
@@ -518,6 +558,15 @@ report when that ID already exists on the order, regardless of its price or quan
 
 Synthetic and inferred reconciliation fills use deterministic IDs. Replaying the same inputs after
 a restart therefore produces the same `trade_id` and is deduplicated.
+
+### Declined fill notification
+
+When the `ExecutionEngine` rejects an `OrderFilled` or `OrderFillVoided` instead of applying it,
+for example as a duplicate, an overfill, or for an order it cannot find, it publishes the unchanged
+event on the `events.order_fill_declined.{instrument_id}` topic. Each rejection site logs the reason;
+the published event does not carry it. An adapter that tracks whether its fills and corrections were
+applied can subscribe to this topic. The engine does not publish on it for reconciliation
+projections, which update only the order.
 
 ### Configuration
 
@@ -565,8 +614,9 @@ A void is a venue action on a trade it already reported. The causes recur across
   positions carry no exposure.
 - **Post-trade restatement**: the venue restates the quantity or fees of a trade during clearing.
 
-The event does not restate the fill price, so a venue price adjustment is not expressible as a
-single correction.
+A venue price adjustment is expressed as a new `OrderFilled` carrying the same `trade_id` at the
+new price, which restates the trade's accounting without changing its matched quantity. The
+`OrderFillVoided` event itself corrects quantity, not price.
 
 A break reaches the client differently by venue. FIX venues signal one through
 [`ExecType <150>`](https://www.onixs.biz/fix-dictionary/5.0.sp2/tagnum_150.html) values `H` (trade

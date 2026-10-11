@@ -400,6 +400,20 @@ impl GreeksData {
             itm_prob: 0.0,
         }
     }
+
+    /// Returns portfolio values with `pnl`, `price`, and all Greeks scaled by the contract multiplier.
+    ///
+    /// Preserves both timestamps and leaves position quantity scaling to the caller.
+    #[must_use]
+    pub fn to_portfolio_greeks(&self) -> PortfolioGreeks {
+        PortfolioGreeks {
+            ts_init: self.ts_init,
+            ts_event: self.ts_event,
+            pnl: self.pnl * self.multiplier,
+            price: self.price * self.multiplier,
+            greeks: self.greeks * self.multiplier,
+        }
+    }
 }
 
 impl Deref for GreeksData {
@@ -461,7 +475,7 @@ impl Display for GreeksData {
     }
 }
 
-// Implement multiplication for quantity * greeks
+/// Scales values by quantity without applying the contract multiplier.
 impl Mul<&GreeksData> for f64 {
     type Output = GreeksData;
 
@@ -593,12 +607,20 @@ impl Add for PortfolioGreeks {
 
 impl From<GreeksData> for PortfolioGreeks {
     fn from(g: GreeksData) -> Self {
-        Self {
+        g.to_portfolio_greeks()
+    }
+}
+
+impl Mul<&PortfolioGreeks> for f64 {
+    type Output = PortfolioGreeks;
+
+    fn mul(self, g: &PortfolioGreeks) -> PortfolioGreeks {
+        PortfolioGreeks {
             ts_init: g.ts_init,
             ts_event: g.ts_event,
-            pnl: g.pnl,
-            price: g.price,
-            greeks: g.greeks,
+            pnl: self * g.pnl,
+            price: self * g.price,
+            greeks: g.greeks * self,
         }
     }
 }
@@ -1122,7 +1144,7 @@ mod tests {
 
     #[rstest]
     fn test_portfolio_greeks_addition() {
-        let greeks1 = PortfolioGreeks::new(
+        let mut greeks1 = PortfolioGreeks::new(
             UnixNanos::from(1_000_000_000),
             UnixNanos::from(1_500_000_000),
             100.0,
@@ -1132,7 +1154,8 @@ mod tests {
             20.0,
             -1.0,
         );
-        let greeks2 = PortfolioGreeks::new(
+
+        let mut greeks2 = PortfolioGreeks::new(
             UnixNanos::from(2_000_000_000),
             UnixNanos::from(2_500_000_000),
             200.0,
@@ -1142,6 +1165,9 @@ mod tests {
             25.0,
             -1.5,
         );
+
+        greeks1.greeks.rho = 12.0;
+        greeks2.greeks.rho = 17.0;
 
         let result = greeks1 + greeks2;
 
@@ -1153,6 +1179,60 @@ mod tests {
         assert_eq!(result.gamma, 0.008);
         assert_eq!(result.vega, 45.0);
         assert_eq!(result.theta, -2.5);
+        assert_eq!(result.rho, 29.0);
+    }
+
+    #[rstest]
+    #[case(1.0, [20.0, 30.0, 40.0, 50.0, 60.0, -70.0, 80.0])]
+    #[case(2.0, [40.0, 60.0, 80.0, 100.0, 120.0, -140.0, 160.0])]
+    #[case(-3.0, [-60.0, -90.0, -120.0, -150.0, -180.0, 210.0, -240.0])]
+    #[case(0.0, [0.0; 7])]
+    fn test_greeks_data_portfolio_scaling(#[case] quantity: f64, #[case] expected: [f64; 7]) {
+        let greeks = GreeksData {
+            pnl: 2.0,
+            price: 3.0,
+            multiplier: 10.0,
+            quantity: 9.0,
+            greeks: OptionGreekValues {
+                delta: 4.0,
+                gamma: 5.0,
+                vega: 6.0,
+                theta: -7.0,
+                rho: 8.0,
+            },
+            ..create_test_greeks_data()
+        };
+
+        let portfolio = quantity * &greeks.to_portfolio_greeks();
+
+        assert_eq!(portfolio.ts_init, UnixNanos::from(1_000_000_000));
+        assert_eq!(portfolio.ts_event, UnixNanos::from(1_500_000_000));
+        assert_eq!(
+            [
+                portfolio.pnl,
+                portfolio.price,
+                portfolio.delta,
+                portfolio.gamma,
+                portfolio.vega,
+                portfolio.theta,
+                portfolio.rho
+            ],
+            expected,
+        );
+        assert_eq!(greeks.pnl, 2.0);
+        assert_eq!(greeks.price, 3.0);
+        assert_eq!(greeks.multiplier, 10.0);
+        assert_eq!(greeks.quantity, 9.0);
+        assert_eq!(
+            greeks.greeks,
+            OptionGreekValues {
+                delta: 4.0,
+                gamma: 5.0,
+                vega: 6.0,
+                theta: -7.0,
+                rho: 8.0,
+            }
+        );
     }
 
     #[rstest]
@@ -1162,12 +1242,13 @@ mod tests {
 
         assert_eq!(portfolio_greeks.ts_init, greeks_data.ts_init);
         assert_eq!(portfolio_greeks.ts_event, greeks_data.ts_event);
-        assert_eq!(portfolio_greeks.pnl, greeks_data.pnl);
-        assert_eq!(portfolio_greeks.price, greeks_data.price);
-        assert_eq!(portfolio_greeks.delta, greeks_data.delta);
-        assert_eq!(portfolio_greeks.gamma, greeks_data.gamma);
-        assert_eq!(portfolio_greeks.vega, greeks_data.vega);
-        assert_eq!(portfolio_greeks.theta, greeks_data.theta);
+        assert_eq!(portfolio_greeks.pnl, 25_000.0);
+        assert_eq!(portfolio_greeks.price, 2_550.0);
+        assert_eq!(portfolio_greeks.delta, 65.0);
+        assert_eq!(portfolio_greeks.gamma, 0.3);
+        assert_eq!(portfolio_greeks.vega, 1_520.0);
+        assert_eq!(portfolio_greeks.theta, -8.0);
+        assert_eq!(portfolio_greeks.rho, 0.0);
     }
 
     #[rstest]

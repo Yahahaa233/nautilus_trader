@@ -23,9 +23,9 @@ use std::{
     time::Duration,
 };
 
-use ahash::AHashSet;
 #[cfg(feature = "live")]
 use crate::live::dst;
+use ahash::AHashSet;
 use bytes::Bytes;
 use indexmap::IndexMap;
 use log::LevelFilter;
@@ -35,7 +35,7 @@ use nautilus_model::{
     data::{
         Bar, BarType, BookOrder, CustomData, DataType, FundingRateUpdate, GreeksData, HasTsInit,
         IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas,
-        OrderBookDepth10, QuoteTick, TradeTick,
+        OrderBookDepth, QuoteTick, TradeTick,
         close::InstrumentClose,
         custom::CustomDataTrait,
         greeks::OptionGreekValues,
@@ -75,8 +75,8 @@ use super::{Actor, DataActor, DataActorCore, DataActorNative, data_actor::DataAc
 use crate::{
     actor::registry::{get_actor, get_actor_unchecked, register_actor},
     cache::Cache,
-    clock::{Clock, TestClock},
-    component::Component,
+    clock::{Clock, VirtualClock},
+    component::{Component, ComponentAccessError},
     logging::{logger::LogGuard, logging_is_initialized},
     messages::{
         data::{
@@ -88,10 +88,10 @@ use crate::{
         system::{QueueCondition, QueueState, QueueStateChanged, SocketState, SocketStateChanged},
     },
     msgbus::{
-        self, MessageBus, get_message_bus,
+        self, MessageBus, ShareableMessageHandler, get_message_bus,
         stubs::get_typed_into_message_saving_handler,
         switchboard::{
-            MessagingSwitchboard, get_bars_topic, get_book_deltas_topic, get_book_depth10_topic,
+            MessagingSwitchboard, get_bars_topic, get_book_deltas_topic, get_book_depth_topic,
             get_book_snapshots_topic, get_custom_topic, get_funding_rate_topic,
             get_index_price_topic, get_instrument_close_topic, get_instrument_status_topic,
             get_instrument_topic, get_mark_price_topic, get_option_chain_topic,
@@ -279,7 +279,7 @@ struct TestDataActor {
     pub received_data: Vec<String>, // Use string for simplicity
     pub received_books: Vec<OrderBook>,
     pub received_deltas: Vec<OrderBookDelta>,
-    pub received_depths: Vec<OrderBookDepth10>,
+    pub received_depths: Vec<OrderBookDepth>,
     pub received_quotes: Vec<QuoteTick>,
     pub received_trades: Vec<TradeTick>,
     pub received_bars: Vec<Bar>,
@@ -364,8 +364,8 @@ impl DataActor for TestDataActor {
         Ok(())
     }
 
-    fn on_book_depth(&mut self, depth: &OrderBookDepth10) -> anyhow::Result<()> {
-        self.received_depths.push(*depth);
+    fn on_book_depth(&mut self, depth: &OrderBookDepth) -> anyhow::Result<()> {
+        self.received_depths.push(depth.clone());
         Ok(())
     }
 
@@ -406,8 +406,8 @@ impl DataActor for TestDataActor {
         Ok(())
     }
 
-    fn on_historical_book_depth(&mut self, depths: &[OrderBookDepth10]) -> anyhow::Result<()> {
-        self.received_depths.extend(depths);
+    fn on_historical_book_depth(&mut self, depths: &[OrderBookDepth]) -> anyhow::Result<()> {
+        self.received_depths.extend(depths.iter().cloned());
         Ok(())
     }
 
@@ -562,8 +562,8 @@ impl TestDataActor {
 }
 
 #[fixture]
-pub fn clock() -> Rc<RefCell<TestClock>> {
-    Rc::new(RefCell::new(TestClock::new()))
+pub fn clock() -> Rc<RefCell<VirtualClock>> {
+    Rc::new(RefCell::new(VirtualClock::new()))
 }
 
 #[fixture]
@@ -616,7 +616,7 @@ impl Actor for DummyActor {
 }
 
 fn register_data_actor(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) -> Ustr {
@@ -686,7 +686,7 @@ fn test_data_actor_component_id_erases_actor_id() {
 
 #[rstest]
 fn test_registered_clock_dispatches_time_events_only_while_actor_is_running(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -722,7 +722,7 @@ fn test_registered_clock_dispatches_time_events_only_while_actor_is_running(
 
 #[rstest]
 fn test_data_actor_rejects_second_registration_without_replacing_dependencies(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -732,7 +732,7 @@ fn test_data_actor_rejects_second_registration_without_replacing_dependencies(
         ..Default::default()
     });
     let initial_clock: Rc<RefCell<dyn Clock>> = clock;
-    let replacement_clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+    let replacement_clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let replacement_cache = Rc::new(RefCell::new(Cache::new(None, None)));
     let replacement_trader_id = TraderId::from("REPLACEMENT-TRADER");
 
@@ -754,7 +754,7 @@ fn test_data_actor_rejects_second_registration_without_replacing_dependencies(
 
 #[rstest]
 fn test_data_actor_clock_api(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -819,7 +819,7 @@ fn test_data_actor_clock_api(
 
 #[rstest]
 fn test_data_actor_cache_api_returns_owned_point_reads(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -909,7 +909,7 @@ fn test_data_actor_cache_api_returns_owned_point_reads(
 
 #[rstest]
 fn test_data_actor_cache_api_returns_owned_market_data_point_reads(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -1113,7 +1113,7 @@ fn test_data_actor_cache_api_returns_owned_market_data_point_reads(
 
 #[rstest]
 fn test_data_actor_cache_api_returns_owned_market_data_collection_reads(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -1334,7 +1334,7 @@ fn test_data_actor_cache_api_returns_owned_market_data_collection_reads(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_data_actor_cache_api_returns_owned_pool(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -1412,7 +1412,7 @@ fn test_data_actor_cache_api_returns_owned_pool(
 
 #[rstest]
 fn test_data_actor_cache_api_surface_returns_owned_values(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -1711,7 +1711,7 @@ fn test_get_actor_unchecked_mutate() {
 
 #[rstest]
 fn test_subscription_facade_sends_exact_command_matrix(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -1732,7 +1732,7 @@ fn test_subscription_facade_sends_exact_command_matrix(
     let depth = NonZeroUsize::new(19);
     let interval_ms = NonZeroUsize::new(250).unwrap();
     let bar_type = BarType::from_str(&format!("{instrument_id}-3-MINUTE-LAST-EXTERNAL")).unwrap();
-    let series_id = OptionSeriesId::new(
+    let series_id = OptionSeriesId::new_derived(
         Venue::from("OPRA"),
         Ustr::from("AAPL"),
         Ustr::from("USD"),
@@ -1764,9 +1764,10 @@ fn test_subscription_facade_sends_exact_command_matrix(
             true,
             Some(params.clone()),
         );
-        actor.subscribe_book_depth10(
+        actor.subscribe_book_depth(
             instrument_id,
             BookType::L2_MBP,
+            depth,
             Some(client_id),
             false,
             Some(params.clone()),
@@ -1813,7 +1814,7 @@ fn test_subscription_facade_sends_exact_command_matrix(
         Some(caller_client_id),
         Some(caller_params.clone()),
     );
-    actor.unsubscribe_book_depth10(
+    actor.unsubscribe_book_depth(
         instrument_id,
         Some(caller_client_id),
         Some(caller_params.clone()),
@@ -1874,7 +1875,7 @@ fn test_subscription_facade_sends_exact_command_matrix(
         DataCommand::Subscribe(SubscribeCommand::Instrument(instrument)),
         DataCommand::Subscribe(SubscribeCommand::Instruments(instruments)),
         DataCommand::Subscribe(SubscribeCommand::BookDeltas(deltas)),
-        DataCommand::Subscribe(SubscribeCommand::BookDepth10(depth10)),
+        DataCommand::Subscribe(SubscribeCommand::BookDepth(book_depth)),
         DataCommand::Subscribe(SubscribeCommand::BookSnapshots(snapshots)),
         DataCommand::Subscribe(SubscribeCommand::Quotes(quotes)),
         DataCommand::Subscribe(SubscribeCommand::Trades(trades)),
@@ -1895,7 +1896,7 @@ fn test_subscription_facade_sends_exact_command_matrix(
         DataCommand::Unsubscribe(UnsubscribeCommand::Instrument(unsub_instrument)),
         DataCommand::Unsubscribe(UnsubscribeCommand::Instruments(unsub_instruments)),
         DataCommand::Unsubscribe(UnsubscribeCommand::BookDeltas(unsub_deltas)),
-        DataCommand::Unsubscribe(UnsubscribeCommand::BookDepth10(unsub_depth10)),
+        DataCommand::Unsubscribe(UnsubscribeCommand::BookDepth(unsub_depth)),
         DataCommand::Unsubscribe(UnsubscribeCommand::BookSnapshots(unsub_snapshots)),
         DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(unsub_quotes)),
         DataCommand::Unsubscribe(UnsubscribeCommand::Trades(unsub_trades)),
@@ -1964,11 +1965,18 @@ fn test_subscription_facade_sends_exact_command_matrix(
             .iter()
             .all(|command| command.correlation_id().is_none())
     );
-    assert!(
-        unsubscriptions
-            .iter()
-            .all(|command| command.correlation_id().is_none())
-    );
+
+    for (subscribe, unsubscribe) in subscriptions.iter().zip(&unsubscriptions) {
+        let expected = matches!(
+            subscribe,
+            SubscribeCommand::BookDeltas(_)
+                | SubscribeCommand::BookDepth(_)
+                | SubscribeCommand::BookSnapshots(_)
+        )
+        .then(|| subscribe.command_id());
+        assert_eq!(unsubscribe.correlation_id(), expected);
+    }
+
     assert_eq!(
         subscriptions
             .iter()
@@ -2003,7 +2011,7 @@ fn test_subscription_facade_sends_exact_command_matrix(
         [
             instrument.instrument_id,
             deltas.instrument_id,
-            depth10.instrument_id,
+            book_depth.instrument_id,
             snapshots.instrument_id,
             quotes.instrument_id,
             trades.instrument_id,
@@ -2021,8 +2029,8 @@ fn test_subscription_facade_sends_exact_command_matrix(
         (BookType::L3_MBO, depth, true)
     );
     assert_eq!(
-        (depth10.book_type, depth10.depth, depth10.managed),
-        (BookType::L2_MBP, NonZeroUsize::new(10), false)
+        (book_depth.book_type, book_depth.depth, book_depth.managed),
+        (BookType::L2_MBP, depth, false)
     );
     assert_eq!(
         (snapshots.book_type, snapshots.depth, snapshots.interval_ms,),
@@ -2047,7 +2055,7 @@ fn test_subscription_facade_sends_exact_command_matrix(
         [
             unsub_instrument.instrument_id,
             unsub_deltas.instrument_id,
-            unsub_depth10.instrument_id,
+            unsub_depth.instrument_id,
             unsub_snapshots.instrument_id,
             unsub_quotes.instrument_id,
             unsub_trades.instrument_id,
@@ -2069,7 +2077,7 @@ fn test_subscription_facade_sends_exact_command_matrix(
             unsub_instrument.params.as_ref(),
             unsub_instruments.params.as_ref(),
             unsub_deltas.params.as_ref(),
-            unsub_depth10.params.as_ref(),
+            unsub_depth.params.as_ref(),
             unsub_snapshots.params.as_ref(),
             unsub_quotes.params.as_ref(),
             unsub_trades.params.as_ref(),
@@ -2088,7 +2096,7 @@ fn test_subscription_facade_sends_exact_command_matrix(
 
 #[rstest]
 fn test_release_subscriptions_emits_retained_unsubscribe_commands(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -2113,7 +2121,7 @@ fn test_release_subscriptions_emits_retained_unsubscribe_commands(
     let remaining_client_id = ClientId::from("RETAINED-REMAINING-CLIENT");
     let interval_ms = NonZeroUsize::new(347).unwrap();
     let bar_type = BarType::from_str(&format!("{instrument_id}-3-MINUTE-LAST-EXTERNAL")).unwrap();
-    let series_id = OptionSeriesId::new(
+    let series_id = OptionSeriesId::new_derived(
         Venue::from("OPRA"),
         Ustr::from("MSFT"),
         Ustr::from("USD"),
@@ -2172,9 +2180,10 @@ fn test_release_subscriptions_emits_retained_unsubscribe_commands(
         false,
         Some(remaining_params.clone()),
     );
-    actor.subscribe_book_depth10(
+    actor.subscribe_book_depth(
         instrument_id,
         BookType::L2_MBP,
+        None,
         Some(remaining_client_id),
         false,
         Some(remaining_params.clone()),
@@ -2229,6 +2238,18 @@ fn test_release_subscriptions_emits_retained_unsubscribe_commands(
         })
         .collect::<AHashSet<_>>();
     assert_eq!(subscribe_ids.len(), 16);
+
+    let snapshot_subscription_id = saver
+        .get_messages()
+        .iter()
+        .find_map(|command| match command {
+            DataCommand::Subscribe(SubscribeCommand::BookSnapshots(command)) => {
+                Some(command.command_id)
+            }
+            _ => None,
+        })
+        .unwrap();
+
     saver.clear();
     clock.borrow_mut().set_time(release_ns);
 
@@ -2267,9 +2288,9 @@ fn test_release_subscriptions_emits_retained_unsubscribe_commands(
                 assert_remaining_identity(command.client_id, command.params.as_ref());
                 "book_deltas"
             }
-            DataCommand::Unsubscribe(UnsubscribeCommand::BookDepth10(command)) => {
+            DataCommand::Unsubscribe(UnsubscribeCommand::BookDepth(command)) => {
                 assert_remaining_identity(command.client_id, command.params.as_ref());
-                "book_depth10"
+                "book_depth"
             }
             DataCommand::Unsubscribe(UnsubscribeCommand::BookSnapshots(_)) => "book_snapshots",
             DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(command)) => {
@@ -2315,7 +2336,7 @@ fn test_release_subscriptions_emits_retained_unsubscribe_commands(
         [
             "bars",
             "book_deltas",
-            "book_depth10",
+            "book_depth",
             "book_snapshots",
             "data",
             "funding_rates",
@@ -2383,7 +2404,7 @@ fn test_release_subscriptions_emits_retained_unsubscribe_commands(
             Some(book_client_id),
             Some(instrument_id.venue),
             release_ns,
-            None,
+            Some(snapshot_subscription_id),
             Some(&book_params),
         ))
     );
@@ -2423,7 +2444,7 @@ fn test_release_subscriptions_emits_retained_unsubscribe_commands(
 
 #[rstest]
 fn test_release_subscriptions_emits_commands_in_topic_order(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -2472,7 +2493,7 @@ fn test_release_subscriptions_emits_commands_in_topic_order(
 
 #[rstest]
 fn test_duplicate_subscription_keeps_first_identity(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -2519,7 +2540,7 @@ fn test_duplicate_subscription_keeps_first_identity(
 
 #[rstest]
 fn test_repeated_unsubscribe_does_not_emit_fallback_command(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -2550,7 +2571,7 @@ fn test_repeated_unsubscribe_does_not_emit_fallback_command(
 
 #[rstest]
 fn test_reset_releases_subscription_before_restart(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -2593,7 +2614,7 @@ fn test_reset_releases_subscription_before_restart(
 
 #[rstest]
 fn test_option_chain_resubscription_sends_edit_and_retains_latest_identity(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -2604,7 +2625,7 @@ fn test_option_chain_resubscription_sends_edit_and_retains_latest_identity(
         MessagingSwitchboard::data_engine_queue_execute(),
         handler,
     );
-    let series_id = OptionSeriesId::new(
+    let series_id = OptionSeriesId::new_derived(
         Venue::from("OPRA"),
         Ustr::from("AAPL"),
         Ustr::from("USD"),
@@ -2686,7 +2707,7 @@ fn test_option_chain_resubscription_sends_edit_and_retains_latest_identity(
 
 #[rstest]
 fn test_subscribe_and_receive_custom_data(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -2708,7 +2729,7 @@ fn test_subscribe_and_receive_custom_data(
 
 #[rstest]
 fn test_local_custom_subscription_upgrades_to_client_backed(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -2756,7 +2777,7 @@ fn test_local_custom_subscription_upgrades_to_client_backed(
 
 #[rstest]
 fn test_unsubscribe_custom_data(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -2787,7 +2808,7 @@ fn test_unsubscribe_custom_data(
 
 #[rstest]
 fn test_subscribe_and_receive_book_deltas(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -2823,8 +2844,8 @@ fn test_subscribe_and_receive_book_deltas(
 }
 
 #[rstest]
-fn test_subscribe_and_receive_book_depth10(
-    clock: Rc<RefCell<TestClock>>,
+fn test_subscribe_and_receive_book_depth(
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -2833,21 +2854,21 @@ fn test_subscribe_and_receive_book_depth10(
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
-    actor.subscribe_book_depth10(audusd_sim.id, BookType::L2_MBP, None, false, None);
+    actor.subscribe_book_depth(audusd_sim.id, BookType::L2_MBP, None, None, false, None);
 
-    let topic = get_book_depth10_topic(audusd_sim.id);
+    let topic = get_book_depth_topic(audusd_sim.id);
     let mut depth = stub_depth10();
     depth.instrument_id = audusd_sim.id;
-    msgbus::publish_depth10(topic, &depth);
+    msgbus::publish_depth(topic, &depth);
 
-    assert_eq!(actor.core.depth10_handler_count(), 1);
-    assert!(actor.core.has_depth10_handler(topic.as_str()));
+    assert_eq!(actor.core.depth_handler_count(), 1);
+    assert!(actor.core.has_depth_handler(topic.as_str()));
     assert_eq!(actor.received_depths, vec![depth]);
 }
 
 #[rstest]
-fn test_unsubscribe_book_depth10_stops_delivery(
-    clock: Rc<RefCell<TestClock>>,
+fn test_unsubscribe_book_depth_stops_delivery(
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -2856,22 +2877,22 @@ fn test_unsubscribe_book_depth10_stops_delivery(
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
-    actor.subscribe_book_depth10(audusd_sim.id, BookType::L2_MBP, None, false, None);
-    actor.unsubscribe_book_depth10(audusd_sim.id, None, None);
+    actor.subscribe_book_depth(audusd_sim.id, BookType::L2_MBP, None, None, false, None);
+    actor.unsubscribe_book_depth(audusd_sim.id, None, None);
 
-    let topic = get_book_depth10_topic(audusd_sim.id);
+    let topic = get_book_depth_topic(audusd_sim.id);
     let mut depth = stub_depth10();
     depth.instrument_id = audusd_sim.id;
-    msgbus::publish_depth10(topic, &depth);
+    msgbus::publish_depth(topic, &depth);
 
-    assert_eq!(actor.core.depth10_handler_count(), 0);
-    assert!(!actor.core.has_depth10_handler(topic.as_str()));
+    assert_eq!(actor.core.depth_handler_count(), 0);
+    assert!(!actor.core.has_depth_handler(topic.as_str()));
     assert!(actor.received_depths.is_empty());
 }
 
 #[rstest]
-fn test_stopped_actor_does_not_receive_book_depth10(
-    clock: Rc<RefCell<TestClock>>,
+fn test_stopped_actor_does_not_receive_book_depth(
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -2879,20 +2900,20 @@ fn test_stopped_actor_does_not_receive_book_depth10(
     let actor_id = register_data_actor(clock, cache, trader_id);
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
-    actor.subscribe_book_depth10(audusd_sim.id, BookType::L2_MBP, None, false, None);
+    actor.subscribe_book_depth(audusd_sim.id, BookType::L2_MBP, None, None, false, None);
     actor.stop().unwrap();
 
-    let topic = get_book_depth10_topic(audusd_sim.id);
+    let topic = get_book_depth_topic(audusd_sim.id);
     let mut depth = stub_depth10();
     depth.instrument_id = audusd_sim.id;
-    msgbus::publish_depth10(topic, &depth);
+    msgbus::publish_depth(topic, &depth);
 
     assert!(actor.received_depths.is_empty());
 }
 
 #[rstest]
-fn test_duplicate_book_depth10_subscription_delivers_once(
-    clock: Rc<RefCell<TestClock>>,
+fn test_duplicate_book_depth_subscription_delivers_once(
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -2900,21 +2921,21 @@ fn test_duplicate_book_depth10_subscription_delivers_once(
     let actor_id = register_data_actor(clock, cache, trader_id);
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
-    actor.subscribe_book_depth10(audusd_sim.id, BookType::L2_MBP, None, false, None);
-    actor.subscribe_book_depth10(audusd_sim.id, BookType::L2_MBP, None, false, None);
+    actor.subscribe_book_depth(audusd_sim.id, BookType::L2_MBP, None, None, false, None);
+    actor.subscribe_book_depth(audusd_sim.id, BookType::L2_MBP, None, None, false, None);
 
-    let topic = get_book_depth10_topic(audusd_sim.id);
+    let topic = get_book_depth_topic(audusd_sim.id);
     let mut depth = stub_depth10();
     depth.instrument_id = audusd_sim.id;
-    msgbus::publish_depth10(topic, &depth);
+    msgbus::publish_depth(topic, &depth);
 
-    assert_eq!(actor.core.depth10_handler_count(), 1);
+    assert_eq!(actor.core.depth_handler_count(), 1);
     assert_eq!(actor.received_depths, vec![depth]);
 }
 
 #[rstest]
-fn test_book_depth10_facade_sends_subscribe_and_unsubscribe_commands(
-    clock: Rc<RefCell<TestClock>>,
+fn test_book_depth_facade_sends_subscribe_and_unsubscribe_commands(
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -2929,23 +2950,23 @@ fn test_book_depth10_facade_sends_subscribe_and_unsubscribe_commands(
         handler,
     );
 
-    let client_id = Some(ClientId::new("DEPTH10-CLIENT"));
-    actor.subscribe_book_depth10(audusd_sim.id, BookType::L2_MBP, client_id, true, None);
+    let client_id = Some(ClientId::new("DEPTH-CLIENT"));
+    actor.subscribe_book_depth(audusd_sim.id, BookType::L2_MBP, None, client_id, true, None);
 
-    actor.unsubscribe_book_depth10(audusd_sim.id, client_id, None);
+    actor.unsubscribe_book_depth(audusd_sim.id, client_id, None);
 
     let commands = saver.get_messages();
     let [
-        DataCommand::Subscribe(SubscribeCommand::BookDepth10(subscribe)),
-        DataCommand::Unsubscribe(UnsubscribeCommand::BookDepth10(unsubscribe)),
+        DataCommand::Subscribe(SubscribeCommand::BookDepth(subscribe)),
+        DataCommand::Unsubscribe(UnsubscribeCommand::BookDepth(unsubscribe)),
     ] = commands.as_slice()
     else {
-        panic!("expected BookDepth10 subscribe and unsubscribe commands, was {commands:?}");
+        panic!("expected BookDepth subscribe and unsubscribe commands, was {commands:?}");
     };
 
     assert_eq!(subscribe.instrument_id, audusd_sim.id);
     assert_eq!(subscribe.book_type, BookType::L2_MBP);
-    assert_eq!(subscribe.depth, NonZeroUsize::new(10));
+    assert_eq!(subscribe.depth, None);
     assert_eq!(subscribe.client_id, client_id);
     assert_eq!(subscribe.venue, Some(audusd_sim.id.venue));
     assert!(subscribe.managed);
@@ -2954,7 +2975,7 @@ fn test_book_depth10_facade_sends_subscribe_and_unsubscribe_commands(
     assert_eq!(unsubscribe.instrument_id, audusd_sim.id);
     assert_eq!(unsubscribe.client_id, client_id);
     assert_eq!(unsubscribe.venue, Some(audusd_sim.id.venue));
-    assert!(unsubscribe.correlation_id.is_none());
+    assert_eq!(unsubscribe.correlation_id, Some(subscribe.command_id));
     assert!(unsubscribe.params.is_none());
 }
 
@@ -2965,8 +2986,8 @@ fn parent_params() -> Params {
 }
 
 #[rstest]
-fn test_parent_book_depth10_subscription_receives_and_unsubscribes(
-    clock: Rc<RefCell<TestClock>>,
+fn test_parent_book_depth_subscription_receives_and_unsubscribes(
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -2976,29 +2997,30 @@ fn test_parent_book_depth10_subscription_receives_and_unsubscribes(
 
     let parent_id = InstrumentId::from("ES.FUT.XCME");
     let underlying_id = InstrumentId::from("ESZ24.XCME");
-    actor.subscribe_book_depth10(
+    actor.subscribe_book_depth(
         parent_id,
         BookType::L2_MBP,
+        None,
         None,
         false,
         Some(parent_params()),
     );
 
-    let topic = get_book_depth10_topic(underlying_id);
+    let topic = get_book_depth_topic(underlying_id);
     let mut depth = stub_depth10();
     depth.instrument_id = underlying_id;
-    msgbus::publish_depth10(topic, &depth);
+    msgbus::publish_depth(topic, &depth);
 
-    actor.unsubscribe_book_depth10(parent_id, None, Some(parent_params()));
-    msgbus::publish_depth10(topic, &depth);
+    actor.unsubscribe_book_depth(parent_id, None, Some(parent_params()));
+    msgbus::publish_depth(topic, &depth);
 
-    assert_eq!(actor.core.depth10_handler_count(), 0);
+    assert_eq!(actor.core.depth_handler_count(), 0);
     assert_eq!(actor.received_depths, vec![depth]);
 }
 
 #[rstest]
 fn test_parent_book_deltas_subscription_receives_per_underlying(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -3044,7 +3066,7 @@ fn test_parent_book_deltas_subscription_receives_per_underlying(
 
 #[rstest]
 fn test_parent_book_deltas_unsubscribe_removes_per_underlying_handler(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -3093,7 +3115,7 @@ fn test_parent_book_deltas_unsubscribe_removes_per_underlying_handler(
 
 #[rstest]
 fn test_betfair_runner_subscription_does_not_cross_leak(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -3157,7 +3179,7 @@ fn test_betfair_runner_subscription_does_not_cross_leak(
 
 #[rstest]
 fn test_unsubscribe_book_deltas(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3212,7 +3234,7 @@ fn test_unsubscribe_book_deltas(
 
 #[rstest]
 fn test_subscribe_and_receive_book_at_interval(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3236,7 +3258,7 @@ fn test_subscribe_and_receive_book_at_interval(
 
 #[rstest]
 fn test_unsubscribe_book_at_interval(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3269,7 +3291,7 @@ fn test_unsubscribe_book_at_interval(
 
 #[rstest]
 fn test_unsubscribe_book_at_interval_keeps_other_intervals(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3304,7 +3326,7 @@ fn test_unsubscribe_book_at_interval_keeps_other_intervals(
 
 #[rstest]
 fn test_subscribe_and_receive_quotes(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3325,7 +3347,7 @@ fn test_subscribe_and_receive_quotes(
 
 #[rstest]
 fn test_unsubscribe_quotes(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3353,7 +3375,7 @@ fn test_unsubscribe_quotes(
 
 #[rstest]
 fn test_subscribe_and_receive_trades(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3374,7 +3396,7 @@ fn test_subscribe_and_receive_trades(
 
 #[rstest]
 fn test_unsubscribe_trades(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3402,7 +3424,7 @@ fn test_unsubscribe_trades(
 
 #[rstest]
 fn test_subscribe_and_receive_bars(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3423,7 +3445,7 @@ fn test_subscribe_and_receive_bars(
 
 #[rstest]
 fn test_unsubscribe_bars(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3452,7 +3474,7 @@ fn test_unsubscribe_bars(
 
 #[rstest]
 fn test_request_instrument(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3489,7 +3511,7 @@ fn test_request_instrument(
 
 #[rstest]
 fn test_request_instruments(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3530,7 +3552,7 @@ fn test_request_instruments(
 
 #[rstest]
 fn test_request_quotes(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3567,7 +3589,7 @@ fn test_request_quotes(
 
 #[rstest]
 fn test_request_quotes_accepts_equal_start_and_end(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3618,7 +3640,7 @@ fn test_request_quotes_accepts_equal_start_and_end(
 #[case(None, Some(1), "end was > now")]
 #[case(Some(-1), Some(-2), "start was > end")]
 fn test_request_quotes_rejects_invalid_time_range(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -3651,7 +3673,7 @@ fn test_request_quotes_rejects_invalid_time_range(
 
 #[rstest]
 fn test_request_bars_rejects_composite_type_without_registering_or_sending(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -3681,7 +3703,7 @@ fn test_request_bars_rejects_composite_type_without_registering_or_sending(
 
 #[rstest]
 fn test_request_facade_sends_exact_command_matrix(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4004,7 +4026,7 @@ fn test_request_facade_sends_exact_command_matrix(
 
 #[rstest]
 fn test_request_trades(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4041,7 +4063,7 @@ fn test_request_trades(
 
 #[rstest]
 fn test_request_book_deltas(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4075,7 +4097,7 @@ fn test_request_book_deltas(
 
 #[rstest]
 fn test_request_book_depth(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4095,7 +4117,7 @@ fn test_request_book_depth(
         request_id,
         client_id,
         audusd_sim.id,
-        vec![depth],
+        vec![depth.clone()],
         None,
         None,
         UnixNanos::default(),
@@ -4110,7 +4132,7 @@ fn test_request_book_depth(
 
 #[rstest]
 fn test_request_funding_rates(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4154,7 +4176,7 @@ fn test_request_funding_rates(
 
 #[rstest]
 fn test_request_bars(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4193,7 +4215,7 @@ fn test_request_bars(
 
 #[rstest]
 fn test_subscribe_and_receive_instruments(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4220,7 +4242,7 @@ fn test_subscribe_and_receive_instruments(
 
 #[rstest]
 fn test_subscribe_and_receive_instrument(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4245,7 +4267,7 @@ fn test_subscribe_and_receive_instrument(
 
 #[rstest]
 fn test_subscribe_and_receive_mark_prices(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4279,7 +4301,7 @@ fn test_subscribe_and_receive_mark_prices(
 
 #[rstest]
 fn test_subscribe_and_receive_index_prices(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4305,7 +4327,7 @@ fn test_subscribe_and_receive_index_prices(
 
 #[rstest]
 fn test_subscribe_and_receive_funding_rates(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4343,7 +4365,7 @@ fn test_subscribe_and_receive_funding_rates(
 
 #[rstest]
 fn test_subscribe_and_receive_instrument_status(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     stub_instrument_status: InstrumentStatus,
@@ -4364,7 +4386,7 @@ fn test_subscribe_and_receive_instrument_status(
 
 #[rstest]
 fn test_subscribe_and_receive_instrument_close(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     stub_instrument_close: InstrumentClose,
@@ -4385,7 +4407,7 @@ fn test_subscribe_and_receive_instrument_close(
 
 #[rstest]
 fn test_subscribe_and_receive_option_greeks(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -4424,7 +4446,7 @@ fn test_subscribe_and_receive_option_greeks(
 
 #[rstest]
 fn test_subscribe_and_receive_option_chain(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -4432,7 +4454,7 @@ fn test_subscribe_and_receive_option_chain(
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
-    let series_id = OptionSeriesId::new(
+    let series_id = OptionSeriesId::new_derived(
         Venue::from("OPRA"),
         Ustr::from("AAPL"),
         Ustr::from("USD"),
@@ -4462,7 +4484,7 @@ fn test_subscribe_and_receive_option_chain(
 
 #[rstest]
 fn test_unsubscribe_instruments(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4496,7 +4518,7 @@ fn test_unsubscribe_instruments(
 
 #[rstest]
 fn test_unsubscribe_instrument(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4527,7 +4549,7 @@ fn test_unsubscribe_instrument(
 
 #[rstest]
 fn test_unsubscribe_mark_prices(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4578,7 +4600,7 @@ fn test_unsubscribe_mark_prices(
 
 #[rstest]
 fn test_unsubscribe_index_prices(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4615,7 +4637,7 @@ fn test_unsubscribe_index_prices(
 
 #[rstest]
 fn test_unsubscribe_funding_rates(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4656,7 +4678,7 @@ fn test_unsubscribe_funding_rates(
 
 #[rstest]
 fn test_unsubscribe_instrument_status(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     stub_instrument_status: InstrumentStatus,
@@ -4683,7 +4705,7 @@ fn test_unsubscribe_instrument_status(
 
 #[rstest]
 fn test_unsubscribe_instrument_close(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     stub_instrument_close: InstrumentClose,
@@ -4710,7 +4732,7 @@ fn test_unsubscribe_instrument_close(
 
 #[rstest]
 fn test_unsubscribe_option_greeks(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -4754,7 +4776,7 @@ fn test_unsubscribe_option_greeks(
 
 #[rstest]
 fn test_unsubscribe_option_chain(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -4762,7 +4784,7 @@ fn test_unsubscribe_option_chain(
     let mut actor = get_actor_unchecked::<TestDataActor>(&actor_id);
     actor.start().unwrap();
 
-    let series_id = OptionSeriesId::new(
+    let series_id = OptionSeriesId::new_derived(
         Venue::from("OPRA"),
         Ustr::from("AAPL"),
         Ustr::from("USD"),
@@ -4797,7 +4819,7 @@ fn test_unsubscribe_option_chain(
 
 #[rstest]
 fn test_request_book_snapshot(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -4837,7 +4859,7 @@ fn test_request_book_snapshot(
 
 #[rstest]
 fn test_request_data(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -4882,7 +4904,7 @@ fn test_request_data(
 
 #[rstest]
 fn test_handle_data_response_preserves_custom_data_payload_shape(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -4956,7 +4978,7 @@ fn test_handle_data_response_preserves_custom_data_payload_shape(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_defi_subscription_facade_sends_exact_command_matrix(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -5135,7 +5157,7 @@ fn test_defi_subscription_facade_sends_exact_command_matrix(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_release_subscriptions_emits_every_defi_unsubscribe_shape(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -5231,7 +5253,7 @@ fn test_release_subscriptions_emits_every_defi_unsubscribe_shape(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_subscribe_and_receive_blocks(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -5262,7 +5284,7 @@ fn test_subscribe_and_receive_blocks(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_unsubscribe_blocks(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -5309,7 +5331,7 @@ fn test_unsubscribe_blocks(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_subscribe_and_receive_pools(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -5378,7 +5400,7 @@ fn test_subscribe_and_receive_pools(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_subscribe_and_receive_pool_swaps(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -5437,7 +5459,7 @@ fn test_subscribe_and_receive_pool_swaps(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_unsubscribe_pool_swaps(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -5519,7 +5541,7 @@ fn test_unsubscribe_pool_swaps(
 #[cfg(feature = "defi")]
 #[rstest]
 fn test_subscribe_receive_and_unsubscribe_remaining_pool_events(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -5556,7 +5578,7 @@ fn test_subscribe_receive_and_unsubscribe_remaining_pool_events(
 
 #[rstest]
 fn test_duplicate_subscribe_custom_data(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -5581,7 +5603,7 @@ fn test_duplicate_subscribe_custom_data(
 
 #[rstest]
 fn test_unsubscribe_before_subscribe_custom_data(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -5624,7 +5646,7 @@ impl DataActor for FailingRetirementActor {
 
 #[rstest]
 fn test_failed_reset_retains_subscriptions(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -5662,7 +5684,7 @@ enum Retirement {
 #[case::fault(Retirement::Fault, "fault failed", 0)]
 #[case::dispose(Retirement::Dispose, "dispose failed", 1)]
 fn test_failed_retirement_subscription_release(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -5741,7 +5763,7 @@ impl DataActor for SaveLoadActor {
 #[case::with_reason(Some("graceful exit".to_string()))]
 #[case::no_reason(None)]
 fn test_shutdown_system_publishes_command(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     #[case] reason: Option<String>,
@@ -5771,7 +5793,7 @@ fn test_shutdown_system_publishes_command(
 
 #[rstest]
 fn test_on_save_and_on_load(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -5800,7 +5822,7 @@ fn test_on_save_and_on_load(
 
 #[rstest]
 fn test_data_actor_core_tracks_quote_handlers(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -5821,7 +5843,7 @@ fn test_data_actor_core_tracks_quote_handlers(
 
 #[rstest]
 fn test_data_actor_core_removes_quote_handler_on_unsubscribe(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -5842,7 +5864,7 @@ fn test_data_actor_core_removes_quote_handler_on_unsubscribe(
 
 #[rstest]
 fn test_data_actor_core_tracks_trade_handlers(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -5863,7 +5885,7 @@ fn test_data_actor_core_tracks_trade_handlers(
 
 #[rstest]
 fn test_data_actor_core_removes_trade_handler_on_unsubscribe(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -5881,7 +5903,7 @@ fn test_data_actor_core_removes_trade_handler_on_unsubscribe(
 
 #[rstest]
 fn test_data_actor_core_tracks_bar_handlers(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -5903,7 +5925,7 @@ fn test_data_actor_core_tracks_bar_handlers(
 
 #[rstest]
 fn test_data_actor_core_removes_bar_handler_on_unsubscribe(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -5922,7 +5944,7 @@ fn test_data_actor_core_removes_bar_handler_on_unsubscribe(
 
 #[rstest]
 fn test_data_actor_core_tracks_deltas_handlers(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -5943,7 +5965,7 @@ fn test_data_actor_core_tracks_deltas_handlers(
 
 #[rstest]
 fn test_data_actor_core_removes_deltas_handler_on_unsubscribe(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -5961,7 +5983,7 @@ fn test_data_actor_core_removes_deltas_handler_on_unsubscribe(
 
 #[rstest]
 fn test_data_actor_core_multiple_subscriptions_tracked(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -5991,7 +6013,7 @@ fn test_data_actor_core_multiple_subscriptions_tracked(
 
 #[rstest]
 fn test_release_subscriptions_removes_every_handler_family_and_is_idempotent(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -6001,7 +6023,7 @@ fn test_release_subscriptions_removes_every_handler_family_and_is_idempotent(
     let instrument_id = audusd_sim.id;
     let interval_ms = NonZeroUsize::new(100).unwrap();
     let bar_type = BarType::from_str(&format!("{instrument_id}-1-MINUTE-LAST-INTERNAL")).unwrap();
-    let series_id = OptionSeriesId::new(
+    let series_id = OptionSeriesId::new_derived(
         Venue::from("OPRA"),
         Ustr::from("AAPL"),
         Ustr::from("USD"),
@@ -6015,7 +6037,7 @@ fn test_release_subscriptions_removes_every_handler_family_and_is_idempotent(
     actor.subscribe_signal("release", None);
     actor.subscribe_instrument(instrument_id, None, None);
     actor.subscribe_book_deltas(instrument_id, BookType::L2_MBP, None, None, false, None);
-    actor.subscribe_book_depth10(instrument_id, BookType::L2_MBP, None, false, None);
+    actor.subscribe_book_depth(instrument_id, BookType::L2_MBP, None, None, false, None);
     actor.subscribe_book_at_interval(
         instrument_id,
         BookType::L2_MBP,
@@ -6051,7 +6073,7 @@ fn test_release_subscriptions_removes_every_handler_family_and_is_idempotent(
             bus.subscriptions.len(),
             bus.router_instruments.subscription_count(),
             bus.router_deltas.subscription_count(),
-            bus.router_depth10.subscription_count(),
+            bus.router_depth.subscription_count(),
             bus.router_book_snapshots.subscription_count(),
             bus.router_quotes.subscription_count(),
             bus.router_trades.subscription_count(),
@@ -6091,7 +6113,7 @@ fn test_release_subscriptions_removes_every_handler_family_and_is_idempotent(
 
 #[rstest]
 fn test_publish_data_reaches_subscriber(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6219,7 +6241,7 @@ fn test_update_synthetic_panics_when_unregistered() {
 
 #[rstest]
 fn test_subscribe_signal_multi_word_name_matches_published_topic(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6249,7 +6271,7 @@ fn test_subscribe_signal_multi_word_name_matches_published_topic(
 #[case("example", "1.5", 0)]
 #[case("risk", "HIGH", 1_700_000_000_000_000_000)]
 fn test_publish_signal_reaches_subscriber(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     #[case] name: &str,
@@ -6284,7 +6306,7 @@ fn test_publish_signal_reaches_subscriber(
 #[case(Some("BINANCE"), Some("market"), vec![0])]
 #[case(Some("MISSING"), None, vec![])]
 fn test_socket_state_filters_route_matching_events(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     #[case] client_id: Option<&str>,
@@ -6330,7 +6352,7 @@ fn test_socket_state_filters_route_matching_events(
 #[case(Some(SystemChannel::ExecCommands), vec![2])]
 #[case(Some(SystemChannel::DataEvents), vec![3])]
 fn test_queue_state_filters_route_matching_events(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     #[case] channel: Option<SystemChannel>,
@@ -6372,7 +6394,7 @@ fn test_queue_state_filters_route_matching_events(
 
 #[rstest]
 fn test_socket_state_unsubscribe_preserves_other_filters(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6405,7 +6427,7 @@ fn test_socket_state_unsubscribe_preserves_other_filters(
 
 #[rstest]
 fn test_queue_state_unsubscribe_preserves_other_filters(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6436,7 +6458,7 @@ fn test_queue_state_unsubscribe_preserves_other_filters(
 
 #[rstest]
 fn test_queue_state_changed_reaches_typed_subscriber(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6458,7 +6480,7 @@ fn test_queue_state_changed_reaches_typed_subscriber(
 
 #[rstest]
 fn test_socket_state_changed_reaches_typed_subscriber(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6484,7 +6506,7 @@ fn test_socket_state_changed_reaches_typed_subscriber(
 #[cfg(feature = "live")]
 #[rstest]
 fn test_reconnect_socket_enqueues_typed_command(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6509,7 +6531,7 @@ fn test_reconnect_socket_enqueues_typed_command(
 
 #[rstest]
 fn test_socket_state_changed_skips_delivery_when_not_running(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6533,7 +6555,7 @@ fn test_socket_state_changed_skips_delivery_when_not_running(
 
 #[rstest]
 fn test_unsubscribe_socket_state_stops_delivery(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6571,7 +6593,7 @@ fn test_unsubscribe_socket_state_stops_delivery(
 
 #[rstest]
 fn test_subscribe_socket_state_dispatches_in_priority_order(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6626,7 +6648,7 @@ fn test_subscribe_socket_state_dispatches_in_priority_order(
 
 #[rstest]
 fn test_subscribe_socket_state_resubscribe_does_not_update_priority(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6648,7 +6670,7 @@ fn test_subscribe_socket_state_resubscribe_does_not_update_priority(
 
 #[rstest]
 fn test_queue_state_changed_skips_delivery_when_not_running(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6669,7 +6691,7 @@ fn test_queue_state_changed_skips_delivery_when_not_running(
 
 #[rstest]
 fn test_unsubscribe_queue_state_stops_delivery(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6701,7 +6723,7 @@ fn test_unsubscribe_queue_state_stops_delivery(
 
 #[rstest]
 fn test_subscribe_queue_state_dispatches_in_priority_order(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6753,7 +6775,7 @@ fn test_subscribe_queue_state_dispatches_in_priority_order(
 
 #[rstest]
 fn test_subscribe_queue_state_resubscribe_does_not_update_priority(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6772,7 +6794,7 @@ fn test_subscribe_queue_state_resubscribe_does_not_update_priority(
 
 #[rstest]
 fn test_subscribe_signal_wildcard_matches_all_names(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6797,7 +6819,7 @@ fn test_subscribe_signal_wildcard_matches_all_names(
 
 #[rstest]
 fn test_unsubscribe_signal_stops_delivery(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6831,7 +6853,7 @@ fn test_unsubscribe_signal_stops_delivery(
 #[case(1_000_000, 10)] // Above old u8 ceiling: locks in u32 widening
 #[case(u32::MAX, 0)] // Saturated boundary
 fn test_subscribe_signal_dispatches_in_priority_order(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     #[case] high_priority: u32,
@@ -6891,7 +6913,7 @@ fn test_subscribe_signal_dispatches_in_priority_order(
 
 #[rstest]
 fn test_subscribe_signal_resubscribe_does_not_update_priority(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6914,7 +6936,7 @@ fn test_subscribe_signal_resubscribe_does_not_update_priority(
 
 #[rstest]
 fn test_add_synthetic_stores_in_cache(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -6953,7 +6975,7 @@ fn test_add_synthetic_stores_in_cache(
 
 #[rstest]
 fn test_update_synthetic_replaces_existing(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
 ) {
@@ -7025,7 +7047,7 @@ fn native_local_binding_test_source() -> crate::recovery_trace::NativeTraceSourc
 #[cfg(feature = "live")]
 #[rstest]
 fn test_native_local_quote_bar_prepare_has_no_effects_and_startup_reuses_handlers(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -7138,7 +7160,7 @@ fn test_native_local_quote_bar_prepare_has_no_effects_and_startup_reuses_handler
 #[cfg(feature = "live")]
 #[rstest]
 fn test_native_local_binding_rejects_foreign_running_and_remote_downgrade(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -7234,7 +7256,7 @@ fn test_native_local_binding_rejects_foreign_running_and_remote_downgrade(
 #[cfg(feature = "live")]
 #[rstest]
 fn test_native_local_mark_prepare_has_no_effects_and_startup_reuses_actual_handler(
-    clock: Rc<RefCell<TestClock>>,
+    clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
     trader_id: TraderId,
     audusd_sim: CurrencyPair,
@@ -7316,4 +7338,212 @@ fn test_native_local_mark_prepare_has_no_effects_and_startup_reuses_actual_handl
     );
     actor.unsubscribe_mark_prices(audusd_sim.id, None, None);
     assert_eq!(saver.get_messages().len(), 2);
+}
+
+#[rstest]
+fn test_signal_publication_orders_reserved_deliveries_after_raw_republication(
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    super::clear_callbacks().unwrap();
+    *get_message_bus().borrow_mut() = MessageBus::default();
+    let mut publisher = DataActorCore::new(DataActorConfig::default());
+    publisher.register(trader_id, clock, cache.clone()).unwrap();
+    let publisher = Rc::new(publisher);
+    let nested = publisher.clone();
+    msgbus::subscribe_any(
+        "data.SignalReentry".into(),
+        ShareableMessageHandler::from_typed(move |data: &CustomData| {
+            let signal = data.data.as_any().downcast_ref::<Signal>().unwrap();
+            if signal.value == "outer" {
+                nested.publish_signal("reentry", "inner".to_string(), UnixNanos::from(2));
+            }
+        }),
+        Some(100),
+    );
+
+    let received = Rc::new(RefCell::new(Vec::new()));
+    let captured = received.clone();
+    let callback_cache = cache.clone();
+    msgbus::subscribe_any(
+        "data.SignalReentry".into(),
+        ShareableMessageHandler::from_typed(move |data: &CustomData| {
+            let signal = data.data.as_any().downcast_ref::<Signal>().unwrap();
+            super::dispatch::reserve(signal.value.capacity())
+                .unwrap()
+                .commit(
+                    (captured.clone(), signal.clone(), callback_cache.clone()),
+                    |capture| {
+                        let _cache = capture.2.borrow_mut();
+                        capture.0.borrow_mut().push(capture.1.clone());
+                        true
+                    },
+                );
+        }),
+        None,
+    );
+
+    let cache_guard = cache.borrow_mut();
+    publisher.publish_signal("reentry", "outer".to_string(), UnixNanos::from(1));
+    assert!(received.borrow().is_empty());
+    drop(cache_guard);
+    assert_eq!(super::drain_callbacks(1), Ok(true));
+    assert_eq!(super::drain_callbacks(1), Ok(false));
+    assert_eq!(
+        *received.borrow(),
+        [
+            Signal::new(
+                "reentry".into(),
+                "outer".to_string(),
+                UnixNanos::from(1),
+                UnixNanos::default()
+            ),
+            Signal::new(
+                "reentry".into(),
+                "inner".to_string(),
+                UnixNanos::from(2),
+                UnixNanos::default()
+            ),
+        ]
+    );
+    super::clear_callbacks().unwrap();
+}
+
+#[rstest]
+#[case::self_publication(false)]
+#[case::nested_fanout(true)]
+#[ignore = "canonical signal callbacks reenter before the current publication completes"]
+fn test_reentrant_signal_publication_preserves_callback_order(
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    #[case] fanout: bool,
+) {
+    set_data_cmd_sender(Arc::new(SyncDataCommandSender));
+    *get_message_bus().borrow_mut() = MessageBus::default();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+
+    for (name, priority) in [("A", 100), ("B", 10)] {
+        if name == "B" && !fanout {
+            continue;
+        }
+
+        let mut actor = ReentrantSignalActor {
+            core: DataActorCore::new(DataActorConfig {
+                actor_id: Some(ActorId::new(name)),
+                ..DataActorConfig::default()
+            }),
+            name,
+            trace: trace.clone(),
+        };
+
+        actor
+            .register(trader_id, clock.clone(), cache.clone())
+            .unwrap();
+        let id = actor.actor_id().inner();
+        register_actor(actor);
+        let mut actor = get_actor_unchecked::<ReentrantSignalActor>(&id);
+        actor.start().unwrap();
+        actor.subscribe_signal("reentry", Some(priority));
+    }
+
+    let mut publisher = TestDataActor::new(DataActorConfig::default());
+    publisher.register(trader_id, clock, cache).unwrap();
+    publisher.publish_signal("reentry", "outer".to_string(), UnixNanos::from(1));
+    assert!(!super::drain_callbacks(8).unwrap());
+
+    let mut expected = Vec::new();
+
+    for value in ["outer", "inner"] {
+        for name in if fanout { &["A", "B"][..] } else { &["A"][..] } {
+            expected.push(format!("{name}:{value}:enter"));
+            expected.push(format!("{name}:{value}:exit"));
+        }
+    }
+
+    assert_eq!(*trace.borrow(), expected);
+}
+
+#[derive(Debug)]
+struct ReentrantSignalActor {
+    core: DataActorCore,
+    name: &'static str,
+    trace: Rc<RefCell<Vec<String>>>,
+}
+
+nautilus_actor!(ReentrantSignalActor);
+
+impl DataActor for ReentrantSignalActor {
+    fn on_signal(&mut self, signal: &Signal) -> anyhow::Result<()> {
+        self.trace
+            .borrow_mut()
+            .push(format!("{}:{}:enter", self.name, signal.value));
+
+        if self.name == "A" && signal.value == "outer" {
+            self.publish_signal("reentry", "inner".to_string(), UnixNanos::from(2));
+        }
+
+        self.trace
+            .borrow_mut()
+            .push(format!("{}:{}:exit", self.name, signal.value));
+        Ok(())
+    }
+}
+
+#[rstest]
+fn test_native_borrow_conflicts_return_component_access_errors(
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    let mut actor = TestDataActor::new(DataActorConfig::default());
+    actor
+        .register(trader_id, clock.clone(), cache.clone())
+        .unwrap();
+    let cache_borrow = cache.borrow_mut();
+    let cache_error = actor.try_cache_ref().unwrap_err();
+    drop(cache_borrow);
+    let clock_borrow = clock.borrow();
+    let clock_error = actor.try_clock_mut().err().unwrap();
+    drop(clock_borrow);
+
+    assert_eq!(
+        cache_error,
+        ComponentAccessError::ReadConflict {
+            resource: "cache",
+            operation: "cache_ref",
+        }
+    );
+    assert_eq!(
+        clock_error,
+        ComponentAccessError::WriteConflict {
+            resource: "clock",
+            operation: "clock_mut",
+        }
+    );
+    assert!(actor.try_cache_ref().is_ok());
+    assert!(actor.try_clock_mut().is_ok());
+}
+
+#[rstest]
+fn test_native_borrow_before_registration_returns_component_access_error() {
+    let mut actor = TestDataActor::new(DataActorConfig::default());
+    let cache_error = actor.try_cache_ref().unwrap_err();
+    let clock_error = actor.try_clock_mut().err().unwrap();
+
+    assert_eq!(
+        cache_error,
+        ComponentAccessError::NotRegistered {
+            resource: "cache",
+            operation: "cache_ref",
+        }
+    );
+    assert_eq!(
+        clock_error,
+        ComponentAccessError::NotRegistered {
+            resource: "clock",
+            operation: "clock_mut",
+        }
+    );
 }

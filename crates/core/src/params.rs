@@ -29,6 +29,9 @@ use serde_json::Value;
 /// This represents a map of string keys to JSON values, used for passing
 /// adapter-specific configuration, metadata, and any generic key-value data.
 ///
+/// `from_pydict` rejects integer values outside the signed or unsigned 64-bit range with
+/// `ValueError`, including values in nested containers.
+///
 /// `Params` uses `IndexMap` to preserve insertion order, which is important for
 /// consistent serialization and debugging.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -103,7 +106,7 @@ impl Params {
     ///
     /// # Errors
     ///
-    /// Returns a `PyErr` if conversion of any value fails.
+    /// Returns an error if conversion of any value fails.
     pub fn to_pydict(&self, py: pyo3::Python<'_>) -> pyo3::PyResult<pyo3::Py<pyo3::types::PyDict>> {
         crate::python::params::params_to_pydict(py, self)
     }
@@ -139,9 +142,10 @@ impl<'a> IntoIterator for &'a Params {
 ///
 /// # Errors
 ///
-/// Returns a `PyErr` if:
-/// - the dict cannot be serialized to JSON
-/// - the JSON is not a valid object
+/// Returns an error if:
+/// - The dict cannot be serialized to JSON.
+/// - The JSON is not a valid object.
+/// - An integer value is outside the signed or unsigned 64-bit range.
 pub fn from_pydict(
     py: pyo3::Python<'_>,
     dict: &pyo3::Py<pyo3::types::PyDict>,

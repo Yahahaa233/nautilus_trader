@@ -15,12 +15,19 @@
 
 //! Tokio-based channel senders for live trading runtime.
 //!
-//! This module provides thread-local storage for tokio mpsc channels used in live trading.
+//! Stores channel senders for the current runtime thread.
+//!
+//! Data and execution event setters accept either a runtime-bound [`EventSender`] or a plain
+//! Tokio sender. Plain senders carry no callback context. Getters and clones preserve the
+//! installed mode and owner; moving a runtime-bound sender to another thread makes its sends
+//! independent ingress.
 
-use super::ingress::IngressSender;
 use std::cell::RefCell;
 
-use crate::messages::{DataEvent, ExecutionEvent, SystemCommand, SystemEvent};
+use crate::{
+    live::sender::{DispatchSender, EventSender},
+    messages::{DataEvent, ExecutionEvent, SystemCommand, SystemEvent},
+};
 
 /// Gets the thread-local data event sender.
 ///
@@ -28,7 +35,7 @@ use crate::messages::{DataEvent, ExecutionEvent, SystemCommand, SystemEvent};
 ///
 /// Panics if the sender is uninitialized.
 #[must_use]
-pub fn get_data_event_sender() -> IngressSender<DataEvent> {
+pub fn get_data_event_sender() -> EventSender<DataEvent> {
     DATA_EVENT_SENDER.with(|sender| {
         sender
             .borrow()
@@ -43,7 +50,7 @@ pub fn get_data_event_sender() -> IngressSender<DataEvent> {
 /// Returns `None` if the sender is not initialized (e.g., in Python/v1 bridge environments
 /// before a runner or adapter bridge has registered a sender).
 #[must_use]
-pub fn try_get_data_event_sender() -> Option<IngressSender<DataEvent>> {
+pub fn try_get_data_event_sender() -> Option<EventSender<DataEvent>> {
     DATA_EVENT_SENDER.with(|sender| sender.borrow().as_ref().cloned())
 }
 
@@ -54,7 +61,7 @@ pub fn try_get_data_event_sender() -> Option<IngressSender<DataEvent>> {
 /// # Panics
 ///
 /// Panics if a sender has already been set.
-pub fn set_data_event_sender(sender: impl Into<IngressSender<DataEvent>>) {
+pub fn set_data_event_sender(sender: impl Into<EventSender<DataEvent>>) {
     let sender = sender.into();
     DATA_EVENT_SENDER.with(|s| {
         let mut slot = s.borrow_mut();
@@ -64,7 +71,7 @@ pub fn set_data_event_sender(sender: impl Into<IngressSender<DataEvent>>) {
 }
 
 /// Replaces the data event sender for the current thread.
-pub fn replace_data_event_sender(sender: impl Into<IngressSender<DataEvent>>) {
+pub fn replace_data_event_sender(sender: impl Into<EventSender<DataEvent>>) {
     let sender = sender.into();
     DATA_EVENT_SENDER.with(|s| {
         let previous = s.borrow().clone();
@@ -82,7 +89,7 @@ pub fn replace_data_event_sender(sender: impl Into<IngressSender<DataEvent>>) {
 ///
 /// Panics if the sender is uninitialized.
 #[must_use]
-pub fn get_system_event_sender() -> IngressSender<SystemEvent> {
+pub fn get_system_event_sender() -> EventSender<SystemEvent> {
     SYSTEM_EVENT_SENDER.with(|sender| {
         sender
             .borrow()
@@ -96,7 +103,7 @@ pub fn get_system_event_sender() -> IngressSender<SystemEvent> {
 ///
 /// Returns `None` if the sender is not initialized (e.g., in test environments).
 #[must_use]
-pub fn try_get_system_event_sender() -> Option<IngressSender<SystemEvent>> {
+pub fn try_get_system_event_sender() -> Option<EventSender<SystemEvent>> {
     SYSTEM_EVENT_SENDER.with(|sender| sender.borrow().as_ref().cloned())
 }
 
@@ -107,7 +114,7 @@ pub fn try_get_system_event_sender() -> Option<IngressSender<SystemEvent>> {
 /// # Panics
 ///
 /// Panics if a sender has already been set.
-pub fn set_system_event_sender(sender: impl Into<IngressSender<SystemEvent>>) {
+pub fn set_system_event_sender(sender: impl Into<EventSender<SystemEvent>>) {
     let sender = sender.into();
     SYSTEM_EVENT_SENDER.with(|s| {
         let mut slot = s.borrow_mut();
@@ -117,7 +124,7 @@ pub fn set_system_event_sender(sender: impl Into<IngressSender<SystemEvent>>) {
 }
 
 /// Replaces the system event sender for the current thread.
-pub fn replace_system_event_sender(sender: impl Into<IngressSender<SystemEvent>>) {
+pub fn replace_system_event_sender(sender: impl Into<EventSender<SystemEvent>>) {
     let sender = sender.into();
     SYSTEM_EVENT_SENDER.with(|s| {
         let previous = s.borrow().clone();
@@ -135,7 +142,7 @@ pub fn replace_system_event_sender(sender: impl Into<IngressSender<SystemEvent>>
 ///
 /// Panics if the sender is uninitialized.
 #[must_use]
-pub fn get_system_command_sender() -> IngressSender<SystemCommand> {
+pub fn get_system_command_sender() -> DispatchSender<SystemCommand> {
     SYSTEM_COMMAND_SENDER.with(|sender| {
         sender
             .borrow()
@@ -149,7 +156,7 @@ pub fn get_system_command_sender() -> IngressSender<SystemCommand> {
 ///
 /// Returns `None` if the sender is not initialized.
 #[must_use]
-pub fn try_get_system_command_sender() -> Option<IngressSender<SystemCommand>> {
+pub fn try_get_system_command_sender() -> Option<DispatchSender<SystemCommand>> {
     SYSTEM_COMMAND_SENDER.with(|sender| sender.borrow().as_ref().cloned())
 }
 
@@ -160,7 +167,7 @@ pub fn try_get_system_command_sender() -> Option<IngressSender<SystemCommand>> {
 /// # Panics
 ///
 /// Panics if a sender has already been set.
-pub fn set_system_command_sender(sender: impl Into<IngressSender<SystemCommand>>) {
+pub fn set_system_command_sender(sender: impl Into<DispatchSender<SystemCommand>>) {
     let sender = sender.into();
     SYSTEM_COMMAND_SENDER.with(|s| {
         let mut slot = s.borrow_mut();
@@ -170,7 +177,7 @@ pub fn set_system_command_sender(sender: impl Into<IngressSender<SystemCommand>>
 }
 
 /// Replaces the system command sender for the current thread.
-pub fn replace_system_command_sender(sender: impl Into<IngressSender<SystemCommand>>) {
+pub fn replace_system_command_sender(sender: impl Into<DispatchSender<SystemCommand>>) {
     let sender = sender.into();
     SYSTEM_COMMAND_SENDER.with(|s| {
         let previous = s.borrow().clone();
@@ -188,7 +195,7 @@ pub fn replace_system_command_sender(sender: impl Into<IngressSender<SystemComma
 ///
 /// Panics if the sender is uninitialized.
 #[must_use]
-pub fn get_exec_event_sender() -> IngressSender<ExecutionEvent> {
+pub fn get_exec_event_sender() -> EventSender<ExecutionEvent> {
     EXEC_EVENT_SENDER.with(|sender| {
         sender
             .borrow()
@@ -202,7 +209,7 @@ pub fn get_exec_event_sender() -> IngressSender<ExecutionEvent> {
 ///
 /// Returns `None` if the sender is not initialized (e.g., in test environments).
 #[must_use]
-pub fn try_get_exec_event_sender() -> Option<IngressSender<ExecutionEvent>> {
+pub fn try_get_exec_event_sender() -> Option<EventSender<ExecutionEvent>> {
     EXEC_EVENT_SENDER.with(|sender| sender.borrow().as_ref().cloned())
 }
 
@@ -213,7 +220,7 @@ pub fn try_get_exec_event_sender() -> Option<IngressSender<ExecutionEvent>> {
 /// # Panics
 ///
 /// Panics if a sender has already been set.
-pub fn set_exec_event_sender(sender: impl Into<IngressSender<ExecutionEvent>>) {
+pub fn set_exec_event_sender(sender: impl Into<EventSender<ExecutionEvent>>) {
     let sender = sender.into();
     EXEC_EVENT_SENDER.with(|s| {
         let mut slot = s.borrow_mut();
@@ -226,7 +233,7 @@ pub fn set_exec_event_sender(sender: impl Into<IngressSender<ExecutionEvent>>) {
 }
 
 /// Replaces the execution event sender for the current thread.
-pub fn replace_exec_event_sender(sender: impl Into<IngressSender<ExecutionEvent>>) {
+pub fn replace_exec_event_sender(sender: impl Into<EventSender<ExecutionEvent>>) {
     let sender = sender.into();
     EXEC_EVENT_SENDER.with(|s| {
         let previous = s.borrow().clone();
@@ -239,10 +246,10 @@ pub fn replace_exec_event_sender(sender: impl Into<IngressSender<ExecutionEvent>
 }
 
 thread_local! {
-    static DATA_EVENT_SENDER: RefCell<Option<IngressSender<DataEvent>>> = const { RefCell::new(None) };
-    static EXEC_EVENT_SENDER: RefCell<Option<IngressSender<ExecutionEvent>>> = const { RefCell::new(None) };
-    static SYSTEM_EVENT_SENDER: RefCell<Option<IngressSender<SystemEvent>>> = const { RefCell::new(None) };
-    static SYSTEM_COMMAND_SENDER: RefCell<Option<IngressSender<SystemCommand>>> = const { RefCell::new(None) };
+    static DATA_EVENT_SENDER: RefCell<Option<EventSender<DataEvent>>> = const { RefCell::new(None) };
+    static EXEC_EVENT_SENDER: RefCell<Option<EventSender<ExecutionEvent>>> = const { RefCell::new(None) };
+    static SYSTEM_EVENT_SENDER: RefCell<Option<EventSender<SystemEvent>>> = const { RefCell::new(None) };
+    static SYSTEM_COMMAND_SENDER: RefCell<Option<DispatchSender<SystemCommand>>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -252,6 +259,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::live::dispatch::DispatchMessage;
 
     #[rstest]
     fn test_replace_data_event_sender_overwrites_previous() {
@@ -284,8 +292,8 @@ mod tests {
     #[rstest]
     fn test_set_data_event_sender_panics_on_double_set() {
         let result = std::thread::spawn(|| {
-            let (tx1, _rx1) = super::super::ingress::IngressGate::new().channel();
-            let (tx2, _rx2) = super::super::ingress::IngressGate::new().channel();
+            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
+            let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
             set_data_event_sender(tx1);
             set_data_event_sender(tx2);
         })
@@ -296,8 +304,10 @@ mod tests {
     #[rstest]
     fn test_set_exec_event_sender_panics_on_double_set() {
         let result = std::thread::spawn(|| {
-            let (tx1, _rx1) = super::super::ingress::IngressGate::new().channel();
-            let (tx2, _rx2) = super::super::ingress::IngressGate::new().channel();
+            let (tx1, _rx1) =
+                tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
+            let (tx2, _rx2) =
+                tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
             set_exec_event_sender(tx1);
             set_exec_event_sender(tx2);
         })
@@ -308,8 +318,10 @@ mod tests {
     #[rstest]
     fn test_set_system_event_sender_panics_on_double_set() {
         let result = std::thread::spawn(|| {
-            let (tx1, _rx1) = super::super::ingress::IngressGate::new().channel();
-            let (tx2, _rx2) = super::super::ingress::IngressGate::new().channel();
+            let (tx1, _rx1) =
+                tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemEvent>>();
+            let (tx2, _rx2) =
+                tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemEvent>>();
             set_system_event_sender(tx1);
             set_system_event_sender(tx2);
         })
@@ -320,8 +332,10 @@ mod tests {
     #[rstest]
     fn test_set_system_command_sender_panics_on_double_set() {
         let result = std::thread::spawn(|| {
-            let (tx1, _rx1) = super::super::ingress::IngressGate::new().channel();
-            let (tx2, _rx2) = super::super::ingress::IngressGate::new().channel();
+            let (tx1, _rx1) =
+                tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemCommand>>();
+            let (tx2, _rx2) =
+                tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemCommand>>();
             set_system_command_sender(tx1);
             set_system_command_sender(tx2);
         })
@@ -353,9 +367,13 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[test]
+    #[rstest]
     fn replacing_event_tls_invalidates_only_active_snapshot() {
-        fn check<T: Send + 'static>(replace: fn(IngressSender<T>)) {
+        fn check<T: Send + 'static>(
+            replace: fn(
+                super::super::ingress::IngressSender<super::super::dispatch::DispatchMessage<T>>,
+            ),
+        ) {
             std::thread::spawn(move || {
                 let gate = super::super::ingress::IngressGate::new();
                 let (first, _receiver) = gate.channel();
@@ -380,32 +398,32 @@ mod tests {
         check(replace_system_command_sender);
     }
 
-    fn assert_sender_replaced<T: Send + 'static>(
-        replace: fn(IngressSender<T>),
-        get: fn() -> IngressSender<T>,
+    fn assert_sender_replaced<T: Send + 'static, S: SenderChannel<T> + Send + 'static>(
+        replace: fn(tokio::sync::mpsc::UnboundedSender<T>),
+        get: fn() -> S,
     ) {
         std::thread::spawn(move || {
-            let (tx1, _rx1) = super::super::ingress::IngressGate::new().channel();
-            let (tx2, _rx2) = super::super::ingress::IngressGate::new().channel();
+            let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+            let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
 
             replace(tx1.clone());
             replace(tx2.clone());
             let sender = get();
 
-            assert!(!sender.same_channel(&tx1));
-            assert!(sender.same_channel(&tx2));
+            assert!(!sender.targets(&tx1));
+            assert!(sender.targets(&tx2));
         })
         .join()
         .expect("sender replacement test thread should join");
     }
 
-    fn assert_sender_thread_local<T: Send + 'static>(
-        replace: fn(IngressSender<T>),
-        get: fn() -> IngressSender<T>,
+    fn assert_sender_thread_local<T: Send + 'static, S: SenderChannel<T> + Send + 'static>(
+        replace: fn(tokio::sync::mpsc::UnboundedSender<T>),
+        get: fn() -> S,
     ) {
         let barrier = Arc::new(Barrier::new(2));
-        let (tx1, _rx1) = super::super::ingress::IngressGate::new().channel();
-        let (tx2, _rx2) = super::super::ingress::IngressGate::new().channel();
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
         let expected1 = tx1.clone();
         let expected2 = tx2.clone();
 
@@ -414,13 +432,13 @@ mod tests {
         let thread1 = std::thread::spawn(move || {
             replace(tx1);
             barrier1.wait();
-            assert!(get().same_channel(&expected1));
+            assert!(get().targets(&expected1));
         });
 
         let thread2 = std::thread::spawn(move || {
             replace(tx2);
             barrier.wait();
-            assert!(get().same_channel(&expected2));
+            assert!(get().targets(&expected2));
         });
 
         thread1
@@ -429,5 +447,21 @@ mod tests {
         thread2
             .join()
             .expect("second sender isolation test thread should join");
+    }
+
+    trait SenderChannel<T> {
+        fn targets(&self, sender: &tokio::sync::mpsc::UnboundedSender<T>) -> bool;
+    }
+
+    impl<T> SenderChannel<T> for tokio::sync::mpsc::UnboundedSender<T> {
+        fn targets(&self, sender: &Self) -> bool {
+            self.same_channel(sender)
+        }
+    }
+
+    impl<T> SenderChannel<T> for EventSender<T> {
+        fn targets(&self, sender: &tokio::sync::mpsc::UnboundedSender<T>) -> bool {
+            self.same_channel(&sender.clone().into())
+        }
     }
 }

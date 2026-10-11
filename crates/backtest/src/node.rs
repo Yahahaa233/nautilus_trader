@@ -15,31 +15,34 @@
 
 //! Provides a [`BacktestNode`] that orchestrates catalog-driven backtests.
 
-use std::iter::Peekable;
+use std::{iter::Peekable, mem};
 
 use ahash::{AHashMap, AHashSet};
-use nautilus_core::UnixNanos;
+use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
-    data::{
-        Bar, Data, FundingRateUpdate, HasTsInit, IndexPriceUpdate, InstrumentClose,
-        InstrumentStatus, MarkPriceUpdate, OptionGreeks, OrderBookDelta, OrderBookDepth10,
-        QuoteTick, TradeTick,
-    },
-    enums::{BookType, OtoTriggerMode},
+    data::{Data, HasTsInit, NautilusDataType, OrderBookDelta, OrderBookDeltas},
+    enums::{BookType, OtoTriggerMode, RecordFlag},
     identifiers::{InstrumentId, Venue},
     types::Money,
 };
-use nautilus_persistence::backend::{catalog::ParquetDataCatalog, session::QueryResult};
+use nautilus_persistence::{
+    backend::default_catalog_factories,
+    catalog::{
+        factory as catalog_factory,
+        traits::{CatalogInstrumentQuery, CatalogQuery, DataCatalog},
+    },
+    config::DataCatalogConfig,
+};
 
 use crate::{
-    config::{BacktestDataConfig, BacktestRunConfig, NautilusDataType, SimulatedVenueConfig},
+    config::{BacktestDataConfig, BacktestRunConfig, SimulatedVenueConfig},
     engine::BacktestEngine,
     result::BacktestResult,
 };
 
 /// Orchestrates catalog-driven backtests from run configurations.
 ///
-/// `BacktestNode` connects the [`ParquetDataCatalog`] with [`BacktestEngine`] to load
+/// `BacktestNode` connects the catalog with [`BacktestEngine`] to load
 /// historical data and run backtests. Supports both oneshot and streaming modes.
 #[derive(Debug)]
 #[cfg_attr(
@@ -53,6 +56,7 @@ use crate::{
 pub struct BacktestNode {
     configs: Vec<BacktestRunConfig>,
     engines: AHashMap<String, BacktestEngine>,
+    disposed: bool,
 }
 
 impl BacktestNode {
@@ -72,6 +76,7 @@ impl BacktestNode {
         Ok(Self {
             configs,
             engines: AHashMap::new(),
+            disposed: false,
         })
     }
 
@@ -87,12 +92,17 @@ impl BacktestNode {
     /// instruments from the catalog. If building a config fails with
     /// [`BacktestRunConfig::raise_exception`] disabled, logs the error and skips that config;
     /// successful return does not guarantee an engine for every config.
+    /// A disposed node cannot be built again; create a new node instead.
     ///
     /// # Errors
     ///
-    /// Returns an error if building an engine from a config fails and
-    /// [`BacktestRunConfig::raise_exception`] is enabled for that config.
+    /// Returns an error if:
+    /// - This node has been disposed.
+    /// - Building an engine from a config fails and
+    ///   [`BacktestRunConfig::raise_exception`] is enabled for that config.
     pub fn build(&mut self) -> anyhow::Result<()> {
+        self.ensure_not_disposed()?;
+
         for config in &self.configs {
             if self.engines.contains_key(config.id()) {
                 continue;
@@ -137,13 +147,20 @@ impl BacktestNode {
     /// Supports both oneshot (`chunk_size = None`) and streaming modes.
     /// Configs without a built engine are skipped. If a run fails with
     /// [`BacktestRunConfig::raise_exception`] disabled, logs the error, clears its loaded data,
-    /// leaves the engine undisposed, and omits its result.
+    /// leaves the engine undisposed, and omits its result. A streaming run that fails to load
+    /// data after replaying earlier chunks ends its engine first, stopping the trader and engines.
+    /// A node disposed by a completed run or by [`dispose()`](Self::dispose)
+    /// cannot run again; create a new node instead.
     ///
     /// # Errors
     ///
-    /// Returns an error if building, data loading, or engine execution fails and
-    /// [`BacktestRunConfig::raise_exception`] is enabled for the run config.
+    /// Returns an error if:
+    /// - This node has been disposed.
+    /// - Building, data loading, or engine execution fails and
+    ///   [`BacktestRunConfig::raise_exception`] is enabled for the run config.
     pub fn run(&mut self) -> anyhow::Result<Vec<BacktestResult>> {
+        self.ensure_not_disposed()?;
+
         // Auto-build if not already done
         if self.engines.is_empty() {
             self.build()?;
@@ -175,6 +192,7 @@ impl BacktestNode {
 
             if config.dispose_on_completion() {
                 engine.dispose();
+                self.disposed = true;
             } else {
                 engine.clear_data();
             }
@@ -183,12 +201,12 @@ impl BacktestNode {
         Ok(results)
     }
 
-    /// Creates a [`ParquetDataCatalog`] from a data config.
+    /// Creates a catalog from a data config.
     ///
     /// # Errors
     ///
     /// Returns an error if the catalog cannot be created from the URI.
-    pub fn load_catalog(config: &BacktestDataConfig) -> anyhow::Result<ParquetDataCatalog> {
+    pub fn load_catalog(config: &BacktestDataConfig) -> anyhow::Result<DataCatalog> {
         create_catalog(config)
     }
 
@@ -206,11 +224,23 @@ impl BacktestNode {
     }
 
     /// Disposes all engines and releases resources.
+    /// Subsequent calls to [`run()`](Self::run) or [`build()`](Self::build)
+    /// return an error; create a new node to run again.
     pub fn dispose(&mut self) {
+        self.disposed = true;
+
         for engine in self.engines.values_mut() {
             engine.dispose();
         }
         self.engines.clear();
+    }
+
+    fn ensure_not_disposed(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.disposed,
+            "BacktestNode has been disposed; create a new BacktestNode to run again"
+        );
+        Ok(())
     }
 }
 
@@ -240,7 +270,18 @@ fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
             .cloned()
             .unwrap_or_default()
             .into();
-        let fee_model = venue_config.fee_model().cloned().unwrap_or_default().into();
+
+        let fee_model = venue_config
+            .fee_model()
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "BacktestVenueConfig for '{}' requires an explicit fee_model, including an explicit zero-fee model",
+                    venue_config.name()
+                )
+            })?
+            .into();
+
         let latency_model = venue_config.latency_model().cloned().map(Into::into);
         let sim_config = SimulatedVenueConfig::builder()
             .venue(Venue::from(venue_config.name().as_str()))
@@ -281,7 +322,7 @@ fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
     }
 
     for data_config in config.data() {
-        let catalog = create_catalog(data_config)?;
+        let mut catalog = create_catalog(data_config)?;
         let instr_ids: Vec<InstrumentId> = data_config.get_instrument_ids()?;
         let filter: Option<Vec<String>> = if instr_ids.is_empty() {
             None
@@ -289,7 +330,8 @@ fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
             Some(instr_ids.iter().map(ToString::to_string).collect())
         };
 
-        let instruments = catalog.query_instruments(filter.as_deref())?;
+        let instruments =
+            catalog.instruments(&CatalogInstrumentQuery::new().with_instrument_ids(filter))?;
 
         if !instr_ids.is_empty() && instruments.is_empty() {
             let ids: Vec<String> = instr_ids.iter().map(ToString::to_string).collect();
@@ -359,7 +401,7 @@ fn validate_configs(configs: &[BacktestRunConfig]) -> anyhow::Result<()> {
                 let has_book_data = config.data().iter().any(|dc| {
                     let is_book_type = matches!(
                         dc.data_type(),
-                        NautilusDataType::OrderBookDelta | NautilusDataType::OrderBookDepth10
+                        NautilusDataType::OrderBookDelta | NautilusDataType::OrderBookDepth
                     );
 
                     if !is_book_type {
@@ -417,9 +459,7 @@ fn run_streaming(
 
     for (catalog, data_config) in catalogs.iter_mut().zip(data_configs) {
         let result = dispatch_query(catalog, data_config, config.start(), config.end())?;
-        let mut stream = result
-            .map(|item| item.map_err(anyhow::Error::from))
-            .peekable();
+        let mut stream = result.peekable();
 
         match stream.peek() {
             Some(Ok(_)) => streams.push(stream),
@@ -479,9 +519,11 @@ fn stream_chunks<I: Iterator<Item = anyhow::Result<Data>>>(
     }
 
     let mut next_start = config.start();
+    let mut started = false;
 
     loop {
-        let chunk = take_aligned_chunk(&mut iter, chunk_size)?;
+        let chunk = take_aligned_chunk(&mut iter, chunk_size)
+            .map_err(|e| end_after_load_failure(engine, started, e))?;
         if chunk.is_empty() {
             break;
         }
@@ -493,9 +535,12 @@ fn stream_chunks<I: Iterator<Item = anyhow::Result<Data>>>(
             chunk.last().map(HasTsInit::ts_init)
         };
 
-        engine.add_data(chunk, None, false, true)?;
+        engine
+            .add_data(chunk, None, false, true)
+            .map_err(|e| end_after_load_failure(engine, started, e))?;
         engine.run(next_start, end, Some(config.id().to_string()), true)?;
         engine.clear_data();
+        started = true;
 
         // A shutdown request during the chunk already triggered end() inside
         // engine.run(); stop loading further chunks so later data is not processed
@@ -509,6 +554,19 @@ fn stream_chunks<I: Iterator<Item = anyhow::Result<Data>>>(
     }
 
     engine.end()
+}
+
+// Ends an engine that earlier chunks started, so a failure to load later data still stops the
+// trader and engines; the load failure stays the reported error
+fn end_after_load_failure(
+    engine: &mut BacktestEngine,
+    started: bool,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if started && let Err(e) = engine.end() {
+        log::error!("Failed to end backtest after a data load failure: {e:#}");
+    }
+    error
 }
 
 // Takes up to `chunk_size` items, then extends to include all remaining
@@ -539,16 +597,23 @@ fn take_aligned_chunk<I: Iterator<Item = anyhow::Result<Data>>>(
     Ok(chunk)
 }
 
-fn create_catalog(config: &BacktestDataConfig) -> anyhow::Result<ParquetDataCatalog> {
-    let uri = match config.catalog_fs_protocol() {
-        Some(protocol) => format!("{protocol}://{}", config.catalog_path()),
-        None => config.catalog_path().to_string(),
-    };
-    let storage_options = config
-        .catalog_fs_rust_storage_options()
-        .cloned()
-        .or_else(|| config.catalog_fs_storage_options().cloned());
-    ParquetDataCatalog::from_uri(&uri, storage_options, None, None, None)
+fn create_catalog(config: &BacktestDataConfig) -> anyhow::Result<DataCatalog> {
+    let catalog_config = DataCatalogConfig::new(
+        config.catalog_path().to_string(),
+        config.catalog_fs_protocol().map(str::to_string),
+        Some(config.catalog_backend()),
+    )
+    .with_storage_options(
+        config
+            .catalog_fs_rust_storage_options()
+            .cloned()
+            .or_else(|| config.catalog_fs_storage_options().cloned()),
+    );
+    catalog_factory::create_catalog(
+        catalog_config.catalog_backend(),
+        &catalog_config.connect_config(),
+        &default_catalog_factories(),
+    )
 }
 
 fn load_data(
@@ -558,38 +623,55 @@ fn load_data(
 ) -> anyhow::Result<Vec<Data>> {
     let mut catalog = create_catalog(config)?;
     let result = dispatch_query(&mut catalog, config, run_start, run_end)?;
-    Ok(result.collect::<Result<Vec<_>, _>>()?)
+    result.collect::<Result<Vec<_>, _>>()
 }
 
 fn dispatch_query(
-    catalog: &mut ParquetDataCatalog,
+    catalog: &mut DataCatalog,
     config: &BacktestDataConfig,
-    run_start: Option<UnixNanos>,
-    run_end: Option<UnixNanos>,
-) -> anyhow::Result<QueryResult> {
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<Data>>>> {
     catalog.reset_session();
+    let mut query = CatalogQuery::new(config.data_type().clone())
+        .with_identifiers(config.query_identifiers())
+        .with_range(
+            max_opt(config.start_time(), start),
+            min_opt(config.end_time(), end),
+        )
+        .with_where_clause(config.filter_expr().map(str::to_string));
+    let mut params = Params::new();
+    params.insert(
+        "optimize_file_loading".to_string(),
+        config.optimize_file_loading().into(),
+    );
+    query.params = Some(params);
+    let mut session = catalog.query_batch_session(&query, None)?;
+    let mut failed = false;
+    let rows = std::iter::from_fn(move || {
+        if failed {
+            return None;
+        }
 
-    let identifiers = config.query_identifiers();
-    let start = max_opt(config.start_time(), run_start);
-    let end = min_opt(config.end_time(), run_end);
-    let filter = config.filter_expr();
-    let optimize = config.optimize_file_loading();
+        match session.next_batch() {
+            Ok(Some(batch)) => Some(Ok(batch.to_data_vec_for_compat())),
+            Ok(None) => None,
+            Err(e) => {
+                failed = true;
+                Some(Err(e))
+            }
+        }
+    })
+    .flat_map(|batch| match batch {
+        Ok(rows) => rows.into_iter().map(Ok).collect::<Vec<_>>(),
+        Err(e) => vec![Err(e)],
+    });
 
-    #[rustfmt::skip]
-    let result = match config.data_type() {
-        NautilusDataType::QuoteTick => catalog.query::<QuoteTick>(identifiers, start, end, filter, None, optimize),
-        NautilusDataType::TradeTick => catalog.query::<TradeTick>(identifiers, start, end, filter, None, optimize),
-        NautilusDataType::Bar => catalog.query::<Bar>(identifiers, start, end, filter, None, optimize),
-        NautilusDataType::OrderBookDelta => catalog.query::<OrderBookDelta>(identifiers, start, end, filter, None, optimize),
-        NautilusDataType::OrderBookDepth10 => catalog.query::<OrderBookDepth10>(identifiers, start, end, filter, None, optimize),
-        NautilusDataType::MarkPriceUpdate => catalog.query::<MarkPriceUpdate>(identifiers, start, end, filter, None, optimize),
-        NautilusDataType::IndexPriceUpdate => catalog.query::<IndexPriceUpdate>(identifiers, start, end, filter, None, optimize),
-        NautilusDataType::FundingRateUpdate => catalog.query::<FundingRateUpdate>(identifiers, start, end, filter, None, optimize),
-        NautilusDataType::InstrumentStatus => catalog.query::<InstrumentStatus>(identifiers, start, end, filter, None, optimize),
-        NautilusDataType::OptionGreeks => catalog.query::<OptionGreeks>(identifiers, start, end, filter, None, optimize),
-        NautilusDataType::InstrumentClose => catalog.query::<InstrumentClose>(identifiers, start, end, filter, None, optimize),
-    };
-    result
+    if config.batch_deltas() && *config.data_type() == NautilusDataType::OrderBookDelta {
+        return Ok(Box::new(BookDeltasBatcher::new(rows)));
+    }
+
+    Ok(Box::new(rows))
 }
 
 fn max_opt(a: Option<UnixNanos>, b: Option<UnixNanos>) -> Option<UnixNanos> {
@@ -610,12 +692,99 @@ fn min_opt(a: Option<UnixNanos>, b: Option<UnixNanos>) -> Option<UnixNanos> {
     }
 }
 
+// Regroups flat catalog deltas into `OrderBookDeltas` closed by `F_LAST`, so the engine applies
+// each book event at once. Each instrument keeps its own pending group because a multi-instrument
+// query interleaves rows by `ts_init`; a group replays at its closing delta, preserving that order.
+struct BookDeltasBatcher<I> {
+    rows: I,
+    pending: AHashMap<InstrumentId, Vec<OrderBookDelta>>,
+    finished: bool,
+}
+
+impl<I> BookDeltasBatcher<I> {
+    fn new(rows: I) -> Self {
+        Self {
+            rows,
+            pending: AHashMap::new(),
+            finished: false,
+        }
+    }
+}
+
+impl<I: Iterator<Item = anyhow::Result<Data>>> Iterator for BookDeltasBatcher<I> {
+    type Item = anyhow::Result<Data>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        loop {
+            match self.rows.next() {
+                Some(Ok(Data::BookDelta(delta))) => {
+                    let group = self.pending.entry(delta.instrument_id).or_default();
+                    group.push(delta);
+
+                    if RecordFlag::F_LAST.matches(delta.flags) {
+                        let deltas = mem::replace(group, Vec::with_capacity(group.len()));
+                        let deltas = OrderBookDeltas::new_checked(delta.instrument_id, deltas);
+                        return Some(deltas.map(|deltas| Data::BookDeltas(Box::new(deltas))));
+                    }
+                }
+                Some(item) => {
+                    // A failed query must not flush its pending groups as complete events
+                    if item.is_err() {
+                        self.finished = true;
+                    }
+                    return Some(item);
+                }
+                None => {
+                    self.finished = true;
+                    return unterminated_deltas_error(&self.pending).map(Err);
+                }
+            }
+        }
+    }
+}
+
+fn unterminated_deltas_error(
+    pending: &AHashMap<InstrumentId, Vec<OrderBookDelta>>,
+) -> Option<anyhow::Error> {
+    let mut groups: Vec<_> = pending
+        .iter()
+        .filter_map(|(instrument_id, group)| {
+            let first = group.first()?.ts_init;
+            let last = group.last()?.ts_init;
+            Some((*instrument_id, group.len(), first, last))
+        })
+        .collect();
+
+    if groups.is_empty() {
+        return None;
+    }
+
+    groups.sort_unstable_by_key(|(instrument_id, ..)| *instrument_id);
+    let details = groups
+        .iter()
+        .map(|(instrument_id, count, first, last)| {
+            format!("{instrument_id} ({count} pending, ts_init {first} to {last})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Some(anyhow::anyhow!(
+        "Order book deltas end without an `F_LAST` delta for {details}; \
+         set `batch_deltas` to false to replay individual deltas"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "python")]
-    use nautilus_model::enums::{AccountType, OmsType};
+    use nautilus_common::component::Component;
+    use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
     use nautilus_model::{
-        enums::AggressorSide,
+        data::{BookOrder, QuoteTick, TradeTick},
+        enums::{AccountType, AggressorSide, BookAction, OmsType, OrderSide},
         identifiers::{InstrumentId, TradeId},
         types::{Price, Quantity},
     };
@@ -624,10 +793,18 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::config::MAX_BACKTEST_CHUNK_SIZE;
+    use crate::{
+        config::{
+            BacktestEngineConfig, BacktestVenueConfig, MAX_BACKTEST_CHUNK_SIZE,
+            SimulatedVenueConfig,
+        },
+        modules::{
+            AccountAdjustmentOutcome, ExchangeContext, SimulationModule, SimulationModuleHandle,
+            SimulationModuleResult,
+        },
+    };
     #[cfg(feature = "python")]
     use crate::{
-        config::BacktestVenueConfig,
         modules::SimulationModuleAny,
         python::modules::{PySimulationModule, PythonSimulationModule},
     };
@@ -658,6 +835,82 @@ mod tests {
 
     fn stream_failure() -> anyhow::Error {
         anyhow::anyhow!("injected stream failure")
+    }
+
+    #[derive(Debug)]
+    struct FailingDiagnosticsModule;
+
+    impl SimulationModule for FailingDiagnosticsModule {
+        fn pre_process(&self, _data: &Data) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn process(
+            &self,
+            _ts_now: UnixNanos,
+            _ctx: &ExchangeContext,
+        ) -> anyhow::Result<SimulationModuleResult> {
+            Ok(SimulationModuleResult::NotReady)
+        }
+
+        fn acknowledge(&self, _outcomes: &[AccountAdjustmentOutcome]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn log_diagnostics(&self) -> anyhow::Result<()> {
+            anyhow::bail!("diagnostics failure")
+        }
+
+        fn reset(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn book_delta(instrument_id: &str, flags: u8, sequence: u64, ts_init: u64) -> OrderBookDelta {
+        OrderBookDelta::new(
+            InstrumentId::from(instrument_id),
+            BookAction::Add,
+            BookOrder::new(
+                OrderSide::Buy,
+                Price::from("1.0000"),
+                Quantity::from("100"),
+                sequence,
+            ),
+            flags,
+            sequence,
+            UnixNanos::from(ts_init - 1),
+            UnixNanos::from(ts_init),
+        )
+    }
+
+    fn batch_book_deltas(deltas: &[OrderBookDelta]) -> Vec<Data> {
+        BookDeltasBatcher::new(deltas.iter().map(|delta| Ok(Data::BookDelta(*delta))))
+            .collect::<anyhow::Result<_>>()
+            .expect("the batcher must not fail")
+    }
+
+    type BookDeltasFields = (
+        InstrumentId,
+        Vec<OrderBookDelta>,
+        u8,
+        u64,
+        UnixNanos,
+        UnixNanos,
+    );
+
+    // Lists every field because `OrderBookDeltas` equality compares only instrument and sequence
+    fn book_deltas_fields(data: &Data) -> BookDeltasFields {
+        let Data::BookDeltas(deltas) = data else {
+            panic!("expected `OrderBookDeltas`, was {data:?}");
+        };
+        (
+            deltas.instrument_id,
+            deltas.deltas.clone(),
+            deltas.flags,
+            deltas.sequence,
+            deltas.ts_event,
+            deltas.ts_init,
+        )
     }
 
     #[rstest]
@@ -781,6 +1034,198 @@ mod tests {
         assert_eq!(chunk[0].ts_init(), UnixNanos::from(1));
     }
 
+    #[rstest]
+    fn book_deltas_batcher_closes_groups_only_on_f_last() {
+        let last = RecordFlag::F_LAST as u8;
+        let d1 = book_delta("EUR/USD.SIM", 0, 1, 10);
+        let d2 = book_delta("EUR/USD.SIM", last, 2, 10);
+        let d3 = book_delta("EUR/USD.SIM", last, 3, 10);
+        let d4 = book_delta("EUR/USD.SIM", 0, 4, 20);
+        let d5 = book_delta("EUR/USD.SIM", last, 5, 30);
+
+        let batches = batch_book_deltas(&[d1, d2, d3, d4, d5]);
+
+        // Same-timestamp events stay apart, and an event spanning timestamps replays at its close
+        let instrument_id = InstrumentId::from("EUR/USD.SIM");
+        assert_eq!(
+            batches.iter().map(book_deltas_fields).collect::<Vec<_>>(),
+            vec![
+                (
+                    instrument_id,
+                    vec![d1, d2],
+                    last,
+                    2,
+                    UnixNanos::from(9),
+                    UnixNanos::from(10),
+                ),
+                (
+                    instrument_id,
+                    vec![d3],
+                    last,
+                    3,
+                    UnixNanos::from(9),
+                    UnixNanos::from(10),
+                ),
+                (
+                    instrument_id,
+                    vec![d4, d5],
+                    last,
+                    5,
+                    UnixNanos::from(29),
+                    UnixNanos::from(30),
+                ),
+            ]
+        );
+    }
+
+    #[rstest]
+    fn book_deltas_batcher_keeps_interleaved_instruments_apart() {
+        let last = RecordFlag::F_LAST as u8;
+        let aud1 = book_delta("AUD/USD.SIM", 0, 1, 10);
+        let eur1 = book_delta("EUR/USD.SIM", 0, 2, 10);
+        let eur2 = book_delta("EUR/USD.SIM", last, 3, 10);
+        let aud2 = book_delta("AUD/USD.SIM", last, 4, 20);
+
+        let batches = batch_book_deltas(&[aud1, eur1, eur2, aud2]);
+
+        // The completed EUR/USD event is not held behind the pending AUD/USD event
+        assert_eq!(
+            batches.iter().map(book_deltas_fields).collect::<Vec<_>>(),
+            vec![
+                (
+                    InstrumentId::from("EUR/USD.SIM"),
+                    vec![eur1, eur2],
+                    last,
+                    3,
+                    UnixNanos::from(9),
+                    UnixNanos::from(10),
+                ),
+                (
+                    InstrumentId::from("AUD/USD.SIM"),
+                    vec![aud1, aud2],
+                    last,
+                    4,
+                    UnixNanos::from(19),
+                    UnixNanos::from(20),
+                ),
+            ]
+        );
+    }
+
+    #[rstest]
+    fn book_deltas_batcher_takes_flags_from_closing_delta() {
+        let instrument_id = InstrumentId::from("EUR/USD.SIM");
+        let clear =
+            OrderBookDelta::clear(instrument_id, 1, UnixNanos::from(9), UnixNanos::from(10));
+        let add = book_delta("EUR/USD.SIM", RecordFlag::F_MBP as u8, 2, 10);
+        let close = book_delta("EUR/USD.SIM", RecordFlag::F_LAST as u8, 3, 10);
+
+        let batches = batch_book_deltas(&[clear, add, close]);
+
+        // A snapshot clear does not close the event, and earlier flags are not merged in
+        assert_eq!(
+            batches.iter().map(book_deltas_fields).collect::<Vec<_>>(),
+            vec![(
+                instrument_id,
+                vec![clear, add, close],
+                RecordFlag::F_LAST as u8,
+                3,
+                UnixNanos::from(9),
+                UnixNanos::from(10),
+            )]
+        );
+    }
+
+    #[rstest]
+    fn book_deltas_batcher_yields_nothing_for_empty_input() {
+        let batches = batch_book_deltas(&[]);
+
+        assert!(batches.is_empty());
+    }
+
+    #[rstest]
+    fn book_deltas_batcher_rejects_deltas_left_without_f_last() {
+        let last = RecordFlag::F_LAST as u8;
+        let d1 = book_delta("EUR/USD.SIM", last, 1, 10);
+        let d2 = book_delta("EUR/USD.SIM", 0, 2, 20);
+        let d3 = book_delta("EUR/USD.SIM", 0, 3, 30);
+        let d4 = book_delta("AUD/USD.SIM", 0, 4, 40);
+        let rows = [d1, d2, d3, d4].map(|delta| Ok(Data::BookDelta(delta)));
+        let mut batcher = BookDeltasBatcher::new(rows.into_iter());
+
+        let first = batcher.next().expect("the complete event must be yielded");
+        let second = batcher.next().expect("the pending deltas must be reported");
+        let third = batcher.next();
+
+        assert_eq!(
+            book_deltas_fields(&first.expect("the complete event must not fail")),
+            (
+                InstrumentId::from("EUR/USD.SIM"),
+                vec![d1],
+                last,
+                1,
+                UnixNanos::from(9),
+                UnixNanos::from(10),
+            )
+        );
+        assert_eq!(
+            second
+                .expect_err("pending deltas must not replay as an event")
+                .to_string(),
+            "Order book deltas end without an `F_LAST` delta for \
+             AUD/USD.SIM (1 pending, ts_init 40 to 40), \
+             EUR/USD.SIM (2 pending, ts_init 20 to 30); \
+             set `batch_deltas` to false to replay individual deltas"
+        );
+        assert!(third.is_none());
+    }
+
+    #[rstest]
+    fn book_deltas_batcher_reports_a_query_failure_without_flushing() {
+        let pending = book_delta("EUR/USD.SIM", 0, 1, 10);
+        let after_failure = book_delta("EUR/USD.SIM", RecordFlag::F_LAST as u8, 2, 20);
+        let rows = vec![
+            Ok(Data::BookDelta(pending)),
+            Err(stream_failure()),
+            Ok(Data::BookDelta(after_failure)),
+        ];
+
+        let items: Vec<anyhow::Result<Data>> = BookDeltasBatcher::new(rows.into_iter()).collect();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0]
+                .as_ref()
+                .expect_err("the query failure must be yielded")
+                .to_string(),
+            "injected stream failure"
+        );
+    }
+
+    #[rstest]
+    fn end_after_load_failure_reports_the_load_failure_when_ending_fails() {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let venue = SimulatedVenueConfig::builder()
+            .venue(Venue::from("SIM"))
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USD")])
+            .modules(vec![SimulationModuleHandle::new(FailingDiagnosticsModule)])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .build()
+            .unwrap();
+        engine.add_venue(venue).unwrap();
+        engine.run(None, None, None, true).unwrap();
+
+        let error = end_after_load_failure(&mut engine, true, stream_failure());
+
+        // Ending fails on the module diagnostics after the trader stops
+        assert_eq!(error.to_string(), "injected stream failure");
+        assert!(engine.kernel().trader.borrow().is_stopped());
+        assert!(engine.get_result().run_finished.is_some());
+    }
+
     #[cfg(feature = "python")]
     #[rstest]
     fn build_engine_accepts_python_module_from_node_config() {
@@ -811,6 +1256,7 @@ mod tests {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
                 .starting_balances(vec!["1000 USD".to_string()])
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()))
                 .modules(vec![SimulationModuleAny::Python(
                     PythonSimulationModule::new(module.clone().unbind()),
                 )])
@@ -830,5 +1276,27 @@ mod tests {
                 1
             );
         });
+    }
+
+    #[rstest]
+    fn test_build_engine_rejects_venue_without_fee_model() {
+        let venue = BacktestVenueConfig::builder()
+            .name("SIM")
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec!["1_000_000 USD".to_string()])
+            .build()
+            .unwrap();
+        let config = BacktestRunConfig::builder()
+            .venues(vec![venue])
+            .data(Vec::new())
+            .build()
+            .unwrap();
+        let err = build_engine(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("explicit fee_model"),
+            "unexpected error: {err}"
+        );
     }
 }

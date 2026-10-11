@@ -244,6 +244,106 @@ impl<T> SnapshotReceiver<T> {
         Ok(())
     }
     #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn bind_historical_source_frontier(
+        &mut self,
+        guard: &nautilus_common::live::ingress::FrozenIngress,
+        source_channel_id: nautilus_core::UUID4,
+        next_ordinal: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.recovered_prefix_released && self.prefix.is_empty(),
+            "historical source frontier requires the unreleased source prefix"
+        );
+        match &mut self.receiver {
+            Receiver::Native(receiver) => {
+                receiver.bind_historical_source_frontier(guard, source_channel_id, next_ordinal)
+            }
+            Receiver::Raw(_) => {
+                anyhow::bail!("historical source requires the owned native receiver")
+            }
+        }
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn append_historical_external(
+        &mut self,
+        guard: &nautilus_common::live::ingress::FrozenIngress,
+        message: T,
+        receipt: NativeIngressReceipt,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.recovered_prefix_released && self.receiver.len() == 0,
+            "historical external admission cannot overtake a physical native input"
+        );
+        if let Some(previous) = self.prefix.back().or_else(|| self.recovered_prefix.back()) {
+            anyhow::ensure!(
+                previous.receipt.as_ref().is_some_and(|previous| {
+                    previous.channel_id == receipt.channel_id
+                        && previous.channel_ordinal.checked_add(1) == Some(receipt.channel_ordinal)
+                }),
+                "historical external admission changed original channel FIFO"
+            );
+        }
+        self.prefix.try_reserve(1)?;
+        match &mut self.receiver {
+            Receiver::Native(receiver) => {
+                receiver.advance_historical_source_frontier(guard, &receipt)?
+            }
+            Receiver::Raw(_) => {
+                anyhow::bail!("historical external input requires native receipt ownership")
+            }
+        }
+        self.prefix.push_back(Retained {
+            message,
+            receipt: Some(receipt),
+        });
+        Ok(())
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn take_historical_front(
+        &mut self,
+        expected: &NativeIngressReceipt,
+    ) -> anyhow::Result<Option<Retained<T>>> {
+        anyhow::ensure!(
+            !self.recovered_prefix_released,
+            "historical source FIFO already released"
+        );
+        // Stage only the next physical entry. A later external source admission
+        // cannot silently change the ordinals of already resident native entries.
+        if self.recovered_prefix.is_empty() && self.prefix.is_empty() && self.receiver.len() > 0 {
+            self.prefix.try_reserve(1)?;
+            self.prefix.push_back(self.receiver.try_recv()?);
+        }
+        let Some(front) = self
+            .recovered_prefix
+            .front()
+            .or_else(|| self.prefix.front())
+        else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            front.receipt.as_ref() == Some(expected),
+            "historical Begin is not the next original physical FIFO receipt"
+        );
+        Ok(if self.recovered_prefix.is_empty() {
+            self.prefix.pop_front()
+        } else {
+            self.recovered_prefix.pop_front()
+        })
+    }
+    #[cfg(feature = "native-tail-replay")]
+    pub(crate) fn hold_historical_pending(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.recovered_prefix_released,
+            "historical pending FIFO already released"
+        );
+        self.stage()?;
+        self.recovered_prefix.try_reserve(self.prefix.len())?;
+        // The initial source prefix precedes actual historical descendants.
+        // All remain unavailable to ordinary startup until the same fresh release.
+        self.recovered_prefix.append(&mut self.prefix);
+        Ok(())
+    }
+    #[cfg(feature = "native-tail-replay")]
     pub(crate) fn prepare_recovered_prefix_release(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.recovered_prefix_released,
@@ -261,11 +361,15 @@ impl<T> SnapshotReceiver<T> {
         }
         self.recovered_prefix_released = true;
     }
-    pub(crate) fn prepend_retained(&mut self, retained: &mut VecDeque<T>) -> anyhow::Result<()> {
+    #[cfg(all(feature = "node", feature = "dispatch-observer"))]
+    pub(crate) fn prepend_retained<U: Into<T>>(
+        &mut self,
+        retained: &mut VecDeque<U>,
+    ) -> anyhow::Result<()> {
         self.prefix.try_reserve(retained.len())?;
         while let Some(message) = retained.pop_back() {
             self.prefix.push_front(Retained {
-                message,
+                message: message.into(),
                 receipt: None,
             });
         }

@@ -26,7 +26,7 @@ use std::{
 
 use ahash::{AHashMap, AHashSet};
 use nautilus_common::{
-    live::{ingress::IngressSender, runner::try_get_system_event_sender},
+    live::{runner::try_get_system_event_sender, sender::EventSender},
     messages::{
         SystemEvent,
         system::{SocketState as SystemSocketState, SocketStateChange},
@@ -359,6 +359,7 @@ fn remove_entry(
         let matches = entries
             .get(&owner_id)
             .is_some_and(|entry| generation.is_none_or(|value| entry.generation == value));
+
         if matches {
             entry = entries.remove(&owner_id);
         }
@@ -384,7 +385,7 @@ fn deactivate(entry: Option<RegistryEntry>) {
 pub struct SocketControlFactory {
     client_id: ClientId,
     venue: Option<Venue>,
-    sender: Option<IngressSender<SystemEvent>>,
+    sender: Option<EventSender<SystemEvent>>,
     owner: Option<SocketReconnectOwner>,
     controls: Arc<Mutex<AHashMap<Ustr, SocketControl>>>,
 }
@@ -454,7 +455,7 @@ struct SocketStatePublisher {
     client_id: ClientId,
     venue: Option<Venue>,
     endpoint: Ustr,
-    sender: Option<IngressSender<SystemEvent>>,
+    sender: Option<EventSender<SystemEvent>>,
     active_generation: Arc<AtomicU64>,
     publish_lock: Arc<Mutex<()>>,
 }
@@ -616,6 +617,7 @@ impl Drop for SocketControl {
 
 fn advance_generation(counter: &AtomicU64) -> u64 {
     let mut current = counter.load(Ordering::Relaxed);
+
     loop {
         let next = current.wrapping_add(1).max(1);
         match counter.compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed) {
@@ -780,6 +782,7 @@ mod tests {
 
         let stale_handle = handle(&registry);
         let request_handle = stale_handle.clone();
+
         let request = thread::spawn(move || request_handle.request_reconnect());
         entered.wait();
 
@@ -849,6 +852,7 @@ mod tests {
             .map(|entry| entry.generation)
             .unwrap();
         let request_handle = stale_handle.clone();
+
         let request = thread::spawn(move || request_handle.request_reconnect());
         entered.wait();
 
@@ -870,6 +874,7 @@ mod tests {
                 .get(&key)
                 .and_then(|entries| entries.values().next())
                 .is_some_and(|entry| entry.generation == old_generation);
+
             if !old_entry_is_registered {
                 break;
             }

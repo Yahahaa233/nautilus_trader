@@ -48,7 +48,8 @@ pub trait RunningAdapterCheckpoint: Debug {
 
 pub use data::DataClient;
 pub use execution::{
-    DEFAULT_POSITION_RECONCILIATION_TOLERANCE, ExecutionClient, generate_mass_status,
+    DEFAULT_POSITION_RECONCILIATION_TOLERANCE, ExecutionClient, ExecutionReportTask,
+    generate_mass_status,
 };
 
 #[inline(always)]

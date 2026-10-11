@@ -19,7 +19,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use nautilus_common::{
     cache::Cache,
-    clock::TestClock,
+    clock::VirtualClock,
     live::runner::{replace_data_event_sender, replace_exec_event_sender},
     messages::{DataEvent, ExecutionEvent},
 };
@@ -71,6 +71,7 @@ fn assert_data_factory_extracts_from_python_object(py: Python<'_>) {
     let factory = Py::new(py, DeriveDataClientFactory::new())
         .expect("factory should convert to Python object")
         .into_any();
+
     let config = Py::new(
         py,
         DeriveDataClientConfig {
@@ -82,6 +83,7 @@ fn assert_data_factory_extracts_from_python_object(py: Python<'_>) {
     )
     .expect("config should convert to Python object")
     .into_any();
+
     let registry = get_global_pyo3_registry();
 
     let extracted_factory = registry
@@ -95,7 +97,7 @@ fn assert_data_factory_extracts_from_python_object(py: Python<'_>) {
         .downcast_ref::<DeriveDataClientConfig>()
         .expect("data config should downcast");
     let cache = Rc::new(RefCell::new(Cache::default()));
-    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
     let client = extracted_factory
         .create(
             "DERIVE-DATA-EXTRACTED",
@@ -119,6 +121,7 @@ fn assert_exec_factory_extracts_from_python_object(py: Python<'_>) {
     let factory = Py::new(py, DeriveExecutionClientFactory::new())
         .expect("factory should convert to Python object")
         .into_any();
+
     let config = Py::new(
         py,
         DeriveExecutionClientConfig {
@@ -133,6 +136,7 @@ fn assert_exec_factory_extracts_from_python_object(py: Python<'_>) {
     )
     .expect("config should convert to Python object")
     .into_any();
+
     let registry = get_global_pyo3_registry();
 
     let extracted_factory = registry
@@ -152,7 +156,7 @@ fn assert_exec_factory_extracts_from_python_object(py: Python<'_>) {
             "DERIVE-EXEC-EXTRACTED",
             extracted_config.as_ref(),
             cache.into(),
-            Rc::new(RefCell::new(TestClock::new())),
+            Rc::new(RefCell::new(VirtualClock::new())),
         )
         .expect("extracted factory should create exec client");
 

@@ -34,8 +34,9 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos};
+use nautilus_execution::engine::settlement::{settle_instrument_close, settlement_close};
 use nautilus_model::{
-    data::{Bar, QuoteTick, TradeTick},
+    data::{Bar, InstrumentClose, QuoteTick, TradeTick},
     enums::{OmsType, OrderSide, PositionSide},
     events::{
         AccountState, OrderEventAny, OrderFillVoided, OrderFilled, OrderInitialized,
@@ -70,17 +71,17 @@ use crate::{
     backend::{EventStore, ScanDirection},
     capture::builtins::{
         PAYLOAD_TYPE_ACCOUNT_STATE, PAYLOAD_TYPE_BARS_RESPONSE,
-        PAYLOAD_TYPE_FUNDING_RATES_RESPONSE, PAYLOAD_TYPE_INSTRUMENT_RESPONSE,
-        PAYLOAD_TYPE_INSTRUMENTS_RESPONSE, PAYLOAD_TYPE_ORDER_ACCEPTED,
-        PAYLOAD_TYPE_ORDER_CANCEL_REJECTED, PAYLOAD_TYPE_ORDER_CANCELED, PAYLOAD_TYPE_ORDER_DENIED,
-        PAYLOAD_TYPE_ORDER_EMULATED, PAYLOAD_TYPE_ORDER_EXPIRED, PAYLOAD_TYPE_ORDER_FILL_VOIDED,
-        PAYLOAD_TYPE_ORDER_FILLED, PAYLOAD_TYPE_ORDER_INITIALIZED,
-        PAYLOAD_TYPE_ORDER_MODIFY_REJECTED, PAYLOAD_TYPE_ORDER_PENDING_CANCEL,
-        PAYLOAD_TYPE_ORDER_PENDING_UPDATE, PAYLOAD_TYPE_ORDER_REJECTED,
-        PAYLOAD_TYPE_ORDER_RELEASED, PAYLOAD_TYPE_ORDER_SUBMITTED, PAYLOAD_TYPE_ORDER_TRIGGERED,
-        PAYLOAD_TYPE_ORDER_UPDATED, PAYLOAD_TYPE_POSITION_ADJUSTED, PAYLOAD_TYPE_POSITION_CHANGED,
-        PAYLOAD_TYPE_POSITION_CLOSED, PAYLOAD_TYPE_POSITION_OPENED, PAYLOAD_TYPE_QUOTES_RESPONSE,
-        PAYLOAD_TYPE_SUBMIT_ORDER_LIST, PAYLOAD_TYPE_TRADES_RESPONSE,
+        PAYLOAD_TYPE_FUNDING_RATES_RESPONSE, PAYLOAD_TYPE_INSTRUMENT_CLOSE,
+        PAYLOAD_TYPE_INSTRUMENT_RESPONSE, PAYLOAD_TYPE_INSTRUMENTS_RESPONSE,
+        PAYLOAD_TYPE_ORDER_ACCEPTED, PAYLOAD_TYPE_ORDER_CANCEL_REJECTED,
+        PAYLOAD_TYPE_ORDER_CANCELED, PAYLOAD_TYPE_ORDER_DENIED, PAYLOAD_TYPE_ORDER_EMULATED,
+        PAYLOAD_TYPE_ORDER_EXPIRED, PAYLOAD_TYPE_ORDER_FILL_VOIDED, PAYLOAD_TYPE_ORDER_FILLED,
+        PAYLOAD_TYPE_ORDER_INITIALIZED, PAYLOAD_TYPE_ORDER_MODIFY_REJECTED,
+        PAYLOAD_TYPE_ORDER_PENDING_CANCEL, PAYLOAD_TYPE_ORDER_PENDING_UPDATE,
+        PAYLOAD_TYPE_ORDER_REJECTED, PAYLOAD_TYPE_ORDER_RELEASED, PAYLOAD_TYPE_ORDER_SUBMITTED,
+        PAYLOAD_TYPE_ORDER_TRIGGERED, PAYLOAD_TYPE_ORDER_UPDATED, PAYLOAD_TYPE_POSITION_ADJUSTED,
+        PAYLOAD_TYPE_POSITION_CHANGED, PAYLOAD_TYPE_POSITION_CLOSED, PAYLOAD_TYPE_POSITION_OPENED,
+        PAYLOAD_TYPE_QUOTES_RESPONSE, PAYLOAD_TYPE_SUBMIT_ORDER_LIST, PAYLOAD_TYPE_TRADES_RESPONSE,
     },
     entry::EventStoreEntry,
     error::EventStoreError,
@@ -119,6 +120,7 @@ pub struct EventStoreReplayReport {
 pub(crate) const CACHE_REPLAY_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_SUBMIT_ORDER_LIST,
     PAYLOAD_TYPE_ACCOUNT_STATE,
+    PAYLOAD_TYPE_INSTRUMENT_CLOSE,
     PAYLOAD_TYPE_INSTRUMENT_RESPONSE,
     PAYLOAD_TYPE_INSTRUMENTS_RESPONSE,
     PAYLOAD_TYPE_QUOTES_RESPONSE,
@@ -486,7 +488,7 @@ pub trait ReplayCatalog {
     ///
     /// # Errors
     ///
-    /// Returns the catalog implementation's error when slice planning fails.
+    /// Returns an error if slice planning fails (the catalog implementation's error).
     fn plan_slice(
         &mut self,
         query: &CatalogSliceQuery,
@@ -499,7 +501,7 @@ pub trait ReplayCatalog {
     ///
     /// # Errors
     ///
-    /// Returns the catalog implementation's error when slice loading fails.
+    /// Returns an error if slice loading fails (the catalog implementation's error).
     fn load_slice(
         &mut self,
         plan: &CatalogSlicePlan,
@@ -745,10 +747,12 @@ impl CacheReplayContext {
 ///
 /// # Errors
 ///
-/// Returns [`CacheReplayError::EventStore`] when the reader fails, `restore_snapshot`'s
-/// error when the cache snapshot restore hook fails, [`CacheReplayError::Decode`] when
-/// a supported payload cannot be decoded, and [`CacheReplayError::Apply`] when the
-/// decoded payload cannot be applied to the cache.
+/// Returns an error if:
+///
+/// - The reader fails.
+/// - The `restore_snapshot` hook fails.
+/// - A supported payload cannot be decoded.
+/// - The decoded payload cannot be applied to the cache.
 pub fn restore_cache_snapshot_and_replay_tail<B, F>(
     cache: &mut Cache,
     reader: &EventStoreReader<B>,
@@ -798,7 +802,7 @@ where
 ///
 /// # Errors
 ///
-/// See [`restore_cache_snapshot_and_replay_tail`].
+/// Returns an error if [`restore_cache_snapshot_and_replay_tail`] fails.
 pub fn replay_cache_snapshot_tail<B>(
     cache: &mut Cache,
     reader: &EventStoreReader<B>,
@@ -816,8 +820,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`ReplayInputError::InvalidSeqRange`] when `range` is invalid and
-/// [`ReplayInputError::EventStore`] when the reader scan fails.
+/// Returns an error if `range` is invalid or the reader scan fails.
 pub fn plan_forensics_replay_inputs<B>(
     reader: &EventStoreReader<B>,
     range: ReplaySeqRange,
@@ -842,7 +845,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`ReplayInputError::EventStore`] when the reader scan fails.
+/// Returns an error if the reader scan fails.
 pub fn load_forensics_replay_inputs<B>(
     reader: &EventStoreReader<B>,
     plan: &ReplayInputPlan,
@@ -864,12 +867,14 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`ReplayInputError::EmptyCatalogSelection`] when no catalog slices are selected,
-/// [`ReplayInputError::InvalidSeqRange`] when `range` is invalid,
-/// [`ReplayInputError::MissingCatalogTimeBounds`] when an unbounded selector cannot inherit
-/// bounds from an empty event-store scan, [`ReplayInputError::InvalidCatalogTimeRange`] when a
-/// resolved slice has `start > end`, [`ReplayInputError::Catalog`] when catalog planning fails,
-/// and [`ReplayInputError::EventStore`] when the reader scan fails.
+/// Returns an error if:
+///
+/// - No catalog slices are selected.
+/// - `range` is invalid.
+/// - An unbounded selector cannot inherit bounds from an empty event-store scan.
+/// - A resolved slice has `start > end`.
+/// - Catalog planning fails.
+/// - The reader scan fails.
 pub fn plan_catalog_replay_inputs<B, C>(
     reader: &EventStoreReader<B>,
     catalog: &mut C,
@@ -891,9 +896,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`ReplayInputError::MissingCatalogSlice`] when a required slice is missing,
-/// [`ReplayInputError::Catalog`] when catalog loading fails, and
-/// [`ReplayInputError::EventStore`] when the reader scan fails.
+/// Returns an error if a required slice is missing, if catalog loading fails, or if the reader scan
+/// fails.
 pub fn load_catalog_replay_inputs<B, C>(
     reader: &EventStoreReader<B>,
     catalog: &mut C,
@@ -915,9 +919,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`CacheReplayError::EventStore`] when the run is missing, not sealed, quarantined, or
-/// unreadable; see [`restore_cache_snapshot_and_replay_tail`] for snapshot, decode, and apply
-/// failures.
+/// Returns an error if the run is missing, not sealed, quarantined, or unreadable; see
+/// [`restore_cache_snapshot_and_replay_tail`] for snapshot, decode, and apply failures.
 pub fn restore_cache_from_sealed_run(
     cache: &mut Cache,
     base_dir: impl Into<PathBuf>,
@@ -938,8 +941,7 @@ pub fn restore_cache_from_sealed_run(
 ///
 /// # Errors
 ///
-/// Returns [`CacheReplayError::EventStore`] when the run is missing, not sealed, quarantined, or
-/// unreadable.
+/// Returns an error if the run is missing, not sealed, quarantined, or unreadable.
 pub fn open_event_store_replay_source(
     base_dir: impl Into<PathBuf>,
     instance_id: &str,
@@ -955,8 +957,7 @@ pub fn open_event_store_replay_source(
 ///
 /// # Errors
 ///
-/// Returns [`CacheReplayError::EventStore`] when the run is missing, not sealed, quarantined, or
-/// unreadable.
+/// Returns an error if the run is missing, not sealed, quarantined, or unreadable.
 pub fn validate_event_store_replay_source(
     base_dir: impl Into<PathBuf>,
     instance_id: &str,
@@ -1195,8 +1196,8 @@ fn validate_seq_range(range: ReplaySeqRange) -> Result<(), ReplayInputError> {
 ///
 /// # Errors
 ///
-/// Returns [`CacheReplayError::SnapshotRestore`] when the blob is missing, fails to load, fails its
-/// content hash check, or fails to restore into the cache.
+/// Returns an error if the blob is missing, fails to load, fails its content hash check, or fails
+/// to restore into the cache.
 pub fn restore_cache_snapshot_blob(
     cache: &mut Cache,
     anchor: Option<&SnapshotAnchor>,
@@ -1237,8 +1238,8 @@ pub fn restore_cache_snapshot_blob(
 ///
 /// # Errors
 ///
-/// Returns [`CacheReplayError::Decode`] when a supported payload cannot be decoded and
-/// [`CacheReplayError::Apply`] when the decoded payload cannot be applied to the cache.
+/// Returns an error if a supported payload cannot be decoded or the decoded payload cannot be
+/// applied to the cache.
 pub fn apply_cache_replay_entry(
     cache: &mut Cache,
     entry: &EventStoreEntry,
@@ -1262,6 +1263,10 @@ fn apply_cache_replay_entry_with_context(
         PAYLOAD_TYPE_ACCOUNT_STATE => {
             let state = decode_payload::<AccountState>(entry)?;
             apply_result(entry, cache.update_account_state(&state))?;
+        }
+        PAYLOAD_TYPE_INSTRUMENT_CLOSE => {
+            let close = decode_payload::<InstrumentClose>(entry)?;
+            apply_result(entry, settle_instrument_close(cache, close))?;
         }
         PAYLOAD_TYPE_ORDER_INITIALIZED => {
             let event = decode_order_event::<OrderInitialized>(entry, OrderEventAny::Initialized)?;
@@ -1473,7 +1478,7 @@ fn apply_orderless_flip_fill(
         return Ok(false);
     }
 
-    if position.side != PositionSide::Flat && position.trade_ids().contains(&fill.trade_id) {
+    if position.side != PositionSide::Flat && position.trade_ids.contains(&fill.trade_id) {
         return Ok(true);
     }
 
@@ -1541,11 +1546,16 @@ fn apply_fill_to_position(
         return Ok(true);
     };
 
+    // Live execution applies a fill after settlement to its order only
+    if settlement_close(cache, &fill.instrument_id).is_some() {
+        return Ok(true);
+    }
+
     if let Some(mut position) = cache.position_owned(&position_id) {
         // Mirror live `Position::apply_fill`: a duplicate inside an open episode is
         // the idempotent replay no-op; historical duplicates on a Flat position are
         // ignored inside `apply` itself from the carried replay history.
-        if position.side != PositionSide::Flat && position.trade_ids().contains(&fill.trade_id) {
+        if position.side != PositionSide::Flat && position.trade_ids.contains(&fill.trade_id) {
             return Ok(true);
         }
 
@@ -1617,12 +1627,13 @@ fn apply_fill_void_to_order_and_positions(
     let mut validated_order = order.clone();
     apply_result(entry, validated_order.apply(event.clone()))?;
 
-    let corrected_positions =
-        if let Some(original_fill) = original_fill.filter(|fill| fill.position_id.is_some()) {
+    // Live execution applies a void after settlement to its order only
+    let corrected_positions = match original_fill.filter(|fill| fill.position_id.is_some()) {
+        Some(original_fill) if settlement_close(cache, &fill_voided.instrument_id).is_none() => {
             prepare_fill_void_positions(cache, entry, fill_voided, original_fill.event_id)?
-        } else {
-            Vec::new()
-        };
+        }
+        _ => Vec::new(),
+    };
 
     apply_result(entry, cache.update_order(&event))?;
     for position in corrected_positions {
@@ -2007,10 +2018,13 @@ mod tests {
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
         accounts::AccountAny,
-        data::{Bar, BarSpecification, BarType, FundingRateUpdate, QuoteTick, TradeTick},
+        data::{
+            Bar, BarSpecification, BarType, FundingRateUpdate, InstrumentClose, QuoteTick,
+            TradeTick,
+        },
         enums::{
-            AggregationSource, AggressorSide, BarAggregation, OrderSide, OrderStatus,
-            PositionAdjustmentType, PositionSide, PriceType,
+            AggregationSource, AggressorSide, BarAggregation, InstrumentCloseType, OrderSide,
+            OrderStatus, PositionAdjustmentType, PositionSide, PriceType,
         },
         events::{
             PositionEvent,
@@ -2024,7 +2038,10 @@ mod tests {
             AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, PositionId, TradeId,
             VenueOrderId,
         },
-        instruments::{Instrument, InstrumentAny, stubs::audusd_sim},
+        instruments::{
+            Instrument, InstrumentAny,
+            stubs::{audusd_sim, binary_option},
+        },
         orders::{Order, OrderList},
         types::{Currency, Money, Price, Quantity},
     };
@@ -2038,7 +2055,8 @@ mod tests {
         backend::{AppendEntry, MemoryBackend, RedbBackend},
         capture::{
             builtins::{
-                DEFAULT_CAPTURE_PAYLOAD_TYPES, encode_order_event_any, encode_position_event,
+                DEFAULT_CAPTURE_PAYLOAD_TYPES, encode_instrument_close, encode_order_event_any,
+                encode_position_event,
             },
             encode_account_state,
         },
@@ -2280,6 +2298,39 @@ mod tests {
             &[],
         ),
         cache_mutation(
+            // Reapplied by execution client registration on every node start
+            "add_client_account",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
+            "remove_client_account",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
+            // Reapplied by execution client routing setup on every node start
+            "add_client_route",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
+            "set_default_client",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
+            "remove_client_routes",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
+            // Reapplied from execution engine configuration on every node start
+            "add_external_client",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
             "set_database",
             CacheMutationRecoveryClass::SnapshotOwned,
             &[],
@@ -2445,6 +2496,11 @@ mod tests {
             &[PAYLOAD_TYPE_BARS_RESPONSE],
         ),
         cache_mutation(
+            "add_bar_historical",
+            CacheMutationRecoveryClass::MissingLiveRecovery,
+            &[],
+        ),
+        cache_mutation(
             "add_greeks",
             CacheMutationRecoveryClass::MissingLiveRecovery,
             &[],
@@ -2532,6 +2588,11 @@ mod tests {
             &[PAYLOAD_TYPE_ORDER_FILLED],
         ),
         cache_mutation(
+            "replace_position",
+            CacheMutationRecoveryClass::EventStoreCapturedAndReplayed,
+            &[PAYLOAD_TYPE_ORDER_FILLED],
+        ),
+        cache_mutation(
             "update_account",
             CacheMutationRecoveryClass::EventStoreCapturedAndReplayed,
             &[PAYLOAD_TYPE_ACCOUNT_STATE],
@@ -2610,6 +2671,22 @@ mod tests {
             &[PAYLOAD_TYPE_ORDER_FILLED],
         ),
         cache_mutation(
+            "update_position_from_instrument_close",
+            CacheMutationRecoveryClass::EventStoreCapturedAndReplayed,
+            &[PAYLOAD_TYPE_INSTRUMENT_CLOSE],
+        ),
+        cache_mutation(
+            "update_position_from_adjustment",
+            CacheMutationRecoveryClass::EventStoreCapturedAndReplayed,
+            &[PAYLOAD_TYPE_POSITION_ADJUSTED],
+        ),
+        cache_mutation(
+            // Rolls back an adjustment whose event was never published, so replay never applies it
+            "revert_position_adjustment",
+            CacheMutationRecoveryClass::MissingLiveRecovery,
+            &[],
+        ),
+        cache_mutation(
             "snapshot_position",
             CacheMutationRecoveryClass::SnapshotOwned,
             &[],
@@ -2631,6 +2708,14 @@ mod tests {
         ),
         cache_mutation(
             "restore_snapshot_blob",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
+            // Installed from the reader-verified native cut's original cache/configuration
+            // by LiveNode's owner-bound restoration, not ordinary EventStore payload replay.
+            // This classification provides no recovery or execution permission.
+            "restore_native_market_checkpoint",
             CacheMutationRecoveryClass::SnapshotOwned,
             &[],
         ),
@@ -2720,8 +2805,9 @@ mod tests {
     /// Add a file here when the cache module is split further, or its methods drop out of this
     /// classification guard.
     const CACHE_IMPL_SOURCES: &[&str] = &[
-        include_str!("../test_data/upstream-cache/mod.rs"),
-        include_str!("../test_data/upstream-cache/position.rs"),
+        include_str!("../../common/src/cache/mod.rs"),
+        include_str!("../../common/src/cache/position.rs"),
+        include_str!("../../common/src/cache/market_checkpoint.rs"),
     ];
 
     fn collect_cache_public_methods(require_mut_self: bool) -> AHashSet<&'static str> {
@@ -2736,6 +2822,7 @@ mod tests {
                 let Some(rest) = trimmed
                     .strip_prefix("pub fn ")
                     .or_else(|| trimmed.strip_prefix("pub async fn "))
+                    .or_else(|| trimmed.strip_prefix("pub const fn "))
                 else {
                     continue;
                 };
@@ -4063,6 +4150,55 @@ mod tests {
     }
 
     #[rstest]
+    fn duplicate_orderless_reducing_fill_is_not_replayed_as_flip() {
+        // A replayed duplicate of an earlier reducing fill can exceed the remaining
+        // quantity; its trade ID is already in the open episode, so it must be the
+        // idempotent no-op rather than a flip.
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let position_id = PositionId::from("P-ORDERLESS-DUPLICATE");
+        let opening_fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("SPREAD-LEG-DUPLICATE"))
+            .venue_order_id(VenueOrderId::from("V-SPREAD-LEG-DUPLICATE-1"))
+            .trade_id(TradeId::from("T-SPREAD-LEG-DUPLICATE-1"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(3))
+            .position_id(position_id)
+            .build();
+        let reducing_fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(opening_fill.client_order_id)
+            .venue_order_id(VenueOrderId::from("V-SPREAD-LEG-DUPLICATE-2"))
+            .trade_id(TradeId::from("T-SPREAD-LEG-DUPLICATE-2"))
+            .order_side(OrderSide::Sell)
+            .last_qty(Quantity::from(2))
+            .position_id(position_id)
+            .build();
+        let mut original = Position::new(&instrument, opening_fill);
+        original.apply(&reducing_fill);
+        let entry = append_order_event(1, &OrderEventAny::Filled(reducing_fill)).entry;
+        let mut cache = Cache::default();
+        cache
+            .add_instrument(instrument)
+            .expect("add replay instrument");
+        cache
+            .add_position_without_order(&original, OmsType::Hedging)
+            .expect("seed orderless position");
+
+        let applied = apply_cache_replay_entry(&mut cache, &entry)
+            .expect("duplicate reducing fill is the idempotent no-op");
+        let after = cache
+            .position_owned(&position_id)
+            .expect("position retained");
+
+        assert!(applied);
+        assert_eq!(after.side, PositionSide::Long);
+        assert_eq!(after.quantity, original.quantity);
+        assert_eq!(after.event_count(), original.event_count());
+        assert_eq!(after.trade_ids(), original.trade_ids());
+    }
+
+    #[rstest]
     fn order_fill_replay_without_instrument_counts_fill_as_ignored() {
         // The position side cannot open without the instrument; the fill must count
         // as ignored rather than claim a full apply.
@@ -4177,6 +4313,130 @@ mod tests {
         assert_eq!(position.commissions(), vec![Money::from("0.60 USD")]);
         assert_eq!(position.fill_voids.len(), 1);
         assert_eq!(position.fill_voids[0].event, fill_voided);
+    }
+
+    fn binary_order_events(
+        instrument: &InstrumentAny,
+        order_id: &str,
+        quantity: &str,
+        price: &str,
+    ) -> [OrderEventAny; 4] {
+        let position_id = PositionId::from("P-SETTLED");
+        let initialized = OrderInitializedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from(order_id))
+            .quantity(Quantity::from(quantity))
+            .build();
+        let submitted = OrderSubmittedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(initialized.client_order_id)
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(initialized.client_order_id)
+            .venue_order_id(VenueOrderId::from(format!("V-{order_id}").as_str()))
+            .account_id(submitted.account_id)
+            .build();
+        let filled = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(initialized.client_order_id)
+            .venue_order_id(accepted.venue_order_id)
+            .account_id(submitted.account_id)
+            .trade_id(TradeId::from(format!("T-{order_id}").as_str()))
+            .last_qty(Quantity::from(quantity))
+            .last_px(Price::from(price))
+            .currency(Currency::USDC())
+            .position_id(position_id)
+            .build();
+
+        [
+            OrderEventAny::Initialized(initialized),
+            OrderEventAny::Submitted(submitted),
+            OrderEventAny::Accepted(accepted),
+            OrderEventAny::Filled(filled),
+        ]
+    }
+
+    #[rstest]
+    fn instrument_close_replay_settles_position_and_keeps_later_changes_off_it() {
+        let instrument = InstrumentAny::BinaryOption(binary_option());
+        let opening = binary_order_events(&instrument, "O-OPEN", "10.00", "0.400");
+        let late = binary_order_events(&instrument, "O-LATE", "5.00", "0.500");
+
+        let OrderEventAny::Filled(opening_fill) = &opening[3] else {
+            unreachable!();
+        };
+
+        let close = InstrumentClose::new(
+            instrument.id(),
+            Price::from("1.000"),
+            InstrumentCloseType::ContractExpired,
+            UnixNanos::from(300),
+            UnixNanos::from(301),
+        );
+        let fill_voided = OrderFillVoidedSpec::builder()
+            .trader_id(opening_fill.trader_id)
+            .strategy_id(opening_fill.strategy_id)
+            .instrument_id(opening_fill.instrument_id)
+            .client_order_id(opening_fill.client_order_id)
+            .venue_order_id(opening_fill.venue_order_id)
+            .account_id(opening_fill.account_id)
+            .trade_id(opening_fill.trade_id)
+            .voided_qty(Quantity::from("4.00"))
+            .order_side(opening_fill.order_side)
+            .order_type(opening_fill.order_type)
+            .last_px(opening_fill.last_px)
+            .currency(opening_fill.currency)
+            .liquidity_side(opening_fill.liquidity_side)
+            .position_id(PositionId::from("P-SETTLED"))
+            .build();
+        let encoded_close = encode_instrument_close(&close).expect("encode instrument close");
+        let mut entries: Vec<AppendEntry> = opening
+            .iter()
+            .enumerate()
+            .map(|(index, event)| append_order_event(index as u64 + 1, event))
+            .collect();
+        entries.push(append_payload(
+            5,
+            PAYLOAD_TYPE_INSTRUMENT_CLOSE,
+            encoded_close.payload,
+        ));
+        entries.extend(
+            late.iter()
+                .enumerate()
+                .map(|(index, event)| append_order_event(index as u64 + 6, event)),
+        );
+        entries.push(append_order_event(
+            10,
+            &OrderEventAny::FillVoided(fill_voided),
+        ));
+        let reader = reader_with_entries("run-settlement-replay", &entries);
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument).expect("add instrument");
+
+        let report = replay_cache_snapshot_tail(&mut cache, &reader).expect("replay");
+        let position = cache
+            .position_owned(&PositionId::from("P-SETTLED"))
+            .expect("position replayed");
+        let late_order = cache
+            .order_owned(&ClientOrderId::from("O-LATE"))
+            .expect("late order replayed");
+        let opening_order = cache
+            .order_owned(&ClientOrderId::from("O-OPEN"))
+            .expect("opening order replayed");
+
+        assert_eq!(report.applied_entries, 10);
+        assert_eq!(report.ignored_entries, 0);
+        assert!(position.is_settled());
+        assert!(position.is_closed());
+        assert_eq!(position.quantity, Quantity::from("0.00"));
+        assert_eq!(position.buy_qty, Quantity::from("10.00"));
+        assert_eq!(position.realized_pnl, Some(Money::from("6.00 USDC")));
+        assert!(position.fill_voids.is_empty());
+        assert_eq!(late_order.status(), OrderStatus::Filled);
+        assert_eq!(late_order.filled_qty(), Quantity::from("5.00"));
+        assert_eq!(opening_order.voided_qty(), Quantity::from("4.00"));
+        assert_eq!(cache.instrument_close(&close.instrument_id), Some(&close));
     }
 
     #[rstest]

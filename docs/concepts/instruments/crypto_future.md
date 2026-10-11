@@ -32,8 +32,6 @@ Examples include dated BTC or ETH futures on crypto derivatives venues.
 | `min_price`           | `Option<Price>`    | `Price \| None`    | `None`           | Minimum valid quote or order price.      |
 | `margin_init`         | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Initial margin rate.                     |
 | `margin_maint`        | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maintenance margin rate.                 |
-| `maker_fee`           | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Maker fee rate. Negative values rebate.  |
-| `taker_fee`           | `Option<Decimal>`  | `Decimal \| None`  | `0`              | Taker fee rate. Negative values rebate.  |
 | `tick_scheme`         | `Option<Ustr>`     | `str \| None`      | `None`           | Registered variable tick scheme name.    |
 | `info`                | `Option<Params>`   | `dict \| None`     | `None`           | Adapter metadata.                        |
 | `ts_event`            | `UnixNanos`        | `int`              | Required         | Event timestamp in nanoseconds.          |
@@ -44,6 +42,7 @@ Examples include dated BTC or ETH futures on crypto derivatives venues.
 ## Behavior
 
 - `CryptoFuture` has asset class `Cryptocurrency` and instrument class `Future`.
+- Prices can be zero or negative, except for inverse futures.
 - Use `CryptoPerpetual` for crypto derivatives with no expiration.
 
 The currency set determines the settlement style:
@@ -131,7 +130,6 @@ btcusdt_future = CryptoFuture(
 
 Representative adapters that create or consume `CryptoFuture` instruments include:
 
-- [BitMEX](../../integrations/bitmex.md) for inverse and linear dated futures.
 - [Bybit](../../integrations/bybit.md) for crypto futures markets.
 - [Deribit](../../integrations/deribit.md) for dated crypto futures.
 - [OKX](../../integrations/okx.md) for dated crypto futures.

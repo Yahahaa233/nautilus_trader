@@ -576,8 +576,8 @@ impl BybitHttpClient {
     /// Fetches instrument info and returns the current status of each symbol.
     ///
     /// Paginates through the instruments endpoint collecting only
-    /// `(InstrumentId, MarketStatusAction)` pairs. This avoids fee-rate
-    /// fetching and full instrument parsing.
+    /// `(InstrumentId, MarketStatusAction)` pairs. This avoids full instrument
+    /// parsing.
     ///
     /// # Errors
     ///
@@ -1228,7 +1228,7 @@ impl BybitHttpClient {
     ///
     /// # Errors
     ///
-    /// This function returns an error if the request fails.
+    /// Returns an error if the request fails.
     ///
     /// # References
     ///
@@ -1271,8 +1271,8 @@ impl BybitHttpClient {
     ///
     /// # Errors
     ///
-    /// This function returns an error if the request fails, or if SPOT position reports are enabled
-    /// and no instrument is specified, because wallet balances carry no pair identity.
+    /// Returns an error if the request fails, or if SPOT position reports are enabled and no
+    /// instrument is specified, because wallet balances carry no pair identity.
     ///
     /// # References
     ///

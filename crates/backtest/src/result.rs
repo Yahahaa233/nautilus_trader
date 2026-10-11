@@ -140,6 +140,7 @@ pub(crate) struct CanonicalDiagnostic {
 pub(crate) enum CanonicalDiagnosticCode {
     FundingSettlementFailed,
     ComponentStopFailed,
+    AccountBalanceRejected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -413,7 +414,11 @@ fn validate_diagnostics(value: &Value) -> anyhow::Result<()> {
         anyhow::ensure!(
             matches!(
                 object.get("code").and_then(Value::as_str),
-                Some("funding-settlement-failed" | "component-stop-failed")
+                Some(
+                    "funding-settlement-failed"
+                        | "component-stop-failed"
+                        | "account-balance-rejected"
+                )
             ),
             "unsupported canonical diagnostic code"
         );

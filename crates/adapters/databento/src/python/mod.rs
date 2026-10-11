@@ -40,6 +40,7 @@ use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
 
 #[cfg(feature = "live")]
+use crate::types::register_databento_custom_data;
 use crate::{
     common::DATABENTO, data::DatabentoDataClientConfig, factories::DatabentoDataClientFactory,
 };
@@ -78,9 +79,11 @@ fn extract_databento_data_config(
 ///
 /// # Errors
 ///
-/// Returns a `PyErr` if registering any module components fails.
+/// Returns an error if registering any module components fails.
 #[pymodule]
 pub fn databento(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    register_databento_custom_data();
+
     m.add_class::<super::enums::DatabentoStatisticType>()?;
     m.add_class::<super::enums::DatabentoStatisticUpdateAction>()?;
     m.add_class::<super::types::DatabentoPublisher>()?;

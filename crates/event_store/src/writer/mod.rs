@@ -269,8 +269,8 @@ mod imp {
         ///
         /// # Errors
         ///
-        /// Returns [`EventStoreError::Backend`] when the backend has no open run or when
-        /// the writer thread cannot be spawned.
+        /// Returns an error if the backend has no open run or when the writer thread cannot be
+        /// spawned.
         pub fn spawn(
             backend: Box<dyn EventStore + Send>,
             clock: &'static AtomicTime,
@@ -329,10 +329,8 @@ mod imp {
         ///
         /// # Errors
         ///
-        /// Returns [`SubmitError::Closed`] when the writer is shut down, the writer
-        /// thread has exited, or a prior halt fired, and
-        /// [`SubmitError::HaltSignaled`] when this submit's stall first crosses the
-        /// configured halt threshold.
+        /// Returns an error if the writer is shut down, the writer thread has exited, or a prior
+        /// halt fired, or if this submit's stall first crosses the configured halt threshold.
         pub fn submit(&self, draft: EntryDraft) -> Result<(), SubmitError> {
             // Refuse further entries once a halt has been signaled, even if the
             // channel later drains: halt is terminal for the run.
@@ -373,9 +371,8 @@ mod imp {
         ///
         /// # Errors
         ///
-        /// Returns [`EventStoreError::Closed`] when the writer is closed or halted, and
-        /// forwards backend errors when flushing pending entries or recording the anchor
-        /// fails.
+        /// Returns an error if the writer is closed or halted, and forwards backend errors when
+        /// flushing pending entries or recording the anchor fails.
         pub fn record_snapshot_anchor(
             &self,
             blob_ref: impl Into<String>,
@@ -542,8 +539,8 @@ mod imp {
         ///
         /// # Errors
         ///
-        /// Returns [`EventStoreError`] when the writer thread fails to commit the final
-        /// batch, when seal fails, or when the writer thread panicked.
+        /// Returns an error if the writer thread fails to commit the final batch, when seal fails,
+        /// or when the writer thread panicked.
         pub fn close(mut self, run_ended: EntryDraft) -> Result<u64, EventStoreError> {
             let tx = self
                 .tx
@@ -645,7 +642,7 @@ mod imp {
         ///
         /// # Errors
         ///
-        /// Returns [`EventStoreError::Backend`] when the backend has no open run.
+        /// Returns an error if the backend has no open run.
         pub fn spawn(
             backend: Box<dyn EventStore + Send>,
             clock: &'static AtomicTime,
@@ -672,7 +669,7 @@ mod imp {
         ///
         /// # Errors
         ///
-        /// Returns [`SubmitError::Closed`] if the writer has been closed or fail-stopped.
+        /// Returns an error if the writer has been closed or fail-stopped.
         pub fn submit(&self, draft: EntryDraft) -> Result<(), SubmitError> {
             let mut inner = self.inner.lock();
 
@@ -765,8 +762,8 @@ mod imp {
         ///
         /// # Errors
         ///
-        /// Returns [`EventStoreError::Closed`] when the writer has closed, and forwards
-        /// backend errors when recording the anchor fails.
+        /// Returns an error if the writer has closed, and forwards backend errors when recording
+        /// the anchor fails.
         pub fn record_snapshot_anchor(
             &self,
             blob_ref: impl Into<String>,
@@ -798,7 +795,7 @@ mod imp {
         ///
         /// # Errors
         ///
-        /// Returns [`EventStoreError`] when the final commit or seal fails.
+        /// Returns an error if the final commit or seal fails.
         pub fn close(self, run_ended: EntryDraft) -> Result<u64, EventStoreError> {
             let mut inner = self.inner.lock();
 

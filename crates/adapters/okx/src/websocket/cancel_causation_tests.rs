@@ -141,9 +141,10 @@ fn dispatch(message: OKXWsMessage, emitter: &ExecutionEventEmitter, state: &WsDi
         emitter,
         state,
         AccountId::from("OKX-001"),
+        AccountType::Margin,
         &instruments,
-        &mut AHashMap::new(),
-        &mut AHashMap::new(),
+        &mut crate::websocket::parse::FeeCache::new(),
+        &mut crate::websocket::parse::FilledQtyCache::new(),
         &mut AHashMap::<ClientOrderId, OrderStateSnapshot>::new(),
         get_atomic_clock_realtime(),
     );

@@ -25,14 +25,14 @@ use databento::{
 use indexmap::IndexMap;
 use nautilus_core::{AtomicMap, UnixNanos, consts::NAUTILUS_USER_AGENT, time::AtomicTime};
 use nautilus_model::{
-    data::{Bar, Data, InstrumentStatus, OrderBookDelta, OrderBookDepth10, QuoteTick, TradeTick},
+    data::{Bar, Data, InstrumentStatus, OrderBookDelta, OrderBookDepth, QuoteTick, TradeTick},
     enums::BarAggregation,
     identifiers::{InstrumentId, Symbol, Venue},
     instruments::{Instrument, InstrumentAny},
 };
 
 use crate::{
-    common::{Credential, get_date_time_range},
+    common::{Credential, get_date_time_range, ohlcv_schema_from_aggregation},
     decode::{
         MboDeltaBuffer, decode_imbalance_msg, decode_instrument_def_msg, decode_mbo_msg,
         decode_mbp10_msg, decode_record, decode_statistics_msg, decode_status_msg,
@@ -203,7 +203,7 @@ impl DatabentoHistoricalClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when no precision is available.
+    /// Returns an error if no precision is available.
     fn resolve_price_precision(
         &self,
         instrument_id: &InstrumentId,
@@ -471,16 +471,16 @@ impl DatabentoHistoricalClient {
         Ok(result)
     }
 
-    /// Fetches order book depth10 snapshots for the given parameters.
+    /// Fetches order book depth snapshots for the given parameters.
     ///
     /// # Errors
     ///
     /// Returns an error if the API request or data processing fails.
-    pub async fn get_range_order_book_depth10(
+    pub async fn get_range_order_book_depth(
         &self,
         params: RangeQueryParams,
         depth: Option<usize>,
-    ) -> anyhow::Result<Vec<OrderBookDepth10>> {
+    ) -> anyhow::Result<Vec<OrderBookDepth>> {
         let symbols: Vec<&str> = params.symbols.iter().map(String::as_str).collect();
         check_consistent_symbology(&symbols)?;
 
@@ -519,7 +519,7 @@ impl DatabentoHistoricalClient {
         let metadata = decoder.metadata().clone();
         let mut metadata_cache = MetadataCache::new(metadata);
         let mut precision_cache = AHashMap::new();
-        let mut result: Vec<OrderBookDepth10> = Vec::new();
+        let mut result: Vec<OrderBookDepth> = Vec::new();
 
         let mut process_record = |record: dbn::RecordRef| -> anyhow::Result<()> {
             let sym_map = self.symbol_venue_map.load();
@@ -770,13 +770,7 @@ impl DatabentoHistoricalClient {
             .first()
             .ok_or_else(|| anyhow::anyhow!("No symbols provided"))?;
         let stype_in = infer_symbology_type(first_symbol);
-        let schema = match aggregation {
-            BarAggregation::Second => dbn::Schema::Ohlcv1S,
-            BarAggregation::Minute => dbn::Schema::Ohlcv1M,
-            BarAggregation::Hour => dbn::Schema::Ohlcv1H,
-            BarAggregation::Day => dbn::Schema::Ohlcv1D,
-            _ => anyhow::bail!("Invalid `BarAggregation` for request, was {aggregation}"),
-        };
+        let schema = ohlcv_schema_from_aggregation(aggregation)?;
 
         let end = params.end.unwrap_or_else(|| self.clock.get_time_ns());
         let time_range = get_date_time_range(params.start, end)?;

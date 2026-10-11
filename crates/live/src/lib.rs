@@ -39,7 +39,7 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
-//! - `defi`: Enables `DeFi` (Decentralized Finance) support.
+//! - `defi`: Enables DeFi (Decentralized Finance) support.
 //! - `examples`: Enables example strategies and testkit support for live nodes.
 //! - `extension-module`: Builds as a Python extension module.
 //! - `fuzz`: Provides shared libFuzzer integration for adapter fuzz binaries.
@@ -118,6 +118,7 @@
 // macro expansion; an item-level `allow` cannot reach the expansion
 #![allow(clippy::clone_on_copy)]
 
+pub mod book;
 pub mod execution;
 pub mod runner;
 pub mod runner_recovery;
@@ -141,6 +142,9 @@ pub mod python;
 #[cfg(feature = "test-support")]
 pub mod testing;
 
+/// Native callback draining and optional durable dispatch observation.
+pub mod dispatch;
+
 // Re-exports for adapters
 pub use execution::{emitter, emitter::ExecutionEventEmitter, manager};
 pub use nautilus_common::factories::OrderEventFactory;
@@ -154,6 +158,5 @@ pub use socket::{
     SocketReconnectRequestOutcome,
 };
 
-/// Opt-in dispatch bookkeeping; callers must explicitly wire every ingress.
 #[cfg(feature = "dispatch-observer")]
-pub mod dispatch;
+mod dispatch_observer;

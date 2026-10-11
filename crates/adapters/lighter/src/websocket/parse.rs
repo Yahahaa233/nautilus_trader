@@ -20,8 +20,7 @@ use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     data::{
         Bar, BarType, BookOrder, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate,
-        OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
-        depth::DEPTH10_LEN,
+        OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick, depth::DEPTH10_LEN,
     },
     enums::{
         AccountType, AggregationSource, BookAction, LiquiditySide, OrderSide, OrderStatus,
@@ -61,11 +60,7 @@ use crate::{
     },
 };
 
-/// Lighter encodes per-trade fees as integer micro-currency ticks (1 unit = `1e-6`),
-/// matching the deployment's quote-decimal precision. The fee scale (6) lets us
-/// build the commission Decimal via `Decimal::new(ticks, FEE_DECIMALS)` -
-/// directly populating mantissa+scale, avoiding the heavier division path
-/// the prior implementation used.
+// Trade fee ticks encode rates: 100 ticks = 1 basis point
 const FEE_DECIMALS: u32 = 6;
 
 #[derive(Debug, thiserror::Error)]
@@ -162,7 +157,7 @@ pub fn parse_ws_order_book_deltas(
         .context("failed to construct OrderBookDeltas from Lighter WebSocket book")
 }
 
-/// Parses a full Lighter order book payload into a Nautilus [`OrderBookDepth10`].
+/// Parses a full Lighter order book payload into a Nautilus [`OrderBookDepth`].
 ///
 /// Call this only for snapshot or depth payloads that contain the full visible
 /// book. Incremental updates should be parsed as deltas.
@@ -170,12 +165,12 @@ pub fn parse_ws_order_book_deltas(
 /// # Errors
 ///
 /// Returns an error if any price or size cannot be converted.
-pub fn parse_ws_order_book_depth10(
+pub fn parse_ws_order_book_depth(
     book: &LighterWsOrderBook,
     instrument: &InstrumentAny,
     timestamp_ms: u64,
     ts_init: UnixNanos,
-) -> anyhow::Result<OrderBookDepth10> {
+) -> anyhow::Result<OrderBookDepth> {
     let ts_event = parse_millis_to_nanos(timestamp_ms)?;
     let sequence = u64::try_from(book.nonce).context("negative Lighter book nonce")?;
     let mut bids = [BookOrder::default(); DEPTH10_LEN];
@@ -221,7 +216,7 @@ pub fn parse_ws_order_book_depth10(
         );
     }
 
-    Ok(OrderBookDepth10::new(
+    Ok(OrderBookDepth::new(
         instrument.id(),
         bids,
         asks,
@@ -580,7 +575,9 @@ fn order_type_requires_trigger_type(order_type: OrderType) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error if any price, size, or timestamp field cannot be converted.
+/// Returns an error if:
+/// - The trade ID, price, size, or timestamp cannot be converted.
+/// - The commission calculation overflows or cannot be represented as [`Money`].
 pub fn parse_ws_fill_report(
     trade: &LighterTrade,
     account_index: i64,
@@ -625,8 +622,8 @@ pub fn parse_ws_fill_report(
     } else {
         trade.taker_fee
     };
-    let commission = lighter_fee_to_commission(fee_value, instrument.quote_currency())?;
 
+    let commission = lighter_fee_to_commission(fee_value, trade, instrument.quote_currency())?;
     let client_order_id = if user_is_bidder {
         client_order_id_from(trade.bid_client_id_str.as_deref(), trade.bid_client_id)
     } else {
@@ -665,8 +662,8 @@ pub(crate) fn parse_lighter_trade_id(trade: &LighterTrade) -> anyhow::Result<Tra
 
 /// Outcome of [`parse_lighter_order_event`] for tracked orders.
 ///
-/// Mirrors `ParsedOrderEvent` in the BitMEX adapter (see
-/// `crates/adapters/bitmex/src/websocket/parse.rs`). The execution
+/// Parses raw order events into typed intermediate events (see
+/// the execution
 /// consumption loop maps these into [`nautilus_model::events::OrderEventAny`]
 /// variants for tracked orders; untracked orders flow through the
 /// `OrderStatusReport` path instead.
@@ -948,8 +945,9 @@ pub(crate) fn parse_lighter_order_event(
 ///
 /// # Errors
 ///
-/// Returns an error if any price, size, fee, or timestamp field cannot be
-/// converted.
+/// Returns an error if:
+/// - The trade ID, price, size, or timestamp cannot be converted.
+/// - The commission calculation overflows or cannot be represented as [`Money`].
 #[expect(
     clippy::too_many_arguments,
     reason = "identity and account context are independent inputs threaded by the dispatcher"
@@ -996,7 +994,8 @@ pub(crate) fn parse_lighter_order_filled(
     } else {
         trade.taker_fee
     };
-    let commission = lighter_fee_to_commission(fee_value, instrument.quote_currency())?;
+
+    let commission = lighter_fee_to_commission(fee_value, trade, instrument.quote_currency())?;
 
     let timestamp_ms =
         u64::try_from(trade.timestamp).context("negative Lighter trade timestamp")?;
@@ -1204,10 +1203,15 @@ fn parse_optional_price(value: Decimal, precision: u8) -> anyhow::Result<Option<
 
 fn lighter_fee_to_commission(
     fee_ticks: Option<i32>,
+    trade: &LighterTrade,
     currency: Currency,
 ) -> Result<Money, LighterCommissionError> {
     let ticks = fee_ticks.unwrap_or(0);
-    let amount = Decimal::new(i64::from(ticks), FEE_DECIMALS);
+    let rate = Decimal::new(i64::from(ticks), FEE_DECIMALS);
+    let amount = rate
+        .checked_mul(trade.size)
+        .and_then(|amount| amount.checked_mul(trade.price))
+        .ok_or_else(|| LighterCommissionError::new("overflow calculating fee amount"))?;
     Money::from_decimal(amount, currency).map_err(|e| LighterCommissionError::new(e.to_string()))
 }
 
@@ -1716,32 +1720,29 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_ws_order_book_depth10_pads_levels() {
+    fn test_parse_ws_order_book_depth_preserves_sparse_levels() {
         let instrument = create_test_instrument();
-        let depth = parse_ws_order_book_depth10(
-            &stub_book(),
-            &instrument,
-            1774884082326,
-            UnixNanos::from(1),
-        )
-        .unwrap();
+        let depth =
+            parse_ws_order_book_depth(&stub_book(), &instrument, 1774884082326, UnixNanos::from(1))
+                .unwrap();
 
+        assert_eq!(depth.instrument_id, instrument.id());
+        assert_eq!(depth.bids.len(), 1);
+        assert_eq!(depth.asks.len(), 1);
         assert_eq!(depth.bids[0].price, Price::from("2064.30"));
-        // Populated level must round-trip price AND size, otherwise a
-        // future refactor that swaps fields or drops precision would not
-        // be caught by this test.
         assert_eq!(depth.bids[0].size, Quantity::from("1.0392"));
         assert_eq!(depth.bids[0].side, OrderSide::Buy.into());
+        assert_eq!(depth.bids[0].order_id, 0);
         assert_eq!(depth.asks[0].price, Price::from("2064.54"));
         assert_eq!(depth.asks[0].size, Quantity::from("0.3285"));
         assert_eq!(depth.asks[0].side, OrderSide::Sell.into());
+        assert_eq!(depth.asks[0].order_id, 0);
         assert_eq!(depth.sequence, 9_182_390_020);
-        assert_eq!(depth.bid_counts[0], 1);
-        assert_eq!(depth.ask_counts[0], 1);
-        assert_eq!(depth.bid_counts[1], 0);
-        assert_eq!(depth.ask_counts[1], 0);
-        assert!(depth.bids[1].size.is_zero());
-        assert!(depth.asks[1].size.is_zero());
+        assert_eq!(depth.bid_counts.as_slice(), &[1]);
+        assert_eq!(depth.ask_counts.as_slice(), &[1]);
+        assert_eq!(depth.flags, RecordFlag::F_SNAPSHOT as u8);
+        assert_eq!(depth.ts_event, UnixNanos::from(1_774_884_082_326_000_000));
+        assert_eq!(depth.ts_init, UnixNanos::from(1));
     }
 
     #[rstest]
@@ -2137,28 +2138,28 @@ mod tests {
         true,
         OrderSide::Buy,
         LiquiditySide::Taker,
-        "0.000196 USDC"
+        "0.06160765 USDC"
     )]
     #[case::asker_maker_ask_is_maker(
         false,
         true,
         OrderSide::Sell,
         LiquiditySide::Maker,
-        "0.000028 USDC"
+        "0.00880109 USDC"
     )]
     #[case::bidder_maker_bid_is_maker(
         true,
         false,
         OrderSide::Buy,
         LiquiditySide::Maker,
-        "0.000028 USDC"
+        "0.00880109 USDC"
     )]
     #[case::asker_maker_bid_is_taker(
         false,
         false,
         OrderSide::Sell,
         LiquiditySide::Taker,
-        "0.000196 USDC"
+        "0.06160765 USDC"
     )]
     fn test_parse_ws_fill_report_liquidity_side_matrix(
         #[case] user_is_bidder: bool,
@@ -2186,6 +2187,56 @@ mod tests {
             "281476929510102"
         };
         assert_eq!(report.venue_order_id.to_string(), expected_voi);
+    }
+
+    #[rstest]
+    #[case::larger_size("0.2672", "2352.73", Some(196), "0.12321529 USDC")]
+    #[case::higher_price("0.1336", "4705.46", Some(196), "0.12321529 USDC")]
+    #[case::small_notional("0.0001", "2352.73", Some(196), "0.00004611 USDC")]
+    #[case::missing_fee("0.1336", "2352.73", None, "0 USDC")]
+    #[case::zero_fee("0.1336", "2352.73", Some(0), "0 USDC")]
+    fn test_fill_commission_scales_with_notional(
+        #[case] size: &str,
+        #[case] price: &str,
+        #[case] fee: Option<i32>,
+        #[case] expected: &str,
+    ) {
+        let instrument = create_test_instrument();
+        let mut trade = stub_account_trade(1234, true, true);
+        trade.size = Decimal::from_str(size).unwrap();
+        trade.price = Decimal::from_str(price).unwrap();
+        trade.taker_fee = fee;
+
+        let report =
+            parse_ws_fill_report(&trade, 1234, &instrument, account_id(), UnixNanos::from(1))
+                .unwrap()
+                .expect("user-side fill");
+        let filled = parse_lighter_order_filled(
+            &trade,
+            &instrument,
+            &test_identity(),
+            test_cloid(),
+            account_id(),
+            test_trader_id(),
+            1234,
+            UnixNanos::from(1),
+        )
+        .unwrap()
+        .expect("user-side fill");
+
+        assert_eq!(report.commission, Money::from(expected));
+        assert_eq!(filled.commission, Some(report.commission));
+    }
+
+    #[rstest]
+    fn test_lighter_fee_to_commission_rejects_overflow() {
+        let mut trade = stub_account_trade(1234, true, true);
+        trade.size = Decimal::MAX;
+        trade.price = Decimal::MAX;
+
+        let err = lighter_fee_to_commission(Some(196), &trade, Currency::USDC()).unwrap_err();
+
+        assert_eq!(err.detail, "overflow calculating fee amount");
     }
 
     #[rstest]
@@ -2270,11 +2321,13 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_ws_fill_report_handles_missing_fee() {
+    #[case::missing(None)]
+    #[case::zero(Some(0))]
+    fn test_parse_ws_fill_report_handles_zero_fee(#[case] fee: Option<i32>) {
         let instrument = create_test_instrument();
         let mut trade = stub_account_trade(1234, true, true);
-        trade.taker_fee = None;
-        trade.maker_fee = None;
+        trade.taker_fee = fee;
+        trade.maker_fee = fee;
 
         let report =
             parse_ws_fill_report(&trade, 1234, &instrument, account_id(), UnixNanos::from(1))
@@ -2297,7 +2350,7 @@ mod tests {
                 .unwrap()
                 .expect("user-side fill");
 
-        assert_eq!(report.commission, Money::from("0.000196 USDG"));
+        assert_eq!(report.commission, Money::from("0.06160765 USDG"));
     }
 
     #[rstest]
@@ -3110,9 +3163,17 @@ mod tests {
     }
 
     #[rstest]
-    fn parse_lighter_order_filled_builds_order_filled_for_account() {
+    #[case::bidder_maker_ask_is_taker(true, true, "0.06160765 USDC")]
+    #[case::asker_maker_ask_is_maker(true, false, "0.00880109 USDC")]
+    #[case::bidder_maker_bid_is_maker(false, true, "0.00880109 USDC")]
+    #[case::asker_maker_bid_is_taker(false, false, "0.06160765 USDC")]
+    fn parse_lighter_order_filled_builds_order_filled_for_account(
+        #[case] is_maker_ask: bool,
+        #[case] user_is_bidder: bool,
+        #[case] expected_commission: &str,
+    ) {
         let instrument = create_test_instrument();
-        let trade = stub_account_trade(1234, true, true);
+        let trade = stub_account_trade(1234, is_maker_ask, user_is_bidder);
 
         let filled = parse_lighter_order_filled(
             &trade,
@@ -3132,7 +3193,7 @@ mod tests {
         assert_eq!(filled.order_type, OrderType::Limit);
         assert_eq!(filled.last_qty, Quantity::from("0.1336"));
         assert_eq!(filled.last_px, Price::from("2352.73"));
-        assert!(filled.commission.is_some());
+        assert_eq!(filled.commission, Some(Money::from(expected_commission)));
     }
 
     #[rstest]

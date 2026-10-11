@@ -409,9 +409,9 @@ impl EventStoreSession {
     ///
     /// # Errors
     ///
-    /// Returns [`EventStoreError`] if the writer fails to commit the final batch, the
-    /// seal step fails, or the writer Arc has outstanding clones (the bus tap must be
-    /// cleared before close to release the adapter's writer reference).
+    /// Returns an error if the writer fails to commit the final batch, the seal step fails, or the
+    /// writer Arc has outstanding clones (the bus tap must be cleared before close to release the
+    /// adapter's writer reference).
     pub fn close(&mut self, ts_init: UnixNanos) -> Result<(), EventStoreError> {
         if self.is_halted() {
             return Err(EventStoreError::Closed);
@@ -491,8 +491,14 @@ struct ExternalJournalParent {
 
 impl ExternalJournalParent {
     fn verify(&self) -> anyhow::Result<String> {
-        let backend = RedbBackend::open_sealed(&self.directory, &self.instance.to_string(), &self.run_id)?;
-        EventStoreLifecycle::sealed_backend_fingerprint(Box::new(backend), self.instance, &self.run_id, self.watermark)
+        let backend =
+            RedbBackend::open_sealed(&self.directory, &self.instance.to_string(), &self.run_id)?;
+        EventStoreLifecycle::sealed_backend_fingerprint(
+            Box::new(backend),
+            self.instance,
+            &self.run_id,
+            self.watermark,
+        )
     }
 }
 
@@ -532,8 +538,8 @@ impl EventStoreLifecycle {
     ///
     /// # Errors
     ///
-    /// Returns the underlying [`EventStoreError`] when the recovery sweep fails for a
-    /// reason other than the expected `CrashedPredecessor` handshake.
+    /// Returns an error if the recovery sweep fails for a reason other than the expected handshake
+    /// with a crashed predecessor.
     pub fn boot(
         config: Option<EventStoreConfig>,
         instance_id: UUID4,
@@ -554,8 +560,8 @@ impl EventStoreLifecycle {
     ///
     /// # Errors
     ///
-    /// Returns the underlying [`EventStoreError`] when the recovery sweep fails for a
-    /// reason other than the expected `CrashedPredecessor` handshake.
+    /// Returns an error if the recovery sweep fails for a reason other than the expected handshake
+    /// with a crashed predecessor.
     pub fn boot_with_options(
         config: Option<EventStoreConfig>,
         instance_id: UUID4,
@@ -601,10 +607,22 @@ impl EventStoreLifecycle {
         source_run_id: &str,
         expected_high_watermark: u64,
     ) -> anyhow::Result<String> {
-        anyhow::ensure!(expected_high_watermark > 0 && !source_run_id.is_empty()
-            && source_run_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'), "invalid external parent reference");
-        ExternalJournalParent { directory: source_base_dir.into(), instance: source_instance,
-            run_id: source_run_id.into(), watermark: expected_high_watermark, fingerprint: String::new() }.verify()
+        anyhow::ensure!(
+            expected_high_watermark > 0
+                && !source_run_id.is_empty()
+                && source_run_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "invalid external parent reference"
+        );
+        ExternalJournalParent {
+            directory: source_base_dir.into(),
+            instance: source_instance,
+            run_id: source_run_id.into(),
+            watermark: expected_high_watermark,
+            fingerprint: String::new(),
+        }
+        .verify()
     }
 
     /// Verifies and fingerprints the caller's already-open sealed source handle.
@@ -618,25 +636,47 @@ impl EventStoreLifecycle {
         source_run_id: &str,
         expected_high_watermark: u64,
     ) -> anyhow::Result<String> {
-        anyhow::ensure!(expected_high_watermark > 0 && !source_run_id.is_empty()
-            && source_run_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'), "invalid external parent reference");
+        anyhow::ensure!(
+            expected_high_watermark > 0
+                && !source_run_id.is_empty()
+                && source_run_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "invalid external parent reference"
+        );
         let manifest = backend.manifest()?;
-        anyhow::ensure!(manifest.instance_id == source_instance.to_string() && manifest.run_id == source_run_id,
-            "external parent identity mismatch");
-        anyhow::ensure!(matches!(manifest.status, RunStatus::Ended | RunStatus::CrashedRecovered),
-            "external parent must be sealed and usable");
-        anyhow::ensure!(backend.high_watermark()? == expected_high_watermark, "external parent watermark changed");
+        anyhow::ensure!(
+            manifest.instance_id == source_instance.to_string() && manifest.run_id == source_run_id,
+            "external parent identity mismatch"
+        );
+        anyhow::ensure!(
+            matches!(
+                manifest.status,
+                RunStatus::Ended | RunStatus::CrashedRecovered
+            ),
+            "external parent must be sealed and usable"
+        );
+        anyhow::ensure!(
+            backend.high_watermark()? == expected_high_watermark,
+            "external parent watermark changed"
+        );
         let mut hash = blake3::Hasher::new();
         hash.update(b"nautilus-external-journal-parent/v1");
         let manifest_bytes = rmp_serde::to_vec_named(&manifest)?;
         hash.update(&(manifest_bytes.len() as u64).to_le_bytes());
         hash.update(&manifest_bytes);
         for sequence in 1..=expected_high_watermark {
-            let entry = backend.scan_seq(sequence)?.ok_or_else(|| anyhow::anyhow!("external parent sequence missing"))?;
+            let entry = backend
+                .scan_seq(sequence)?
+                .ok_or_else(|| anyhow::anyhow!("external parent sequence missing"))?;
             hash.update(entry.entry_hash.as_bytes());
         }
         let report = crate::verifier::Verifier::new(backend).verify()?;
-        anyhow::ensure!(report.is_clean(), "external parent integrity verification failed: {:?}", report.findings);
+        anyhow::ensure!(
+            report.is_clean(),
+            "external parent integrity verification failed: {:?}",
+            report.findings
+        );
         Ok(hash.finalize().to_hex().to_string())
     }
 
@@ -654,17 +694,44 @@ impl EventStoreLifecycle {
         expected_high_watermark: u64,
         expected_fingerprint: &str,
     ) -> anyhow::Result<()> {
-        let config = self.config.as_ref().ok_or_else(|| anyhow::anyhow!("journal configuration required"))?;
-        anyhow::ensure!(!self.opened_once && self.session.is_none() && !self.is_halted(), "external parent requires a pristine healthy lifecycle");
-        anyhow::ensure!(self.external_parent.is_none() && self.parent_run_id.is_none() && config.replay_from_run_id.is_none(),
-            "external parent cannot replace or mix with existing lineage or replay");
-        anyhow::ensure!(source_instance != self.instance_id, "external parent must have a different instance");
-        anyhow::ensure!(expected_high_watermark > 0 && !source_run_id.is_empty()
-            && source_run_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'), "invalid external parent reference");
-        let mut parent = ExternalJournalParent { directory: source_base_dir.into(), instance: source_instance,
-            run_id: source_run_id.into(), watermark: expected_high_watermark, fingerprint: String::new() };
+        let config = self
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("journal configuration required"))?;
+        anyhow::ensure!(
+            !self.opened_once && self.session.is_none() && !self.is_halted(),
+            "external parent requires a pristine healthy lifecycle"
+        );
+        anyhow::ensure!(
+            self.external_parent.is_none()
+                && self.parent_run_id.is_none()
+                && config.replay_from_run_id.is_none(),
+            "external parent cannot replace or mix with existing lineage or replay"
+        );
+        anyhow::ensure!(
+            source_instance != self.instance_id,
+            "external parent must have a different instance"
+        );
+        anyhow::ensure!(
+            expected_high_watermark > 0
+                && !source_run_id.is_empty()
+                && source_run_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "invalid external parent reference"
+        );
+        let mut parent = ExternalJournalParent {
+            directory: source_base_dir.into(),
+            instance: source_instance,
+            run_id: source_run_id.into(),
+            watermark: expected_high_watermark,
+            fingerprint: String::new(),
+        };
         parent.fingerprint = parent.verify()?;
-        anyhow::ensure!(parent.fingerprint == expected_fingerprint, "external parent differs from verified recovery source");
+        anyhow::ensure!(
+            parent.fingerprint == expected_fingerprint,
+            "external parent differs from verified recovery source"
+        );
         self.external_parent = Some(parent);
         Ok(())
     }
@@ -681,8 +748,8 @@ impl EventStoreLifecycle {
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError::EventStoreBoot`] when opening the new run, spawning the
-    /// writer, or blocking on the `RunStarted` ack fails.
+    /// Returns an error if opening the new run, spawning the writer, or blocking on the
+    /// `RunStarted` ack fails.
     pub fn open(
         &mut self,
         instance_id: UUID4,
@@ -695,12 +762,18 @@ impl EventStoreLifecycle {
 
         if let Some(parent) = &self.external_parent {
             if instance_id != self.instance_id || self.opened_once || self.is_halted() {
-                return Err(KernelError::ExternalParent("continuation target changed or already used".into()));
+                return Err(KernelError::ExternalParent(
+                    "continuation target changed or already used".into(),
+                ));
             }
             self.opened_once = true;
-            let fingerprint = parent.verify().map_err(|error| KernelError::ExternalParent(format!("{error:#}")))?;
+            let fingerprint = parent
+                .verify()
+                .map_err(|error| KernelError::ExternalParent(format!("{error:#}")))?;
             if fingerprint != parent.fingerprint {
-                return Err(KernelError::ExternalParent("external parent contents changed".into()));
+                return Err(KernelError::ExternalParent(
+                    "external parent contents changed".into(),
+                ));
             }
         } else {
             self.opened_once = true;
@@ -729,7 +802,10 @@ impl EventStoreLifecycle {
             )?;
             Some(replay_run_id.to_string())
         } else {
-            self.external_parent.as_ref().map(|parent| parent.run_id.clone()).or_else(|| self.parent_run_id.clone())
+            self.external_parent
+                .as_ref()
+                .map(|parent| parent.run_id.clone())
+                .or_else(|| self.parent_run_id.clone())
         };
         let session = open_run_with_options(
             &config,
@@ -765,15 +841,16 @@ impl EventStoreLifecycle {
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError::CacheReplay`] when the source reader, snapshot restore, decode,
-    /// or cache apply step fails.
+    /// Returns an error if the source reader, snapshot restore, decode, or cache apply step fails.
     pub fn restore_parent_cache(
         &self,
         instance_id: UUID4,
         cache: &mut Cache,
     ) -> Result<Option<CacheReplayReport>, KernelError> {
         if self.external_parent.is_some() {
-            return Err(KernelError::ExternalParent("external parent requires composite recovery; native cache replay denied".into()));
+            return Err(KernelError::ExternalParent(
+                "external parent requires composite recovery; native cache replay denied".into(),
+            ));
         }
         let Some(config) = self.config.as_ref() else {
             return Ok(None);
@@ -850,7 +927,11 @@ impl EventStoreLifecycle {
         self.config
             .as_ref()
             .and_then(|config| config.replay_from_run_id.as_deref())
-            .or_else(|| self.external_parent.as_ref().map(|parent| parent.run_id.as_str()))
+            .or_else(|| {
+                self.external_parent
+                    .as_ref()
+                    .map(|parent| parent.run_id.as_str())
+            })
             .or(self.parent_run_id.as_deref())
     }
 
@@ -1010,10 +1091,8 @@ impl Drop for EventStoreLifecycle {
 ///
 /// # Errors
 ///
-/// Returns [`EventStoreError`] when the directory enumeration fails, or when a
-/// predecessor unexpectedly reopens without the
-/// [`EventStoreError::CrashedPredecessor`] handshake the backend uses to surface
-/// unsealed runs.
+/// Returns an error if directory enumeration fails or a predecessor unexpectedly reopens without
+/// the handshake the backend uses to report an unsealed run.
 pub fn recover_predecessors(
     base_dir: &Path,
     instance_id: &str,
@@ -1122,10 +1201,9 @@ pub fn build_run_id(start_ts_init: UnixNanos) -> RunId {
 ///
 /// # Errors
 ///
-/// Returns [`BootError::EventStore`] when the backend rejects open, [`BootError::RunStartedSubmit`]
-/// when the writer rejects the submit, [`BootError::RunStartedTimeout`] when the
-/// commit does not happen inside the configured ceiling, and [`BootError::HaltedDuringBoot`]
-/// when the writer fail-stops while waiting for the commit.
+/// Returns an error if the backend rejects open, if the writer rejects the submit, if the commit
+/// does not happen inside the configured ceiling, or if the writer fail-stops while waiting for the
+/// commit.
 #[expect(
     clippy::too_many_arguments,
     reason = "run opening requires the boot context and event-store handles"
@@ -1160,10 +1238,9 @@ pub fn open_run(
 ///
 /// # Errors
 ///
-/// Returns [`BootError::EventStore`] when the backend rejects open, [`BootError::RunStartedSubmit`]
-/// when the writer rejects the submit, [`BootError::RunStartedTimeout`] when the
-/// commit does not happen inside the configured ceiling, and [`BootError::HaltedDuringBoot`]
-/// when the writer fail-stops while waiting for the commit.
+/// Returns an error if the backend rejects open, if the writer rejects the submit, if the commit
+/// does not happen inside the configured ceiling, or if the writer fail-stops while waiting for the
+/// commit.
 #[expect(
     clippy::too_many_arguments,
     reason = "run opening with options requires the boot context and lifecycle handles"
@@ -1321,7 +1398,7 @@ fn marker_manifest_for(
 const fn data_marker_class_to_data_class(class: DataMarkerClass) -> DataClass {
     match class {
         DataMarkerClass::BookDeltas => DataClass::BookDeltas,
-        DataMarkerClass::BookDepth10 => DataClass::BookDepth10,
+        DataMarkerClass::BookDepth => DataClass::BookDepth,
         DataMarkerClass::Quote => DataClass::Quote,
         DataMarkerClass::Trade => DataClass::Trade,
         DataMarkerClass::Bar => DataClass::Bar,
@@ -1383,9 +1460,8 @@ fn writer_config_from(config: &EventStoreConfig) -> WriterConfig {
 ///
 /// # Errors
 ///
-/// Returns [`BootError::RunStartedSubmit`] when the writer rejects the submit,
-/// [`BootError::HaltedDuringBoot`] when the writer fail-stops during the wait, and
-/// [`BootError::RunStartedTimeout`] when the writer does not commit within `timeout`.
+/// Returns an error if the writer rejects the submit, if the writer fail-stops during the wait, or
+/// if the writer does not commit within `timeout`.
 pub(crate) fn submit_run_started_blocking(
     writer: &EventStoreWriter,
     components: &RegisteredComponents,
@@ -1588,25 +1664,38 @@ impl KernelEventStoreTrait for EventStoreLifecycle {
         EventStoreLifecycle::open(self, instance_id, components, environment).map_err(Into::into)
     }
 
-    fn continue_paused_start(&mut self, instance_id: UUID4, child_run_id: &str,
-        components: &RegisteredComponents, environment: Environment) -> anyhow::Result<()> {
+    fn continue_paused_start(
+        &mut self,
+        instance_id: UUID4,
+        child_run_id: &str,
+        components: &RegisteredComponents,
+        environment: Environment,
+    ) -> anyhow::Result<()> {
         let session = self.session.as_ref().ok_or(EventStoreError::Closed)?;
-        anyhow::ensure!(!self.paused_start_consumed && !session.is_halted()
-            && session.writer.is_some() && instance_id == self.instance_id
-            && session.manifest().instance_id == instance_id.to_string()
-            && session.run_id() == child_run_id
-            && session.manifest().registered_components == *components
-            && self.opened_environment == Some(environment),
-            "owned paused Journal continuation changed or already consumed");
+        anyhow::ensure!(
+            !self.paused_start_consumed
+                && !session.is_halted()
+                && session.writer.is_some()
+                && instance_id == self.instance_id
+                && session.manifest().instance_id == instance_id.to_string()
+                && session.run_id() == child_run_id
+                && session.manifest().registered_components == *components
+                && self.opened_environment == Some(environment),
+            "owned paused Journal continuation changed or already consumed"
+        );
         session.flush()?;
         self.paused_start_consumed = true;
         Ok(())
     }
 
     #[cfg(feature = "live")]
-    fn native_trace_handle(&self, source: nautilus_common::recovery_trace::NativeTraceSource)
-        -> anyhow::Result<Rc<dyn std::any::Any>> {
-        Ok(Rc::new(EventStoreLifecycle::native_trace_recorder(self, source)?))
+    fn native_trace_handle(
+        &self,
+        source: nautilus_common::recovery_trace::NativeTraceSource,
+    ) -> anyhow::Result<Rc<dyn std::any::Any>> {
+        Ok(Rc::new(EventStoreLifecycle::native_trace_recorder(
+            self, source,
+        )?))
     }
 
     fn snapshot_anchorer(&self) -> Option<SnapshotAnchorer> {
@@ -1629,19 +1718,24 @@ impl KernelEventStoreTrait for EventStoreLifecycle {
         Ok(())
     }
 
-
-    fn failure_retention(&self) -> Option<nautilus_system::event_store::EventStoreFailureRetention> {
+    fn failure_retention(
+        &self,
+    ) -> Option<nautilus_system::event_store::EventStoreFailureRetention> {
         let session = self.session.as_ref()?;
         if session.writer.is_none() {
             return None;
         }
         let halt = self.halt.clone();
-        Some(nautilus_system::event_store::EventStoreFailureRetention::new(move |reason| {
-            anyhow::ensure!(!reason.is_empty(), "native failure reason missing");
-            halt.callback()(HaltReason::ExternalPersistence("native dispatch failed".into()));
-            anyhow::ensure!(halt.is_halted(), "actual Journal failure was not latched");
-            Ok(())
-        }))
+        Some(
+            nautilus_system::event_store::EventStoreFailureRetention::new(move |reason| {
+                anyhow::ensure!(!reason.is_empty(), "native failure reason missing");
+                halt.callback()(HaltReason::ExternalPersistence(
+                    "native dispatch failed".into(),
+                ));
+                anyhow::ensure!(halt.is_halted(), "actual Journal failure was not latched");
+                Ok(())
+            }),
+        )
     }
 
     fn run_id(&self) -> Option<&str> {
@@ -1669,7 +1763,7 @@ mod tests {
 
     use indexmap::IndexMap;
     use nautilus_common::{
-        clock::TestClock,
+        clock::VirtualClock,
         messages::{
             data::{
                 DataCommand, DataResponse, QuotesResponse, RequestCommand, RequestQuotes,
@@ -1998,7 +2092,7 @@ mod tests {
     #[rstest]
     fn lifecycle_options_custom_registry_captures_registered_message() {
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
         let options = EventStoreLifecycleOptions::new().with_encoder_registry(test_registry());
 
@@ -2039,7 +2133,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let memory = Arc::new(Mutex::new(MemoryBackend::new()));
         let opener_memory = Arc::clone(&memory);
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
         let options = EventStoreLifecycleOptions::new()
             .with_encoder_registry(test_registry())
@@ -2205,7 +2299,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let memory = Arc::new(Mutex::new(MemoryBackend::new()));
         let opener_memory = Arc::clone(&memory);
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
         let mut config = make_config(tmp.path().to_path_buf());
         config.identity.seed = Some(seed);
@@ -2620,42 +2714,158 @@ mod tests {
         let source_instance = UUID4::new();
         let target_instance = UUID4::new();
         let source_config = make_config(source_dir.path().into());
-        let mut source = open_run(&source_config, &source_instance.to_string(),
-            build_run_id(10_000u64.into()), None, 10_000u64.into(),
-            &RegisteredComponents::default(), HaltSignal::new(), get_atomic_clock_static())?;
+        let mut source = open_run(
+            &source_config,
+            &source_instance.to_string(),
+            build_run_id(10_000u64.into()),
+            None,
+            10_000u64.into(),
+            &RegisteredComponents::default(),
+            HaltSignal::new(),
+            get_atomic_clock_static(),
+        )?;
         let source_id = source.run_id().to_owned();
         source.close(20_000u64.into())?;
         drop(source);
-        let parent = RedbBackend::open_sealed(source_dir.path(), &source_instance.to_string(), &source_id)?;
+        let parent =
+            RedbBackend::open_sealed(source_dir.path(), &source_instance.to_string(), &source_id)?;
         let watermark = parent.high_watermark()?;
         drop(parent);
-        let fingerprint = EventStoreLifecycle::sealed_run_fingerprint(source_dir.path(), source_instance, &source_id, watermark)?;
-        let new_lifecycle = |instance, config| EventStoreLifecycle::boot(Some(config), instance,
-            Rc::new(RefCell::new(TestClock::new())));
+        let fingerprint = EventStoreLifecycle::sealed_run_fingerprint(
+            source_dir.path(),
+            source_instance,
+            &source_id,
+            watermark,
+        )?;
+        let new_lifecycle = |instance, config| {
+            EventStoreLifecycle::boot(
+                Some(config),
+                instance,
+                Rc::new(RefCell::new(VirtualClock::new())),
+            )
+        };
         let mut child = new_lifecycle(target_instance, make_config(target_dir.path().into()))?;
-        assert!(child.bind_external_parent(source_dir.path(), target_instance, &source_id, watermark, &fingerprint).is_err());
-        assert!(child.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark + 1, &fingerprint).is_err());
-        assert!(child.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark, "incorrect").is_err());
-        child.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark, &fingerprint)?;
+        assert!(
+            child
+                .bind_external_parent(
+                    source_dir.path(),
+                    target_instance,
+                    &source_id,
+                    watermark,
+                    &fingerprint
+                )
+                .is_err()
+        );
+        assert!(
+            child
+                .bind_external_parent(
+                    source_dir.path(),
+                    source_instance,
+                    &source_id,
+                    watermark + 1,
+                    &fingerprint
+                )
+                .is_err()
+        );
+        assert!(
+            child
+                .bind_external_parent(
+                    source_dir.path(),
+                    source_instance,
+                    &source_id,
+                    watermark,
+                    "incorrect"
+                )
+                .is_err()
+        );
+        child.bind_external_parent(
+            source_dir.path(),
+            source_instance,
+            &source_id,
+            watermark,
+            &fingerprint,
+        )?;
         assert_eq!(child.parent_run_id(), Some(source_id.as_str()));
-        assert!(child.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark, &fingerprint).is_err());
-        assert!(child.restore_parent_cache(target_instance, &mut Cache::default()).is_err());
-        child.open(target_instance, &RegisteredComponents::default(), Environment::Backtest)?;
+        assert!(
+            child
+                .bind_external_parent(
+                    source_dir.path(),
+                    source_instance,
+                    &source_id,
+                    watermark,
+                    &fingerprint
+                )
+                .is_err()
+        );
+        assert!(
+            child
+                .restore_parent_cache(target_instance, &mut Cache::default())
+                .is_err()
+        );
+        child.open(
+            target_instance,
+            &RegisteredComponents::default(),
+            Environment::Backtest,
+        )?;
         let child_id = child.run_id().unwrap().to_owned();
-        assert!(child.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark, &fingerprint).is_err());
+        assert!(
+            child
+                .bind_external_parent(
+                    source_dir.path(),
+                    source_instance,
+                    &source_id,
+                    watermark,
+                    &fingerprint
+                )
+                .is_err()
+        );
         child.seal(30_000u64.into());
-        assert!(child.open(target_instance, &RegisteredComponents::default(), Environment::Backtest).is_err());
-        let backend = RedbBackend::open_sealed(target_dir.path(), &target_instance.to_string(), &child_id)?;
+        assert!(
+            child
+                .open(
+                    target_instance,
+                    &RegisteredComponents::default(),
+                    Environment::Backtest
+                )
+                .is_err()
+        );
+        let backend =
+            RedbBackend::open_sealed(target_dir.path(), &target_instance.to_string(), &child_id)?;
         let manifest = backend.manifest()?;
         assert_eq!(manifest.parent_run_id.as_deref(), Some(source_id.as_str()));
         assert_eq!(manifest.instance_id, target_instance.to_string());
-        assert_eq!(backend.scan_seq(1)?.unwrap().payload_type.as_str(), "RunStarted");
-        assert!(crate::verifier::Verifier::new(Box::new(backend)).verify()?.is_clean());
-        assert_eq!(EventStoreLifecycle::sealed_run_fingerprint(source_dir.path(), source_instance, &source_id, watermark)?, fingerprint);
+        assert_eq!(
+            backend.scan_seq(1)?.unwrap().payload_type.as_str(),
+            "RunStarted"
+        );
+        assert!(
+            crate::verifier::Verifier::new(Box::new(backend))
+                .verify()?
+                .is_clean()
+        );
+        assert_eq!(
+            EventStoreLifecycle::sealed_run_fingerprint(
+                source_dir.path(),
+                source_instance,
+                &source_id,
+                watermark
+            )?,
+            fingerprint
+        );
         let mut replay_config = make_config(target_dir.path().into());
         replay_config.replay_from_run_id = Some(source_id.clone());
         let mut replay = new_lifecycle(UUID4::new(), replay_config)?;
-        assert!(replay.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark, &fingerprint).is_err());
+        assert!(
+            replay
+                .bind_external_parent(
+                    source_dir.path(),
+                    source_instance,
+                    &source_id,
+                    watermark,
+                    &fingerprint
+                )
+                .is_err()
+        );
         Ok(())
     }
 
@@ -2664,38 +2874,98 @@ mod tests {
         let source_dir = TempDir::new()?;
         let target_dir = TempDir::new()?;
         let source_instance = UUID4::new();
-        let mut source = open_run(&make_config(source_dir.path().into()), &source_instance.to_string(),
-            build_run_id(10_000u64.into()), None, 10_000u64.into(),
-            &RegisteredComponents::default(), HaltSignal::new(), get_atomic_clock_static())?;
+        let mut source = open_run(
+            &make_config(source_dir.path().into()),
+            &source_instance.to_string(),
+            build_run_id(10_000u64.into()),
+            None,
+            10_000u64.into(),
+            &RegisteredComponents::default(),
+            HaltSignal::new(),
+            get_atomic_clock_static(),
+        )?;
         let source_id = source.run_id().to_owned();
         source.close(20_000u64.into())?;
         drop(source);
-        let backend = RedbBackend::open_sealed(source_dir.path(), &source_instance.to_string(), &source_id)?;
+        let backend =
+            RedbBackend::open_sealed(source_dir.path(), &source_instance.to_string(), &source_id)?;
         let watermark = backend.high_watermark()?;
         drop(backend);
-        let fingerprint = EventStoreLifecycle::sealed_run_fingerprint(source_dir.path(), source_instance, &source_id, watermark)?;
+        let fingerprint = EventStoreLifecycle::sealed_run_fingerprint(
+            source_dir.path(),
+            source_instance,
+            &source_id,
+            watermark,
+        )?;
         let instance = UUID4::new();
-        let mut child = EventStoreLifecycle::boot(Some(make_config(target_dir.path().into())), instance,
-            Rc::new(RefCell::new(TestClock::new())))?;
-        child.bind_external_parent(source_dir.path(), source_instance, &source_id, watermark, &fingerprint)?;
-        assert!(child.open(UUID4::new(), &RegisteredComponents::default(), Environment::Backtest).is_err());
+        let mut child = EventStoreLifecycle::boot(
+            Some(make_config(target_dir.path().into())),
+            instance,
+            Rc::new(RefCell::new(VirtualClock::new())),
+        )?;
+        child.bind_external_parent(
+            source_dir.path(),
+            source_instance,
+            &source_id,
+            watermark,
+            &fingerprint,
+        )?;
+        assert!(
+            child
+                .open(
+                    UUID4::new(),
+                    &RegisteredComponents::default(),
+                    Environment::Backtest
+                )
+                .is_err()
+        );
         // Replace a sealed source with a different valid journal retaining the same identity
         // and watermark. Integrity alone must not substitute for the original content proof.
-        let verified_handle = RedbBackend::open_sealed(source_dir.path(), &source_instance.to_string(), &source_id)?;
+        let verified_handle =
+            RedbBackend::open_sealed(source_dir.path(), &source_instance.to_string(), &source_id)?;
         let prior_instance_path = source_dir.path().join(source_instance.to_string());
-        std::fs::rename(&prior_instance_path, source_dir.path().join("saved-original"))?;
+        std::fs::rename(
+            &prior_instance_path,
+            source_dir.path().join("saved-original"),
+        )?;
         let mut changed_config = make_config(source_dir.path().into());
         changed_config.identity.binary_hash = "different-binary".into();
-        let mut replacement = open_run(&changed_config, &source_instance.to_string(), source_id.clone(),
-            None, 10_000u64.into(), &RegisteredComponents::default(), HaltSignal::new(), get_atomic_clock_static())?;
+        let mut replacement = open_run(
+            &changed_config,
+            &source_instance.to_string(),
+            source_id.clone(),
+            None,
+            10_000u64.into(),
+            &RegisteredComponents::default(),
+            HaltSignal::new(),
+            get_atomic_clock_static(),
+        )?;
         replacement.close(20_000u64.into())?;
         drop(replacement);
-        let changed = EventStoreLifecycle::sealed_run_fingerprint(source_dir.path(), source_instance, &source_id, watermark)?;
+        let changed = EventStoreLifecycle::sealed_run_fingerprint(
+            source_dir.path(),
+            source_instance,
+            &source_id,
+            watermark,
+        )?;
         assert_ne!(changed, fingerprint);
-        assert_eq!(EventStoreLifecycle::sealed_backend_fingerprint(Box::new(verified_handle),
-            source_instance, &source_id, watermark)?, fingerprint,
-            "already-validated source handle must not adopt a replacement path's fingerprint");
-        let error = child.open(instance, &RegisteredComponents::default(), Environment::Backtest).unwrap_err();
+        assert_eq!(
+            EventStoreLifecycle::sealed_backend_fingerprint(
+                Box::new(verified_handle),
+                source_instance,
+                &source_id,
+                watermark
+            )?,
+            fingerprint,
+            "already-validated source handle must not adopt a replacement path's fingerprint"
+        );
+        let error = child
+            .open(
+                instance,
+                &RegisteredComponents::default(),
+                Environment::Backtest,
+            )
+            .unwrap_err();
         assert!(error.to_string().contains("contents changed"));
         assert!(child.run_id().is_none());
         Ok(())
@@ -2850,9 +3120,9 @@ mod tests {
         // BacktestEngine::run -> reset -> run reuses the kernel. EventStoreLifecycle::open
         // must seal any leftover session before opening a fresh one so RunStarted is
         // the first entry of every run. The UUID suffix in build_run_id keeps the
-        // two ids distinct even though TestClock holds start_ts_init at zero.
+        // two ids distinct even though VirtualClock holds start_ts_init at zero.
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
 
         let mut store = EventStoreLifecycle::boot(
@@ -2907,7 +3177,7 @@ mod tests {
     ) {
         let tmp = TempDir::new().expect("tempdir");
         let instance_id = UUID4::new();
-        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let mut store = EventStoreLifecycle::boot(
             Some(make_config(tmp.path().to_path_buf())),
             instance_id,
@@ -2961,7 +3231,7 @@ mod tests {
         // rerun (reset -> run) opens with a fresh signal, reports no stale halt, and
         // its graceful stop still seals Ended.
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
 
         let mut store = EventStoreLifecycle::boot(
@@ -3251,7 +3521,7 @@ mod tests {
     #[rstest]
     fn bus_tap_captures_submit_order_sent_through_msgbus() {
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
 
         let mut store = EventStoreLifecycle::boot(
@@ -3320,7 +3590,7 @@ mod tests {
     #[rstest]
     fn kernel_with_markers_captures_snapshots_over_synthetic_bus() {
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
         let mut config = make_config(tmp.path().to_path_buf());
         config.data_markers = Some(DataMarkerConfig {
@@ -3386,7 +3656,7 @@ mod tests {
     #[rstest]
     fn boot_recovery_ignores_marker_sidecar_files() {
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
         let mut config = make_config(tmp.path().to_path_buf());
         config.data_markers = Some(DataMarkerConfig {
@@ -3486,7 +3756,7 @@ mod tests {
     #[rstest]
     fn marker_registry_factory_receives_enabled_classes() {
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
         let seen_classes: Arc<Mutex<Vec<Vec<DataClass>>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_for_factory = Arc::clone(&seen_classes);
@@ -3522,7 +3792,7 @@ mod tests {
     #[rstest]
     fn markers_disabled_installs_no_file_and_no_cost() {
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
 
         let mut store = EventStoreLifecycle::boot(
@@ -3566,7 +3836,7 @@ mod tests {
     #[rstest]
     fn bus_tap_captures_time_event_handler_run() {
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
 
         let mut store = EventStoreLifecycle::boot(
@@ -3613,7 +3883,7 @@ mod tests {
     #[rstest]
     fn seal_clears_bus_tap_so_post_seal_dispatches_do_not_capture() {
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
 
         let mut store = EventStoreLifecycle::boot(
@@ -3658,7 +3928,7 @@ mod tests {
     #[rstest]
     fn bus_tap_captures_trading_command_envelope_with_inner_payload_type() {
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
 
         let mut store = EventStoreLifecycle::boot(
@@ -3740,7 +4010,7 @@ mod tests {
     #[rstest]
     fn bus_tap_captures_order_event_any_envelope_with_inner_payload_type() {
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
 
         let mut store = EventStoreLifecycle::boot(
@@ -3820,7 +4090,7 @@ mod tests {
     #[rstest]
     fn bus_tap_captures_data_command_envelopes_with_category_payload_types() {
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
 
         let mut store = EventStoreLifecycle::boot(
@@ -3921,7 +4191,7 @@ mod tests {
     #[rstest]
     fn bus_tap_captures_data_response_sent_through_correlation_handler() {
         let tmp = TempDir::new().expect("tempdir");
-        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let clock_rc: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
         let instance_id = UUID4::new();
 
         let mut store = EventStoreLifecycle::boot(
@@ -3941,7 +4211,7 @@ mod tests {
 
         let correlation_id = UUID4::new();
         let handler_called = Rc::new(RefCell::new(false));
-        let handler_called_clone = handler_called.clone();
+        let handler_called_clone = Rc::clone(&handler_called);
         msgbus::register_response_handler(
             &correlation_id,
             msgbus::ShareableMessageHandler::from_typed(move |_resp: &QuotesResponse| {

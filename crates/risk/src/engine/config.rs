@@ -45,12 +45,16 @@ use serde::{Deserialize, Serialize};
 #[builder(finish_fn(name = build_inner, vis = ""))]
 #[serde(default, deny_unknown_fields)]
 pub struct RiskEngineConfig {
+    /// Whether to bypass risk checks and order rate limits.
     #[builder(default)]
     pub bypass: bool,
+    /// Rate limit for order submission commands.
     #[builder(default = RateLimit::new(100, DurationNanos::from_secs(1)))]
     pub max_order_submit: RateLimit,
+    /// Rate limit for order modifications, counting each batch child separately.
     #[builder(default = RateLimit::new(100, DurationNanos::from_secs(1)))]
     pub max_order_modify: RateLimit,
+    /// Maximum notional per order by instrument, in each instrument's quote currency.
     #[builder(default)]
     pub max_notional_per_order: AHashMap<InstrumentId, Decimal>,
     /// Venues whose execution clients enforce whole-position conditional exits.
@@ -58,6 +62,7 @@ pub struct RiskEngineConfig {
     /// Validated exits skip bounds that apply only to their placeholder quantity and notional.
     #[builder(default)]
     pub full_position_exit_venues: AHashSet<Venue>,
+    /// Whether to emit additional debug logs.
     #[builder(default)]
     pub debug: bool,
 }
@@ -67,8 +72,7 @@ impl<S: risk_engine_config_builder::IsComplete> RiskEngineConfigBuilder<S> {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if any field fails validation
-    /// (see [`RiskEngineConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`RiskEngineConfig::validate`]).
     pub fn build(self) -> ConfigResult<RiskEngineConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -81,8 +85,8 @@ impl RiskEngineConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
 

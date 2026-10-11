@@ -17,6 +17,8 @@
 #   7. No raw tokio::{time,task,runtime,signal} paths that bypass the madsim
 #      facade on production DST paths
 #
+# A missing ADAPTER_PATHS entry is also a violation: an unmatched glob does not fail
+#
 # Use '// dst-ok' inline comment to allow specific exceptions.
 # Test modules (files under tests/, matching *_tests.rs, or lines inside an
 # inline `#[cfg(test)]` module) are excluded.
@@ -42,17 +44,70 @@ IN_SCOPE_CRATES=(
   "risk" "serialization" "system" "trading"
 )
 
-# Audited OKX DST-path production files. Static coverage alone does not
+# Audited adapter DST-path production files. Static coverage alone does not
 # establish runtime eligibility for every capability those files serve.
+#
+# A file is gated when it carries DST-path runtime logic that could grow a
+# banned pattern; the rest stay excluded. Re-audit a file if that changes.
+# Files under src/python/ are skipped separately by the /python/ path rule,
+# per the repo-wide Python/FFI policy.
+#
+# Derive additionally gates signing clocks, credentials derived from those clocks,
+# native parsing, rate limits, and instrument collection. Its remaining module
+# declarations, constants, enums, errors, URLs, factories, retry classifiers,
+# configuration/credential/signing-context resolvers, and WebSocket context
+# container carry no async/time/RNG boundary. Python bindings stay excluded.
+#
+# The following exclusions apply to OKX:
+# - Module declarations: lib.rs and the common/http/websocket mod.rs files.
+# - Pure venue types: common/enums.rs, websocket/enums.rs, both error.rs
+#   files, common/models.rs.
+# - Pure tables and mappings: common/urls.rs, common/consts.rs (pure
+#   predicates, validators, and resolvers; contains-only retry lookup).
+# - Deterministic helpers: common/credential.rs (caller-provided timestamp;
+#   config-or-environment resolution), common/failure.rs.
+# - Construction wiring only: factories.rs.
+# - Test-only or placeholder: common/testing.rs, http/parse.rs.
+
 ADAPTER_PATHS=(
-  "crates/adapters/okx/src/book_sync.rs"
+  "crates/adapters/derive/src/common/parse.rs"
+  "crates/adapters/derive/src/common/rate_limit.rs"
+  "crates/adapters/derive/src/config.rs"
+  "crates/adapters/derive/src/data.rs"
+  "crates/adapters/derive/src/execution.rs"
+  "crates/adapters/derive/src/http/client.rs"
+  "crates/adapters/derive/src/http/models.rs"
+  "crates/adapters/derive/src/http/query.rs"
+  "crates/adapters/derive/src/http/parse.rs"
+  "crates/adapters/derive/src/signing/encoding.rs"
+  "crates/adapters/derive/src/signing/nonce.rs"
+  "crates/adapters/derive/src/signing/auth.rs"
+  "crates/adapters/derive/src/signing/eip712.rs"
+  "crates/adapters/derive/src/signing/modules/trade.rs"
+  "crates/adapters/derive/src/providers.rs"
+  "crates/adapters/derive/src/websocket/client.rs"
+  "crates/adapters/derive/src/websocket/dispatch.rs"
+  "crates/adapters/derive/src/websocket/handler.rs"
+  "crates/adapters/derive/src/websocket/messages.rs"
+  "crates/adapters/derive/src/websocket/parse.rs"
+
+  "crates/adapters/okx/src/book/mod.rs"
+  "crates/adapters/okx/src/book/recovery.rs"
+  "crates/adapters/okx/src/book/sync.rs"
+  "crates/adapters/okx/src/common/parse.rs"
   "crates/adapters/okx/src/common/task.rs"
+  "crates/adapters/okx/src/config.rs"
   "crates/adapters/okx/src/data.rs"
   "crates/adapters/okx/src/execution.rs"
   "crates/adapters/okx/src/http/client.rs"
+  "crates/adapters/okx/src/http/models.rs"
+  "crates/adapters/okx/src/http/query.rs"
   "crates/adapters/okx/src/websocket/client.rs"
   "crates/adapters/okx/src/websocket/dispatch.rs"
   "crates/adapters/okx/src/websocket/handler.rs"
+  "crates/adapters/okx/src/websocket/messages.rs"
+  "crates/adapters/okx/src/websocket/parse.rs"
+  "crates/adapters/okx/src/websocket/subscription.rs"
 )
 
 # Rule-1 L-dispositioned sites from the codebase audit: log timing, progress
@@ -230,6 +285,20 @@ report() {
   echo
   VIOLATIONS=$((VIOLATIONS + 1))
 }
+
+################################################################################
+# Adapter path coverage: every audited OKX file must exist
+################################################################################
+
+# Fail loudly instead of silently skipping a moved file
+echo "Checking DST adapter path coverage..."
+
+for adapter_path in "${ADAPTER_PATHS[@]}"; do
+  if [[ ! -f "$adapter_path" ]]; then
+    report "coverage" "$adapter_path" "0" "(file not found)" \
+      "Update ADAPTER_PATHS to the file's new location"
+  fi
+done
 
 ################################################################################
 # Rule 1: direct std::time clock reads
