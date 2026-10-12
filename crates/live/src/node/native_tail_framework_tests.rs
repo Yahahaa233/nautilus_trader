@@ -131,6 +131,7 @@ struct FrameworkStrategy {
     fail_historical_stop: bool,
     historical_clock_fault: String,
     bindings: bool,
+    cancelled_timer_backlog: Option<CancelledTimerBacklog>,
 }
 impl FrameworkStrategy {
     fn with_timer_completion(
@@ -165,6 +166,7 @@ impl FrameworkStrategy {
             fail_historical_stop,
             historical_clock_fault: String::new(),
             bindings: false,
+            cancelled_timer_backlog: None,
         };
         let indicator = value.indicator.clone();
         value
@@ -467,6 +469,41 @@ nautilus_strategy!(FrameworkStrategy, {
             assert_eq!(event.client_order_id(), ClientOrderId::from(ORDER));
             assert_eq!(event.instrument_id(), instrument_id());
             assert_eq!(event.strategy_id(), StrategyId::from(STRATEGY));
+            if matches!(event, OrderEventAny::Canceled(_))
+                && let Some(backlog) = self.cancelled_timer_backlog.take()
+            {
+                // The actual terminal handler owns this point before another
+                // timer can dispatch; a later Notify wake can observe Stopped.
+                assert_eq!(self.state(), ComponentState::Running);
+                assert_eq!(
+                    self.cache_ref()
+                        .order(&ClientOrderId::from(ORDER))
+                        .unwrap()
+                        .status(),
+                    OrderStatus::Canceled,
+                );
+                let mut publications = backlog.sender.publications.lock().unwrap();
+                let already_published = publications.len();
+                while publications.len() < already_published + 2 {
+                    let remaining = Duration::from_secs(20)
+                        .checked_sub(backlog.source_started.elapsed())
+                        .expect("actual timer backlog exceeded original Source budget");
+                    let (next, waited) = backlog
+                        .sender
+                        .arrived
+                        .wait_timeout(publications, remaining)
+                        .unwrap();
+                    publications = next;
+                    assert!(
+                        !waited.timed_out() || publications.len() >= already_published + 2,
+                        "actual native timer publication did not reach the original Source budget"
+                    );
+                }
+                backlog
+                    .stopped_timer_ids
+                    .borrow_mut()
+                    .extend_from_slice(&publications[already_published + 1..]);
+            }
             self.gtd_order_events.push(event);
             return;
         }
@@ -649,6 +686,12 @@ struct QueuedMarketExitTimerSender {
     original: std::sync::Arc<dyn nautilus_common::runner::TimeEventSender>,
     publications: std::sync::Mutex<Vec<UUID4>>,
     arrived: std::sync::Condvar,
+}
+#[derive(Debug)]
+struct CancelledTimerBacklog {
+    sender: std::sync::Arc<QueuedMarketExitTimerSender>,
+    source_started: std::time::Instant,
+    stopped_timer_ids: Rc<RefCell<Vec<UUID4>>>,
 }
 impl nautilus_common::runner::TimeEventSender for QueuedMarketExitTimerSender {
     fn invalidate_snapshot(&self) {
@@ -1118,6 +1161,15 @@ async fn run_actual_registered_framework_tail(
     let stopped_timer_ids = Rc::new(RefCell::new(Vec::new()));
     let stopped_timers = stopped_timer_ids.clone();
     let source_started = std::time::Instant::now();
+    if let Some(sender) = &held_timer {
+        let mut original =
+            get_actor_unchecked::<FrameworkStrategy>(&StrategyId::from(STRATEGY).inner());
+        original.cancelled_timer_backlog = Some(CancelledTimerBacklog {
+            sender: sender.clone(),
+            source_started,
+            stopped_timer_ids: stopped_timers,
+        });
+    }
     let produced = async move {
         ready.notified().await;
         if complete_gtd {
@@ -1295,46 +1347,6 @@ async fn run_actual_registered_framework_tail(
             .unwrap();
             let queued_before_dispatch =
                 original_cuts.borrow().last().unwrap().0.last_input_sequence;
-            if let Some(queued) = &held_timer {
-                // Wait until the real Canceled response is applied before
-                // delaying the owner runloop. The original LiveTimer runs on
-                // its real background runtime and admits each native message.
-                loop {
-                    progress.notified().await;
-                    let original = get_actor_unchecked::<FrameworkStrategy>(
-                        &StrategyId::from(STRATEGY).inner(),
-                    );
-                    if original
-                        .cache_ref()
-                        .order(&ClientOrderId::from(ORDER))
-                        .is_some_and(|order| order.status() == OrderStatus::Canceled)
-                    {
-                        assert_eq!(original.state(), ComponentState::Running);
-                        break;
-                    }
-                }
-                let mut publications = queued.publications.lock().unwrap();
-                let already_published = publications.len();
-                while publications.len() < already_published + 2 {
-                    let remaining = Duration::from_secs(20)
-                        .checked_sub(source_started.elapsed())
-                        .expect("actual timer backlog exceeded original Source budget");
-                    let (next, waited) = queued
-                        .arrived
-                        .wait_timeout(publications, remaining)
-                        .unwrap();
-                    publications = next;
-                    assert!(
-                        !waited.timed_out() || publications.len() >= already_published + 2,
-                        "actual native timer publication did not reach the original Source budget"
-                    );
-                }
-                // The first newly admitted real message completes normal stop;
-                // every later original message is already in the same FIFO.
-                stopped_timers
-                    .borrow_mut()
-                    .extend_from_slice(&publications[already_published + 1..]);
-            }
             loop {
                 progress.notified().await;
                 let value =
