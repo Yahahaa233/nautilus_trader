@@ -65,8 +65,8 @@ use tempfile::TempDir;
 #[case("64-bit")]
 #[case("128-bit")]
 fn migration_preserves_released_quotes_and_instruments(#[case] precision: &str) {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test_data/nautilus/catalog_1_231_0")
+    let source = nautilus_core::paths::get_test_data_path()
+        .join("nautilus/catalog_1_231_0")
         .join(precision);
     let original = catalog_files(&source);
     let temporary = TempDir::new().unwrap();
@@ -197,8 +197,8 @@ fn migration_rejects_source_rows_outside_declared_coverage() {
     let temporary = TempDir::new().unwrap();
     let source = temporary.path().join("source");
     let target = temporary.path().join("destination");
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test_data/nautilus/catalog_1_231_0/128-bit/data/quote_tick/AUDUSD.SIM")
+    let fixture = nautilus_core::paths::get_test_data_path()
+        .join("nautilus/catalog_1_231_0/128-bit/data/quote_tick/AUDUSD.SIM")
         .join("2023-11-14T22-13-20-000000023Z_2023-11-14T22-13-20-000000126Z.parquet");
     let path = source
         .join("data/quote_tick/AUDUSD.SIM")
@@ -913,7 +913,7 @@ fn migration_rejects_custom_int64_timestamps_before_writing(#[case] with_metadat
 }
 
 fn fixture_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_data/nautilus/catalog_develop/128-bit")
+    nautilus_core::paths::get_test_data_path().join("nautilus/catalog_develop/128-bit")
 }
 
 fn config(source: &Path, target: &Path, dry_run: bool) -> ParquetMigrationConfig {
@@ -980,4 +980,158 @@ fn remote_migration_preserves_encoded_object_paths(#[case] prefix: &str) {
     assert_eq!(report.migrated_rows, 2);
     assert_eq!(actual, expected);
     assert_eq!(fs::read(source_file).unwrap(), fixture.1);
+}
+
+const RUST_FUNDING_EVENT_NS: u64 = 1_700_000_000_000_000_023;
+const RUST_FUNDING_INIT_NS: u64 = 1_700_000_000_000_000_126;
+const RUST_FUNDING_ID: &str = "DOGE-USDT-SWAP.OKX";
+
+fn rust_legacy_funding_batch(case: &str) -> RecordBatch {
+    let metadata = HashMap::from([
+        (
+            "instrument_id".to_string(),
+            if case == "wrong_metadata_id" {
+                "TRUMP-USDT-SWAP.OKX".to_string()
+            } else {
+                RUST_FUNDING_ID.to_string()
+            },
+        ),
+        (
+            "type".to_string(),
+            if case == "wrong_namespace" {
+                "UnregisteredFunding".to_string()
+            } else {
+                "FundingRateUpdate".to_string()
+            },
+        ),
+    ]);
+    let mut fields = vec![
+        Field::new("instrument_id", DataType::Utf8, false),
+        Field::new("rate", DataType::Utf8, false),
+        Field::new("interval", DataType::UInt64, true),
+        Field::new("next_funding_ns", DataType::UInt64, true),
+        Field::new("ts_event", DataType::UInt64, false),
+        Field::new("ts_init", DataType::UInt64, false),
+    ];
+    let mut columns: Vec<Arc<dyn arrow::array::Array>> = vec![
+        Arc::new(StringArray::from(vec![
+            RUST_FUNDING_ID,
+            if case == "wrong_row_id" {
+                "TRUMP-USDT-SWAP.OKX"
+            } else {
+                RUST_FUNDING_ID
+            },
+        ])),
+        Arc::new(StringArray::from(vec![
+            if case == "invalid_rate" {
+                "not-a-decimal"
+            } else {
+                "-0.0000123456789012345678901234"
+            },
+            "0.0000000000000000000000000001",
+        ])),
+        Arc::new(UInt64Array::from(vec![
+            Some(if case == "interval_overflow" {
+                65_536
+            } else {
+                65_535
+            }),
+            None,
+        ])),
+        Arc::new(UInt64Array::from(vec![
+            Some(RUST_FUNDING_EVENT_NS + 1_000_000),
+            None,
+        ])),
+        Arc::new(UInt64Array::from(vec![
+            RUST_FUNDING_EVENT_NS,
+            RUST_FUNDING_EVENT_NS + 103,
+        ])),
+        Arc::new(UInt64Array::from(vec![
+            RUST_FUNDING_INIT_NS,
+            RUST_FUNDING_INIT_NS + 103,
+        ])),
+    ];
+    if case == "extra_economic_column" {
+        fields.push(Field::new("account_fee_rate", DataType::UInt64, false));
+        columns.push(Arc::new(UInt64Array::from(vec![100, 100])));
+    }
+    RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, metadata)),
+        columns,
+    )
+    .unwrap()
+}
+
+fn write_rust_legacy_funding(source: &Path, case: &str) {
+    let path_id = if case == "wrong_path_id" {
+        "TRUMP-USDT-SWAP.OKX"
+    } else {
+        RUST_FUNDING_ID
+    };
+    let path = source
+        .join("data/funding_rate_update")
+        .join(path_id)
+        .join("funding.parquet");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let batch = rust_legacy_funding_batch(case);
+    let mut writer =
+        ArrowWriter::try_new(fs::File::create(path).unwrap(), batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+#[rstest]
+fn migration_preserves_rust_funding_decimal_interval_null_and_nanoseconds() {
+    let temporary = TempDir::new().unwrap();
+    let source = temporary.path().join("source");
+    let target = temporary.path().join("destination");
+    write_rust_legacy_funding(&source, "valid");
+    let original = catalog_files(&source);
+    let dry = migrate_parquet_catalog(config(&source, &target, true)).unwrap();
+    assert_eq!(dry.total_leaf_files, 1);
+    assert!(!target.exists());
+    let report = migrate_parquet_catalog(config(&source, &target, false)).unwrap();
+    assert_eq!(report.migrated_files, 1);
+    assert_eq!(report.migrated_rows, 2);
+    let mut catalog = ParquetDataCatalog::new(&target, None, None, None, None);
+    let actual = catalog
+        .query::<nautilus_model::data::FundingRateUpdate>(None, None, None, None, None, true)
+        .unwrap();
+    // FundingRateUpdate::PartialEq omits timestamps: compare the full serialized
+    // native records so ts_event/ts_init and next funding ns cannot go untested.
+    let expected = serde_json::json!([
+        {"type":"FundingRateUpdate","instrument_id":RUST_FUNDING_ID,
+         "rate":"-0.0000123456789012345678901234","interval":65_535,
+         "next_funding_ns":RUST_FUNDING_EVENT_NS + 1_000_000,
+         "ts_event":RUST_FUNDING_EVENT_NS,"ts_init":RUST_FUNDING_INIT_NS},
+        {"type":"FundingRateUpdate","instrument_id":RUST_FUNDING_ID,
+         "rate":"0.0000000000000000000000000001","interval":null,"next_funding_ns":null,
+         "ts_event":RUST_FUNDING_EVENT_NS + 103,"ts_init":RUST_FUNDING_INIT_NS + 103}
+    ]);
+    assert_eq!(serde_json::to_value(&actual).unwrap(), expected);
+    assert_eq!(catalog_files(&source), original);
+}
+
+#[rstest]
+#[case("interval_overflow")]
+#[case("invalid_rate")]
+#[case("wrong_row_id")]
+#[case("wrong_metadata_id")]
+#[case("wrong_path_id")]
+#[case("wrong_namespace")]
+#[case("extra_economic_column")]
+fn migration_rejects_rust_funding_semantic_loss(#[case] case: &str) {
+    let temporary = TempDir::new().unwrap();
+    let source = temporary.path().join("source");
+    let target = temporary.path().join("destination");
+    write_rust_legacy_funding(&source, case);
+    let original = catalog_files(&source);
+    let failure = migrate_parquet_catalog(config(&source, &target, false)).unwrap_err();
+    assert!(!failure.to_string().is_empty());
+    assert_eq!(catalog_files(&source), original);
+    // Values are validated while each source file is read. This one-file
+    // fixture produces no native rows; do not invent all-catalog transactionality.
+    if target.exists() {
+        assert!(catalog_files(&target).is_empty());
+    }
 }

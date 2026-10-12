@@ -464,6 +464,7 @@ pub fn prepare_migration_parts(
         BTreeMap::new();
 
     for batch in batches {
+        verify_legacy_rust_funding_identity(file, &batch)?;
         for (identifier, source, batch) in split_batch_by_identifier(file, batch)? {
             if batch.num_rows() == 0 {
                 continue;
@@ -972,6 +973,59 @@ fn schema_conflicts(files: &[PlannedMigrationFile]) -> Vec<SchemaConflict> {
             })
         })
         .collect()
+}
+
+// The former Rust FundingRateUpdate writer carried the same single-instrument
+// identity in rows, metadata and the catalog path. Validate it before current
+// schema projection removes its redundant instrument_id column.
+fn verify_legacy_rust_funding_identity(
+    file: &PlannedMigrationFile,
+    batch: &RecordBatch,
+) -> anyhow::Result<()> {
+    if file.target_type_name != "funding_rates"
+        || file.source_type_name != "funding_rate_update"
+        || batch.column_by_name(KEY_INSTRUMENT_ID).is_none()
+    {
+        return Ok(());
+    }
+    let schema = batch.schema();
+    let metadata_id = schema.metadata().get(KEY_INSTRUMENT_ID).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Legacy Rust funding file {} has no instrument_id metadata",
+            file.path
+        )
+    })?;
+    let path_id = record_identifier_from_path(&file.relative_path, &file.source_type_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Legacy Rust funding file {} has no path identifier",
+                file.path
+            )
+        })?;
+    anyhow::ensure!(
+        !metadata_id.is_empty() && metadata_id == &path_id,
+        "Legacy Rust funding metadata/path identifiers differ in {}",
+        file.path,
+    );
+    for name in [KEY_INSTRUMENT_ID, KEY_IDENTIFIER] {
+        let Some(column) = batch.column_by_name(name) else {
+            continue;
+        };
+        let column = StringColumnRef::try_from_array(column.as_ref()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Legacy Rust funding identity {name} is not string-like in {}",
+                file.path
+            )
+        })?;
+        for row in 0..batch.num_rows() {
+            anyhow::ensure!(
+                column.value_opt(row) == Some(metadata_id.as_str()),
+                "Legacy Rust funding row/metadata/path identifiers differ in {} at row {row}",
+                file.path,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn split_batch_by_identifier(

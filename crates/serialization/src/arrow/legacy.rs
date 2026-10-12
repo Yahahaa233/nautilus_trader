@@ -1033,6 +1033,19 @@ const LEGACY_SCHEMA_FAMILIES: &[(&[&str], LegacySchemaFields)] = &[
             ("ts_init", LegacyFieldType::UInt64, false),
         ],
     ),
+    // Released Rust catalogs used string decimals and UInt64 intervals, with
+    // an explicit row instrument_id in addition to schema/path identity.
+    (
+        &["FundingRateUpdate"],
+        &[
+            ("instrument_id", LegacyFieldType::Utf8, false),
+            ("rate", LegacyFieldType::Utf8, false),
+            ("interval", LegacyFieldType::UInt64, true),
+            ("next_funding_ns", LegacyFieldType::UInt64, true),
+            ("ts_event", LegacyFieldType::UInt64, false),
+            ("ts_init", LegacyFieldType::UInt64, false),
+        ],
+    ),
     (
         &["FundingRateUpdate"],
         &[
