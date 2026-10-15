@@ -229,6 +229,7 @@ pub enum BootError {
 pub struct HaltSignal {
     halted: Arc<AtomicBool>,
     reason: Arc<Mutex<Option<HaltReason>>>,
+    transport_failure: nautilus_core::transmission::TransmissionVetoSource,
 }
 
 impl Default for HaltSignal {
@@ -241,10 +242,23 @@ impl HaltSignal {
     /// Constructs a fresh, un-fired halt signal.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_transport_failure(nautilus_core::transmission::TransmissionVetoSource::default())
+    }
+
+    fn with_transport_failure(
+        transport_failure: nautilus_core::transmission::TransmissionVetoSource,
+    ) -> Self {
         Self {
             halted: Arc::new(AtomicBool::new(false)),
             reason: Arc::new(Mutex::new(None)),
+            transport_failure,
         }
+    }
+
+    // Backtest reset may re-arm the run-local flag. It must not detach a
+    // transport observer bound during assembly or revive a failed Live process.
+    fn rearm(&self) -> Self {
+        Self::with_transport_failure(self.transport_failure.clone())
     }
 
     /// Returns the [`HaltCallback`] the writer fires when an unrecoverable condition
@@ -258,12 +272,14 @@ impl HaltSignal {
     pub fn callback(&self) -> HaltCallback {
         let halted = Arc::clone(&self.halted);
         let reason = Arc::clone(&self.reason);
+        let transport_failure = self.transport_failure.clone();
         Arc::new(move |r| {
             let mut slot = reason.lock();
             if slot.is_none() {
                 *slot = Some(r);
             }
             drop(slot);
+            transport_failure.latch();
             halted.store(true, Ordering::Release);
         })
     }
@@ -272,6 +288,13 @@ impl HaltSignal {
     #[must_use]
     pub fn is_halted(&self) -> bool {
         self.halted.load(Ordering::Acquire)
+    }
+
+    /// Read-only irreversible transport failure, stable across run re-arming.
+    /// The observer cannot change the halt reason or clear failure.
+    #[must_use]
+    pub fn transmission_veto(&self) -> nautilus_core::transmission::TransmissionVeto {
+        self.transport_failure.observer()
     }
 
     /// Returns the [`HaltReason`] recorded on the first fail-stop, if any.
@@ -789,7 +812,9 @@ impl EventStoreLifecycle {
         // Re-arm the fail-stop signal: a halt is terminal for the run that fired it,
         // not for the kernel. A stale signal fails the rerun's boot or opens it
         // permanently halted, downgrading its graceful stop to CrashedRecovered.
-        self.halt = HaltSignal::new();
+        // Preserve the assembly-time transport observer across the first open
+        // and reruns. Re-arming a research run never revives a failed Live gate.
+        self.halt = self.halt.rearm();
 
         let clock = Self::clock_for(environment);
         let start_ts_init = self.clock.borrow().timestamp_ns();
@@ -961,6 +986,13 @@ impl EventStoreLifecycle {
     #[must_use]
     pub fn is_halted(&self) -> bool {
         self.halt.is_halted()
+    }
+
+    /// Process-private observation of this lifecycle's actual native failures.
+    /// It only vetoes transport and cannot be restored from a durable receipt.
+    #[must_use]
+    pub fn transmission_veto(&self) -> nautilus_core::transmission::TransmissionVeto {
+        self.halt.transmission_veto()
     }
 
     /// Returns the [`HaltReason`] recorded on the first fail-stop, if any.
@@ -1994,11 +2026,20 @@ mod tests {
     #[rstest]
     fn halt_signal_callback_records_first_reason() {
         let signal = HaltSignal::new();
+        let gate = nautilus_core::transmission::TransmissionGate::default();
+        assert!(gate.bind_veto(signal.transmission_veto()));
+        let queued = gate.capture();
+        assert!(queued.can_transmit());
         let cb = signal.callback();
-        cb(HaltReason::BackendDisk("ENOSPC".to_string()));
-        cb(HaltReason::BackendError("second".to_string()));
+        std::thread::spawn(move || cb(HaltReason::BackendDisk("ENOSPC".to_string())))
+            .join()
+            .unwrap();
+        signal.callback()(HaltReason::BackendError("second".to_string()));
 
         assert!(signal.is_halted());
+        assert!(!queued.can_transmit());
+        gate.invalidate();
+        assert!(!gate.capture().can_transmit());
         match signal.reason() {
             Some(HaltReason::BackendDisk(msg)) => assert!(msg.contains("ENOSPC")),
             other => panic!("expected first reason BackendDisk, was {other:?}"),
@@ -3294,6 +3335,11 @@ mod tests {
         )
         .expect("boot store");
 
+        let gate = nautilus_core::transmission::TransmissionGate::default();
+        assert!(gate.bind_veto(store.transmission_veto()));
+        let before_open = gate.capture();
+        assert!(before_open.can_transmit());
+
         store
             .open(
                 instance_id,
@@ -3302,9 +3348,14 @@ mod tests {
             )
             .expect("open first run");
         let run_one = store.run_id().expect("run one open").to_string();
+        assert!(
+            before_open.can_transmit(),
+            "first open keeps its assembly binding"
+        );
 
         store.halt.callback()(HaltReason::BackendDisk("ENOSPC".to_string()));
         assert!(store.halt.is_halted());
+        assert!(!before_open.can_transmit());
 
         store
             .open(
@@ -3318,6 +3369,16 @@ mod tests {
         assert_ne!(run_one, run_two);
         assert!(!store.halt.is_halted(), "open must re-arm the halt signal");
         assert!(store.halt.reason().is_none());
+        assert!(
+            gate.bind_veto(store.transmission_veto()),
+            "same lifecycle source survives rearm"
+        );
+        gate.invalidate();
+        assert!(!before_open.can_transmit());
+        assert!(
+            !gate.capture().can_transmit(),
+            "rerun must not revive failed transport"
+        );
 
         drop(store);
         let manifests =
