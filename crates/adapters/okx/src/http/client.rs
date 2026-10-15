@@ -648,6 +648,131 @@ mod tests {
     }
 
     #[rstest]
+    #[case("/api/v5/trade/amend-order")]
+    #[case("/api/v5/trade/amend-batch-orders")]
+    #[case("/api/v5/trade/cancel-batch-orders")]
+    #[case("/api/v5/trade/cancel-algos")]
+    #[case("/api/v5/trade/cancel-advance-algos")]
+    #[case("/api/v5/sprd/cancel-order")]
+    #[case("/api/v5/sprd/mass-cancel")]
+    #[tokio::test]
+    async fn test_ambiguous_amend_cancel_is_sent_once(
+        #[case] path: &str,
+        #[values(503, 429, 200)] status: u16,
+    ) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = axum::Router::new().fallback(move || {
+            let calls = observed.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    axum::Json(serde_json::json!({"code":"50013", "msg":"System busy", "data":[]})),
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OKXRawHttpClient::new(
+            Some(format!("http://{address}")),
+            5,
+            3,
+            1,
+            1,
+            OKXEnvironment::Live,
+            None,
+        )
+        .unwrap();
+        let error = client
+            .send_request::<serde_json::Value, ()>(
+                Method::POST,
+                path,
+                None,
+                Some(
+                    serde_json::to_vec(
+                        &serde_json::json!({"instId":"BTC-USDT-SWAP", "ordId":"original-order"}),
+                    )
+                    .unwrap(),
+                ),
+                false,
+            )
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(
+            error.is_retryable(),
+            "the response must exercise the transient retry gate"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an unknown mutation must not be replayed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_retries_still_reach_a_successful_response() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = axum::Router::new().fallback(move || {
+            let calls = observed.clone();
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(
+                            serde_json::json!({"code":"50013", "msg":"System busy", "data":[]}),
+                        ),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({"code":"0", "msg":"", "data":[]})),
+                    )
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OKXRawHttpClient::new(
+            Some(format!("http://{address}")),
+            5,
+            3,
+            1,
+            1,
+            OKXEnvironment::Live,
+            None,
+        )
+        .unwrap();
+        let result = client
+            .send_request::<serde_json::Value, ()>(
+                Method::GET,
+                "/api/v5/trade/orders-pending",
+                None,
+                None,
+                false,
+            )
+            .await;
+        server.abort();
+        assert!(
+            result.is_ok(),
+            "a safe read must retain its transient retry policy"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[rstest]
     #[case("BTC-USD")]
     #[case("BTC-USD-241217")]
     #[case("BTC-USD-241217-92000")]
@@ -1426,7 +1551,7 @@ impl OKXRawHttpClient {
 
         // Retry strategy based on OKX error responses and HTTP status codes:
         //
-        // 1. Network errors: always retry (transient connection issues)
+        // 1. Network errors on replay-safe requests: retry transient connection issues
         // 2. Undecoded HTTP 5xx/429: server errors and rate limiting should be retried
         // 3. OKX specific retryable error codes (defined in common::consts)
         //
@@ -1438,8 +1563,8 @@ impl OKXRawHttpClient {
         // already have filled and freed the client order ID. Retrying could then
         // place a second live order, so submits are sent once and an ambiguous
         // outcome is left for stream updates and reconciliation to resolve.
-        // Algo amendments also run once: a retry can reject after an earlier
-        // attempt applied and the order triggered, leaving the original outcome ambiguous.
+        // Amendments and cancellations also run once: a retry can reject after
+        // an earlier attempt applied, leaving that original outcome ambiguous.
         let is_order_mutation = method == Method::POST
             && matches!(
                 path,
@@ -1447,7 +1572,15 @@ impl OKXRawHttpClient {
                     | "/api/v5/trade/batch-orders"
                     | "/api/v5/trade/order-algo"
                     | "/api/v5/trade/amend-algos"
+                    | "/api/v5/trade/amend-order"
+                    | "/api/v5/trade/amend-batch-orders"
+                    | "/api/v5/trade/cancel-order"
+                    | "/api/v5/trade/cancel-batch-orders"
+                    | "/api/v5/trade/cancel-algos"
+                    | "/api/v5/trade/cancel-advance-algos"
                     | "/api/v5/sprd/order"
+                    | "/api/v5/sprd/cancel-order"
+                    | "/api/v5/sprd/mass-cancel"
             );
         let should_retry = |error: &OKXHttpError| !is_order_mutation && error.is_retryable();
 

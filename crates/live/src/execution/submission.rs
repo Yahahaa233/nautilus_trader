@@ -46,7 +46,9 @@ pub enum SubmissionRecoveryPolicy {
     /// Selects local resolution using the existing timeout and missing-order policies.
     #[default]
     ResolveLocally,
-    /// Retains unacknowledged orders without further automatic per-order recovery queries.
+    /// Retains unacknowledged submissions and pending modification/cancellation commands
+    /// without restarting their exhausted automatic per-order recovery queries.
+    /// Only subsequent native outcomes or definitive venue evidence can resolve their state.
     RetainUnresolved,
 }
 

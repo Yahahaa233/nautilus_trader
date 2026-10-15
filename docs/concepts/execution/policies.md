@@ -154,6 +154,11 @@ That list is not a complete census. The
 the checked HTTP gates.
 :::
 
+This fork sends the named OKX trade and spread submit, amend, cancel, and mass-cancel HTTP POSTs
+once, including batch and algorithmic-order endpoints. Transient failure keeps the original
+outcome unresolved; query GETs retain their retry policy. This change does not establish
+conformance for other adapter transports or endpoints.
+
 #### Outcome
 
 Whether a failure is safe to retry is separate from the venue outcome. A failure can be safe to
@@ -263,8 +268,12 @@ The `submission_recovery_policy` setting defaults to `SubmissionRecoveryPolicy::
 With `SubmissionRecoveryPolicy::RetainUnresolved`, orders that have never been accepted retain their
 unacknowledged state after recovery exhaustion, including a pending cancel or update. The Polymarket
 client requires this behavior regardless of the configured policy. Automatic per-order recovery
-queries stop, but later venue events and reports can still resolve the order. Already accepted orders
-continue to use the local resolution rules above.
+queries stop, but later venue events and reports can still resolve the order. The configured
+`RetainUnresolved` policy also preserves already accepted orders in `PENDING_UPDATE` or
+`PENDING_CANCEL` after their command query budget is exhausted. Their pending state and budget
+survive native manager checkpoints; duplicate registration does not restart the budget. Shutdown
+reports these pending commands as unresolved. Accepted orders without a pending command continue
+to use the local missing-order resolution rules above.
 
 :::warning[Local terminal state is not venue confirmation]
 The first row is backed by an explicit venue status. The remaining rows restore a terminal local

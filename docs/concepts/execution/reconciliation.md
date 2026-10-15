@@ -377,6 +377,12 @@ budget until acknowledgement. Exhausted unacknowledged submissions remain unreso
 automatic per-order recovery queries stopped. Clients can also require this protection independently
 of the configured policy. Polymarket enables this protection automatically.
 
+The configured `RetainUnresolved` policy also retains an already accepted order's pending modify
+or cancel command after query exhaustion. An exhausted budget is not restarted by duplicate
+registration or a missing-order query result. The original pending state and query counters use
+the existing manager checkpoint. Subsequent native or venue outcomes can still resolve the order.
+These pending commands are included in the node's unresolved shutdown result.
+
 Retained submissions also affect the [node shutdown result](../live.md#submission-recovery-at-shutdown).
 Rust `LiveNode::stop` and `run`, and hosted runs, report unresolved client order IDs after teardown
 when submission recovery is incomplete at the `delay_post_stop` boundary. This includes Polymarket

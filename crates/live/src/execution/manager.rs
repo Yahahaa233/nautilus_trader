@@ -511,6 +511,18 @@ impl ExecutionManager {
     pub fn register_inflight(&mut self, client_order_id: ClientOrderId) {
         self.confirm_submission_outcome(&client_order_id);
 
+        if self.config.submission_recovery_policy == SubmissionRecoveryPolicy::RetainUnresolved
+            && self.order_inflight_checks.contains_key(&client_order_id)
+            && self.get_order(client_order_id).is_some_and(|order| {
+                matches!(
+                    order.status(),
+                    OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                )
+            })
+        {
+            return;
+        }
+
         if self.submission_recovery_pending(client_order_id)
             && (self.order_inflight_checks.contains_key(&client_order_id)
                 || self.submission_is_retained(client_order_id))
@@ -632,11 +644,23 @@ impl ExecutionManager {
     /// see it as dead code.
     #[cfg(feature = "node")]
     pub(crate) fn unresolved_submission_ids(&self) -> Vec<ClientOrderId> {
-        self.submissions
+        let mut unresolved: IndexSet<_> = self
+            .submissions
             .keys()
             .copied()
             .filter(|client_order_id| self.submission_recovery_pending(*client_order_id))
-            .collect()
+            .collect();
+        if self.config.submission_recovery_policy == SubmissionRecoveryPolicy::RetainUnresolved {
+            unresolved.extend(self.order_inflight_checks.keys().copied().filter(|id| {
+                self.get_order(*id).is_some_and(|order| {
+                    matches!(
+                        order.status(),
+                        OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                    )
+                })
+            }));
+        }
+        unresolved.into_iter().collect()
     }
 
     /// Retires submission recovery after a native outcome has been applied.
@@ -2073,8 +2097,9 @@ impl ExecutionManager {
     ///
     /// For retries below `inflight_max_retries`, generates `QueryOrder` commands to poll
     /// the venue for the order's current status. At max retries, generates terminal events
-    /// (rejection or cancellation) based on the order's status. Orders never accepted are
-    /// retained when the recovery policy or their client requires definitive venue evidence.
+    /// (rejection or cancellation) based on the order's status. The retain-unresolved policy
+    /// preserves both unacknowledged submissions and pending modification/cancellation commands.
+    /// A timeout alone does not establish any of these commands' venue outcomes.
     pub fn check_inflight_orders(&mut self) -> InflightCheckResult {
         let mut result = InflightCheckResult::default();
         let now = nautilus_common::recovery_trace::scope::effective_activity_instant();
@@ -2104,6 +2129,23 @@ impl ExecutionManager {
             }
 
             if self.order_query_pending.contains(&client_order_id) {
+                continue;
+            }
+
+            let retain_pending_command = self.config.submission_recovery_policy
+                == SubmissionRecoveryPolicy::RetainUnresolved
+                && self.get_order(client_order_id).is_some_and(|order| {
+                    matches!(
+                        order.status(),
+                        OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                    )
+                });
+            if retain_pending_command
+                && self
+                    .order_inflight_checks
+                    .get(&client_order_id)
+                    .is_some_and(|check| check.retry_count >= self.config.inflight_max_retries)
+            {
                 continue;
             }
 
@@ -2151,6 +2193,12 @@ impl ExecutionManager {
                             }
                         }
                         OrderStatus::PendingUpdate | OrderStatus::PendingCancel => {
+                            if retain_pending_command {
+                                log::warn!(
+                                    "Command recovery exhausted for {client_order_id}, retaining pending command until venue evidence"
+                                );
+                                continue;
+                            }
                             // Generate cancellation for orders stuck in pending modify/cancel
                             result
                                 .events
@@ -2532,8 +2580,19 @@ impl ExecutionManager {
 
             // A positive report, including one mapped by venue order ID, is proof the venue
             // still knows the order: reset the missing-order ladder so only consecutive misses
-            // accumulate (mirrors the Python engine's per-report clear).
-            self.order_recon_retries.shift_remove(&client_order_id);
+            // accumulate. A still-pending retained command needs its own definitive outcome;
+            // merely seeing the original open order must not restart that command's budget.
+            let pending_command = self.config.submission_recovery_policy
+                == SubmissionRecoveryPolicy::RetainUnresolved
+                && self.get_order(client_order_id).is_some_and(|order| {
+                    matches!(
+                        order.status(),
+                        OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                    )
+                });
+            if !pending_command {
+                self.order_recon_retries.shift_remove(&client_order_id);
+            }
         }
 
         let mut events = Vec::new();
@@ -3728,6 +3787,16 @@ impl ExecutionManager {
         if self.submission_is_retained(client_order_id) {
             return None;
         }
+        if self.config.submission_recovery_policy == SubmissionRecoveryPolicy::RetainUnresolved
+            && matches!(
+                order.status(),
+                OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+            )
+            && self.recon_check_retry_count(&client_order_id)
+                >= self.config.open_check_missing_retries
+        {
+            return None;
+        }
 
         // The order may have closed while the report request was in flight;
         // the check must come before the retry increment or the stale empty
@@ -3849,7 +3918,10 @@ impl ExecutionManager {
                     order.status()
                 );
 
-                if self.submission_recovery_pending(client_order_id) {
+                if self.submission_recovery_pending(client_order_id)
+                    || self.config.submission_recovery_policy
+                        == SubmissionRecoveryPolicy::RetainUnresolved
+                {
                     return events;
                 }
 
@@ -6902,6 +6974,174 @@ mod tests {
         assert_eq!(
             manager.order_query_pending.contains(&client_order_id),
             expect_inflight,
+        );
+    }
+
+    #[rstest]
+    #[case(OrderStatus::PendingUpdate)]
+    #[case(OrderStatus::PendingCancel)]
+    fn test_retain_unresolved_pending_command_never_fabricates_cancellation(
+        #[case] pending_status: OrderStatus,
+        #[values(false, true)] retain: bool,
+    ) {
+        let id = ClientOrderId::from("O-UNKNOWN-COMMAND");
+        let venue_id = VenueOrderId::from("V-UNKNOWN-COMMAND");
+        let account = AccountId::from("TEST-001");
+        let instrument = crypto_perpetual_ethusdt().id();
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        clock.borrow().set_time(UnixNanos::from(1_000u64));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        insert_accepted_limit_order(&cache, id, venue_id, instrument, ClientId::from("TEST"));
+        let order = cache.borrow().order_owned(&id).unwrap();
+        let pending = match pending_status {
+            OrderStatus::PendingUpdate => OrderEventAny::PendingUpdate(
+                OrderPendingUpdateSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(instrument)
+                    .client_order_id(id)
+                    .account_id(account)
+                    .venue_order_id(venue_id)
+                    .build(),
+            ),
+            OrderStatus::PendingCancel => OrderEventAny::PendingCancel(
+                OrderPendingCancelSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(instrument)
+                    .client_order_id(id)
+                    .account_id(account)
+                    .venue_order_id(venue_id)
+                    .build(),
+            ),
+            _ => unreachable!(),
+        };
+        cache.borrow_mut().update_order(&pending).unwrap();
+        let config = ExecutionManagerConfig {
+            inflight_threshold_ms: 100,
+            inflight_max_retries: 1,
+            open_check_missing_retries: 1,
+            open_check_open_only: false,
+            submission_recovery_policy: if retain {
+                SubmissionRecoveryPolicy::RetainUnresolved
+            } else {
+                SubmissionRecoveryPolicy::ResolveLocally
+            },
+            ..Default::default()
+        };
+        let mut manager =
+            ExecutionManager::new(clock.clone(), cache.clone(), config.clone()).unwrap();
+        manager.register_inflight(id);
+        manager
+            .order_inflight_checks
+            .get_mut(&id)
+            .unwrap()
+            .submitted_at = dst::time::Instant::now() - Duration::from_secs(1);
+        let result = manager.check_inflight_orders();
+        assert!(result.queries.is_empty());
+        if !retain {
+            assert!(matches!(
+                result.events.as_slice(),
+                [OrderEventAny::Canceled(_)]
+            ));
+            assert!(!manager.order_inflight_checks.contains_key(&id));
+            return;
+        }
+        assert!(result.events.is_empty());
+        assert_eq!(cache.borrow().order(&id).unwrap().status(), pending_status);
+        assert_eq!(manager.order_inflight_checks[&id].retry_count, 1);
+        manager.register_inflight(id);
+        assert_eq!(manager.order_inflight_checks[&id].retry_count, 1);
+        #[cfg(feature = "node")]
+        assert_eq!(manager.unresolved_submission_ids(), vec![id]);
+        assert!(manager.resolve_missing_order(id).is_empty());
+        assert!(manager.prepare_missing_order_query(id).is_none());
+        for _ in 0..3 {
+            let result = manager.check_inflight_orders();
+            assert!(result.events.is_empty() && result.queries.is_empty());
+            assert_eq!(manager.order_inflight_checks[&id].retry_count, 1);
+        }
+        let report = OrderStatusReport::new(
+            account,
+            instrument,
+            Some(id),
+            venue_id,
+            OrderSide::Buy.into(),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Accepted,
+            Quantity::from("10.0"),
+            Quantity::from("0.0"),
+            UnixNanos::from(1_000),
+            UnixNanos::from(1_000),
+            UnixNanos::from(1_000),
+            None,
+        )
+        .with_price(Price::from("100.0"));
+        let check = manager.prepare_open_order_report_check(UUID4::new(), &[]);
+        let result = manager.reconcile_open_order_reports(
+            &check,
+            vec![SourcedOrderStatusReport {
+                client_id: ClientId::from("TEST"),
+                report,
+            }],
+            &IndexSet::from([ClientId::from("TEST")]),
+            &IndexSet::new(),
+            &[],
+        );
+        assert!(result.events.is_empty() && result.targeted_queries.is_empty());
+        assert_eq!(manager.recon_check_retry_count(&id), 1);
+        assert_eq!(cache.borrow().order(&id).unwrap().status(), pending_status);
+        // The existing native manager checkpoint retains the exhausted command
+        // without adding another recovery namespace or restarting its budget.
+        #[cfg(all(feature = "node", feature = "dispatch-observer"))]
+        {
+            let snapshot = manager
+                .checkpoint_inventory(dst::time::Instant::now())
+                .unwrap();
+            let mut restored = ExecutionManager::new(clock, cache.clone(), config).unwrap();
+            restored
+                .restore_checkpoint_inventory_at(&snapshot, 0, dst::time::Instant::now())
+                .unwrap();
+            let result = restored.check_inflight_orders();
+            assert!(result.events.is_empty() && result.queries.is_empty());
+            assert_eq!(restored.order_inflight_checks[&id].retry_count, 1);
+            manager = restored;
+        }
+        let current = cache.borrow().order_owned(&id).unwrap();
+        let outcome = if pending_status == OrderStatus::PendingCancel {
+            TestOrderEventStubs::canceled(&current, account, Some(venue_id))
+        } else {
+            OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .trader_id(current.trader_id())
+                    .strategy_id(current.strategy_id())
+                    .instrument_id(instrument)
+                    .client_order_id(id)
+                    .account_id(account)
+                    .venue_order_id(venue_id)
+                    .quantity(current.quantity())
+                    .price(Price::from("101.0"))
+                    .build(),
+            )
+        };
+        cache.borrow_mut().update_order(&outcome).unwrap();
+        manager
+            .order_inflight_checks
+            .get_mut(&id)
+            .unwrap()
+            .last_query_at = Some(dst::time::Instant::now() - Duration::from_secs(1));
+        assert!(manager.check_inflight_orders().events.is_empty());
+        assert!(!manager.order_inflight_checks.contains_key(&id));
+        #[cfg(feature = "node")]
+        assert!(manager.unresolved_submission_ids().is_empty());
+        assert_eq!(
+            cache.borrow().order(&id).unwrap().status(),
+            if pending_status == OrderStatus::PendingCancel {
+                OrderStatus::Canceled
+            } else {
+                OrderStatus::Accepted
+            }
         );
     }
 
