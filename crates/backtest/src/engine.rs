@@ -85,7 +85,18 @@ use crate::{
 /// The completed callback runs once after all input items at a timestamp and
 /// native timer, funding, and liquidation settlement. It cannot see next data.
 pub trait ReplayTimestampObserver {
+    /// Observes data after delivery and settlement.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error encountered by the observer while processing settled data.
     fn on_data_settled(&mut self, data: &Data) -> anyhow::Result<()>;
+
+    /// Observes a completed timestamp after native settlement.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error encountered by the observer while completing the timestamp.
     fn on_timestamp_complete(
         &mut self,
         engine: &mut BacktestEngine,
@@ -215,6 +226,10 @@ impl BacktestEngine {
     }
 
     /// Installs the explicit research observer before a run. Legacy default is None.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a run has begun or an observer is already installed.
     pub fn set_replay_timestamp_observer(
         &mut self,
         observer: Rc<RefCell<dyn ReplayTimestampObserver>>,
@@ -997,18 +1012,17 @@ impl BacktestEngine {
                 self.finalize_timestamp(&clocks, prev_last_ns, settlement_scope)?;
                 if !self.kernel.is_shutdown_requested()
                     && self.last_observer_ns != Some(prev_last_ns)
+                    && let Some(observer) = self.replay_observer.clone()
                 {
-                    if let Some(observer) = self.replay_observer.clone() {
-                        // No next input is exposed to the adapter. Any commands
-                        // submitted by the barrier are drained at this same time,
-                        // without recursively finalizing or invoking the barrier.
-                        self.last_observer_ns = Some(prev_last_ns);
-                        observer
-                            .borrow_mut()
-                            .on_timestamp_complete(self, prev_last_ns)?;
-                        self.drain_command_queues()?;
-                        self.settle_venues(prev_last_ns, settlement_scope)?;
-                    }
+                    // No next input is exposed to the adapter. Any commands
+                    // submitted by the barrier are drained at this same time,
+                    // without recursively finalizing or invoking the barrier.
+                    self.last_observer_ns = Some(prev_last_ns);
+                    observer
+                        .borrow_mut()
+                        .on_timestamp_complete(self, prev_last_ns)?;
+                    self.drain_command_queues()?;
+                    self.settle_venues(prev_last_ns, settlement_scope)?;
                 }
             }
 

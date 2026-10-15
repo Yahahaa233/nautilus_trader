@@ -14,7 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 //! Actual EXTERNAL-bar engine inventory; no internal pipeline is inferred empty.
-use super::*;
+use super::{BarType, ClientId, Context, DataEngine, DataEngineConfig, Venue};
 use anyhow::{Result, ensure};
 use std::collections::BTreeMap;
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -106,6 +106,9 @@ impl DataEngine {
     }
     /// Returns typed replay data only when actual owned internal pipelines are
     /// empty. A nonempty pipeline yields its exact family/count, never zero.
+    ///
+    /// # Errors
+    /// Returns an error if the current native configuration, subscriptions, routes, or codec state cannot be encoded.
     pub fn running_checkpoint_state(&self) -> Result<serde_json::Value> {
         let counts = self.checkpoint_subsystem_counts()?;
         let mut registered_stateless_helpers = BTreeMap::new();
@@ -178,6 +181,9 @@ impl DataEngine {
     }
     /// Installs counters only into the same actual routing/configuration before
     /// tail replay. Internal request/aggregation pipelines have no supported path.
+    ///
+    /// # Errors
+    /// Returns an error for invalid or changed source configuration, subscriptions, routes, or nonempty actual state.
     pub fn restore_running_checkpoint_state(&mut self, source: &serde_json::Value) -> Result<()> {
         let mut source: Snapshot = serde_json::from_value(source.clone())?;
         if source.profile == "native_data_engine_external_bars_no_internal_pipelines.v1" {
@@ -240,7 +246,16 @@ impl DataEngine {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use nautilus_common::{
+        cache::Cache,
+        messages::data::{RequestBars, RequestCommand},
+    };
+    use nautilus_core::{UUID4, UnixNanos};
+
     use super::*;
+    use crate::engine::futures::ContinuousFutureRoller;
     fn engine() -> DataEngine {
         DataEngine::new(
             Rc::new(RefCell::new(nautilus_common::clock::VirtualClock::new())),

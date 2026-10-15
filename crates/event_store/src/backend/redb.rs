@@ -157,7 +157,7 @@ impl StorageWriteEpoch {
             ));
         }
         *owner = Some(std::thread::current().id());
-        Ok(StorageWritePermit(self.clone()))
+        Ok(StorageWritePermit(Arc::clone(self)))
     }
 
     fn check_owned(&self) -> Result<(), EventStoreError> {
@@ -778,7 +778,7 @@ impl EventStore for RedbBackend {
             .map_err(|e| map_database_err(e.into()))?;
         let storage = OwnedStorageBackend {
             inner: FileBackend::new(file).map_err(map_database_err)?,
-            epoch: writes.clone(),
+            epoch: Arc::clone(&writes),
         };
         let db = Database::builder()
             .create_with_backend(storage)
@@ -867,34 +867,10 @@ impl EventStore for RedbBackend {
             return Ok(state.high_watermark);
         }
 
+        validate_append_sequence(state.high_watermark, entries)?;
+        #[cfg(test)]
         let entry_count = u64::try_from(entries.len())
             .map_err(|_| EventStoreError::Backend("native prefix batch count overflow".into()))?;
-        let first = state
-            .high_watermark
-            .checked_add(1)
-            .ok_or_else(|| EventStoreError::Backend("native prefix sequence exhausted".into()))?;
-        state
-            .high_watermark
-            .checked_add(entry_count)
-            .ok_or_else(|| {
-                EventStoreError::Backend("native prefix batch sequence exhausted".into())
-            })?;
-        for (offset, append) in entries.iter().enumerate() {
-            let offset = u64::try_from(offset)
-                .map_err(|_| EventStoreError::Backend("native prefix offset overflow".into()))?;
-            let expected = first.checked_add(offset).ok_or_else(|| {
-                EventStoreError::Backend("native prefix sequence offset exhausted".into())
-            })?;
-            if append.entry.seq != expected {
-                // Atomically rejected: surface the durable high-watermark, not the within-batch
-                // validation cursor, so callers that resync from this value never skip entries
-                // that were never committed.
-                return Err(EventStoreError::OutOfOrder {
-                    high_watermark: state.high_watermark,
-                    seq: append.entry.seq,
-                });
-            }
-        }
 
         if let Some(prefix) = &mut state.append_only_prefix {
             prefix.hashes.try_reserve(entries.len()).map_err(|e| {
@@ -915,34 +891,7 @@ impl EventStore for RedbBackend {
 
         crate::writer::mark_backend_phase(3);
         let db = state.db.read_write()?;
-        let txn = begin_immediate_write(db)?;
-        {
-            let mut entries_table = txn.open_table(ENTRIES_TABLE).map_err(map_table_err)?;
-            let mut client_table = txn.open_table(CLIENT_ORDER_INDEX).map_err(map_table_err)?;
-            let mut venue_table = txn.open_table(VENUE_ORDER_INDEX).map_err(map_table_err)?;
-
-            for (append, bytes) in entries.iter().zip(encoded.iter()) {
-                entries_table
-                    .insert(append.entry.seq, bytes.as_slice())
-                    .map_err(map_storage_err)?;
-
-                for IndexKey { kind, key } in &append.index_keys {
-                    let table = match kind {
-                        IndexKind::ClientOrderId => &mut client_table,
-                        IndexKind::VenueOrderId => &mut venue_table,
-                    };
-                    let already = table.get(key.as_str()).map_err(map_storage_err)?.is_some();
-
-                    if !already {
-                        table
-                            .insert(key.as_str(), append.entry.seq)
-                            .map_err(map_storage_err)?;
-                    }
-                }
-            }
-        }
-        crate::writer::mark_backend_phase(4);
-        txn.commit().map_err(map_commit_err)?;
+        commit_append_entries(db, entries, &encoded)?;
         crate::writer::mark_backend_phase(5);
 
         let mut max_ts = state.max_ts_init;
@@ -961,38 +910,7 @@ impl EventStore for RedbBackend {
         if state.append_only_prefix.is_some() {
             // No acknowledgment or cached hash is issued from the pre-commit draft.
             // Read the exact committed suffix once in one database transaction.
-            let result = (|| {
-                let txn = state.db.begin_read()?;
-                let table = txn.open_table(ENTRIES_TABLE).map_err(map_table_err)?;
-                let mut hashes = Vec::new();
-                hashes.try_reserve(entries.len()).map_err(|e| {
-                    EventStoreError::Backend(format!("native suffix capacity unavailable: {e}"))
-                })?;
-                for (append, expected_bytes) in entries.iter().zip(&encoded) {
-                    let value = table
-                        .get(append.entry.seq)
-                        .map_err(map_storage_err)?
-                        .ok_or_else(|| {
-                            EventStoreError::Backend("native committed suffix absent".into())
-                        })?;
-                    let bytes = value.value();
-                    if bytes != expected_bytes.as_slice() {
-                        return Err(EventStoreError::Backend(
-                            "native committed suffix bytes changed".into(),
-                        ));
-                    }
-                    let actual =
-                        codec::decode_from_slice::<EventStoreEntry>(bytes).map_err(|e| {
-                            EventStoreError::Corrupted(format!("native committed suffix: {e}"))
-                        })?;
-                    check_embedded_seq(append.entry.seq, &actual)?;
-                    if actual.recompute_hash() != actual.entry_hash {
-                        return Err(EventStoreError::HashMismatch { seq: actual.seq });
-                    }
-                    hashes.push(actual.entry_hash);
-                }
-                Ok(hashes)
-            })();
+            let result = verify_committed_suffix(state, entries, &encoded);
             match result {
                 Ok(hashes) => {
                     #[cfg(test)]
@@ -1286,6 +1204,108 @@ fn check_embedded_seq(seq: u64, entry: &EventStoreEntry) -> Result<(), EventStor
     Ok(())
 }
 
+fn verify_committed_suffix(
+    state: &RunState,
+    entries: &[AppendEntry],
+    encoded: &[Vec<u8>],
+) -> Result<Vec<EntryHash>, EventStoreError> {
+    let txn = state.db.begin_read()?;
+    let table = txn.open_table(ENTRIES_TABLE).map_err(map_table_err)?;
+    let mut hashes = Vec::new();
+    hashes.try_reserve(entries.len()).map_err(|e| {
+        EventStoreError::Backend(format!("native suffix capacity unavailable: {e}"))
+    })?;
+    for (append, expected_bytes) in entries.iter().zip(encoded) {
+        let value = table
+            .get(append.entry.seq)
+            .map_err(map_storage_err)?
+            .ok_or_else(|| EventStoreError::Backend("native committed suffix absent".into()))?;
+        let bytes = value.value();
+        if bytes != expected_bytes.as_slice() {
+            return Err(EventStoreError::Backend(
+                "native committed suffix bytes changed".into(),
+            ));
+        }
+        let actual = codec::decode_from_slice::<EventStoreEntry>(bytes)
+            .map_err(|e| EventStoreError::Corrupted(format!("native committed suffix: {e}")))?;
+        check_embedded_seq(append.entry.seq, &actual)?;
+        if actual.recompute_hash() != actual.entry_hash {
+            return Err(EventStoreError::HashMismatch { seq: actual.seq });
+        }
+        hashes.push(actual.entry_hash);
+    }
+    Ok(hashes)
+}
+
+fn validate_append_sequence(
+    high_watermark: u64,
+    entries: &[AppendEntry],
+) -> Result<(), EventStoreError> {
+    let entry_count = u64::try_from(entries.len())
+        .map_err(|_| EventStoreError::Backend("native prefix batch count overflow".into()))?;
+    let first = high_watermark
+        .checked_add(1)
+        .ok_or_else(|| EventStoreError::Backend("native prefix sequence exhausted".into()))?;
+    high_watermark
+        .checked_add(entry_count)
+        .ok_or_else(|| EventStoreError::Backend("native prefix batch sequence exhausted".into()))?;
+    for (offset, append) in entries.iter().enumerate() {
+        let offset = u64::try_from(offset)
+            .map_err(|_| EventStoreError::Backend("native prefix offset overflow".into()))?;
+        let expected = first.checked_add(offset).ok_or_else(|| {
+            EventStoreError::Backend("native prefix sequence offset exhausted".into())
+        })?;
+        if append.entry.seq != expected {
+            // Atomically rejected: surface the durable high-watermark, not the within-batch
+            // validation cursor, so callers that resync from this value never skip entries
+            // that were never committed.
+            return Err(EventStoreError::OutOfOrder {
+                high_watermark,
+                seq: append.entry.seq,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn commit_append_entries(
+    db: &Database,
+    entries: &[AppendEntry],
+    encoded: &[Vec<u8>],
+) -> Result<(), EventStoreError> {
+    let txn = begin_immediate_write(db)?;
+    {
+        let mut entries_table = txn.open_table(ENTRIES_TABLE).map_err(map_table_err)?;
+        let mut client_table = txn.open_table(CLIENT_ORDER_INDEX).map_err(map_table_err)?;
+        let mut venue_table = txn.open_table(VENUE_ORDER_INDEX).map_err(map_table_err)?;
+
+        for (append, bytes) in entries.iter().zip(encoded.iter()) {
+            entries_table
+                .insert(append.entry.seq, bytes.as_slice())
+                .map_err(map_storage_err)?;
+
+            for IndexKey { kind, key } in &append.index_keys {
+                let table = match kind {
+                    IndexKind::ClientOrderId => &mut client_table,
+                    IndexKind::VenueOrderId => &mut venue_table,
+                };
+                let already = table.get(key.as_str()).map_err(map_storage_err)?.is_some();
+
+                if !already {
+                    table
+                        .insert(key.as_str(), append.entry.seq)
+                        .map_err(map_storage_err)?;
+                }
+            }
+        }
+    }
+    crate::writer::mark_backend_phase(4);
+    txn.commit().map_err(map_commit_err)?;
+
+    Ok(())
+}
+
 fn begin_immediate_write(db: &Database) -> Result<WriteTransaction, EventStoreError> {
     let mut txn = db.begin_write().map_err(map_transaction_err)?;
     txn.set_durability(Durability::Immediate)
@@ -1408,9 +1428,9 @@ mod tests {
             schema_version: 1,
             crate_versions: "native-source".into(),
             feature_flags: Vec::new(),
-            adapter_versions: Default::default(),
+            adapter_versions: indexmap::IndexMap::default(),
             config_hash: "frozen-config".into(),
-            registered_components: Default::default(),
+            registered_components: crate::manifest::RegisteredComponents::default(),
             seed: None,
             start_ts_init: UnixNanos::from(0),
             end_ts_init: None,
@@ -1490,7 +1510,7 @@ mod tests {
                     .expect("file"),
             )
             .expect("actual FileBackend"),
-            epoch: epoch.clone(),
+            epoch: Arc::clone(&epoch),
         };
         let start = Bound::Included(1 << 62);
         let end = Bound::Excluded((1 << 62) + 1);
@@ -1846,10 +1866,10 @@ mod tests {
         epoch.armed.store(true, Ordering::SeqCst);
         let storage = Arc::new(OwnedStorageBackend {
             inner: FileBackend::new(file).expect("same locked FileBackend"),
-            epoch: epoch.clone(),
+            epoch: Arc::clone(&epoch),
         });
         let _permit = epoch.begin_owned(0).expect("legal current-thread scope");
-        let concurrent = storage.clone();
+        let concurrent = Arc::clone(&storage);
         std::thread::spawn(move || concurrent.write(0, b"changed!"))
             .join()
             .expect("owned thread")
@@ -1880,7 +1900,7 @@ mod tests {
                     .expect("file"),
             )
             .expect("locked FileBackend"),
-            epoch: epoch.clone(),
+            epoch: Arc::clone(&epoch),
         };
         assert!(storage.write(0, b"changed!").is_err());
         assert!(storage.set_len(0).is_err());
@@ -1894,7 +1914,7 @@ mod tests {
         let failed = Arc::new(StorageWriteEpoch::default());
         let storage = OwnedStorageBackend {
             inner: FileBackend::new(readonly).expect("same FileBackend lock"),
-            epoch: failed.clone(),
+            epoch: Arc::clone(&failed),
         };
         assert!(storage.write(0, b"changed!").is_err());
         assert!(storage.set_len(0).is_err());

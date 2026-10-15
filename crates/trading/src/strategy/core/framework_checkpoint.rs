@@ -13,9 +13,12 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Explicit actual StrategyCore profile. No clock read, UUID generation, event
+//! Explicit actual `StrategyCore` profile. No clock read, UUID generation, event
 //! dispatch, timer reset, transport call, or execution permission is performed.
-use super::*;
+use super::{
+    ActorId, Cache, ClientOrderId, Debug, StrategyConfig, StrategyCore, StrategyId, TraderId,
+    UUID4, Ustr,
+};
 use anyhow::{Context, Result, ensure};
 use nautilus_model::{enums::TimeInForce, orders::Order};
 use serde::{Deserialize, Serialize};
@@ -51,10 +54,16 @@ pub struct NativeStrategyFrameworkCheckpoint(FrameworkState);
 
 impl NativeStrategyFrameworkCheckpoint {
     /// Serializes these exact actual facts without recreating a restore capability.
+    ///
+    /// # Errors
+    /// Returns an error if the original framework state cannot be serialized.
     pub fn value(&self) -> Result<Value> {
         Ok(serde_json::to_value(&self.0)?)
     }
     /// Exact actual object comparison, with no time/random draw or mutation.
+    ///
+    /// # Errors
+    /// Returns an error if this actual strategy object differs from its frozen framework checkpoint.
     pub fn verify_current(&self, core: &StrategyCore) -> Result<()> {
         ensure!(
             core.native_framework_checkpoint()?.0 == self.0,
@@ -63,11 +72,17 @@ impl NativeStrategyFrameworkCheckpoint {
         Ok(())
     }
     /// Shape/cache validation only; this never reconstructs a restore receipt.
+    ///
+    /// # Errors
+    /// Returns an error for malformed source state or an invalid configuration, identity, cache association, or framework profile.
     pub fn validate_serialized(value: &Value, cache: &Cache) -> Result<()> {
         let state: FrameworkState = serde_json::from_value(value.clone())?;
         state.validate(cache)
     }
     /// Joins the original Core state to this same owner's frozen schedules.
+    ///
+    /// # Errors
+    /// Returns an error if source timers or callback identities do not match the original strategy owner.
     pub fn verify_timer_inventory(&self, inventory: &Value) -> Result<()> {
         self.0.verify_timers(inventory)
     }
@@ -161,6 +176,9 @@ impl FrameworkState {
 impl StrategyCore {
     /// Reads the limited complete Core profile from this actual registered object.
     /// This never samples time, generates an ID, dispatches, or changes lifecycle.
+    ///
+    /// # Errors
+    /// Returns an error if the registered strategy, native order managers, or timer bindings cannot establish a complete framework snapshot.
     pub fn native_framework_checkpoint(&self) -> Result<NativeStrategyFrameworkCheckpoint> {
         let factory = self
             .order_factory

@@ -62,6 +62,7 @@
 #[cfg(feature = "native-tail-replay")]
 use anyhow::Context;
 use nautilus_common::live::ingress::{FrozenIngress, IngressGate, IngressSender};
+use nautilus_common::recovery_trace::NativeInputSource;
 use std::{
     fmt::Debug,
     sync::{
@@ -288,13 +289,13 @@ impl Debug for AsyncRunner {
 /// constructed by an application and cannot replace the actual channel receivers.
 #[cfg(all(feature = "node", feature = "dispatch-observer"))]
 pub(crate) struct RunningReceivers<'a> {
-    pub time_evt_rx: &'a mut SnapshotReceiver<DispatchMessage<TimeEventMessage>>,
-    pub system_evt_rx: &'a mut SnapshotReceiver<DispatchMessage<SystemEvent>>,
-    pub system_cmd_rx: &'a mut SnapshotReceiver<DispatchMessage<SystemCommand>>,
-    pub exec_evt_rx: &'a mut SnapshotReceiver<DispatchMessage<ExecutionEvent>>,
-    pub exec_cmd_rx: &'a mut SnapshotReceiver<DispatchMessage<TradingCommandMessage>>,
-    pub data_evt_rx: &'a mut SnapshotReceiver<DispatchMessage<DataEvent>>,
-    pub data_cmd_rx: &'a mut SnapshotReceiver<DispatchMessage<DataCommand>>,
+    pub time_events: &'a mut SnapshotReceiver<DispatchMessage<TimeEventMessage>>,
+    pub system_events: &'a mut SnapshotReceiver<DispatchMessage<SystemEvent>>,
+    pub system_commands: &'a mut SnapshotReceiver<DispatchMessage<SystemCommand>>,
+    pub execution_events: &'a mut SnapshotReceiver<DispatchMessage<ExecutionEvent>>,
+    pub execution_commands: &'a mut SnapshotReceiver<DispatchMessage<TradingCommandMessage>>,
+    pub data_events: &'a mut SnapshotReceiver<DispatchMessage<DataEvent>>,
+    pub data_commands: &'a mut SnapshotReceiver<DispatchMessage<DataCommand>>,
 }
 
 #[cfg(all(feature = "node", feature = "dispatch-observer"))]
@@ -321,13 +322,13 @@ impl RunningReceivers<'_> {
                 }
             };
         }
-        capture!(time_evt_rx);
-        capture!(system_evt_rx);
-        capture!(system_cmd_rx);
-        capture!(exec_evt_rx);
-        capture!(exec_cmd_rx);
-        capture!(data_evt_rx);
-        capture!(data_cmd_rx);
+        capture!(time_events);
+        capture!(system_events);
+        capture!(system_commands);
+        capture!(execution_events);
+        capture!(execution_commands);
+        capture!(data_events);
+        capture!(data_commands);
         let state = nautilus_common::actor::capture_channel_contexts(&contexts)?;
         Ok(crate::runner_recovery::RunnerCallbackAncestry {
             profile: crate::runner_recovery::CALLBACK_ANCESTRY_PROFILE.into(),
@@ -338,35 +339,35 @@ impl RunningReceivers<'_> {
 
     pub(crate) fn reborrow(&mut self) -> RunningReceivers<'_> {
         RunningReceivers {
-            time_evt_rx: self.time_evt_rx,
-            system_evt_rx: self.system_evt_rx,
-            system_cmd_rx: self.system_cmd_rx,
-            exec_evt_rx: self.exec_evt_rx,
-            exec_cmd_rx: self.exec_cmd_rx,
-            data_evt_rx: self.data_evt_rx,
-            data_cmd_rx: self.data_cmd_rx,
+            time_events: self.time_events,
+            system_events: self.system_events,
+            system_commands: self.system_commands,
+            execution_events: self.execution_events,
+            execution_commands: self.execution_commands,
+            data_events: self.data_events,
+            data_commands: self.data_commands,
         }
     }
     #[cfg(feature = "native-tail-replay")]
     pub(crate) fn prepare_recovered_prefix_release(&mut self) -> anyhow::Result<()> {
-        self.time_evt_rx.prepare_recovered_prefix_release()?;
-        self.system_evt_rx.prepare_recovered_prefix_release()?;
-        self.system_cmd_rx.prepare_recovered_prefix_release()?;
-        self.exec_evt_rx.prepare_recovered_prefix_release()?;
-        self.exec_cmd_rx.prepare_recovered_prefix_release()?;
-        self.data_evt_rx.prepare_recovered_prefix_release()?;
-        self.data_cmd_rx.prepare_recovered_prefix_release()?;
+        self.time_events.prepare_recovered_prefix_release()?;
+        self.system_events.prepare_recovered_prefix_release()?;
+        self.system_commands.prepare_recovered_prefix_release()?;
+        self.execution_events.prepare_recovered_prefix_release()?;
+        self.execution_commands.prepare_recovered_prefix_release()?;
+        self.data_events.prepare_recovered_prefix_release()?;
+        self.data_commands.prepare_recovered_prefix_release()?;
         Ok(())
     }
     #[cfg(feature = "native-tail-replay")]
     pub(crate) fn release_recovered_prefix(&mut self) {
-        self.time_evt_rx.release_recovered_prefix();
-        self.system_evt_rx.release_recovered_prefix();
-        self.system_cmd_rx.release_recovered_prefix();
-        self.exec_evt_rx.release_recovered_prefix();
-        self.exec_cmd_rx.release_recovered_prefix();
-        self.data_evt_rx.release_recovered_prefix();
-        self.data_cmd_rx.release_recovered_prefix();
+        self.time_events.release_recovered_prefix();
+        self.system_events.release_recovered_prefix();
+        self.system_commands.release_recovered_prefix();
+        self.execution_events.release_recovered_prefix();
+        self.execution_commands.release_recovered_prefix();
+        self.data_events.release_recovered_prefix();
+        self.data_commands.release_recovered_prefix();
     }
     #[cfg(feature = "native-tail-replay")]
     pub(crate) fn native_pending_receipts(
@@ -388,13 +389,13 @@ impl RunningReceivers<'_> {
                 }
             };
         }
-        receipts!(time_evt_rx);
-        receipts!(system_evt_rx);
-        receipts!(system_cmd_rx);
-        receipts!(exec_evt_rx);
-        receipts!(exec_cmd_rx);
-        receipts!(data_evt_rx);
-        receipts!(data_cmd_rx);
+        receipts!(time_events);
+        receipts!(system_events);
+        receipts!(system_commands);
+        receipts!(execution_events);
+        receipts!(execution_commands);
+        receipts!(data_events);
+        receipts!(data_commands);
         Ok(pending)
     }
     #[cfg(feature = "native-tail-replay")]
@@ -421,13 +422,13 @@ impl RunningReceivers<'_> {
                 }
             };
         }
-        capture!(time_evt_rx, Time);
-        capture!(system_evt_rx, SystemEvent);
-        capture!(system_cmd_rx, SystemCommand);
-        capture!(exec_evt_rx, ExecutionEvent);
-        capture!(exec_cmd_rx, TradingCommand);
-        capture!(data_evt_rx, DataEvent);
-        capture!(data_cmd_rx, DataCommand);
+        capture!(time_events, Time);
+        capture!(system_events, SystemEvent);
+        capture!(system_commands, SystemCommand);
+        capture!(execution_events, ExecutionEvent);
+        capture!(execution_commands, TradingCommand);
+        capture!(data_events, DataEvent);
+        capture!(data_commands, DataCommand);
         Ok(pending)
     }
     pub(crate) fn snapshot(
@@ -453,13 +454,13 @@ impl RunningReceivers<'_> {
                 }
             };
         }
-        capture!(time_evt_rx, TimeEvent);
-        capture!(system_evt_rx, SystemEvent);
-        capture!(system_cmd_rx, SystemCommand);
-        capture!(exec_evt_rx, ExecutionEvent);
-        capture!(exec_cmd_rx, ExecutionCommand);
-        capture!(data_evt_rx, DataEvent);
-        capture!(data_cmd_rx, DataCommand);
+        capture!(time_events, TimeEvent);
+        capture!(system_events, SystemEvent);
+        capture!(system_commands, SystemCommand);
+        capture!(execution_events, ExecutionEvent);
+        capture!(execution_commands, ExecutionCommand);
+        capture!(data_events, DataEvent);
+        capture!(data_commands, DataCommand);
         guard.verify()?;
         let callback_ancestry = Some(self.callback_ancestry()?);
         guard.verify()?;
@@ -482,34 +483,33 @@ impl AsyncRunner {
         use tokio::sync::mpsc::unbounded_channel; // tokio-import-ok
 
         let ingress = IngressGate::new();
-        use nautilus_common::recovery_trace::NativeInputSource;
-        let (time_evt_tx, time_evt_rx) =
+        let (time_evt_tx, time_events) =
             ingress.native_channel::<DispatchMessage<TimeEventMessage>>(NativeInputSource::Time);
-        let (system_evt_tx, system_evt_rx) =
+        let (system_evt_tx, system_events) =
             ingress.native_channel::<DispatchMessage<SystemEvent>>(NativeInputSource::SystemEvent);
-        let (system_cmd_tx, system_cmd_rx) =
+        let (system_cmd_tx, system_commands) =
             ingress.native_channel::<DispatchMessage<SystemCommand>>(NativeInputSource::SystemCommand);
         let (signal_tx, signal_rx) = unbounded_channel::<()>();
-        let (exec_evt_tx, exec_evt_rx) =
+        let (exec_evt_tx, execution_events) =
             ingress.native_channel::<DispatchMessage<ExecutionEvent>>(NativeInputSource::ExecutionEvent);
-        let (exec_cmd_tx, exec_cmd_rx) =
+        let (exec_cmd_tx, execution_commands) =
             ingress.native_channel::<DispatchMessage<TradingCommandMessage>>(NativeInputSource::TradingCommand);
-        let (data_evt_tx, data_evt_rx) =
+        let (data_evt_tx, data_events) =
             ingress.native_channel::<DispatchMessage<DataEvent>>(NativeInputSource::DataEvent);
-        let (data_cmd_tx, data_cmd_rx) =
+        let (data_cmd_tx, data_commands) =
             ingress.native_channel::<DispatchMessage<DataCommand>>(NativeInputSource::DataCommand);
         let recovery_progress = crate::runner_recovery::RunnerRecoveryProgressHandle::new();
 
         Self {
             ingress,
             channels: AsyncRunnerChannels {
-                time_evt_rx: time_evt_rx.into(),
-                system_evt_rx: system_evt_rx.into(),
-                system_cmd_rx: system_cmd_rx.into(),
-                exec_evt_rx: exec_evt_rx.into(),
-                exec_cmd_rx: exec_cmd_rx.into(),
-                data_evt_rx: data_evt_rx.into(),
-                data_cmd_rx: data_cmd_rx.into(),
+                time_evt_rx: time_events.into(),
+                system_evt_rx: system_events.into(),
+                system_cmd_rx: system_commands.into(),
+                exec_evt_rx: execution_events.into(),
+                exec_cmd_rx: execution_commands.into(),
+                data_evt_rx: data_events.into(),
+                data_cmd_rx: data_commands.into(),
             },
             time_evt_tx,
             system_evt_tx,
@@ -559,7 +559,6 @@ impl AsyncRunner {
         context: Option<nautilus_common::actor::RestoredCallbackContext>,
     ) -> anyhow::Result<()> {
         use crate::runner_recovery::RunnerRecoveryEvent;
-        use nautilus_common::recovery_trace::NativeInputSource;
         anyhow::ensure!(
             guard.belongs_to(&self.ingress),
             "foreign retained ingress gate"
@@ -572,7 +571,7 @@ impl AsyncRunner {
                 self.channels.time_evt_rx.append_native_retained(
                     DispatchMessage::from_checkpoint_context(message, context),
                     receipt,
-                )?
+                )?;
             }
             RunnerRecoveryEvent::SystemEvent(message)
                 if receipt.input_source == NativeInputSource::SystemEvent =>
@@ -580,7 +579,7 @@ impl AsyncRunner {
                 self.channels.system_evt_rx.append_native_retained(
                     DispatchMessage::from_checkpoint_context(message, context),
                     receipt,
-                )?
+                )?;
             }
             RunnerRecoveryEvent::SystemCommand(message)
                 if receipt.input_source == NativeInputSource::SystemCommand =>
@@ -588,7 +587,7 @@ impl AsyncRunner {
                 self.channels.system_cmd_rx.append_native_retained(
                     DispatchMessage::from_checkpoint_context(message, context),
                     receipt,
-                )?
+                )?;
             }
             RunnerRecoveryEvent::ExecutionEvent(message)
                 if receipt.input_source == NativeInputSource::ExecutionEvent =>
@@ -596,7 +595,7 @@ impl AsyncRunner {
                 self.channels.exec_evt_rx.append_native_retained(
                     DispatchMessage::from_checkpoint_context(message, context),
                     receipt,
-                )?
+                )?;
             }
             RunnerRecoveryEvent::ExecutionCommand(message)
                 if receipt.input_source == NativeInputSource::TradingCommand =>
@@ -604,7 +603,7 @@ impl AsyncRunner {
                 self.channels.exec_cmd_rx.append_native_retained(
                     DispatchMessage::from_checkpoint_context(message, context),
                     receipt,
-                )?
+                )?;
             }
             RunnerRecoveryEvent::DataEvent(message)
                 if receipt.input_source == NativeInputSource::DataEvent =>
@@ -612,7 +611,7 @@ impl AsyncRunner {
                 self.channels.data_evt_rx.append_native_retained(
                     DispatchMessage::from_checkpoint_context(message, context),
                     receipt,
-                )?
+                )?;
             }
             RunnerRecoveryEvent::DataCommand(message)
                 if receipt.input_source == NativeInputSource::DataCommand =>
@@ -620,7 +619,7 @@ impl AsyncRunner {
                 self.channels.data_cmd_rx.append_native_retained(
                     DispatchMessage::from_checkpoint_context(message, context),
                     receipt,
-                )?
+                )?;
             }
             _ => anyhow::bail!("retained original input decoder changed its channel"),
         }
@@ -690,25 +689,25 @@ impl AsyncRunner {
         }
         match event {
             E::TimeEvent(message) if receipt.input_source == N::Time => {
-                append!(time_evt_rx, message)
+                append!(time_evt_rx, message);
             }
             E::SystemEvent(message) if receipt.input_source == N::SystemEvent => {
-                append!(system_evt_rx, message)
+                append!(system_evt_rx, message);
             }
             E::SystemCommand(message) if receipt.input_source == N::SystemCommand => {
-                append!(system_cmd_rx, message)
+                append!(system_cmd_rx, message);
             }
             E::ExecutionEvent(message) if receipt.input_source == N::ExecutionEvent => {
-                append!(exec_evt_rx, message)
+                append!(exec_evt_rx, message);
             }
             E::ExecutionCommand(message) if receipt.input_source == N::TradingCommand => {
-                append!(exec_cmd_rx, message)
+                append!(exec_cmd_rx, message);
             }
             E::DataEvent(message) if receipt.input_source == N::DataEvent => {
-                append!(data_evt_rx, message)
+                append!(data_evt_rx, message);
             }
             E::DataCommand(message) if receipt.input_source == N::DataCommand => {
-                append!(data_cmd_rx, message)
+                append!(data_cmd_rx, message);
             }
             _ => anyhow::bail!("historical external source decoder changed its channel"),
         }
@@ -767,21 +766,21 @@ impl AsyncRunner {
         );
         guard.verify()?;
         let receivers = RunningReceivers {
-            time_evt_rx: &mut self.channels.time_evt_rx,
-            system_evt_rx: &mut self.channels.system_evt_rx,
-            system_cmd_rx: &mut self.channels.system_cmd_rx,
-            exec_evt_rx: &mut self.channels.exec_evt_rx,
-            exec_cmd_rx: &mut self.channels.exec_cmd_rx,
-            data_evt_rx: &mut self.channels.data_evt_rx,
-            data_cmd_rx: &mut self.channels.data_cmd_rx,
+            time_events: &mut self.channels.time_evt_rx,
+            system_events: &mut self.channels.system_evt_rx,
+            system_commands: &mut self.channels.system_cmd_rx,
+            execution_events: &mut self.channels.exec_evt_rx,
+            execution_commands: &mut self.channels.exec_cmd_rx,
+            data_events: &mut self.channels.data_evt_rx,
+            data_commands: &mut self.channels.data_cmd_rx,
         };
-        receivers.time_evt_rx.hold_historical_pending()?;
-        receivers.system_evt_rx.hold_historical_pending()?;
-        receivers.system_cmd_rx.hold_historical_pending()?;
-        receivers.exec_evt_rx.hold_historical_pending()?;
-        receivers.exec_cmd_rx.hold_historical_pending()?;
-        receivers.data_evt_rx.hold_historical_pending()?;
-        receivers.data_cmd_rx.hold_historical_pending()?;
+        receivers.time_events.hold_historical_pending()?;
+        receivers.system_events.hold_historical_pending()?;
+        receivers.system_commands.hold_historical_pending()?;
+        receivers.execution_events.hold_historical_pending()?;
+        receivers.execution_commands.hold_historical_pending()?;
+        receivers.data_events.hold_historical_pending()?;
+        receivers.data_commands.hold_historical_pending()?;
         let inputs = receivers.native_pending_inputs(encode)?;
         let ancestry = receivers.callback_ancestry()?;
         guard.verify()?;
@@ -800,13 +799,13 @@ impl AsyncRunner {
         );
         guard.verify()?;
         let receivers = RunningReceivers {
-            time_evt_rx: &mut self.channels.time_evt_rx,
-            system_evt_rx: &mut self.channels.system_evt_rx,
-            system_cmd_rx: &mut self.channels.system_cmd_rx,
-            exec_evt_rx: &mut self.channels.exec_evt_rx,
-            exec_cmd_rx: &mut self.channels.exec_cmd_rx,
-            data_evt_rx: &mut self.channels.data_evt_rx,
-            data_cmd_rx: &mut self.channels.data_cmd_rx,
+            time_events: &mut self.channels.time_evt_rx,
+            system_events: &mut self.channels.system_evt_rx,
+            system_commands: &mut self.channels.system_cmd_rx,
+            execution_events: &mut self.channels.exec_evt_rx,
+            execution_commands: &mut self.channels.exec_cmd_rx,
+            data_events: &mut self.channels.data_evt_rx,
+            data_commands: &mut self.channels.data_cmd_rx,
         };
         anyhow::ensure!(
             receivers.callback_ancestry()? == *expected,
@@ -1751,11 +1750,16 @@ mod tests {
         fail_second: bool,
         panic_second: bool,
     }
+    impl SnapshotCodec {
+        fn assert_no_injected_panic(&self) {
+            assert!(!self.panic_second, "injected codec panic");
+        }
+    }
     impl crate::runner_recovery::RunnerRecoveryCodec for SnapshotCodec {
         fn channel(&self) -> crate::runner_recovery::RunnerRecoveryChannel {
             crate::runner_recovery::RunnerRecoveryChannel::SystemEvent
         }
-        fn codec_id(&self) -> &str {
+        fn codec_id(&self) -> &'static str {
             "snapshot.test.v1"
         }
         fn decode(
@@ -1771,7 +1775,7 @@ mod tests {
             let call = self.calls.get() + 1;
             self.calls.set(call);
             if call == 2 {
-                assert!(!self.panic_second, "injected codec panic");
+                self.assert_no_injected_panic();
                 anyhow::ensure!(!self.fail_second, "injected unsupported second message");
             }
             Ok(serde_json::json!(format!("{event:?}")))
@@ -1952,7 +1956,7 @@ mod tests {
                 .time_evt_rx
                 .try_recv()
                 .unwrap()
-                .dispatch(|message| message.dispatch())
+                .dispatch(nautilus_common::runner::TimeEventMessage::dispatch)
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert!(runner.channels.time_evt_rx.try_recv().is_err());
@@ -1993,18 +1997,18 @@ mod tests {
     // Sender halves are dummies (not connected to the test receivers) since
     // these tests exercise the event loop, not TLS binding.
     fn create_test_runner(
-        time_evt_rx: SnapshotReceiver<DispatchMessage<TimeEventMessage>>,
-        data_evt_rx: SnapshotReceiver<DispatchMessage<DataEvent>>,
-        data_cmd_rx: SnapshotReceiver<DispatchMessage<DataCommand>>,
-        exec_evt_rx: SnapshotReceiver<DispatchMessage<ExecutionEvent>>,
-        exec_cmd_rx: SnapshotReceiver<DispatchMessage<TradingCommandMessage>>,
+        time_events: SnapshotReceiver<DispatchMessage<TimeEventMessage>>,
+        data_events: SnapshotReceiver<DispatchMessage<DataEvent>>,
+        data_commands: SnapshotReceiver<DispatchMessage<DataCommand>>,
+        execution_events: SnapshotReceiver<DispatchMessage<ExecutionEvent>>,
+        execution_commands: SnapshotReceiver<DispatchMessage<TradingCommandMessage>>,
         signal_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
         signal_tx: tokio::sync::mpsc::UnboundedSender<()>,
     ) -> AsyncRunner {
         let ingress = IngressGate::new();
         let (time_evt_tx, _) = ingress.channel();
-        let (system_evt_tx, system_evt_rx) = ingress.channel();
-        let (system_cmd_tx, system_cmd_rx) = ingress.channel();
+        let (system_evt_tx, system_events) = ingress.channel();
+        let (system_cmd_tx, system_commands) = ingress.channel();
         let (data_evt_tx, _) = ingress.channel();
         let (data_cmd_tx, _) = ingress.channel();
         let (exec_evt_tx, _) = ingress.channel();
@@ -2013,13 +2017,13 @@ mod tests {
         AsyncRunner {
             ingress,
             channels: AsyncRunnerChannels {
-                time_evt_rx,
-                system_evt_rx: system_evt_rx.into(),
-                system_cmd_rx: system_cmd_rx.into(),
-                exec_evt_rx,
-                exec_cmd_rx,
-                data_evt_rx,
-                data_cmd_rx,
+                time_evt_rx: time_events,
+                system_evt_rx: system_events.into(),
+                system_cmd_rx: system_commands.into(),
+                exec_evt_rx: execution_events,
+                exec_cmd_rx: execution_commands,
+                data_evt_rx: data_events,
+                data_cmd_rx: data_commands,
             },
             time_evt_tx,
             system_evt_tx,
@@ -2038,11 +2042,11 @@ mod tests {
     #[cfg(feature = "node")]
     #[rstest]
     fn test_poll_pending_processes_entry_snapshot_across_channels() {
-        let (time_evt_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (exec_cmd_tx, exec_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (time_evt_tx, time_events) = tokio::sync::mpsc::unbounded_channel();
+        let (data_evt_tx, data_events) = tokio::sync::mpsc::unbounded_channel();
+        let (data_cmd_tx, data_commands) = tokio::sync::mpsc::unbounded_channel();
+        let (exec_evt_tx, execution_events) = tokio::sync::mpsc::unbounded_channel();
+        let (exec_cmd_tx, execution_commands) = tokio::sync::mpsc::unbounded_channel();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let time_event = TimeEvent::new(
@@ -2105,11 +2109,11 @@ mod tests {
             .unwrap();
 
         let mut runner = create_test_runner(
-            time_evt_rx.into(),
-            data_evt_rx.into(),
-            data_cmd_rx.into(),
-            exec_evt_rx.into(),
-            exec_cmd_rx.into(),
+            time_events.into(),
+            data_events.into(),
+            data_commands.into(),
+            execution_events.into(),
+            execution_commands.into(),
             signal_rx,
             signal_tx,
         );
@@ -2186,18 +2190,18 @@ mod tests {
     #[cfg(feature = "node")]
     #[tokio::test]
     async fn test_recv_processes_system_event_before_command() {
-        let (_time_evt_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_exec_cmd_tx, exec_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_time_evt_tx, time_events) = tokio::sync::mpsc::unbounded_channel();
+        let (_data_evt_tx, data_events) = tokio::sync::mpsc::unbounded_channel();
+        let (_data_cmd_tx, data_commands) = tokio::sync::mpsc::unbounded_channel();
+        let (_exec_evt_tx, execution_events) = tokio::sync::mpsc::unbounded_channel();
+        let (_exec_cmd_tx, execution_commands) = tokio::sync::mpsc::unbounded_channel();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut runner = create_test_runner(
-            time_evt_rx.into(),
-            data_evt_rx.into(),
-            data_cmd_rx.into(),
-            exec_evt_rx.into(),
-            exec_cmd_rx.into(),
+            time_events.into(),
+            data_events.into(),
+            data_commands.into(),
+            execution_events.into(),
+            execution_commands.into(),
             signal_rx,
             signal_tx,
         );
@@ -2729,24 +2733,24 @@ mod tests {
     #[tokio::test]
     async fn test_runner_shutdown_signal() {
         // Create runner with manual channels to avoid global state
-        let (_data_tx, data_evt_rx) =
+        let (_data_tx, data_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_cmd_tx, data_cmd_rx) =
+        let (_cmd_tx, data_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_tx, time_evt_rx) =
+        let (_time_tx, time_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
+        let (_exec_evt_tx, execution_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
+        let (_exec_cmd_tx, execution_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx.into(),
-            data_evt_rx.into(),
-            data_cmd_rx.into(),
-            exec_evt_rx.into(),
-            exec_cmd_rx.into(),
+            time_events.into(),
+            data_events.into(),
+            data_commands.into(),
+            execution_events.into(),
+            execution_commands.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -2766,24 +2770,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_closes_on_channel_drop() {
-        let (data_tx, data_evt_rx) =
+        let (data_tx, data_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_cmd_tx, data_cmd_rx) =
+        let (_cmd_tx, data_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_tx, time_evt_rx) =
+        let (_time_tx, time_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
+        let (_exec_evt_tx, execution_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
+        let (_exec_cmd_tx, execution_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx.into(),
-            data_evt_rx.into(),
-            data_cmd_rx.into(),
-            exec_evt_rx.into(),
-            exec_cmd_rx.into(),
+            time_events.into(),
+            data_events.into(),
+            data_commands.into(),
+            execution_events.into(),
+            execution_commands.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -2809,25 +2813,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_event_sending() {
-        let (data_evt_tx, data_evt_rx) =
+        let (data_evt_tx, data_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_data_cmd_tx, data_cmd_rx) =
+        let (_data_cmd_tx, data_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_evt_tx, time_evt_rx) =
+        let (_time_evt_tx, time_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
+        let (_exec_evt_tx, execution_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
+        let (_exec_cmd_tx, execution_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         // Setup runner
         let mut runner = create_test_runner(
-            time_evt_rx.into(),
-            data_evt_rx.into(),
-            data_cmd_rx.into(),
-            exec_evt_rx.into(),
-            exec_cmd_rx.into(),
+            time_events.into(),
+            data_events.into(),
+            data_commands.into(),
+            execution_events.into(),
+            execution_commands.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -3096,24 +3100,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_processes_trading_commands() {
-        let (_data_evt_tx, data_evt_rx) =
+        let (_data_evt_tx, data_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_data_cmd_tx, data_cmd_rx) =
+        let (_data_cmd_tx, data_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_evt_tx, time_evt_rx) =
+        let (_time_evt_tx, time_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
+        let (_exec_evt_tx, execution_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (exec_cmd_tx, exec_cmd_rx) =
+        let (exec_cmd_tx, execution_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx.into(),
-            data_evt_rx.into(),
-            data_cmd_rx.into(),
-            exec_evt_rx.into(),
-            exec_cmd_rx.into(),
+            time_events.into(),
+            data_events.into(),
+            data_commands.into(),
+            execution_events.into(),
+            execution_commands.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -3149,24 +3153,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_processes_multiple_trading_commands() {
-        let (_data_evt_tx, data_evt_rx) =
+        let (_data_evt_tx, data_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_data_cmd_tx, data_cmd_rx) =
+        let (_data_cmd_tx, data_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_evt_tx, time_evt_rx) =
+        let (_time_evt_tx, time_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
+        let (_exec_evt_tx, execution_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (exec_cmd_tx, exec_cmd_rx) =
+        let (exec_cmd_tx, execution_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx.into(),
-            data_evt_rx.into(),
-            data_cmd_rx.into(),
-            exec_evt_rx.into(),
-            exec_cmd_rx.into(),
+            time_events.into(),
+            data_events.into(),
+            data_commands.into(),
+            execution_events.into(),
+            execution_commands.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -3360,24 +3364,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_stop_method() {
-        let (_data_tx, data_evt_rx) =
+        let (_data_tx, data_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_cmd_tx, data_cmd_rx) =
+        let (_cmd_tx, data_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_tx, time_evt_rx) =
+        let (_time_tx, time_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
+        let (_exec_evt_tx, execution_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
+        let (_exec_cmd_tx, execution_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx.into(),
-            data_evt_rx.into(),
-            data_cmd_rx.into(),
-            exec_evt_rx.into(),
-            exec_cmd_rx.into(),
+            time_events.into(),
+            data_events.into(),
+            data_commands.into(),
+            execution_events.into(),
+            execution_commands.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -3395,24 +3399,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_all_event_types_integration() {
-        let (data_evt_tx, data_evt_rx) =
+        let (data_evt_tx, data_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (data_cmd_tx, data_cmd_rx) =
+        let (data_cmd_tx, data_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (time_evt_tx, time_evt_rx) =
+        let (time_evt_tx, time_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (exec_evt_tx, exec_evt_rx) =
+        let (exec_evt_tx, execution_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
+        let (_exec_cmd_tx, execution_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx.into(),
-            data_evt_rx.into(),
-            data_cmd_rx.into(),
-            exec_evt_rx.into(),
-            exec_cmd_rx.into(),
+            time_events.into(),
+            data_events.into(),
+            data_commands.into(),
+            execution_events.into(),
+            execution_commands.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -3546,24 +3550,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_handle_stops_runner() {
-        let (_data_tx, data_evt_rx) =
+        let (_data_tx, data_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_cmd_tx, data_cmd_rx) =
+        let (_cmd_tx, data_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_tx, time_evt_rx) =
+        let (_time_tx, time_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
+        let (_exec_evt_tx, execution_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
+        let (_exec_cmd_tx, execution_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx.into(),
-            data_evt_rx.into(),
-            data_cmd_rx.into(),
-            exec_evt_rx.into(),
-            exec_cmd_rx.into(),
+            time_events.into(),
+            data_events.into(),
+            data_commands.into(),
+            execution_events.into(),
+            execution_commands.into(),
             signal_rx,
             signal_tx.clone(),
         );
@@ -3599,24 +3603,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_runner_processes_events_before_stop() {
-        let (data_evt_tx, data_evt_rx) =
+        let (data_evt_tx, data_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_cmd_tx, data_cmd_rx) =
+        let (_cmd_tx, data_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_tx, time_evt_rx) =
+        let (_time_tx, time_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
+        let (_exec_evt_tx, execution_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
+        let (_exec_cmd_tx, execution_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let mut runner = create_test_runner(
-            time_evt_rx.into(),
-            data_evt_rx.into(),
-            data_cmd_rx.into(),
-            exec_evt_rx.into(),
-            exec_cmd_rx.into(),
+            time_events.into(),
+            data_events.into(),
+            data_commands.into(),
+            execution_events.into(),
+            execution_commands.into(),
             signal_rx,
             signal_tx.clone(),
         );

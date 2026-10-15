@@ -15,7 +15,7 @@
 
 //! Preserves order/fee/cumulative-fill state before a new authenticated session.
 
-use super::*;
+use super::{AccountId, ClientId, ExecutionClient, OKXExecutionClient};
 use anyhow::{Result, ensure};
 use std::sync::atomic::Ordering;
 #[derive(serde::Deserialize)]

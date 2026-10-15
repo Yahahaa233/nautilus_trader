@@ -711,6 +711,24 @@ mod imp {
         }
     }
 
+    enum EnqueueFailure {
+        Stalled(Duration),
+        Closed,
+    }
+
+    impl Drop for EventStoreWriter {
+        fn drop(&mut self) {
+            // Implicit drop without close(): release the producer so the writer thread
+            // exits cleanly, leaving the manifest unsealed so a later open of the same
+            // run observes a CrashedPredecessor.
+            self.tx.take();
+
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
     #[cfg(test)]
     mod deadline_tests {
         use std::{
@@ -809,24 +827,6 @@ mod imp {
                 Err(EventStoreError::Closed)
             ));
             assert_eq!(captured.lock().len(), 1);
-        }
-    }
-
-    enum EnqueueFailure {
-        Stalled(Duration),
-        Closed,
-    }
-
-    impl Drop for EventStoreWriter {
-        fn drop(&mut self) {
-            // Implicit drop without close(): release the producer so the writer thread
-            // exits cleanly, leaving the manifest unsealed so a later open of the same
-            // run observes a CrashedPredecessor.
-            self.tx.take();
-
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
         }
     }
 }

@@ -484,7 +484,13 @@ impl PromotionBackend for ParquetPromotionBackend {
             identifiers.as_deref(),
         );
 
-        if self.identity_recorded(&identity)? {
+        let legacy_identity = legacy_btree_feather_replay_identity(
+            &source.storage.original_uri,
+            file,
+            &read.content_hash,
+            identifiers.as_deref(),
+        );
+        if self.identity_recorded(&identity)? || self.identity_recorded(&legacy_identity)? {
             return Ok(None);
         }
 
@@ -551,15 +557,45 @@ fn feather_replay_identity(
         identifiers.dedup();
     }
 
-    let identity = serde_json::json!({
-        "source_uri": source_uri,
-        "source_path": source_path,
-        "content_hash": content_hash,
-        "identifiers": identifiers,
-    });
+    // The original golden binds declaration order, not JSON map key order.
+    // Serialize each value unchanged so feature unification cannot reorder keys.
+    let identity = format!(
+        "{{\"source_uri\":{},\"source_path\":{},\"content_hash\":{},\"identifiers\":{}}}",
+        serde_json::json!(source_uri),
+        serde_json::json!(source_path),
+        serde_json::json!(content_hash),
+        serde_json::json!(identifiers),
+    );
     format!(
         "nautilus-feather:{}",
-        blake3::hash(identity.to_string().as_bytes()).to_hex(),
+        blake3::hash(identity.as_bytes()).to_hex(),
+    )
+}
+
+// Older serde_json builds without preserve_order serialized this exact preimage
+// in BTreeMap key order. Read that identity only; all new writes stay canonical.
+fn legacy_btree_feather_replay_identity(
+    source_uri: &str,
+    source_path: &str,
+    content_hash: &str,
+    identifiers: Option<&[String]>,
+) -> String {
+    let mut identifiers = identifiers.map(<[String]>::to_vec);
+    if let Some(identifiers) = identifiers.as_mut() {
+        identifiers.sort();
+        identifiers.dedup();
+    }
+
+    let identity = format!(
+        "{{\"content_hash\":{},\"identifiers\":{},\"source_path\":{},\"source_uri\":{}}}",
+        serde_json::json!(content_hash),
+        serde_json::json!(identifiers),
+        serde_json::json!(source_path),
+        serde_json::json!(source_uri),
+    );
+    format!(
+        "nautilus-feather:{}",
+        blake3::hash(identity.as_bytes()).to_hex(),
     )
 }
 
@@ -2560,6 +2596,174 @@ mod tests {
                 "{expected_prefix}_nautilus_promotions/\
                  cd3112001080bc2d11985ffe2b8b90b324d336d82c17ddb66127d3a05f08c69c.json"
             )),
+        );
+    }
+
+    fn promotion_metadata_bytes(backend: &ParquetPromotionBackend, path: &ObjectPath) -> Vec<u8> {
+        block_on_nautilus_with(|| async {
+            backend
+                .catalog
+                .object_store
+                .get(path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .to_vec()
+        })
+    }
+
+    fn seed_legacy_promotion_metadata(
+        backend: &ParquetPromotionBackend,
+        identity: &str,
+        manifest: bool,
+    ) -> ObjectPath {
+        if !manifest {
+            backend.record_identity(identity).unwrap();
+            return backend.marker_path(identity);
+        }
+        let path = backend.manifest_path();
+        let bytes = serde_json::to_vec(&ParquetPromotionManifest {
+            identities: vec![identity.to_string()],
+        })
+        .unwrap();
+        block_on_nautilus_with(|| async {
+            backend
+                .catalog
+                .object_store
+                .put_opts(
+                    &path,
+                    bytes.into(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        });
+        path
+    }
+
+    #[rstest]
+    #[case::same_content(false)]
+    #[case::different_content(true)]
+    fn parquet_promotion_reads_legacy_btree_metadata_without_mutating_it(
+        #[values(false, true)] manifest: bool,
+        #[case] different_content: bool,
+    ) {
+        let directory = TempDir::new().unwrap();
+        let staging = directory.path().join("backtest/run-legacy-identity");
+        let config =
+            WriterConnectConfig::new(staging.to_string_lossy(), Some(local_catalog(&directory)));
+        let mut writer =
+            ParquetWriter::new(&config, WriterClock::Test(Arc::new(AtomicU64::new(0)))).unwrap();
+        let quote = sample_quote();
+        writer.core.write_data(Data::Quote(quote)).unwrap();
+        writer.core.close().unwrap();
+        let source = writer.source.clone();
+        let files =
+            list_session_feather_files(&source.storage, source.environment, &source.instance_id)
+                .unwrap();
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        let object_path = ObjectPath::parse(file).unwrap();
+        let read = block_on_nautilus_with(|| {
+            read_feather_record_batches_with_identity(
+                source.storage.object_store.clone(),
+                &object_path,
+            )
+        })
+        .unwrap();
+        let identifiers = identifiers_from_record_batches(&read.batches).unwrap();
+        let content_hash = read.content_hash.clone();
+        let recorded_hash = if different_content {
+            "other-content"
+        } else {
+            &content_hash
+        };
+        let legacy_identity = legacy_btree_feather_replay_identity(
+            &source.storage.original_uri,
+            file,
+            recorded_hash,
+            Some(&identifiers),
+        );
+        let canonical_identity = feather_replay_identity(
+            &source.storage.original_uri,
+            file,
+            &content_hash,
+            Some(&identifiers),
+        );
+        let mut backend =
+            ParquetPromotionBackend::new(&writer.catalog, Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        if !different_content {
+            assert!(
+                backend
+                    .catalog
+                    .promote_feather_file(&source, file, read.batches, false, &legacy_identity,)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let metadata_path = seed_legacy_promotion_metadata(&backend, &legacy_identity, manifest);
+        let before = promotion_metadata_bytes(&backend, &metadata_path);
+        assert_eq!(
+            backend
+                .convert_file(&source, file, false, true)
+                .unwrap()
+                .is_some(),
+            different_content
+        );
+        assert_eq!(promotion_metadata_bytes(&backend, &metadata_path), before);
+        assert_eq!(
+            backend.identity_recorded(&canonical_identity).unwrap(),
+            different_content
+        );
+        let after = block_on_nautilus_with(|| {
+            read_feather_record_batches_with_identity(
+                source.storage.object_store.clone(),
+                &object_path,
+            )
+        })
+        .unwrap();
+        assert_eq!(after.content_hash, content_hash);
+        let mut catalog = ParquetDataCatalog::new(directory.path(), None, None, None, None);
+        let DataBatch::Quote(rows) = catalog
+            .query_batch(&CatalogQuery::new(NautilusDataType::QuoteTick))
+            .unwrap()
+        else {
+            panic!("expected quotes")
+        };
+        assert_eq!(rows.as_ref(), &[quote]);
+    }
+
+    #[rstest]
+    fn legacy_btree_identity_matches_original_default_map_golden() {
+        let unordered = ["B".to_string(), "A".to_string(), "A".to_string()];
+        let ordered = ["A".to_string(), "B".to_string()];
+        let identity = |identifiers: Option<&[String]>| {
+            legacy_btree_feather_replay_identity(
+                "file:///catalog/backtest/run-1",
+                "quotes/AUDUSD.SIM/part-0.feather",
+                "content-hash",
+                identifiers,
+            )
+        };
+        let expected =
+            "nautilus-feather:6e7867c057306191f612347f0371b4128e3f85516755e46faaf914481aa6b9cd";
+        assert_eq!(identity(Some(&unordered)), expected);
+        assert_eq!(identity(Some(&ordered)), expected);
+        assert_ne!(identity(None), expected);
+        assert_ne!(
+            legacy_btree_feather_replay_identity(
+                "file:///catalog/backtest/run-1",
+                "quotes/AUDUSD.SIM/part-0.feather",
+                "different-content",
+                Some(&ordered),
+            ),
+            expected
         );
     }
 

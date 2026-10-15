@@ -32,7 +32,7 @@ use std::{
     },
 };
 
-use nautilus_common::live::dst::time;
+use nautilus_common::live::{checkpoint::CheckpointGate, dst::time};
 use nautilus_core::{
     AtomicTime,
     string::secret::{REDACTED, SecretString},
@@ -177,14 +177,14 @@ impl OKXWsFeedHandler {
     ) -> Self {
         Self {
             clock,
-            checkpoint_gate: Default::default(),
+            checkpoint_gate: CheckpointGate::default(),
             recovery_raw: None,
             signal,
             inner: None,
             cmd_rx: cmd_rx.into(),
             raw_rx: raw_rx.into(),
-            operation_ack_contexts: Default::default(),
-            operation_ack_request_ids: Default::default(),
+            operation_ack_contexts: Arc::default(),
+            operation_ack_request_ids: Arc::default(),
             connection_instance_id: None,
             out_tx,
             auth_tracker,
@@ -1099,6 +1099,29 @@ fn create_okx_retry_error(error: RetryError) -> OKXWsError {
     }
 }
 
+/// Test drives the production raw inbox and decoder rather than constructing a
+/// parsed message or an `OriginalOrderData` wrapper as a substitute for capture.
+#[cfg(test)]
+pub(crate) async fn read_protection_test_frame(payload: String) -> OKXWsMessage {
+    let (_command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut handler = OKXWsFeedHandler::new(
+        Arc::new(AtomicBool::new(false)),
+        command_rx,
+        raw_rx,
+        out_tx,
+        AuthTracker::new(),
+        SubscriptionState::new(crate::common::consts::OKX_WS_TOPIC_DELIMITER),
+        nautilus_core::time::get_atomic_clock_realtime(),
+    );
+    raw_tx.send(Message::Text(payload.into())).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), handler.next())
+        .await
+        .unwrap()
+        .expect("actual raw frame did not produce data")
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1933,27 +1956,4 @@ mod tests {
             other => panic!("Expected LiquidationWarnings, was {other:?}"),
         }
     }
-}
-
-/// Test drives the production raw inbox and decoder rather than constructing a
-/// parsed message or an OriginalOrderData wrapper as a substitute for capture.
-#[cfg(test)]
-pub(crate) async fn read_protection_test_frame(payload: String) -> OKXWsMessage {
-    let (_command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut handler = OKXWsFeedHandler::new(
-        Arc::new(AtomicBool::new(false)),
-        command_rx,
-        raw_rx,
-        out_tx,
-        AuthTracker::new(),
-        SubscriptionState::new(crate::common::consts::OKX_WS_TOPIC_DELIMITER),
-        nautilus_core::time::get_atomic_clock_realtime(),
-    );
-    raw_tx.send(Message::Text(payload.into())).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), handler.next())
-        .await
-        .unwrap()
-        .expect("actual raw frame did not produce data")
 }

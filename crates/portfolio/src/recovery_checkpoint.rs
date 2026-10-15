@@ -2,7 +2,7 @@
 // Licensed under the GNU Lesser General Public License Version 3.0.
 
 //! The actual Portfolio cut, including calculation caches and original samples.
-//! AccountsManager owns only the already-installed cache/clock references; its
+//! `AccountsManager` owns only the already-installed cache/clock references; its
 //! business data lives in that cache and in the fields sealed below.
 use std::sync::Arc;
 
@@ -167,12 +167,19 @@ impl Portfolio {
 
     /// Installs a complete original cut into this actual Portfolio, without
     /// callbacks, sampling, timers or new event IDs. Native caller admission and
-    /// verified source/frontier are checked by LiveNode, separately from JSON.
+    /// verified source/frontier are checked by `LiveNode`, separately from JSON.
     /// # Errors
     /// Rejects missing/unknown fields, changed config/accounts/factory, duplicate
     /// rows and corrupt or oversized original series. Installs only after full
     /// canonical round-trip validation, retaining the actual cache/clock owners.
     pub fn restore_running_checkpoint_state(&mut self, value: &Value) -> Result<()> {
+        type MissingPrices = Vec<(
+            nautilus_model::identifiers::Venue,
+            Vec<(
+                Option<nautilus_model::identifiers::AccountId>,
+                Vec<nautilus_model::identifiers::InstrumentId>,
+            )>,
+        )>;
         ensure!(
             value["schema"] == "NautilusPortfolioCheckpoint.v1",
             "Portfolio source checkpoint profile missing or unsupported"
@@ -185,8 +192,11 @@ impl Portfolio {
                 && value["analyzer"]["statistics"] == current["analyzer"]["statistics"],
             "Portfolio source configuration/account/factory differs from actual target"
         );
-        let mut prepared =
-            PortfolioState::new(self.clock.clone(), self.cache.clone(), &self.config);
+        let mut prepared = PortfolioState::new(
+            std::rc::Rc::clone(&self.clock),
+            std::rc::Rc::clone(&self.cache),
+            &self.config,
+        );
         prepared.native_statistic_factories =
             self.inner.try_borrow()?.native_statistic_factories.clone();
         prepared.analyzer.statistics = prepared.native_statistic_factories.clone();
@@ -230,13 +240,7 @@ impl Portfolio {
         prepared.min_account_state_logging_interval_ns =
             decode(value, "min_account_state_logging_interval_ns")?;
         prepared.equity_curve_finalized = decode(value, "equity_curve_finalized")?;
-        type MissingPrices = Vec<(
-            nautilus_model::identifiers::Venue,
-            Vec<(
-                Option<nautilus_model::identifiers::AccountId>,
-                Vec<nautilus_model::identifiers::InstrumentId>,
-            )>,
-        )>;
+
         prepared.venues_missing_price = decode::<MissingPrices>(value, "venues_missing_price")?
             .into_iter()
             .map(|(venue, rows)| {
@@ -311,7 +315,7 @@ mod tests {
         let account = AccountAny::default();
         let event = account.last_event().unwrap();
         let concrete = Rc::new(RefCell::new(VirtualClock::new()));
-        let clock: Rc<RefCell<dyn Clock>> = concrete.clone();
+        let clock: Rc<RefCell<dyn Clock>> = Rc::<RefCell<VirtualClock>>::clone(&concrete);
         let cache = Rc::new(RefCell::new(Cache::default()));
         cache.borrow_mut().add_account(account).unwrap();
         let mut portfolio = Portfolio::new(clock, cache, None);
@@ -394,7 +398,7 @@ mod tests {
             "configuration" => checkpoint["configuration"]["equity_curve"] = false.into(),
             "account" => checkpoint["registered_accounts"] = json!([AccountId::from("OTHER-001")]),
             "series_account" => {
-                checkpoint["portfolio_snapshots"][0][1][0]["account_id"] = "OTHER-001".into()
+                checkpoint["portfolio_snapshots"][0][1][0]["account_id"] = "OTHER-001".into();
             }
             "duplicate_series" => {
                 let duplicate = checkpoint["portfolio_snapshots"][0].clone();
@@ -404,7 +408,7 @@ mod tests {
                     .push(duplicate);
             }
             "factory" => {
-                checkpoint["analyzer"]["factory_profile"] = "caller_declared_default".into()
+                checkpoint["analyzer"]["factory_profile"] = "caller_declared_default".into();
             }
             _ => unreachable!(),
         }

@@ -15,7 +15,10 @@
 
 //! Actual OKX no-book adapter restoration before fresh connection.
 
-use super::*;
+use super::{
+    AHashMap, AHashSet, ClientId, Context, DataClient, InstrumentAny, InstrumentId, OKXDataClient,
+    OKXGreeksType, Ordering, Ustr,
+};
 use anyhow::{Result, ensure};
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]

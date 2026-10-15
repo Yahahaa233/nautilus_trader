@@ -198,6 +198,7 @@ impl Default for TaskGroup {
 impl TaskGroup {
     /// Captures ownership of the actual task generation for checkpoint revalidation.
     /// The owner must separately freeze the tasks' callback/request admission.
+    #[must_use]
     pub fn checkpoint_observation(&self) -> TaskGroupCheckpointObservation {
         TaskGroupCheckpointObservation {
             inner: self.inner.clone(),

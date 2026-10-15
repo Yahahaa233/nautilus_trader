@@ -6425,6 +6425,55 @@ async fn test_submission_registry_survives_unacknowledged_command_response(
     );
 }
 
+async fn assert_retained_legacy_inflight_requires_applied_terminal(
+    ctx: &mut TestContext,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    original: serde_json::Value,
+) {
+    assert_eq!(
+        serde_json::to_value(ctx.get_order(&client_order_id).unwrap()).unwrap(),
+        original
+    );
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 1);
+    ctx.advance_both(dst::time::Duration::from_millis(201))
+        .await;
+    let repeated = ctx.manager.check_inflight_orders();
+    assert!(repeated.events.is_empty());
+    assert!(repeated.queries.is_empty());
+    assert!(
+        ctx.manager
+            .take_submission_recovery_exhaustions()
+            .is_empty()
+    );
+    assert_eq!(
+        serde_json::to_value(ctx.get_order(&client_order_id).unwrap()).unwrap(),
+        original
+    );
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 1);
+
+    // The public legacy registration has no command UUID. Only the actual
+    // applied terminal event may resolve its conservative unknown provenance.
+    let cached = ctx.get_order(&client_order_id).unwrap();
+    let terminal = TestOrderEventStubs::canceled(&cached, test_account_id(), Some(venue_order_id));
+    ctx.manager.observe_order_event(&terminal);
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 1);
+    ctx.cache.borrow_mut().update_order(&terminal).unwrap();
+    ctx.manager.confirm_submission_outcome(&client_order_id);
+    let resolved = ctx.get_order(&client_order_id).unwrap();
+    assert_eq!(resolved.status(), OrderStatus::Canceled);
+    assert_eq!(resolved.filled_qty(), cached.filled_qty());
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 0);
+    let after = ctx.manager.check_inflight_orders();
+    assert!(after.events.is_empty());
+    assert!(after.queries.is_empty());
+    assert!(
+        ctx.manager
+            .take_submission_recovery_exhaustions()
+            .is_empty()
+    );
+}
+
 #[rstest]
 #[case::unacknowledged_cancel(false, OrderStatus::PendingCancel)]
 #[case::unacknowledged_modify(false, OrderStatus::PendingUpdate)]
@@ -6501,7 +6550,8 @@ async fn test_submission_registry_interleaved_missing_checks_preserve_budget(
     ctx.cache.borrow_mut().update_order(&pending).unwrap();
     ctx.manager.register_inflight(client_order_id);
     let client = MockExecutionClient::new(Vec::new());
-    let tracked = policy == SubmissionRecoveryPolicy::RetainUnresolved && !acknowledged;
+    let retained = policy == SubmissionRecoveryPolicy::RetainUnresolved;
+    let original = serde_json::to_value(ctx.get_order(&client_order_id).unwrap()).unwrap();
     let mut queries = 0;
     let mut resolutions = Vec::new();
     let mut diagnostics = Vec::new();
@@ -6520,22 +6570,28 @@ async fn test_submission_registry_interleaved_missing_checks_preserve_budget(
         diagnostics.extend(ctx.manager.take_submission_recovery_exhaustions());
     }
 
-    assert_eq!(queries, usize::from(tracked));
+    assert_eq!(queries, 0);
     assert!(resolutions.is_empty());
     assert_eq!(
         client.order_report_query_count.get(),
-        if tracked { 4 } else { 5 }
+        if retained { 1 } else { 5 }
     );
     assert_eq!(
         ctx.get_order(&client_order_id).unwrap().status(),
         pending_status
     );
-    assert_eq!(diagnostics.len(), usize::from(tracked));
-    if tracked {
-        assert_eq!(diagnostics[0].client_order_id, client_order_id);
-        assert_eq!(diagnostics[0].source, SubmissionRecoverySource::Inflight);
-        assert_eq!(diagnostics[0].retry_count, 2);
-        assert_eq!(diagnostics[0].ts_event, UnixNanos::from(404_000_000));
+    // The first explicit missing-order query exhausts the pending-command
+    // budget before the inflight timer. Repeated checks may neither query
+    // again nor manufacture an initial-submission timeout diagnostic.
+    assert!(diagnostics.is_empty());
+    if retained {
+        assert_retained_legacy_inflight_requires_applied_terminal(
+            &mut ctx,
+            client_order_id,
+            VenueOrderId::from("V-INTERLEAVED"),
+            original,
+        )
+        .await;
     }
 }
 
@@ -7023,6 +7079,7 @@ async fn test_inflight_pending_update_generates_canceled(#[case] policy: Submiss
         "3000.00",
         venue_order_id,
     );
+    let original = serde_json::to_value(&order).unwrap();
     ctx.add_order(order);
 
     ctx.manager.register_inflight(client_order_id);
@@ -7036,15 +7093,27 @@ async fn test_inflight_pending_update_generates_canceled(#[case] policy: Submiss
             .take_submission_recovery_exhaustions()
             .is_empty()
     );
-    assert_eq!(result.events.len(), 1);
-    assert!(
-        matches!(result.events[0], OrderEventAny::Canceled(_)),
-        "Expected Canceled for PendingUpdate, was {:?}",
-        result.events[0]
-    );
+    assert!(result.queries.is_empty());
+    if policy == SubmissionRecoveryPolicy::RetainUnresolved {
+        assert!(result.events.is_empty());
+        assert_retained_legacy_inflight_requires_applied_terminal(
+            &mut ctx,
+            client_order_id,
+            venue_order_id,
+            original,
+        )
+        .await;
+    } else {
+        assert_eq!(result.events.len(), 1);
+        assert!(
+            matches!(result.events[0], OrderEventAny::Canceled(_)),
+            "Expected Canceled for PendingUpdate, was {:?}",
+            result.events[0]
+        );
 
-    if let OrderEventAny::Canceled(canceled) = &result.events[0] {
-        assert_eq!(canceled.client_order_id, client_order_id);
+        if let OrderEventAny::Canceled(canceled) = &result.events[0] {
+            assert_eq!(canceled.client_order_id, client_order_id);
+        }
     }
 }
 
@@ -7079,6 +7148,7 @@ async fn test_inflight_pending_cancel_generates_canceled(#[case] policy: Submiss
         "3000.00",
         venue_order_id,
     );
+    let original = serde_json::to_value(&order).unwrap();
     ctx.add_order(order);
 
     ctx.manager.register_inflight(client_order_id);
@@ -7092,15 +7162,27 @@ async fn test_inflight_pending_cancel_generates_canceled(#[case] policy: Submiss
             .take_submission_recovery_exhaustions()
             .is_empty()
     );
-    assert_eq!(result.events.len(), 1);
-    assert!(
-        matches!(result.events[0], OrderEventAny::Canceled(_)),
-        "Expected Canceled for PendingCancel, was {:?}",
-        result.events[0]
-    );
+    assert!(result.queries.is_empty());
+    if policy == SubmissionRecoveryPolicy::RetainUnresolved {
+        assert!(result.events.is_empty());
+        assert_retained_legacy_inflight_requires_applied_terminal(
+            &mut ctx,
+            client_order_id,
+            venue_order_id,
+            original,
+        )
+        .await;
+    } else {
+        assert_eq!(result.events.len(), 1);
+        assert!(
+            matches!(result.events[0], OrderEventAny::Canceled(_)),
+            "Expected Canceled for PendingCancel, was {:?}",
+            result.events[0]
+        );
 
-    if let OrderEventAny::Canceled(canceled) = &result.events[0] {
-        assert_eq!(canceled.client_order_id, client_order_id);
+        if let OrderEventAny::Canceled(canceled) = &result.events[0] {
+            assert_eq!(canceled.client_order_id, client_order_id);
+        }
     }
 }
 

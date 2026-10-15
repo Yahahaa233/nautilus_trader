@@ -129,8 +129,11 @@ impl RestoredCallbackContext {
 
 /// Restored contexts aligned with every original inventory entry, including independent inputs.
 #[derive(Debug)]
+struct RestoredContextSlot(Option<RestoredCallbackContext>);
+
+#[derive(Debug)]
 pub struct RestoredChannelContexts {
-    entries: Vec<Option<Option<RestoredCallbackContext>>>,
+    entries: Vec<Option<RestoredContextSlot>>,
     marker: PhantomData<Rc<()>>,
 }
 
@@ -143,6 +146,7 @@ impl RestoredChannelContexts {
         self.entries
             .get_mut(index)
             .and_then(Option::take)
+            .map(|slot| slot.0)
             .ok_or(DispatchError::InvalidCheckpoint)
     }
 }
@@ -295,6 +299,15 @@ mod tests {
         .unwrap()
     }
 
+    // Copy the data while consuming every original message before restoring the
+    // callback bank; a lazy iterator would keep live original leases during restore.
+    fn consume_message_values(messages: Vec<DispatchMessage<u32>>) -> Vec<u32> {
+        messages
+            .into_iter()
+            .map(|message| *message.message())
+            .collect()
+    }
+
     fn rooted_message(value: u32) -> DispatchMessage<u32> {
         let _publication = super::super::PublicationScope::enter();
         DispatchMessage::new(value, thread::current().id())
@@ -333,8 +346,7 @@ mod tests {
         ));
         let bytes = serde_json::to_vec(&snapshot).unwrap();
         let decoded: CallbackAncestryState = serde_json::from_slice(&bytes).unwrap();
-        let values: Vec<_> = messages.iter().map(|message| *message.message()).collect();
-        drop(messages);
+        let values = consume_message_values(messages);
         assert!(!callbacks_pending());
         clear_callbacks().unwrap();
 
@@ -462,7 +474,7 @@ mod tests {
         message.dispatch(|_| {
             super::super::reserve(0)
                 .unwrap()
-                .commit(received.clone(), record)
+                .commit(received.clone(), record);
         });
         assert_eq!(drain_callbacks(1), Err(DispatchError::Runaway));
         assert!(received.borrow().is_empty());
@@ -631,7 +643,7 @@ pub fn restore_channel_contexts(
                             (None, None) => None,
                             _ => unreachable!("checkpoint has been validated"),
                         };
-                        entries.push(Some(token));
+                        entries.push(Some(RestoredContextSlot(token)));
                     }
                     drop(chains);
                     *state = restored;

@@ -44,7 +44,9 @@ pub type EventStoreFactory = Box<
 /// It must latch the writer's existing failure state and prohibit Drop sealing.
 /// No deserialization, source replacement or recovery permission is available.
 #[derive(Clone)]
-pub struct EventStoreFailureRetention(Rc<dyn Fn(&str) -> anyhow::Result<()>>);
+pub struct EventStoreFailureRetention(Rc<FailureRetentionFn>);
+
+type FailureRetentionFn = dyn Fn(&str) -> anyhow::Result<()>;
 
 impl Debug for EventStoreFailureRetention {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -138,9 +140,14 @@ pub trait KernelEventStore: Debug {
 
     /// Issues a trace handle from this exact owned open Journal. A native node
     /// downcasts it to its concrete reader/recorder type; no JSON grants authority.
+    ///
+    /// # Errors
+    /// Returns an error when the owned journal cannot issue the requested native trace handle.
     #[cfg(feature = "live")]
-    fn native_trace_handle(&self, _source: nautilus_common::recovery_trace::NativeTraceSource)
-        -> anyhow::Result<std::rc::Rc<dyn std::any::Any>> {
+    fn native_trace_handle(
+        &self,
+        _source: nautilus_common::recovery_trace::NativeTraceSource,
+    ) -> anyhow::Result<std::rc::Rc<dyn std::any::Any>> {
         anyhow::bail!("owned Journal native causal trace unsupported")
     }
 
@@ -161,7 +168,7 @@ pub trait KernelEventStore: Debug {
     }
 
     /// Returns a latch on the current actual writer that is safe during callbacks
-    /// holding unrelated RefCell borrows. Unknown stores remain unsupported.
+    /// holding unrelated `RefCell` borrows. Unknown stores remain unsupported.
     fn failure_retention(&self) -> Option<EventStoreFailureRetention> {
         None
     }

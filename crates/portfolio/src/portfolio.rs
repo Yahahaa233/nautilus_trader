@@ -4408,12 +4408,13 @@ fn arm_equity_curve_timer(
     };
     let timer_name = equity_curve_timer_name(account_id);
     let callback = equity_curve_callback(clock, cache, inner, config, account_id);
-    let registered = PortfolioEquityCurveTimerCallback::new(account_id, &config, callback.clone())
-        .and_then(|binding| {
-            clock
-                .borrow_mut()
-                .register_portfolio_equity_curve_callback(binding)
-        });
+    let registered =
+        PortfolioEquityCurveTimerCallback::new(account_id, &config, std::rc::Rc::clone(&callback))
+            .and_then(|binding| {
+                clock
+                    .borrow_mut()
+                    .register_portfolio_equity_curve_callback(binding)
+            });
     let callback = match registered {
         Ok(true) => None,
         Ok(false) => Some(TimeEventCallback::RustLocal(callback)),

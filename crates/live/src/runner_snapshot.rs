@@ -286,7 +286,7 @@ impl<T> SnapshotReceiver<T> {
         self.prefix.try_reserve(1)?;
         match &mut self.receiver {
             Receiver::Native(receiver) => {
-                receiver.advance_historical_source_frontier(guard, &receipt)?
+                receiver.advance_historical_source_frontier(guard, &receipt)?;
             }
             Receiver::Raw(_) => {
                 anyhow::bail!("historical external input requires native receipt ownership")

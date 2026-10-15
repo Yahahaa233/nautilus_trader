@@ -279,6 +279,26 @@ impl ReconciliationFillQueue {
     }
 }
 
+/// The actual mutation dispatched for an inflight order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PendingCommandKind {
+    Modify,
+    Cancel,
+    /// Compatibility callers did not identify a mutation. Only terminal evidence resolves it.
+    Unknown,
+}
+
+/// An actual dispatch boundary, not an additional retry or time budget.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PendingCommandCheck {
+    pub kind: PendingCommandKind,
+    pub command_id: Option<UUID4>,
+    pub applied_event_count: usize,
+    pub applied_event_id: Option<UUID4>,
+}
+
 /// Information about an inflight order check.
 #[derive(Debug, Clone)]
 pub(super) struct InflightCheck {
@@ -287,6 +307,8 @@ pub(super) struct InflightCheck {
     // `Instant` debug output is runtime-specific and intentionally only useful
     // as an opaque monotonic offset.
     pub last_query_at: Option<dst::time::Instant>,
+    pub commands: Vec<PendingCommandCheck>,
+    pub missing_query_exhausted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -854,6 +876,39 @@ pub(super) fn create_reconciliation_canceled(order: &OrderAny, ts_now: UnixNanos
         order.account_id(),
         None,
     ))
+}
+
+/// Tuple identity keys remain ordered pairs instead of lossy JSON object keys.
+pub(crate) fn serialize_ordered_pairs<
+    K: serde::Serialize,
+    V: serde::Serialize,
+    S: serde::Serializer,
+>(
+    values: &IndexMap<K, V>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&values.iter().collect::<Vec<_>>(), serializer)
+}
+
+#[cfg(feature = "native-tail-replay")]
+pub(crate) fn deserialize_ordered_pairs<'de, K, V, D>(
+    deserializer: D,
+) -> Result<IndexMap<K, V>, D::Error>
+where
+    K: serde::Deserialize<'de> + Eq + std::hash::Hash,
+    V: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    let pairs = <Vec<(K, V)> as serde::Deserialize>::deserialize(deserializer)?;
+    if pairs.len() > 1_000_000 {
+        return Err(serde::de::Error::custom("oversized ordered native source"));
+    }
+    let length = pairs.len();
+    let map = pairs.into_iter().collect::<IndexMap<_, _>>();
+    if map.len() != length {
+        return Err(serde::de::Error::custom("duplicate native source identity"));
+    }
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -1781,37 +1836,4 @@ pub(super) mod tests {
             })
             .collect()
     }
-}
-
-/// Tuple identity keys remain ordered pairs instead of lossy JSON object keys.
-pub(crate) fn serialize_ordered_pairs<
-    K: serde::Serialize,
-    V: serde::Serialize,
-    S: serde::Serializer,
->(
-    values: &IndexMap<K, V>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    serde::Serialize::serialize(&values.iter().collect::<Vec<_>>(), serializer)
-}
-
-#[cfg(feature = "native-tail-replay")]
-pub(crate) fn deserialize_ordered_pairs<'de, K, V, D>(
-    deserializer: D,
-) -> Result<IndexMap<K, V>, D::Error>
-where
-    K: serde::Deserialize<'de> + Eq + std::hash::Hash,
-    V: serde::Deserialize<'de>,
-    D: serde::Deserializer<'de>,
-{
-    let pairs = <Vec<(K, V)> as serde::Deserialize>::deserialize(deserializer)?;
-    if pairs.len() > 1_000_000 {
-        return Err(serde::de::Error::custom("oversized ordered native source"));
-    }
-    let length = pairs.len();
-    let map = pairs.into_iter().collect::<IndexMap<_, _>>();
-    if map.len() != length {
-        return Err(serde::de::Error::custom("duplicate native source identity"));
-    }
-    Ok(map)
 }

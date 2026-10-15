@@ -134,7 +134,7 @@ mod tests {
         fn channel(&self) -> crate::runner_recovery::RunnerRecoveryChannel {
             crate::runner_recovery::RunnerRecoveryChannel::TimeEvent
         }
-        fn codec_id(&self) -> &str {
+        fn codec_id(&self) -> &'static str {
             "actual-registered-heartbeat-capture.v1"
         }
         fn encode(
@@ -330,6 +330,21 @@ mod tests {
         heartbeats: Rc<Cell<usize>>,
         commands: Rc<std::cell::RefCell<Vec<String>>>,
     }
+    impl CrossChannelHeartbeatActor {
+        fn record_original_cancel_command(
+            &self,
+            command: &nautilus_common::messages::execution::TradingCommand,
+        ) {
+            let nautilus_common::messages::execution::TradingCommand::CancelOrder(command) =
+                command
+            else {
+                panic!("original cancel command changed");
+            };
+            self.commands
+                .borrow_mut()
+                .push(command.client_order_id.to_string());
+        }
+    }
     impl nautilus_common::actor::DataActor for CrossChannelHeartbeatActor {
         fn on_start(&mut self) -> Result<()> {
             use nautilus_common::{
@@ -344,13 +359,7 @@ mod tests {
                     "CHECKPOINT-CROSS-CHANNEL",
                     move |command: TradingCommand| {
                         let actor = get_actor_unchecked::<Self>(&owner);
-                        let TradingCommand::CancelOrder(command) = command else {
-                            panic!("original cancel command changed");
-                        };
-                        actor
-                            .commands
-                            .borrow_mut()
-                            .push(command.client_order_id.to_string());
+                        actor.record_original_cancel_command(&command);
                     },
                 ),
             );
@@ -420,7 +429,7 @@ mod tests {
         fn channel(&self) -> crate::runner_recovery::RunnerRecoveryChannel {
             crate::runner_recovery::RunnerRecoveryChannel::ExecutionCommand
         }
-        fn codec_id(&self) -> &str {
+        fn codec_id(&self) -> &'static str {
             "actual-fairness-command-capture.v1"
         }
         fn encode(
@@ -879,7 +888,7 @@ mod tests {
         fn channel(&self) -> crate::runner_recovery::RunnerRecoveryChannel {
             crate::runner_recovery::RunnerRecoveryChannel::DataEvent
         }
-        fn codec_id(&self) -> &str {
+        fn codec_id(&self) -> &'static str {
             "actual-native-instrument.v1"
         }
         fn encode(
@@ -1099,7 +1108,7 @@ mod tests {
                 observed_clone.set(true);
                 Ok(())
             },
-            move |_| {
+            move |()| {
                 persisted.borrow_mut().push("terminal_checkpoint");
                 if change_during_write {
                     mutate.stop();
@@ -1648,40 +1657,42 @@ impl LiveNode {
                         }
                     };
                 }
-                take!(time_evt_rx, |node: &mut Self, input| -> Result<()> {
+                take!(time_events, |node: &mut Self, input| -> Result<()> {
                     ensure!(
                         node.process_time_event(input),
                         "final native timer dispatch rejected"
                     );
                     Ok(())
                 });
-                take!(system_evt_rx, |node: &mut Self,
+                take!(system_events, |node: &mut Self,
                                       input: DispatchMessage<SystemEvent>|
                  -> Result<()> {
                     input.dispatch(|domain| node.process_system_event(domain));
                     Ok(())
                 });
-                take!(system_cmd_rx, |node: &mut Self,
-                                      input: DispatchMessage<SystemCommand>|
+                take!(system_commands, |node: &mut Self,
+                                        input: DispatchMessage<SystemCommand>|
                  -> Result<()> {
                     input.dispatch(|domain| node.process_system_command(domain));
                     Ok(())
                 });
-                take!(exec_evt_rx, |node: &mut Self,
-                                    input: DispatchMessage<ExecutionEvent>|
+                take!(execution_events, |node: &mut Self,
+                                         input: DispatchMessage<
+                    ExecutionEvent,
+                >|
                  -> Result<()> {
                     input.dispatch(|domain| node.process_exec_event(domain));
                     Ok(())
                 });
-                take!(exec_cmd_rx, |node: &mut Self, input| -> Result<()> {
+                take!(execution_commands, |node: &mut Self, input| -> Result<()> {
                     node.process_exec_command(input);
                     Ok(())
                 });
-                take!(data_evt_rx, |node: &mut Self, input| -> Result<()> {
+                take!(data_events, |node: &mut Self, input| -> Result<()> {
                     node.process_data_event(input);
                     Ok(())
                 });
-                take!(data_cmd_rx, |node: &mut Self, input| -> Result<()> {
+                take!(data_commands, |node: &mut Self, input| -> Result<()> {
                     node.process_data_command(input);
                     Ok(())
                 });
@@ -1707,7 +1718,7 @@ impl LiveNode {
             if let Some(registration) = &self.running_checkpoint {
                 let reason = format!("final stop checkpoint: {error:#}");
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    (registration.fence)(&reason)
+                    (registration.fence)(&reason);
                 }));
             }
         }
@@ -1907,7 +1918,7 @@ impl LiveNode {
                     Trader::verify_native_strategy_framework_timers(
                         &self.kernel.trader,
                         &strategy_framework,
-                        &timer_state,
+                        timer_state,
                     )?;
                     let manager = self.exec_manager.checkpoint_inventory(now)?;
                     let engine_counts = (
@@ -2046,7 +2057,7 @@ impl LiveNode {
                                 Trader::verify_native_strategy_framework_timers(
                                     &self.kernel.trader,
                                     &strategy_framework,
-                                    &timer_state,
+                                    timer_state,
                                 )?;
                                 ensure!(
                                     data.running_checkpoint_state()? == data_engine_state,
@@ -2084,7 +2095,7 @@ impl LiveNode {
                             let native_trace_cut = observer.native_trace().map(|trace| {
                                 let receipts = receivers.native_pending_receipts()?;
                                 let original_inputs = receivers.native_pending_inputs(&|source, input| {
-                                    Ok(observer.encode_historical_source(crate::node::dispatch::source_dispatch(source)?, "native_enqueue", input)?.payload)
+                                    Ok(observer.encode_historical_source(crate::node::dispatch::source_dispatch(source), "native_enqueue", input)?.payload)
                                 })?;
                                 if let Some(timers) = &self.recovery_timers {
                                     timers.verify_native_continuation(

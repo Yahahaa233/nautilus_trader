@@ -60,6 +60,31 @@ fn checkpoint_manager_restore_keeps_actual_fifo_retries_shapes_and_ages_offline(
         .insert(account, Decimal::new(1, 5));
     let at = dst::time::Instant::now();
     let snapshot = source.checkpoint_inventory(at).unwrap();
+    assert_eq!(snapshot["schema"], "NautilusExecutionManagerCheckpoint.v3");
+    // Legacy non-pending state keeps its exact row shape; unknown pending state is rejected.
+    let mut legacy = snapshot.clone();
+    legacy["schema"] = "NautilusExecutionManagerCheckpoint.v2".into();
+    legacy.as_object_mut().unwrap().remove("submissions");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("submission_exhaustions");
+    for row in legacy["order_inflight_checks"].as_array_mut().unwrap() {
+        let row = row.as_object_mut().unwrap();
+        row.remove("commands");
+        row.remove("missing_query_exhausted");
+    }
+    let mut legacy_restored =
+        ExecutionManager::new(clock.clone(), cache.clone(), config.clone()).unwrap();
+    legacy_restored
+        .restore_checkpoint_inventory_at(&legacy, 0, at)
+        .unwrap();
+    let mut legacy_trace = legacy_restored.trace_effects_inventory(at).unwrap();
+    let mut source_trace = source.trace_effects_inventory(at).unwrap();
+    // Compare at the actual source snapshot boundary, as native recovery does.
+    legacy_trace["captured_at_ns"] = snapshot["captured_at_ns"].clone();
+    source_trace["captured_at_ns"] = snapshot["captured_at_ns"].clone();
+    assert_eq!(legacy_trace, source_trace);
     let mut restored = ExecutionManager::new(clock.clone(), cache.clone(), config.clone()).unwrap();
     restored
         .restore_checkpoint_inventory_at(&snapshot, 1_000_000_000, dst::time::Instant::now())
@@ -102,7 +127,7 @@ fn checkpoint_manager_restore_keeps_actual_fifo_retries_shapes_and_ages_offline(
         .as_array_mut()
         .unwrap()
         .push(duplicate);
-    let mut fresh = ExecutionManager::new(clock.clone(), cache.clone(), config.clone()).unwrap();
+    let mut fresh = ExecutionManager::new(clock.clone(), cache, config).unwrap();
     assert!(
         fresh
             .restore_checkpoint_inventory_at(&broken, 0, dst::time::Instant::now())

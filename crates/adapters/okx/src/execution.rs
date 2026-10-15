@@ -245,8 +245,8 @@ impl OKXExecutionClient {
             trade_mode,
             ws_dispatch_state,
             checkpoint_gate,
-            private_stream_state: Default::default(),
-            business_stream_state: Default::default(),
+            private_stream_state: Arc::default(),
+            business_stream_state: Arc::default(),
             session_tasks: TaskGroup::new(),
             pending_tasks: TaskGroup::new(),
         })
@@ -1031,6 +1031,8 @@ impl OKXExecutionClient {
             .or(cmd.venue_order_id);
 
         let account_id = self.emitter.account_id();
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
         let original = original.clone();
         self.spawn_task("cancel_order", async move {
             let result = ws_private
@@ -1038,19 +1040,48 @@ impl OKXExecutionClient {
                 .await;
 
             if let Err(e) = result {
-                emit_cancel_failure(
-                    classify_okx_ws_failure(&e),
-                    None,
-                    command.client_order_id,
-                    command.instrument_id,
-                    command.strategy_id,
-                    command.venue_order_id,
-                );
+                let failure = classify_okx_ws_failure(&e);
+                if !original_cancel_is_pending(&ws_private, &original) {
+                    emit_cancel_failure(failure, &emitter, clock, &original);
+                }
                 return Err(anyhow::Error::new(e).context("cancel order failed"));
             }
 
             Ok(())
         });
+    }
+
+    fn refuse_duplicate_cancel_batch(&self, commands: &[CancelOrder]) -> bool {
+        let mut ids = AHashSet::new();
+        let blocked = commands.iter().any(|command| {
+            !ids.insert(command.client_order_id)
+                || self
+                    .ws_private
+                    .pending_cancels
+                    .contains_key(command.client_order_id.as_str())
+                || self
+                    .ws_private
+                    .retained_cancel_contexts
+                    .contains_key(command.client_order_id.as_str())
+        });
+        if blocked {
+            let mut rejected = AHashSet::new();
+            for command in commands {
+                if rejected.insert((command.client_order_id, command.command_id))
+                    && !original_cancel_is_pending(&self.ws_private, command)
+                {
+                    emit_cancel_failure(
+                        CommandFailure::not_sent(
+                            "batch cancel repeats an order or unresolved original cancel",
+                        ),
+                        &self.emitter,
+                        self.clock,
+                        command,
+                    );
+                }
+            }
+        }
+        blocked
     }
 
     fn cancel_order_http(&self, cmd: &CancelOrder) {
@@ -1071,14 +1102,7 @@ impl OKXExecutionClient {
                 .await;
 
             if let Err(e) = result {
-                emit_cancel_failure(
-                    classify_okx_http_failure(&e),
-                    Some((&emitter, clock)),
-                    command.client_order_id,
-                    command.instrument_id,
-                    command.strategy_id,
-                    command.venue_order_id,
-                );
+                emit_cancel_failure(classify_okx_http_failure(&e), &emitter, clock, &command);
                 return Err(anyhow::Error::new(e).context("cancel order failed"));
             }
 
@@ -1150,14 +1174,7 @@ impl OKXExecutionClient {
 
             match responses {
                 Err(e) => {
-                    emit_cancel_failure(
-                        classify_okx_http_failure(&e),
-                        Some((&emitter, clock)),
-                        command.client_order_id,
-                        command.instrument_id,
-                        command.strategy_id,
-                        command.venue_order_id,
-                    );
+                    emit_cancel_failure(classify_okx_http_failure(&e), &emitter, clock, &command);
                     return Err(anyhow::Error::new(e).context("cancel algo order failed"));
                 }
                 Ok(resps) => {
@@ -1170,14 +1187,7 @@ impl OKXExecutionClient {
                         let reason = format_order_response_reason(code, msg, "");
                         let failure = classify_okx_venue_code(code, reason.clone());
                         let is_rejected = matches!(failure, CommandFailure::VenueRejected(_));
-                        emit_cancel_failure(
-                            failure,
-                            Some((&emitter, clock)),
-                            command.client_order_id,
-                            command.instrument_id,
-                            command.strategy_id,
-                            command.venue_order_id,
-                        );
+                        emit_cancel_failure(failure, &emitter, clock, &command);
 
                         if is_rejected {
                             anyhow::bail!("{reason}");
@@ -1324,6 +1334,8 @@ impl OKXExecutionClient {
                         log_algo_batch_cancel_failure(
                             classify_okx_http_failure(&e),
                             &regular_contexts,
+                            &emitter,
+                            clock,
                         );
                         return Err(anyhow::Error::new(e).context("cancel algo orders failed"));
                     }
@@ -1351,6 +1363,8 @@ impl OKXExecutionClient {
                         log_algo_batch_cancel_failure(
                             classify_okx_http_failure(&e),
                             &advance_contexts,
+                            &emitter,
+                            clock,
                         );
                         return Err(
                             anyhow::Error::new(e).context("cancel advance algo orders failed")
@@ -1529,7 +1543,7 @@ impl OKXExecutionClient {
                                 break;
                             };
                             let mut stream_state = stream_state.lock();
-                            let crate::checkpoint::ExecutionStreamState { fee_cache, filled_qty_cache, order_state_cache } = &mut *stream_state;
+                            let crate::checkpoint::ExecutionStreamState { fees: fee_cache, filled_quantities: filled_qty_cache, orders: order_state_cache } = &mut *stream_state;
                             dispatch_ws_message(
                                 message,
                                 &emitter,
@@ -1545,7 +1559,7 @@ impl OKXExecutionClient {
                         }
                         ((), _checkpoint_callback) = checkpoint_gate.callback(state.wait_for_linked_child_route()) => {
                             let mut stream_state = stream_state.lock();
-                            let crate::checkpoint::ExecutionStreamState { fee_cache, filled_qty_cache, order_state_cache } = &mut *stream_state;
+                            let crate::checkpoint::ExecutionStreamState { fees: fee_cache, filled_quantities: filled_qty_cache, orders: order_state_cache } = &mut *stream_state;
                             dispatch_ws_message(
                                 OKXWsMessage::Orders(Vec::new()),
                                 &emitter,
@@ -1596,7 +1610,7 @@ impl OKXExecutionClient {
                                 break;
                             };
                             let mut stream_state = stream_state.lock();
-                            let crate::checkpoint::ExecutionStreamState { fee_cache, filled_qty_cache, order_state_cache } = &mut *stream_state;
+                            let crate::checkpoint::ExecutionStreamState { fees: fee_cache, filled_quantities: filled_qty_cache, orders: order_state_cache } = &mut *stream_state;
                             dispatch_ws_message(
                                 message,
                                 &emitter,
@@ -2683,7 +2697,7 @@ impl ExecutionClient for OKXExecutionClient {
         match route {
             OrderCommandRoute::RegularWs => self.cancel_ws_order(&cmd, &original),
             OrderCommandRoute::AlgoHttp => {
-                self.cancel_algo_order(&cmd, serde_json::to_string(&original)?)
+                self.cancel_algo_order(&cmd, serde_json::to_string(&original)?);
             }
             OrderCommandRoute::SpreadHttp => self.cancel_order_http(&cmd),
         }
@@ -2744,6 +2758,9 @@ impl ExecutionClient for OKXExecutionClient {
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
         self.recovery_pristine
             .store(false, std::sync::atomic::Ordering::Release);
+        if self.refuse_duplicate_cancel_batch(&cmd.cancels) {
+            return Ok(());
+        }
         let cache = self.core.cache();
 
         let mut regular_payload = Vec::new();
@@ -2773,11 +2790,9 @@ impl ExecutionClient for OKXExecutionClient {
                         cancel.strategy_id,
                         cancel.instrument_id,
                     );
-                    regular_payload.push((
-                        cancel.instrument_id,
-                        Some(cancel.client_order_id),
-                        authoritative_venue_order_id,
-                    ));
+                    let mut routed = cancel.clone();
+                    routed.venue_order_id = authoritative_venue_order_id;
+                    regular_payload.push(routed);
                 }
                 OrderCommandRoute::AlgoHttp => {
                     let mut cancel = cancel.clone();
@@ -2790,12 +2805,9 @@ impl ExecutionClient for OKXExecutionClient {
                         cancel.strategy_id,
                         cancel.instrument_id,
                     );
-                    http_orders.push((
-                        cancel.client_order_id,
-                        cancel.instrument_id,
-                        cancel.strategy_id,
-                        authoritative_venue_order_id,
-                    ));
+                    let mut routed = cancel.clone();
+                    routed.venue_order_id = authoritative_venue_order_id;
+                    http_orders.push(routed);
                 }
             }
         }
@@ -2803,10 +2815,21 @@ impl ExecutionClient for OKXExecutionClient {
 
         if !regular_payload.is_empty() {
             let ws_private = self.ws_private.clone();
+            let emitter = self.emitter.clone();
+            let clock = self.clock;
             self.spawn_task("batch_cancel_orders", async move {
                 for batch in regular_payload.chunks(20) {
-                    if let Err(e) = ws_private.batch_cancel_orders(batch.to_vec()).await {
-                        log_batch_cancel_failure(classify_okx_ws_failure(&e), batch.len());
+                    if let Err(e) = ws_private
+                        .batch_cancel_orders_with_original(batch.to_vec())
+                        .await
+                    {
+                        let failure = classify_okx_ws_failure(&e);
+                        for command in batch {
+                            if !original_cancel_is_pending(&ws_private, command) {
+                                emit_cancel_failure(failure.clone(), &emitter, clock, command);
+                            }
+                        }
+                        log_batch_cancel_failure(failure, batch.len());
                         return Err(anyhow::Error::new(e).context("batch cancel orders failed"));
                     }
                 }
@@ -2830,6 +2853,7 @@ impl ExecutionClient for OKXExecutionClient {
                         },
                     };
                     let ctx = AlgoCancelContext {
+                        command_id: Some(cancel.command_id),
                         client_order_id: cancel.client_order_id,
                         instrument_id: cancel.instrument_id,
                         strategy_id: cancel.strategy_id,
@@ -2847,18 +2871,20 @@ impl ExecutionClient for OKXExecutionClient {
             let clock = self.clock;
 
             self.spawn_task("cancel_http_orders", async move {
-                for (client_order_id, instrument_id, strategy_id, venue_order_id) in http_orders {
+                for command in http_orders {
                     if let Err(e) = client
-                        .cancel_order(instrument_id, Some(client_order_id), venue_order_id)
+                        .cancel_order(
+                            command.instrument_id,
+                            Some(command.client_order_id),
+                            command.venue_order_id,
+                        )
                         .await
                     {
                         emit_cancel_failure(
                             classify_okx_http_failure(&e),
-                            Some((&emitter, clock)),
-                            client_order_id,
-                            instrument_id,
-                            strategy_id,
-                            venue_order_id,
+                            &emitter,
+                            clock,
+                            &command,
                         );
                     }
                 }
@@ -3971,38 +3997,39 @@ fn algo_amend_request(
 
 fn emit_cancel_failure(
     failure: CommandFailure,
-    emit_venue: Option<(&ExecutionEventEmitter, &'static AtomicTime)>,
-    client_order_id: ClientOrderId,
-    instrument_id: InstrumentId,
-    strategy_id: StrategyId,
-    venue_order_id: Option<VenueOrderId>,
+    emitter: &ExecutionEventEmitter,
+    clock: &'static AtomicTime,
+    command: &CancelOrder,
 ) {
     match failure {
-        CommandFailure::VenueRejected(reason) => {
-            if let Some((emitter, clock)) = emit_venue {
-                emitter.emit_order_cancel_rejected_event(
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
-                    venue_order_id,
-                    &reason,
-                    clock.get_time_ns(),
-                );
-            } else {
-                log::warn!(
-                    "Ambiguous cancel failure for {client_order_id}, awaiting reconciliation: {reason}"
-                );
+        CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+            AlgoCancelContext {
+                client_order_id: command.client_order_id,
+                instrument_id: command.instrument_id,
+                strategy_id: command.strategy_id,
+                venue_order_id: command.venue_order_id,
+                command_id: Some(command.command_id),
             }
-        }
-        CommandFailure::NotSent(reason) => {
-            log::warn!("Cancel command failed local validation for {client_order_id}: {reason}");
+            .emit_rejection(emitter, clock, &reason);
         }
         CommandFailure::Ambiguous(reason) => {
             log::warn!(
-                "Ambiguous cancel failure for {client_order_id}, awaiting reconciliation: {reason}"
+                "Ambiguous cancel failure for {}, awaiting reconciliation: {reason}",
+                command.client_order_id,
             );
         }
     }
+}
+
+fn original_cancel_is_pending(socket: &OKXWebSocketClient, command: &CancelOrder) -> bool {
+    socket
+        .pending_cancels
+        .get(command.client_order_id.as_str())
+        .is_some_and(|context| context.command_id == Some(command.command_id))
+        || socket
+            .retained_cancel_contexts
+            .get(command.client_order_id.as_str())
+            .is_some_and(|context| context.command_id == command.command_id)
 }
 
 fn log_batch_cancel_failure(failure: CommandFailure, order_count: usize) {
@@ -4033,17 +4060,19 @@ fn log_mass_cancel_failure(failure: CommandFailure, instrument_id: InstrumentId)
     }
 }
 
-fn log_algo_batch_cancel_failure(failure: CommandFailure, contexts: &[AlgoCancelContext]) {
+fn log_algo_batch_cancel_failure(
+    failure: CommandFailure,
+    contexts: &[AlgoCancelContext],
+    emitter: &ExecutionEventEmitter,
+    clock: &'static AtomicTime,
+) {
     match failure {
-        CommandFailure::NotSent(reason) => {
-            for ctx in contexts {
-                log::warn!(
-                    "Algo batch cancel command failed local validation for {}: {reason}",
-                    ctx.client_order_id
-                );
+        CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+            for context in contexts {
+                context.emit_rejection(emitter, clock, &reason);
             }
         }
-        CommandFailure::Ambiguous(reason) | CommandFailure::VenueRejected(reason) => {
+        CommandFailure::Ambiguous(reason) => {
             for ctx in contexts {
                 log::warn!(
                     "Ambiguous algo batch cancel failure for {}, awaiting reconciliation: {reason}",
@@ -6323,7 +6352,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_local_cancel_validation_failure_does_not_emit_order_cancel_rejected() {
+    async fn test_local_cancel_validation_failure_rejects_only_original_cancel_command() {
         let (mut client, cache) = build_test_exec_client_with_cache();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         client.emitter.set_sender(event_tx);
@@ -6356,6 +6385,7 @@ mod tests {
             causation_id: None,
         };
 
+        let command_id = command.command_id;
         client.cancel_order(command).expect("cancel order");
         wait_until_async(
             || async { client.pending_tasks.all_finished() },
@@ -6368,12 +6398,161 @@ mod tests {
 
         let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
         assert!(
-            !events.iter().any(|event| matches!(
-                event,
-                ExecutionEvent::Order(OrderEventAny::CancelRejected(rejected))
-                    if rejected.client_order_id == client_order_id
-            )),
-            "local cancel validation failure should not emit OrderCancelRejected: {events:?}",
+            matches!(&events[..], [ExecutionEvent::Order(OrderEventAny::CancelRejected(rejected))]
+            if rejected.client_order_id == client_order_id && rejected.causation_id == Some(command_id)),
+            "local NotSent must reject exactly its original Cancel command: {events:?}"
+        );
+    }
+
+    #[rstest]
+    #[case(CommandFailure::not_sent("not transmitted"), true)]
+    #[case(CommandFailure::venue_rejected("explicit refusal"), true)]
+    #[case(CommandFailure::ambiguous("timeout after send"), false)]
+    fn test_cancel_failure_causation_preserves_actual_command_and_ambiguity(
+        #[case] failure: CommandFailure,
+        #[case] rejected: bool,
+    ) {
+        let mut client = build_test_exec_client();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(sender);
+        let command = CancelOrder {
+            trader_id: client.emitter.trader_id(),
+            client_id: None,
+            strategy_id: StrategyId::from("CANCEL-CAUSE-001"),
+            instrument_id: InstrumentId::from("ETH-USDT-SWAP.OKX"),
+            client_order_id: ClientOrderId::from("OCANCELCAUSE001"),
+            venue_order_id: Some(VenueOrderId::from("12345")),
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        };
+        emit_cancel_failure(failure.clone(), &client.emitter, client.clock, &command);
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        if rejected {
+            assert!(
+                matches!(&events[..], [ExecutionEvent::Order(OrderEventAny::CancelRejected(event))]
+                if event.causation_id == Some(command.command_id)
+                    && event.client_order_id == command.client_order_id
+                    && event.venue_order_id == command.venue_order_id)
+            );
+        } else {
+            assert!(events.is_empty(), "Ambiguous cannot become CancelRejected");
+        }
+        let context = AlgoCancelContext {
+            client_order_id: command.client_order_id,
+            instrument_id: command.instrument_id,
+            strategy_id: command.strategy_id,
+            venue_order_id: command.venue_order_id,
+            command_id: Some(command.command_id),
+        };
+        log_algo_batch_cancel_failure(failure, &[context], &client.emitter, client.clock);
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        if rejected {
+            assert!(
+                matches!(&events[..], [ExecutionEvent::Order(OrderEventAny::CancelRejected(event))]
+                if event.causation_id == Some(command.command_id))
+            );
+        } else {
+            assert!(
+                events.is_empty(),
+                "Ambiguous algo batch cannot become CancelRejected"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_cancel_batch_not_sent_deduplicates_order_and_command_together(
+        #[case] same_original_command: bool,
+        #[values(false, true)] duplicate_second_order: bool,
+    ) {
+        let mut client = build_test_exec_client();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(sender);
+        let original_command = UUID4::new();
+        let shared_command = if same_original_command {
+            original_command
+        } else {
+            UUID4::new()
+        };
+        let first = CancelOrder {
+            trader_id: client.emitter.trader_id(),
+            client_id: None,
+            strategy_id: StrategyId::from("CANCEL-PAIR-001"),
+            instrument_id: InstrumentId::from("ETH-USDT-SWAP.OKX"),
+            client_order_id: ClientOrderId::from("OCANCELPAIR001"),
+            venue_order_id: Some(VenueOrderId::from("12345")),
+            command_id: shared_command,
+            ts_init: UnixNanos::default(),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        };
+        let mut second = first.clone();
+        second.client_order_id = ClientOrderId::from("OCANCELPAIR002");
+        client.ws_private.pending_cancels.insert(
+            first.client_order_id.to_string(),
+            crate::websocket::client::PendingOrderInfo {
+                trader_id: first.trader_id,
+                strategy_id: first.strategy_id,
+                instrument_id: first.instrument_id,
+                command_id: Some(original_command),
+                cancel_request: Some(crate::websocket::client::CancelRequest::Batch(
+                    "original-old-batch".into(),
+                )),
+            },
+        );
+        let mut cancels = vec![first.clone(), second.clone()];
+        if duplicate_second_order {
+            cancels.push(second.clone());
+        }
+        client
+            .batch_cancel_orders(BatchCancelOrders {
+                trader_id: first.trader_id,
+                client_id: None,
+                strategy_id: first.strategy_id,
+                instrument_id: first.instrument_id,
+                cancels,
+                command_id: shared_command,
+                ts_init: first.ts_init,
+                params: None,
+                correlation_id: None,
+                causation_id: None,
+            })
+            .unwrap();
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        let actual: Vec<_> = events
+            .iter()
+            .map(|event| match event {
+                ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) => {
+                    (event.client_order_id, event.causation_id)
+                }
+                other => panic!("expected only original CancelRejected, got {other:?}"),
+            })
+            .collect();
+        let expected = if same_original_command {
+            vec![(second.client_order_id, Some(shared_command))]
+        } else {
+            vec![
+                (first.client_order_id, Some(shared_command)),
+                (second.client_order_id, Some(shared_command)),
+            ]
+        };
+        assert_eq!(actual, expected);
+        assert_eq!(client.ws_private.pending_cancels.len(), 1);
+        let original = client
+            .ws_private
+            .pending_cancels
+            .get(first.client_order_id.as_str())
+            .unwrap();
+        assert_eq!(original.command_id, Some(original_command));
+        assert!(original.matches_cancel(Some("original-old-batch"), true));
+        assert!(
+            client.pending_tasks.all_finished(),
+            "the rejected batch must not dispatch any wire task"
         );
     }
 

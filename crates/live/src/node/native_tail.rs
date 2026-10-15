@@ -76,6 +76,7 @@ impl NativeTailReplayReceipt {
     pub const fn final_watermark(&self) -> &RunnerRecoveryWatermark {
         &self.final_watermark
     }
+    #[must_use]
     pub fn retained_inputs(&self) -> &[NativePendingInput] {
         &self.retained_inputs
     }
@@ -121,6 +122,9 @@ impl LiveNode {
     /// must use an owner-bound native decoder, never a callback guessed from an event name.
     /// Any panic, source gap, callback mismatch or changed output permanently fences
     /// the actual engine and retains the same child Journal unsealed.
+    ///
+    /// # Errors
+    /// Returns an error if original inputs, effects, or retained queues cannot be restored and verified; failures keep the native admission fence closed.
     pub fn replay_native_tail(
         &mut self,
         trace: &VerifiedNativeTrace,
@@ -570,7 +574,7 @@ impl LiveNode {
                 &|source, input| {
                     Ok(observer
                         .encode_historical_source(
-                            super::dispatch::source_dispatch(source)?,
+                            super::dispatch::source_dispatch(source),
                             "native_enqueue",
                             input,
                         )?
@@ -580,7 +584,7 @@ impl LiveNode {
     }
 
     fn decode_original_pending(
-        &mut self,
+        &self,
         trace: &VerifiedNativeTrace,
         original: &NativePendingInput,
         decode_pending: &mut impl FnMut(
@@ -615,7 +619,7 @@ impl LiveNode {
             .as_ref()
             .context("original source codec absent")?
             .encode_historical_source(
-                super::dispatch::source_dispatch(source)?,
+                super::dispatch::source_dispatch(source),
                 "native_enqueue",
                 any,
             )?;
@@ -732,13 +736,13 @@ impl LiveNode {
                         "original owner callback rejected historical event"
                     ),
                     PendingRunnerEvent::SystemEvent(event) => {
-                        event.dispatch(|event| self.process_system_event(event))
+                        event.dispatch(|event| self.process_system_event(event));
                     }
                     PendingRunnerEvent::SystemCommand(command) => {
-                        command.dispatch(|command| self.process_system_command(command))
+                        command.dispatch(|command| self.process_system_command(command));
                     }
                     PendingRunnerEvent::ExecEvent(event) => {
-                        event.dispatch(|event| self.process_exec_event(event))
+                        event.dispatch(|event| self.process_exec_event(event));
                     }
                     PendingRunnerEvent::ExecCommand(command) => self.process_exec_command(command),
                     PendingRunnerEvent::DataEvent(event) => self.process_data_event(event),
@@ -1085,9 +1089,9 @@ fn original_event_ref(event: &RunnerRecoveryEvent) -> (NativeInputSource, &dyn s
     }
 }
 
-fn original_timer_admissions(
-    trace: &VerifiedNativeTrace,
-) -> Result<Vec<(String, u64, bool, nautilus_common::timer::TimeEvent, u64)>> {
+type OriginalTimerAdmission = (String, u64, bool, nautilus_common::timer::TimeEvent, u64);
+
+fn original_timer_admissions(trace: &VerifiedNativeTrace) -> Result<Vec<OriginalTimerAdmission>> {
     use nautilus_common::timer::TimeEvent;
     let parse = |owner: String,
                  binding: &serde_json::Value,
@@ -1344,7 +1348,7 @@ mod tests {
         fn channel(&self) -> RunnerRecoveryChannel {
             RunnerRecoveryChannel::DataEvent
         }
-        fn codec_id(&self) -> &str {
+        fn codec_id(&self) -> &'static str {
             "actual_native_instrument_tail.v1"
         }
         fn encode(&self, event: RunnerRecoveryEventRef<'_>) -> Result<serde_json::Value> {
@@ -1470,8 +1474,8 @@ mod tests {
         Rc::new(registry.seal().unwrap())
     }
 
-    /// Uses two actual LiveNodes, a real source runloop, durable redb Journal,
-    /// native checkpoint barriers and original DataEngine handlers. No venue or
+    /// Uses two actual `LiveNode`s, a real source runloop, durable redb Journal,
+    /// native checkpoint barriers and original `DataEngine` handlers. No venue or
     /// DTO completion fixture supplies the source root.
     #[rstest]
     #[case(false)]
@@ -1481,8 +1485,7 @@ mod tests {
         #[case] changed: bool,
     ) {
         let root = std::env::var_os("CARGO_TARGET_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
             .join(format!("native-tail-test-{}", nautilus_core::UUID4::new()));
         std::fs::create_dir_all(&root).unwrap();
         let mut source = actual_node("native-source", root.join("source"), None);
@@ -1535,7 +1538,7 @@ mod tests {
                     }
                     Ok(())
                 },
-                |_| Ok(()),
+                |()| Ok(()),
                 |_| {},
             )
             .unwrap();
@@ -1876,7 +1879,7 @@ mod tests {
         fn channel(&self) -> RunnerRecoveryChannel {
             RunnerRecoveryChannel::ExecutionCommand
         }
-        fn codec_id(&self) -> &str {
+        fn codec_id(&self) -> &'static str {
             "actual_registered_submission_guard_tail.v1"
         }
         fn encode(&self, event: RunnerRecoveryEventRef<'_>) -> Result<serde_json::Value> {
@@ -1912,7 +1915,7 @@ mod tests {
     // Only its actual native_transport outcome is replayed. The source's local
     // approval branch is not a CQS grant; target phase gates remain closed.
     fn install_original_guard(
-        node: &mut LiveNode,
+        node: &LiveNode,
         approved: bool,
     ) -> (Rc<std::cell::Cell<usize>>, Rc<std::cell::Cell<usize>>) {
         let guard_calls = Rc::new(std::cell::Cell::new(0));
@@ -1952,8 +1955,7 @@ mod tests {
             types::Quantity,
         };
         let directory = std::env::var_os("CARGO_TARGET_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
             .join(format!("original-guard-tail-{}", UUID4::new()));
         std::fs::create_dir_all(&directory).unwrap();
         let order = OrderTestBuilder::new(OrderType::Market)
@@ -1970,7 +1972,7 @@ mod tests {
             .borrow_mut()
             .add_order(order.clone(), None, None, false)
             .unwrap();
-        let (source_guard, source_current) = install_original_guard(&mut source, approved);
+        let (source_guard, source_current) = install_original_guard(&source, approved);
         let instance = source.kernel.instance_id();
         let recorder = source
             .prepare_owned_native_trace(
@@ -2015,7 +2017,7 @@ mod tests {
                     }
                     Ok(())
                 },
-                |_| Ok(()),
+                |()| Ok(()),
                 |_| {},
             )
             .unwrap();
@@ -2129,7 +2131,7 @@ mod tests {
                 let originals: Vec<_> = verified
                     .roots()
                     .iter()
-                    .flat_map(|root| root.inputs())
+                    .flat_map(nautilus_event_store::native_trace::VerifiedNativeRoot::inputs)
                     .filter_map(|input| match input {
                         NativeTraceRecord::Complete { transports, .. } => Some(transports),
                         _ => None,
@@ -2173,7 +2175,7 @@ mod tests {
                     .risk_engine
                     .borrow_mut()
                     .set_trading_state(nautilus_model::enums::TradingState::Halted);
-                let (target_guard, target_current) = install_original_guard(&mut target, approved);
+                let (target_guard, target_current) = install_original_guard(&target, approved);
                 let observation = target
                     .kernel
                     .exec_engine
@@ -2330,12 +2332,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn actual_reader_guard_denial_replays_original_terminal_before_client_routing() {
-        run_actual_original_guard_tail(false).await;
+        Box::pin(run_actual_original_guard_tail(false)).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn actual_reader_approved_guard_keeps_current_observation_fence_and_transport_closed() {
-        run_actual_original_guard_tail(true).await;
+        Box::pin(run_actual_original_guard_tail(true)).await;
     }
 }
 

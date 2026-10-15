@@ -261,8 +261,8 @@ impl OKXDataClient {
             transports_started: false,
             tasks: TaskGroup::new(),
             checkpoint_gate,
-            public_stream_state: Default::default(),
-            business_stream_state: Default::default(),
+            public_stream_state: Arc::default(),
+            business_stream_state: Arc::default(),
             data_sender,
             instruments_by_symbol: Arc::new(AtomicMap::new()),
             instrument_update_lock: Arc::new(InstrumentUpdateLock::default()),
@@ -533,7 +533,7 @@ impl OKXDataClient {
         };
         let fut = async move {
             let _checkpoint_request = checkpoint_request;
-            fut.await
+            fut.await;
         };
         self.recovery_pristine
             .store(false, std::sync::atomic::Ordering::Release);
@@ -3613,7 +3613,7 @@ mod tests {
 
         dispatch_parsed_data(
             NautilusWsMessage::InstrumentStatus(status),
-            &sender.into(),
+            &sender,
             &instruments_by_symbol,
         );
 
@@ -3671,7 +3671,7 @@ mod tests {
                 code: code.to_string(),
                 msg: "Channel does not exist".to_string(),
             },
-            &sender.into(),
+            &sender,
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -3753,7 +3753,7 @@ mod tests {
 
         OKXDataClient::handle_ws_message(
             OKXWsMessage::Reconnected,
-            &sender.clone().into(),
+            &sender.clone(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -3799,7 +3799,7 @@ mod tests {
                     "ts": "3"
                 }]),
             },
-            &sender.clone().into(),
+            &sender.clone(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -3847,7 +3847,7 @@ mod tests {
                     "ts": "4"
                 }]),
             },
-            &sender.into(),
+            &sender,
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -4018,7 +4018,7 @@ mod tests {
         let mut handle = |message| {
             OKXDataClient::handle_ws_message(
                 message,
-                &sender.clone().into(),
+                &sender.clone(),
                 &instruments_by_symbol,
                 &http,
                 &OKXDataClientConfig::default(),
@@ -4301,7 +4301,7 @@ mod tests {
         let ws_business = offline_ws_client();
 
         handle_instruments_message(
-            &sender.into(),
+            &sender,
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -4359,7 +4359,7 @@ mod tests {
 
         for _ in 0..2 {
             handle_instruments_message(
-                &sender.clone().into(),
+                &sender.clone(),
                 &instruments_by_symbol,
                 &http,
                 &OKXDataClientConfig::default(),
@@ -4401,7 +4401,7 @@ mod tests {
         let http = offline_http_client();
 
         handle_instruments_message(
-            &sender.clone().into(),
+            &sender,
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -4410,7 +4410,7 @@ mod tests {
             ws_instruments_message(swap_definition("0.1")),
         );
         handle_instruments_message(
-            &sender.into(),
+            &sender,
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -4463,7 +4463,7 @@ mod tests {
         definition["uly"] = json!("");
 
         handle_instruments_message(
-            &sender.into(),
+            &sender,
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -4507,7 +4507,7 @@ mod tests {
         ]);
 
         handle_instruments_message(
-            &sender.into(),
+            &sender,
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -4557,7 +4557,7 @@ mod tests {
             .build();
 
         handle_instruments_message(
-            &sender.clone().into(),
+            &sender,
             &instruments_by_symbol,
             &http,
             &config,
@@ -4588,7 +4588,7 @@ mod tests {
         assert_eq!(inverse_item["instId"], json!("BTC-USD-SWAP"));
         assert_eq!(inverse_item["ctType"], json!("inverse"));
         handle_instruments_message(
-            &sender.into(),
+            &sender,
             &instruments_by_symbol,
             &http,
             &config,
@@ -4626,7 +4626,7 @@ mod tests {
         eth_definition["uly"] = json!("ETH-USDT");
 
         handle_instruments_message(
-            &sender.clone().into(),
+            &sender,
             &instruments_by_symbol,
             &http,
             &config,
@@ -4651,7 +4651,7 @@ mod tests {
         assert!(instruments_by_symbol.load().is_empty());
 
         handle_instruments_message(
-            &sender.into(),
+            &sender,
             &instruments_by_symbol,
             &http,
             &config,
@@ -4699,7 +4699,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender.clone().into(),
+            &sender.clone(),
         )
         .await
         .expect("reconcile");
@@ -4745,7 +4745,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender.clone().into(),
+            &sender.clone(),
         )
         .await
         .expect("reconcile");
@@ -4855,7 +4855,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender.clone().into(),
+            &sender.clone(),
         )
         .await
         .expect("reconcile");
@@ -4866,7 +4866,7 @@ mod tests {
         let rest_item = test_payload("http_get_instruments_swap.json")["data"][2].clone();
         assert_eq!(rest_item["instId"], json!("BTC-USDT-SWAP"));
         handle_instruments_message(
-            &sender.clone().into(),
+            &sender.clone(),
             &instruments_by_symbol,
             &http,
             &OKXDataClientConfig::default(),
@@ -5090,7 +5090,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender.clone().into(),
+            &sender.clone(),
         )
         .await
         .expect("initial reconcile");
@@ -5107,7 +5107,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender.clone().into(),
+            &sender.clone(),
         )
         .await
         .expect("unchanged reconcile");
@@ -5130,7 +5130,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender.clone().into(),
+            &sender.clone(),
         )
         .await
         .expect("changed reconcile");
@@ -5158,7 +5158,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender.clone().into(),
+            &sender.clone(),
         )
         .await
         .expect("new listing reconcile");
@@ -5183,7 +5183,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender.clone().into(),
+            &sender.clone(),
         )
         .await
         .expect("removal reconcile");
@@ -5223,7 +5223,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender.clone().into(),
+            &sender.clone(),
         )
         .await;
 
@@ -5261,7 +5261,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender.clone().into(),
+            &sender.clone(),
         )
         .await
         .expect("reconcile");
@@ -5319,7 +5319,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender.clone().into(),
+            &sender.clone(),
         )
         .await
         .expect("reconcile");
@@ -5362,7 +5362,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender.clone().into(),
+            &sender.clone(),
         )
         .await
         .expect("reconcile");
@@ -5405,7 +5405,7 @@ mod tests {
                 &update_lock_task,
                 Some(&ws_task),
                 Some(&ws_business_task),
-                &sender.clone().into(),
+                &sender.clone(),
             )
             .await
         });
@@ -5462,7 +5462,7 @@ mod tests {
             &update_lock,
             None,
             None,
-            &sender.clone().into(),
+            &sender.clone(),
         )
         .await
         .expect("seed reconcile");
@@ -5483,7 +5483,7 @@ mod tests {
                     &update_lock,
                     None,
                     None,
-                    &sender.clone().into(),
+                    &sender.clone(),
                 )
                 .await
             })
@@ -5511,7 +5511,7 @@ mod tests {
                 None,
                 None,
                 &update_lock,
-                &sender.clone().into(),
+                &sender.clone(),
             );
         }
 
@@ -5777,9 +5777,9 @@ mod tests {
                                 if let Message::Text(text) = message {
                                     if text == "ping" {
                                         websocket.send(Message::Text("pong".into())).await.unwrap();
-                                    } else if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                                        if let Some(op) = value["op"].as_str() {
-                                            if op == "subscribe" || op == "unsubscribe" {
+                                    } else if let Ok(value) = serde_json::from_str::<Value>(&text)
+                                        && let Some(op) = value["op"].as_str()
+                                            && (op == "subscribe" || op == "unsubscribe") {
                                                 for arg in value["args"].as_array().unwrap() {
                                                     if restore && index >= 2 && op == "subscribe" && arg["channel"] == "bbo-tbt" {
                                                         websocket.send(Message::Text(current_quote.to_string().into())).await.unwrap();
@@ -5789,8 +5789,6 @@ mod tests {
                                                     }).to_string().into())).await.unwrap();
                                                 }
                                             }
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -5870,7 +5868,7 @@ mod tests {
                 assert!(!client.ws_public.as_ref().unwrap().has_task());
                 assert!(!client.ws_business.as_ref().unwrap().has_task());
                 assert!(
-                    !receiver.try_recv().is_ok(),
+                    receiver.try_recv().is_err(),
                     "terminal producer emitted retained input after final cut"
                 );
                 assert_eq!(

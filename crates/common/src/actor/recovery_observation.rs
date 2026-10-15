@@ -129,16 +129,13 @@ impl Drop for RecoveryObservationAdmission {
 pub fn callback_admitted(component_id: &Ustr) -> bool {
     ADMISSION
         .try_with(|state| {
-            state
-                .try_borrow()
-                .map(|state| {
-                    !state.failed
-                        && state
-                            .observers
-                            .as_ref()
-                            .is_none_or(|ids| ids.contains(component_id.as_str()))
-                })
-                .unwrap_or(false)
+            state.try_borrow().is_ok_and(|state| {
+                !state.failed
+                    && state
+                        .observers
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(component_id.as_str()))
+            })
         })
         .unwrap_or(false)
 }
@@ -149,16 +146,13 @@ pub fn callback_admitted(component_id: &Ustr) -> bool {
 pub fn is_observer(component_id: &Ustr) -> bool {
     ADMISSION
         .try_with(|state| {
-            state
-                .try_borrow()
-                .map(|state| {
-                    !state.failed
-                        && state
-                            .observers
-                            .as_ref()
-                            .is_some_and(|ids| ids.contains(component_id.as_str()))
-                })
-                .unwrap_or(false)
+            state.try_borrow().is_ok_and(|state| {
+                !state.failed
+                    && state
+                        .observers
+                        .as_ref()
+                        .is_some_and(|ids| ids.contains(component_id.as_str()))
+            })
         })
         .unwrap_or(false)
 }

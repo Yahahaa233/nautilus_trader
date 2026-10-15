@@ -36,7 +36,7 @@ use ahash::{AHashMap, AHashSet};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures_util::Stream;
-use nautilus_common::live::dst::time;
+use nautilus_common::live::{checkpoint::CheckpointGate, dst::time};
 use nautilus_core::{
     AtomicMap, AtomicTime, UnixNanos,
     env::{get_env_var, get_or_env_var},
@@ -222,6 +222,13 @@ pub(crate) struct PendingOrderInfo {
     pub strategy_id: StrategyId,
     pub instrument_id: InstrumentId,
     pub command_id: Option<nautilus_core::UUID4>,
+    pub cancel_request: Option<CancelRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CancelRequest {
+    Single(String),
+    Batch(String),
 }
 
 impl PendingOrderInfo {
@@ -233,6 +240,7 @@ impl PendingOrderInfo {
             strategy_id: command.strategy_id,
             instrument_id: command.instrument_id,
             command_id: Some(command.command_id),
+            cancel_request: None,
         }
     }
 
@@ -265,6 +273,42 @@ impl PendingOrderInfo {
     pub(crate) fn matches_amendment(&self, request_id: Option<&str>) -> bool {
         self.command_id
             .is_some_and(|id| request_id == Some(id.to_string().replace('-', "").as_str()))
+    }
+
+    pub(crate) fn matches_cancel(&self, request_id: Option<&str>, batch: bool) -> bool {
+        self.cancel_request
+            .as_ref()
+            .is_some_and(|request| match request {
+                CancelRequest::Single(id) if !batch => request_id == Some(id.as_str()),
+                CancelRequest::Batch(id) if batch => request_id == Some(id.as_str()),
+                _ => false,
+            })
+    }
+
+    pub(crate) fn cancel_rejection(
+        &self,
+        account_id: AccountId,
+        client_order_id: ClientOrderId,
+        venue_order_id: Option<VenueOrderId>,
+        reason: &str,
+        ts_event: nautilus_core::UnixNanos,
+        clock: &AtomicTime,
+    ) -> nautilus_model::events::OrderEventAny {
+        let mut event = nautilus_model::events::OrderCancelRejected::new(
+            self.trader_id,
+            self.strategy_id,
+            self.instrument_id,
+            client_order_id,
+            reason.into(),
+            nautilus_common::recovery_trace::native_event_uuid(),
+            ts_event,
+            clock.get_time_ns(),
+            false,
+            venue_order_id,
+            Some(account_id),
+        );
+        event.causation_id = self.command_id;
+        nautilus_model::events::OrderEventAny::CancelRejected(event)
     }
 }
 
@@ -388,7 +432,10 @@ impl PendingCancelInfo {
             && ack["code"] == "0"
             && ack["matched_item"]["sCode"] == "0"
             && ack["matched_item"]["ordId"].as_str()
-                == event.venue_order_id.as_ref().map(|id| id.as_str())
+                == event
+                    .venue_order_id
+                    .as_ref()
+                    .map(nautilus_model::identifiers::VenueOrderId::as_str)
             && ack["matched_item"]["clOrdId"].as_str() == Some(self.client_order_id.as_str()))
         .then_some(self.command_id)
     }
@@ -439,23 +486,21 @@ impl PendingCancelInfo {
         if let (Ok(original), Ok(ack)) = (
             serde_json::to_string(&event),
             serde_json::to_string(acknowledgement),
-        ) {
-            if original.len() <= 16_384
-                && ack.len() <= 65_536
-                && self.command_payload_json.len() <= 16_384
-            {
-                event.command_causation_basis =
-                    Some(nautilus_model::events::OrderCommandCausationBasis {
-                        kind: "venue_cancel_req_id_rejection".into(),
-                        command_id: self.command_id,
-                        command_payload_json: self.command_payload_json.as_str().into(),
-                        request_id: Some(self.request_id.as_str().into()),
-                        acknowledgement_payload_json: Some(ack.as_str().into()),
-                        original_terminal_payload_json: original.as_str().into(),
-                        venue_command_causation_available: true,
-                    });
-                event.causation_id = Some(self.command_id);
-            }
+        ) && original.len() <= 16_384
+            && ack.len() <= 65_536
+            && self.command_payload_json.len() <= 16_384
+        {
+            event.command_causation_basis =
+                Some(nautilus_model::events::OrderCommandCausationBasis {
+                    kind: "venue_cancel_req_id_rejection".into(),
+                    command_id: self.command_id,
+                    command_payload_json: self.command_payload_json.as_str().into(),
+                    request_id: Some(self.request_id.as_str().into()),
+                    acknowledgement_payload_json: Some(ack.as_str().into()),
+                    original_terminal_payload_json: original.as_str().into(),
+                    venue_command_causation_available: true,
+                });
+            event.causation_id = Some(self.command_id);
         }
         nautilus_model::events::OrderEventAny::CancelRejected(event)
     }
@@ -634,12 +679,12 @@ impl OKXWebSocketClient {
                 Arc::new(tokio::sync::RwLock::new(tx))
             },
             out_rx: None,
-            checkpoint_gate: Default::default(),
+            checkpoint_gate: CheckpointGate::default(),
             checkpoint_recovery: None,
             checkpoint_raw: None,
             checkpoint_commands: None,
             checkpoint_outbox: None,
-            checkpoint_pending: Default::default(),
+            checkpoint_pending: Arc::default(),
             handler_tasks: Arc::new(TaskGroup::new()),
             connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             handler_abort: Arc::new(Mutex::new(CancellationToken::new())),
@@ -659,8 +704,8 @@ impl OKXWebSocketClient {
             pending_cancels: Arc::new(DashMap::new()),
             retained_cancel_contexts: Arc::new(DashMap::new()),
             pending_amends: Arc::new(DashMap::new()),
-            operation_ack_contexts: Default::default(),
-            operation_ack_request_ids: Default::default(),
+            operation_ack_contexts: Arc::default(),
+            operation_ack_request_ids: Arc::default(),
             option_greeks_subs: Arc::new(AtomicMap::new()),
             index_pair_subscribers: Arc::new(DashMap::new()),
             index_pair_transition: Arc::new(tokio::sync::Mutex::new(())),
@@ -743,7 +788,7 @@ impl OKXWebSocketClient {
         let raw = self
             .checkpoint_raw
             .as_ref()
-            .map(|inbox| inbox.raw_prefix())
+            .map(crate::checkpoint::RetainedInbox::<crate::checkpoint::SocketRawInput>::raw_prefix)
             .transpose()?;
         Ok(
             serde_json::json!({"profile":"okx_live_socket_retained_raw_prefix.v2",
@@ -907,7 +952,7 @@ impl OKXWebSocketClient {
                 && self
                     .out_rx
                     .as_ref()
-                    .is_none_or(|receiver| receiver.is_empty())
+                    .is_none_or(super::super::checkpoint::RetainedInbox::is_empty)
                 && self.pending_orders.is_empty()
                 && self.pending_cancels.is_empty()
                 && self.pending_amends.is_empty()
@@ -3107,6 +3152,7 @@ impl OKXWebSocketClient {
         &self,
         args: Vec<Value>,
         client_order_ids: Vec<ClientOrderId>,
+        originals: Option<Vec<nautilus_common::messages::execution::CancelOrder>>,
     ) -> Result<(), OKXWsError> {
         let request_id = self.generate_unique_request_id();
         let request = OKXWsRequest::<Value> {
@@ -3119,16 +3165,99 @@ impl OKXWebSocketClient {
         let payload = serde_json::to_string(&request)
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize batch cancel: {e}")))?;
 
+        if let Some(originals) = &originals {
+            self.register_batch_cancel_contexts(originals, &request_id)?;
+        }
+
         let cmd = HandlerCommand::Send {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_BATCH_CANCEL.to_vec()),
-            request_id: Some(request_id),
+            request_id: Some(request_id.clone()),
             client_order_ids,
             op: Some(super::enums::OKXWsOperation::BatchCancelOrders),
             operation_ack: None,
         };
 
-        self.send_cmd(cmd).await
+        let result = self.send_cmd(cmd).await;
+        if let (Err(error), Some(originals)) = (&result, &originals)
+            && matches!(
+                crate::common::failure::classify_okx_ws_failure(error),
+                nautilus_live::execution::failure::CommandFailure::NotSent(_)
+            )
+        {
+            self.remove_batch_cancel_contexts(originals, &request_id);
+        }
+        result
+    }
+
+    fn register_batch_cancel_contexts(
+        &self,
+        originals: &[nautilus_common::messages::execution::CancelOrder],
+        request_id: &str,
+    ) -> Result<(), OKXWsError> {
+        let mut ids = AHashSet::new();
+        for command in originals {
+            if !ids.insert(command.client_order_id)
+                || self
+                    .pending_cancels
+                    .contains_key(command.client_order_id.as_str())
+                || self
+                    .retained_cancel_contexts
+                    .contains_key(command.client_order_id.as_str())
+            {
+                return Err(OKXWsError::ClientError(
+                    "batch cancel repeats an order or an unresolved original cancel".into(),
+                ));
+            }
+        }
+        for command in originals {
+            match self
+                .pending_cancels
+                .entry(command.client_order_id.to_string())
+            {
+                dashmap::mapref::entry::Entry::Occupied(entry) => {
+                    drop(entry);
+                    self.remove_batch_cancel_contexts(originals, request_id);
+                    return Err(OKXWsError::ClientError(
+                        "batch cancel original context changed before dispatch".into(),
+                    ));
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    if self
+                        .retained_cancel_contexts
+                        .contains_key(command.client_order_id.as_str())
+                    {
+                        drop(entry);
+                        self.remove_batch_cancel_contexts(originals, request_id);
+                        return Err(OKXWsError::ClientError(
+                            "original cancel appeared before batch dispatch".into(),
+                        ));
+                    }
+                    entry.insert(PendingOrderInfo {
+                        trader_id: command.trader_id,
+                        strategy_id: command.strategy_id,
+                        instrument_id: command.instrument_id,
+                        command_id: Some(command.command_id),
+                        cancel_request: Some(CancelRequest::Batch(request_id.to_owned())),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_batch_cancel_contexts(
+        &self,
+        originals: &[nautilus_common::messages::execution::CancelOrder],
+        request_id: &str,
+    ) {
+        for command in originals {
+            self.pending_cancels
+                .remove_if(command.client_order_id.as_str(), |_, context| {
+                    context.matches_cancel(Some(request_id), true)
+                        && context.command_id == Some(command.command_id)
+                });
+        }
     }
 
     /// Amend multiple orders in a single batch via WebSocket.
@@ -3558,6 +3687,7 @@ impl OKXWebSocketClient {
         self.pending_orders.insert(
             cl_ord_key.clone(),
             PendingOrderInfo {
+                cancel_request: None,
                 trader_id,
                 strategy_id,
                 instrument_id,
@@ -3752,6 +3882,7 @@ impl OKXWebSocketClient {
                 }
                 dashmap::mapref::entry::Entry::Vacant(entry) => {
                     entry.insert(PendingOrderInfo {
+                        cancel_request: None,
                         trader_id,
                         strategy_id,
                         instrument_id,
@@ -3812,7 +3943,6 @@ impl OKXWebSocketClient {
             client_order_id,
             venue_order_id,
             None,
-            None,
         )
         .await
     }
@@ -3855,8 +3985,8 @@ impl OKXWebSocketClient {
                 account_id,
                 serde_json::to_string(command)
                     .map_err(|error| OKXWsError::JsonError(error.to_string()))?,
+                original_payload,
             )),
-            Some(original_payload),
         )
         .await
     }
@@ -3867,9 +3997,12 @@ impl OKXWebSocketClient {
         instrument_id: InstrumentId,
         client_order_id: Option<ClientOrderId>,
         venue_order_id: Option<VenueOrderId>,
-        original: Option<(nautilus_core::UUID4, AccountId, String)>,
-        original_ack_payload: Option<String>,
+        original: Option<(nautilus_core::UUID4, AccountId, String, String)>,
     ) -> Result<(), OKXWsError> {
+        let (original, original_ack_payload) = original
+            .map_or((None, None), |(id, account, payload, ack)| {
+                (Some((id, account, payload)), Some(ack))
+            });
         let _checkpoint_request = self
             .checkpoint_gate
             .enter_request()
@@ -3944,20 +4077,38 @@ impl OKXWebSocketClient {
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize cancel: {e}")))?;
 
         if let Some(client_order_id) = client_order_id {
-            self.pending_cancels.insert(
-                client_order_id.to_string(),
-                PendingOrderInfo {
-                    trader_id,
-                    strategy_id,
-                    instrument_id,
-                    command_id: original.as_ref().map(|(id, _, _)| *id),
-                },
-            );
+            let context = PendingOrderInfo {
+                cancel_request: Some(CancelRequest::Single(request_id.clone())),
+                trader_id,
+                strategy_id,
+                instrument_id,
+                command_id: original.as_ref().map(|(id, _, _)| *id),
+            };
+            if let Some((command_id, _, _)) = &original {
+                match self.pending_cancels.entry(client_order_id.to_string()) {
+                    dashmap::mapref::entry::Entry::Vacant(entry) => {
+                        entry.insert(context);
+                    }
+                    dashmap::mapref::entry::Entry::Occupied(entry) => {
+                        drop(entry);
+                        self.retained_cancel_contexts
+                            .remove_if(client_order_id.as_str(), |_, saved| {
+                                saved.command_id == *command_id
+                            });
+                        return Err(OKXWsError::ClientError(
+                            "original cancel already pending".into(),
+                        ));
+                    }
+                }
+            } else {
+                self.pending_cancels
+                    .insert(client_order_id.to_string(), context);
+            }
         }
         let cmd = HandlerCommand::Send {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_CANCEL.to_vec()),
-            request_id: Some(request_id),
+            request_id: Some(request_id.clone()),
             client_order_ids: client_order_id.into_iter().collect(),
             op: Some(super::enums::OKXWsOperation::CancelOrder),
             operation_ack: original_ack_payload.map(|command_payload_json| {
@@ -3972,11 +4123,25 @@ impl OKXWebSocketClient {
         };
 
         let result = self.send_cmd(cmd).await;
+        if let (Err(error), Some((command_id, _, _)), Some(key)) = (&result, &original, &cl_ord_key)
+            && matches!(
+                crate::common::failure::classify_okx_ws_failure(error),
+                nautilus_live::execution::failure::CommandFailure::NotSent(_)
+            )
+        {
+            self.pending_cancels.remove_if(key, |_, context| {
+                context.matches_cancel(Some(&request_id), false)
+                    && context.command_id == Some(*command_id)
+            });
+            self.retained_cancel_contexts.remove_if(key, |_, context| {
+                context.request_id == request_id && context.command_id == *command_id
+            });
+        }
 
-        if let (Err(_), Some(key)) = (&result, &cl_ord_key) {
-            if original.is_none() {
-                self.pending_cancels.remove(key);
-            }
+        if let (Err(_), Some(key)) = (&result, &cl_ord_key)
+            && original.is_none()
+        {
+            self.pending_cancels.remove(key);
         }
 
         result
@@ -4326,6 +4491,31 @@ impl OKXWebSocketClient {
         &self,
         orders: Vec<(InstrumentId, Option<ClientOrderId>, Option<VenueOrderId>)>,
     ) -> Result<(), OKXWsError> {
+        self.batch_cancel_orders_inner(orders, None).await
+    }
+
+    pub(crate) async fn batch_cancel_orders_with_original(
+        &self,
+        commands: Vec<nautilus_common::messages::execution::CancelOrder>,
+    ) -> Result<(), OKXWsError> {
+        let orders = commands
+            .iter()
+            .map(|command| {
+                (
+                    command.instrument_id,
+                    Some(command.client_order_id),
+                    command.venue_order_id,
+                )
+            })
+            .collect();
+        self.batch_cancel_orders_inner(orders, Some(commands)).await
+    }
+
+    async fn batch_cancel_orders_inner(
+        &self,
+        orders: Vec<(InstrumentId, Option<ClientOrderId>, Option<VenueOrderId>)>,
+        originals: Option<Vec<nautilus_common::messages::execution::CancelOrder>>,
+    ) -> Result<(), OKXWsError> {
         let _checkpoint_request = self
             .checkpoint_gate
             .enter_request()
@@ -4366,7 +4556,8 @@ impl OKXWebSocketClient {
             args
         };
 
-        self.ws_batch_cancel_orders(args, client_order_ids).await
+        self.ws_batch_cancel_orders(args, client_order_ids, originals)
+            .await
     }
 
     /// Submits an algo order (conditional/stop order).
@@ -4833,6 +5024,7 @@ mod tests {
         socket.pending_orders.insert(
             "test-order".into(),
             PendingOrderInfo {
+                cancel_request: None,
                 trader_id: TraderId::from("TESTER-001"),
                 strategy_id: StrategyId::from("TEST-001"),
                 instrument_id: InstrumentId::from("BTC-USDT-SWAP.OKX"),
@@ -5650,6 +5842,161 @@ mod tests {
         msg.ord_type = OKXOrderType::PostOnly;
 
         assert!(!is_post_only_auto_cancel(&msg));
+    }
+
+    fn original_cancel_for_batch(
+        client_order_id: &str,
+    ) -> nautilus_common::messages::execution::CancelOrder {
+        nautilus_common::messages::execution::CancelOrder {
+            trader_id: TraderId::from("TRADER-001"),
+            client_id: None,
+            strategy_id: StrategyId::from("STRATEGY-001"),
+            instrument_id: InstrumentId::from("ETH-USDT-SWAP.OKX"),
+            client_order_id: ClientOrderId::from(client_order_id),
+            venue_order_id: Some(VenueOrderId::from("12345")),
+            command_id: nautilus_core::UUID4::new(),
+            ts_init: UnixNanos::default(),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn original_batch_cancel_keeps_child_uuid_and_unchanged_wire_arguments() {
+        let original = original_cancel_for_batch("OBATCHCAUSE001");
+        let mut frames = Vec::new();
+        for typed in [false, true] {
+            let socket = OKXWebSocketClient::default();
+            socket.cache_inst_id_code(original.instrument_id.symbol.inner(), 123);
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            *socket.cmd_tx.write().await = sender;
+            if typed {
+                socket
+                    .batch_cancel_orders_with_original(vec![original.clone()])
+                    .await
+                    .unwrap();
+            } else {
+                socket
+                    .batch_cancel_orders(vec![(
+                        original.instrument_id,
+                        Some(original.client_order_id),
+                        original.venue_order_id,
+                    )])
+                    .await
+                    .unwrap();
+            }
+            let HandlerCommand::Send {
+                payload,
+                request_id,
+                client_order_ids,
+                ..
+            } = receiver.try_recv().unwrap()
+            else {
+                panic!("original Send absent")
+            };
+            assert_eq!(client_order_ids, vec![original.client_order_id]);
+            let frame: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(frame["id"].as_str(), request_id.as_deref());
+            if typed {
+                let context = socket
+                    .pending_cancels
+                    .get(original.client_order_id.as_str())
+                    .unwrap();
+                assert_eq!(context.command_id, Some(original.command_id));
+                assert!(context.matches_cancel(request_id.as_deref(), true));
+                assert_ne!(
+                    request_id.as_deref(),
+                    Some(original.command_id.to_string().replace('-', "").as_str())
+                );
+            } else {
+                assert!(socket.pending_cancels.is_empty());
+            }
+            frames.push(frame);
+        }
+        assert_eq!(frames[0]["args"], frames[1]["args"]);
+        assert_eq!(frames[0]["op"], frames[1]["op"]);
+    }
+
+    #[tokio::test]
+    async fn original_batch_cancel_rejects_duplicates_and_preserves_existing_request() {
+        let socket = OKXWebSocketClient::default();
+        let original = original_cancel_for_batch("OBATCHDUP001");
+        socket.cache_inst_id_code(original.instrument_id.symbol.inner(), 123);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        *socket.cmd_tx.write().await = sender;
+        assert!(
+            socket
+                .batch_cancel_orders_with_original(vec![original.clone(), original.clone()])
+                .await
+                .is_err()
+        );
+        assert!(receiver.try_recv().is_err());
+        assert!(socket.pending_cancels.is_empty());
+        socket
+            .batch_cancel_orders_with_original(vec![original.clone()])
+            .await
+            .unwrap();
+        let HandlerCommand::Send { request_id, .. } = receiver.try_recv().unwrap() else {
+            panic!("original Send absent")
+        };
+        let second = original_cancel_for_batch("OBATCHSECOND001");
+        assert!(
+            socket
+                .batch_cancel_orders_with_original(vec![second, original.clone()])
+                .await
+                .is_err()
+        );
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(socket.pending_cancels.len(), 1);
+        let context = socket
+            .pending_cancels
+            .get(original.client_order_id.as_str())
+            .unwrap();
+        assert_eq!(context.command_id, Some(original.command_id));
+        assert!(context.matches_cancel(request_id.as_deref(), true));
+        drop(context);
+        let mut duplicate = original.clone();
+        duplicate.command_id = nautilus_core::UUID4::new();
+        assert!(
+            socket
+                .cancel_order_with_original(&duplicate, &duplicate, AccountId::from("OKX-001"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            socket
+                .pending_cancels
+                .get(original.client_order_id.as_str())
+                .unwrap()
+                .command_id,
+            Some(original.command_id)
+        );
+        assert!(
+            !socket
+                .retained_cancel_contexts
+                .contains_key(original.client_order_id.as_str())
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn original_batch_cancel_not_sent_removes_only_its_new_context() {
+        let socket = OKXWebSocketClient::default();
+        let original = original_cancel_for_batch("OBATCHNOTSENT001");
+        socket.cache_inst_id_code(original.instrument_id.symbol.inner(), 123);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(receiver);
+        *socket.cmd_tx.write().await = sender;
+        let error = socket
+            .batch_cancel_orders_with_original(vec![original])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            crate::common::failure::classify_okx_ws_failure(&error),
+            nautilus_live::execution::failure::CommandFailure::NotSent(_)
+        ));
+        assert!(socket.pending_cancels.is_empty());
     }
 
     #[tokio::test]

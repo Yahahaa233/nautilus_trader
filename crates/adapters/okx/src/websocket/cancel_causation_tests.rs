@@ -149,7 +149,7 @@ fn dispatch(message: OKXWsMessage, emitter: &ExecutionEventEmitter, state: &WsDi
         get_atomic_clock_realtime(),
     );
 }
-fn ack(cmd: &CancelOrder, id: String, code: &str) -> OKXWsMessage {
+fn ack(cmd: &CancelOrder, id: &str, code: &str) -> OKXWsMessage {
     let raw = serde_json::json!({"id":id,"op":"cancel-order","code":"0","msg":"", "data":[
         {"clOrdId":cmd.client_order_id,"ordId":cmd.venue_order_id,"sCode":code,"sMsg":if code=="0" {""} else {"Order does not exist"}}
     ]}).to_string();
@@ -213,7 +213,7 @@ async fn actual_cancel_command_ack_terminal_preserves_local_basis_and_restores_p
         source.checkpoint_inventory().is_err(),
         "unACKed cancel became a complete source"
     );
-    dispatch(ack(&cmd, id.clone(), "0"), &emitter, &source);
+    dispatch(ack(&cmd, &id, "0"), &emitter, &source);
     assert!(
         rx.try_recv().is_err(),
         "ACK was emitted as an order terminal"
@@ -289,11 +289,7 @@ async fn actual_cancel_early_terminal_wrong_ack_and_duplicate_command_never_gain
             before
         );
         if wrong_ack {
-            dispatch(
-                ack(&cmd, "wrong-original-request".into(), "0"),
-                &emitter,
-                &source,
-            );
+            dispatch(ack(&cmd, "wrong-original-request", "0"), &emitter, &source);
             assert!(source.checkpoint_inventory().is_err());
         }
         dispatch(terminal(&cmd), &emitter, &source);
@@ -308,7 +304,7 @@ async fn actual_cancel_matched_rejection_retains_command_and_conflicting_ack_sta
     let id = original_request(&socket, &cmd).await;
     let source = state(&socket, &cmd);
     let (emitter, mut rx) = make_emitter();
-    dispatch(ack(&cmd, id, "51400"), &emitter, &source);
+    dispatch(ack(&cmd, &id, "51400"), &emitter, &source);
     let ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) = rx.try_recv().unwrap() else {
         panic!("actual matched cancel rejection absent")
     };
@@ -334,14 +330,14 @@ async fn actual_cancel_matched_rejection_retains_command_and_conflicting_ack_sta
     let id = original_request(&socket, &cmd).await;
     let source = state(&socket, &cmd);
     let (emitter, mut rx) = make_emitter();
-    dispatch(ack(&cmd, id.clone(), "0"), &emitter, &source);
+    dispatch(ack(&cmd, &id, "0"), &emitter, &source);
     let original = source
         .retained_cancel_contexts
         .get(cmd.client_order_id.as_str())
         .unwrap()
         .acknowledgement
         .clone();
-    let mut changed = ack(&cmd, id, "0");
+    let mut changed = ack(&cmd, &id, "0");
     if let OKXWsMessage::OrderResponse { msg, .. } = &mut changed {
         *msg = "conflicting response".into();
     }

@@ -30,7 +30,7 @@ pub struct SubmitAckCommandBinding {
 }
 
 /// One actual raw-inbox operation response. Duplicate and unbound frames are
-/// retained independently; neither can synthesize or amend OrderAccepted.
+/// retained independently; neither can synthesize or amend `OrderAccepted`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrderOperationAckSource {
@@ -260,7 +260,10 @@ impl OrderOperationAckCommandBinding {
                 && args[0]["instIdCode"].as_u64() == Some(self.instrument_id_code)
                 && args[0]["clOrdId"].as_str() == Some(self.client_order_id.as_str())
                 && args[0]["ordId"].as_str()
-                    == self.routed_venue_order_id.as_ref().map(|v| v.as_str()),
+                    == self
+                        .routed_venue_order_id
+                        .as_ref()
+                        .map(nautilus_model::identifiers::VenueOrderId::as_str),
             "original operation request identity or routing differs"
         );
         let (id, trader, strategy, instrument, client, ts_init) = match operation {

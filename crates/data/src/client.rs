@@ -141,6 +141,9 @@ mod checkpoint;
 
 impl DataClientAdapter {
     /// Restores only the underlying adapter's explicitly supported source profile.
+    ///
+    /// # Errors
+    /// Returns an error if this client cannot restore the original paused checkpoint.
     pub fn restore_running_checkpoint(
         &mut self,
         inventory: &serde_json::Value,
@@ -379,7 +382,7 @@ impl DataClientAdapter {
             "",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe",
                     &cmd.clone(),
                     || client.subscribe(cmd),
@@ -401,7 +404,7 @@ impl DataClientAdapter {
             "",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe",
                     &cmd.clone(),
                     || client.unsubscribe(cmd),
@@ -423,7 +426,7 @@ impl DataClientAdapter {
             "instruments",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe_instruments",
                     &cmd.clone(),
                     || client.subscribe_instruments(cmd),
@@ -445,7 +448,7 @@ impl DataClientAdapter {
             "instruments",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe_instruments",
                     &cmd.clone(),
                     || client.unsubscribe_instruments(cmd),
@@ -467,7 +470,7 @@ impl DataClientAdapter {
             "instrument",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe_instrument",
                     &cmd.clone(),
                     || client.subscribe_instrument(cmd),
@@ -489,7 +492,7 @@ impl DataClientAdapter {
             "instrument",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe_instrument",
                     &cmd.clone(),
                     || client.unsubscribe_instrument(cmd),
@@ -511,7 +514,7 @@ impl DataClientAdapter {
             "order book deltas",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe_book_deltas",
                     &cmd.clone(),
                     || client.subscribe_book_deltas(cmd),
@@ -533,7 +536,7 @@ impl DataClientAdapter {
             "order book deltas",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe_book_deltas",
                     &cmd.clone(),
                     || client.unsubscribe_book_deltas(cmd),
@@ -555,7 +558,7 @@ impl DataClientAdapter {
             "order book depth",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe_book_depth",
                     &cmd.clone(),
                     || client.subscribe_book_depth(cmd),
@@ -577,7 +580,7 @@ impl DataClientAdapter {
             "order book depth",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe_book_depth",
                     &cmd.clone(),
                     || client.unsubscribe_book_depth(cmd),
@@ -599,7 +602,7 @@ impl DataClientAdapter {
             "quotes",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe_quotes",
                     &cmd.clone(),
                     || client.subscribe_quotes(cmd),
@@ -621,7 +624,7 @@ impl DataClientAdapter {
             "quotes",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe_quotes",
                     &cmd.clone(),
                     || client.unsubscribe_quotes(cmd),
@@ -643,7 +646,7 @@ impl DataClientAdapter {
             "trades",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe_trades",
                     &cmd.clone(),
                     || client.subscribe_trades(cmd),
@@ -665,7 +668,7 @@ impl DataClientAdapter {
             "trades",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe_trades",
                     &cmd.clone(),
                     || client.unsubscribe_trades(cmd),
@@ -687,7 +690,7 @@ impl DataClientAdapter {
             "bars",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe_bars",
                     &cmd.clone(),
                     || client.subscribe_bars(cmd),
@@ -709,7 +712,7 @@ impl DataClientAdapter {
             "bars",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe_bars",
                     &cmd.clone(),
                     || client.unsubscribe_bars(cmd),
@@ -731,7 +734,7 @@ impl DataClientAdapter {
             "mark prices",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe_mark_prices",
                     &cmd.clone(),
                     || client.subscribe_mark_prices(cmd),
@@ -753,7 +756,7 @@ impl DataClientAdapter {
             "mark prices",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe_mark_prices",
                     &cmd.clone(),
                     || client.unsubscribe_mark_prices(cmd),
@@ -775,7 +778,7 @@ impl DataClientAdapter {
             "index prices",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe_index_prices",
                     &cmd.clone(),
                     || client.subscribe_index_prices(cmd),
@@ -797,7 +800,7 @@ impl DataClientAdapter {
             "index prices",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe_index_prices",
                     &cmd.clone(),
                     || client.unsubscribe_index_prices(cmd),
@@ -819,7 +822,7 @@ impl DataClientAdapter {
             "funding rates",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe_funding_rates",
                     &cmd.clone(),
                     || client.subscribe_funding_rates(cmd),
@@ -841,7 +844,7 @@ impl DataClientAdapter {
             "funding rates",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe_funding_rates",
                     &cmd.clone(),
                     || client.unsubscribe_funding_rates(cmd),
@@ -866,7 +869,7 @@ impl DataClientAdapter {
             "instrument status",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe_instrument_status",
                     &cmd.clone(),
                     || client.subscribe_instrument_status(cmd),
@@ -891,7 +894,7 @@ impl DataClientAdapter {
             "instrument status",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe_instrument_status",
                     &cmd.clone(),
                     || client.unsubscribe_instrument_status(cmd),
@@ -913,7 +916,7 @@ impl DataClientAdapter {
             "instrument close",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe_instrument_close",
                     &cmd.clone(),
                     || client.subscribe_instrument_close(cmd),
@@ -938,7 +941,7 @@ impl DataClientAdapter {
             "instrument close",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe_instrument_close",
                     &cmd.clone(),
                     || client.unsubscribe_instrument_close(cmd),
@@ -960,7 +963,7 @@ impl DataClientAdapter {
             "option greeks",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.subscribe_option_greeks",
                     &cmd.clone(),
                     || client.subscribe_option_greeks(cmd),
@@ -982,7 +985,7 @@ impl DataClientAdapter {
             "option greeks",
             |client| {
                 nautilus_common::recovery_trace::native_transport(
-                    &client.client_id().to_string(),
+                    client.client_id().as_ref(),
                     "data.unsubscribe_option_greeks",
                     &cmd.clone(),
                     || client.unsubscribe_option_greeks(cmd),
@@ -1047,7 +1050,7 @@ impl DataClientAdapter {
     /// Returns an error if the client request fails.
     pub fn request_data(&self, req: RequestCustomData) -> anyhow::Result<()> {
         nautilus_common::recovery_trace::native_transport(
-            &self.client.client_id().to_string(),
+            self.client.client_id().as_ref(),
             "data.request_data",
             &req.clone(),
             || self.client.request_data(req),
@@ -1061,7 +1064,7 @@ impl DataClientAdapter {
     /// Returns an error if the client fails to process the request.
     pub fn request_instrument(&self, req: RequestInstrument) -> anyhow::Result<()> {
         nautilus_common::recovery_trace::native_transport(
-            &self.client.client_id().to_string(),
+            self.client.client_id().as_ref(),
             "data.request_instrument",
             &req.clone(),
             || self.client.request_instrument(req),
@@ -1075,7 +1078,7 @@ impl DataClientAdapter {
     /// Returns an error if the client fails to process the request.
     pub fn request_instruments(&self, req: RequestInstruments) -> anyhow::Result<()> {
         nautilus_common::recovery_trace::native_transport(
-            &self.client.client_id().to_string(),
+            self.client.client_id().as_ref(),
             "data.request_instruments",
             &req.clone(),
             || self.client.request_instruments(req),
@@ -1089,7 +1092,7 @@ impl DataClientAdapter {
     /// Returns an error if the client fails to process the book snapshot request.
     pub fn request_book_snapshot(&self, req: RequestBookSnapshot) -> anyhow::Result<()> {
         nautilus_common::recovery_trace::native_transport(
-            &self.client.client_id().to_string(),
+            self.client.client_id().as_ref(),
             "data.request_book_snapshot",
             &req.clone(),
             || self.client.request_book_snapshot(req),
@@ -1103,7 +1106,7 @@ impl DataClientAdapter {
     /// Returns an error if the client fails to process the quotes request.
     pub fn request_quotes(&self, req: RequestQuotes) -> anyhow::Result<()> {
         nautilus_common::recovery_trace::native_transport(
-            &self.client.client_id().to_string(),
+            self.client.client_id().as_ref(),
             "data.request_quotes",
             &req.clone(),
             || self.client.request_quotes(req),
@@ -1117,7 +1120,7 @@ impl DataClientAdapter {
     /// Returns an error if the client fails to process the trades request.
     pub fn request_trades(&self, req: RequestTrades) -> anyhow::Result<()> {
         nautilus_common::recovery_trace::native_transport(
-            &self.client.client_id().to_string(),
+            self.client.client_id().as_ref(),
             "data.request_trades",
             &req.clone(),
             || self.client.request_trades(req),
@@ -1131,7 +1134,7 @@ impl DataClientAdapter {
     /// Returns an error if the client fails to process the trades request.
     pub fn request_funding_rates(&self, req: RequestFundingRates) -> anyhow::Result<()> {
         nautilus_common::recovery_trace::native_transport(
-            &self.client.client_id().to_string(),
+            self.client.client_id().as_ref(),
             "data.request_funding_rates",
             &req.clone(),
             || self.client.request_funding_rates(req),
@@ -1148,7 +1151,7 @@ impl DataClientAdapter {
         req: RequestOptionChainReferencePrice,
     ) -> anyhow::Result<()> {
         nautilus_common::recovery_trace::native_transport(
-            &self.client.client_id().to_string(),
+            self.client.client_id().as_ref(),
             "data.request_option_chain_reference_price",
             &req.clone(),
             || self.client.request_option_chain_reference_price(req),
@@ -1162,7 +1165,7 @@ impl DataClientAdapter {
     /// Returns an error if the client fails to process the bars request.
     pub fn request_bars(&self, req: RequestBars) -> anyhow::Result<()> {
         nautilus_common::recovery_trace::native_transport(
-            &self.client.client_id().to_string(),
+            self.client.client_id().as_ref(),
             "data.request_bars",
             &req.clone(),
             || self.client.request_bars(req),
@@ -1176,7 +1179,7 @@ impl DataClientAdapter {
     /// Returns an error if the client fails to process the order book depths request.
     pub fn request_book_depth(&self, req: RequestBookDepth) -> anyhow::Result<()> {
         nautilus_common::recovery_trace::native_transport(
-            &self.client.client_id().to_string(),
+            self.client.client_id().as_ref(),
             "data.request_book_depth",
             &req.clone(),
             || self.client.request_book_depth(req),

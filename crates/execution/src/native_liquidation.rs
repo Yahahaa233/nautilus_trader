@@ -42,7 +42,7 @@ impl NativeLiquidationProof {
             && self.cache.upgrade().is_some_and(|source| {
                 source
                     .try_borrow()
-                    .is_ok_and(|source| std::ptr::eq(&*source, cache))
+                    .is_ok_and(|source| std::ptr::eq(&raw const *source, cache))
             })
     }
 }

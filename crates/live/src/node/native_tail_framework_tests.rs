@@ -115,6 +115,42 @@ impl CountingIndicator {
         self.counts.set(n);
     }
 }
+#[derive(Clone, Copy, Debug)]
+struct TimerCompletion {
+    market_exit: bool,
+    gtd: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameworkBehavior {
+    manage_stop: bool,
+    completion: TimerCompletion,
+    fail_historical_stop: bool,
+}
+
+struct FrameworkScenario {
+    changed: bool,
+    historical_responses: bool,
+    behavior: FrameworkBehavior,
+}
+
+impl FrameworkScenario {
+    fn managed_market_exit() -> Self {
+        Self {
+            changed: false,
+            historical_responses: false,
+            behavior: FrameworkBehavior {
+                manage_stop: true,
+                completion: TimerCompletion {
+                    market_exit: true,
+                    gtd: false,
+                },
+                fail_historical_stop: false,
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 struct FrameworkStrategy {
     core: StrategyCore,
@@ -125,8 +161,7 @@ struct FrameworkStrategy {
     created_gtd: u64,
     post_market_exits: u64,
     time_events: u64,
-    complete_market_exit: bool,
-    complete_gtd: bool,
+    completion: TimerCompletion,
     gtd_order_events: Vec<OrderEventAny>,
     fail_historical_stop: bool,
     historical_clock_fault: String,
@@ -134,12 +169,12 @@ struct FrameworkStrategy {
     cancelled_timer_backlog: Option<CancelledTimerBacklog>,
 }
 impl FrameworkStrategy {
-    fn with_timer_completion(
-        manage_stop: bool,
-        complete_market_exit: bool,
-        complete_gtd: bool,
-        fail_historical_stop: bool,
-    ) -> Self {
+    fn with_timer_completion(behavior: FrameworkBehavior) -> Self {
+        let FrameworkBehavior {
+            manage_stop,
+            completion,
+            fail_historical_stop,
+        } = behavior;
         let mut value = Self {
             core: StrategyCore::new(StrategyConfig {
                 strategy_id: Some(StrategyId::from(STRATEGY)),
@@ -148,7 +183,11 @@ impl FrameworkStrategy {
                 manage_stop,
                 // The complete case has real outstanding source exposure until
                 // its original terminal receipt; the original timer must expire.
-                market_exit_interval_ms: if complete_market_exit { 100 } else { 3_600_000 },
+                market_exit_interval_ms: if completion.market_exit {
+                    100
+                } else {
+                    3_600_000
+                },
                 ..Default::default()
             }),
             indicator: Rc::new(CountingIndicator {
@@ -160,8 +199,7 @@ impl FrameworkStrategy {
             created_gtd: 0,
             post_market_exits: 0,
             time_events: 0,
-            complete_market_exit,
-            complete_gtd,
+            completion,
             gtd_order_events: Vec::new(),
             fail_historical_stop,
             historical_clock_fault: String::new(),
@@ -177,7 +215,7 @@ impl FrameworkStrategy {
             .register_indicator_for_trade_ticks(instrument_id(), indicator.clone());
         value
             .core_mut()
-            .register_indicator_for_bars(bar_type(), indicator.clone());
+            .register_indicator_for_bars(bar_type(), indicator);
         value
     }
     fn bind_original_handlers(&mut self) {
@@ -186,14 +224,14 @@ impl FrameworkStrategy {
         msgbus::subscribe_quotes(
             switchboard::get_quotes_topic(instrument_id()).into(),
             TypedHandler::from(move |q: &QuoteTick| {
-                get_actor_unchecked::<Self>(&id).handle_quote(q)
+                get_actor_unchecked::<Self>(&id).handle_quote(q);
             }),
             None,
         );
         msgbus::subscribe_trades(
             switchboard::get_trades_topic(instrument_id()).into(),
             TypedHandler::from(move |t: &TradeTick| {
-                get_actor_unchecked::<Self>(&id).handle_trade(t)
+                get_actor_unchecked::<Self>(&id).handle_trade(t);
             }),
             None,
         );
@@ -283,7 +321,7 @@ impl DataActor for FrameworkStrategy {
     }
     fn on_quote(&mut self, _: &QuoteTick) -> Result<()> {
         self.business_data(0)?;
-        if self.complete_gtd {
+        if self.completion.gtd {
             let now = self.clock_rc().borrow().timestamp_ns();
             let order = self.order_factory().limit(
                 instrument_id(),
@@ -310,7 +348,7 @@ impl DataActor for FrameworkStrategy {
                 .add_order(order, None, None, false)?;
             return Ok(());
         }
-        if self.complete_market_exit {
+        if self.completion.market_exit {
             self.market_exit()?;
             ensure!(
                 !Strategy::stop(self),
@@ -337,7 +375,7 @@ impl DataActor for FrameworkStrategy {
         Ok(())
     }
     fn on_time_event(&mut self, event: &nautilus_common::timer::TimeEvent) -> Result<()> {
-        if self.complete_gtd {
+        if self.completion.gtd {
             ensure!(
                 event.name.as_str() == format!("GTD-EXPIRY:{ORDER}"),
                 "wrong actual GTD timer owner"
@@ -364,7 +402,7 @@ impl DataActor for FrameworkStrategy {
             return Ok(());
         }
         ensure!(
-            self.complete_market_exit
+            self.completion.market_exit
                 && event.name.as_str() == format!("MARKET_EXIT_CHECK:{STRATEGY}"),
             "unexpected actual framework timer callback"
         );
@@ -455,7 +493,7 @@ nautilus_strategy!(FrameworkStrategy, {
         self.post_market_exits += 1;
     }
     fn on_order_event(&mut self, event: OrderEventAny) {
-        if self.complete_market_exit {
+        if self.completion.market_exit {
             // market_exit prepares PendingCancel synchronously before its
             // queued CancelOrder. Each business receipt must occur once, in
             // its real source order; a duplicate or unrelated event is fatal.
@@ -507,7 +545,7 @@ nautilus_strategy!(FrameworkStrategy, {
             self.gtd_order_events.push(event);
             return;
         }
-        if self.complete_gtd {
+        if self.completion.gtd {
             if matches!(event, OrderEventAny::Accepted(_)) {
                 let order = self
                     .cache_ref()
@@ -569,7 +607,7 @@ impl RunnerRecoveryCodec for FrameworkCodec {
     fn channel(&self) -> RunnerRecoveryChannel {
         self.0
     }
-    fn codec_id(&self) -> &str {
+    fn codec_id(&self) -> &'static str {
         "actual_registered_framework_tail.v1"
     }
     fn encode(&self, event: RunnerRecoveryEventRef<'_>) -> Result<serde_json::Value> {
@@ -646,18 +684,11 @@ fn install(
     node: &mut LiveNode,
     order: &OrderAny,
     source: bool,
-    manage_stop: bool,
-    complete_market_exit: bool,
-    complete_gtd: bool,
-    fail_historical_stop: bool,
+    behavior: FrameworkBehavior,
     historical_clock_fault: &str,
 ) {
-    let mut strategy = FrameworkStrategy::with_timer_completion(
-        manage_stop,
-        complete_market_exit,
-        complete_gtd,
-        fail_historical_stop,
-    );
+    let complete_gtd = behavior.completion.gtd;
+    let mut strategy = FrameworkStrategy::with_timer_completion(behavior);
     if !source {
         strategy.historical_clock_fault = historical_clock_fault.into();
     }
@@ -733,21 +764,31 @@ async fn actual_registered_native_tail_framework_effects_and_changed_input(
     #[case] complete_gtd: bool,
     #[case] historical_clock_fault: &str,
 ) {
-    run_actual_registered_framework_tail(
-        changed,
-        historical_responses,
-        manage_stop,
-        complete_market_exit,
-        fail_historical_stop,
-        complete_gtd,
+    Box::pin(run_actual_registered_framework_tail(
+        FrameworkScenario {
+            changed,
+            historical_responses,
+            behavior: FrameworkBehavior {
+                manage_stop,
+                completion: TimerCompletion {
+                    market_exit: complete_market_exit,
+                    gtd: complete_gtd,
+                },
+                fail_historical_stop,
+            },
+        },
         (historical_clock_fault, false),
-    )
+    ))
     .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn actual_cancelled_queued_default_timer_after_stop_keeps_original_reader_route() {
-    run_actual_registered_framework_tail(false, false, true, true, false, false, ("", true)).await;
+    Box::pin(run_actual_registered_framework_tail(
+        FrameworkScenario::managed_market_exit(),
+        ("", true),
+    ))
+    .await;
 }
 
 // These are original Reader inputs and their actual native Ingress receipts,
@@ -860,8 +901,7 @@ struct TimerSnapshotPublicationSender {
 }
 impl nautilus_common::runner::TimeEventSender for TimerSnapshotPublicationSender {
     fn send(&self, message: nautilus_common::runner::TimeEventMessage) {
-        let publisher_observed_ns =
-            nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64;
+        let publisher_observed_ns = nautilus_core::time::nanos_since_unix_epoch();
         self.delivered
             .send((publisher_observed_ns, message))
             .unwrap();
@@ -899,7 +939,7 @@ async fn actual_registered_timer_witness_capture_keeps_original_admission_bounda
     ));
     frozen.verify().unwrap();
     let original_inventory = frozen.inventory().clone();
-    let captured_at_ns = nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64;
+    let captured_at_ns = nautilus_core::time::nanos_since_unix_epoch();
     assert_eq!(original_inventory["timers"][0]["binding"]["state"], 0);
     assert_eq!(
         original_inventory["timers"][0]["next_time_ns"],
@@ -916,18 +956,31 @@ async fn actual_registered_timer_witness_capture_keeps_original_admission_bounda
     clock.cancel_timers();
     // Same original-object Source / sealed Reader / Target path as the managed
     // timer fixture, with independently checked Begin snapshot/Ingress counts.
-    run_actual_registered_framework_tail(false, false, true, true, false, false, ("", false)).await;
+    Box::pin(run_actual_registered_framework_tail(
+        FrameworkScenario::managed_market_exit(),
+        ("", false),
+    ))
+    .await;
 }
 
 async fn run_actual_registered_framework_tail(
-    changed: bool,
-    historical_responses: bool,
-    manage_stop: bool,
-    complete_market_exit: bool,
-    fail_historical_stop: bool,
-    complete_gtd: bool,
+    scenario: FrameworkScenario,
     historical: (&str, bool),
 ) {
+    let FrameworkScenario {
+        changed,
+        historical_responses,
+        behavior,
+    } = scenario;
+    let FrameworkBehavior {
+        manage_stop,
+        completion:
+            TimerCompletion {
+                market_exit: complete_market_exit,
+                gtd: complete_gtd,
+            },
+        fail_historical_stop,
+    } = behavior;
     let (historical_clock_fault, cancelled_queued_after_stop) = historical;
     let directory = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap())
         .join(format!("framework-tail-{}", UUID4::new()));
@@ -950,7 +1003,7 @@ async fn run_actual_registered_framework_tail(
     let held_timer = cancelled_queued_after_stop.then(|| {
         let held = std::sync::Arc::new(QueuedMarketExitTimerSender {
             original: nautilus_common::runner::get_time_event_sender(),
-            publications: Default::default(),
+            publications: std::sync::Mutex::default(),
             arrived: std::sync::Condvar::new(),
         });
         nautilus_common::runner::replace_time_event_sender(held.clone());
@@ -960,10 +1013,10 @@ async fn run_actual_registered_framework_tail(
         &mut source,
         &order,
         true,
-        manage_stop,
-        complete_market_exit,
-        complete_gtd,
-        false,
+        FrameworkBehavior {
+            fail_historical_stop: false,
+            ..behavior
+        },
         "",
     );
     if historical_responses {
@@ -975,11 +1028,11 @@ async fn run_actual_registered_framework_tail(
             let count = received.clone();
             let handler = if bars {
                 ShareableMessageHandler::from_typed(move |_: &BarsResponse| {
-                    count.set(count.get() + 1)
+                    count.set(count.get() + 1);
                 })
             } else {
                 ShareableMessageHandler::from_typed(move |_: &QuotesResponse| {
-                    count.set(count.get() + 1)
+                    count.set(count.get() + 1);
                 })
             };
             msgbus::get_message_bus()
@@ -1125,7 +1178,7 @@ async fn run_actual_registered_framework_tail(
                 }
                 Ok(())
             },
-            |_| Ok(()),
+            |()| Ok(()),
             |_| {},
         )
         .unwrap();
@@ -1142,10 +1195,12 @@ async fn run_actual_registered_framework_tail(
     let mut trade = nautilus_model::data::stubs::stub_trade_ethusdt_buy();
     trade.ts_event = now;
     trade.ts_init = now;
-    let mut bar = Bar::default();
-    bar.bar_type = bar_type();
-    bar.ts_event = now;
-    bar.ts_init = now;
+    let bar = Bar {
+        bar_type: bar_type(),
+        ts_event: now,
+        ts_init: now,
+        ..Bar::default()
+    };
     let denied = OrderEventAny::Denied(OrderDenied::new(
         order.trader_id(),
         order.strategy_id(),
@@ -1474,20 +1529,19 @@ async fn run_actual_registered_framework_tail(
     let original_business_time_events = actual.time_events;
     if complete_market_exit {
         assert!(original_business_time_events >= 1);
-        assert_managed_business_cache(&mut actual);
+        assert_managed_business_cache(&actual);
     } else {
         assert_eq!(original_business_time_events, u64::from(complete_gtd));
     }
     assert!(!actual.is_exiting());
     assert_eq!(actual.state(), ComponentState::Stopped);
-    assert_eq!(
-        actual
+    assert!(
+        !actual
             .clock_rc()
             .borrow()
             .timer_names()
             .iter()
-            .any(|n| n == &format!("MARKET_EXIT_CHECK:{STRATEGY}")),
-        false
+            .any(|n| n == &format!("MARKET_EXIT_CHECK:{STRATEGY}"))
     );
     if complete_gtd {
         assert_gtd_business_cache(&mut actual);
@@ -1551,7 +1605,7 @@ async fn run_actual_registered_framework_tail(
     let timer_start_reads = verified
         .roots()
         .iter()
-        .flat_map(|root| root.inputs())
+        .flat_map(nautilus_event_store::native_trace::VerifiedNativeRoot::inputs)
         .filter_map(|input| match input {
             NativeTraceRecord::Complete { clock_reads, .. } => Some(clock_reads),
             _ => None,
@@ -1580,13 +1634,12 @@ async fn run_actual_registered_framework_tail(
             let matches: Vec<_> = verified
                 .roots()
                 .iter()
-                .filter_map(|root| {
-                    let has_original = root.inputs().iter().any(|input| {
+                .filter(|root| {
+                    root.inputs().iter().any(|input| {
                         matches!(input,
                 NativeTraceRecord::Begin { input_source: NativeInputSource::Time, payload, .. }
                     if payload["event_id"] == serde_json::to_value(event_id).unwrap())
-                    });
-                    has_original.then_some(root)
+                    })
                 })
                 .collect();
             assert_eq!(matches.len(), 1);
@@ -1647,7 +1700,7 @@ async fn run_actual_registered_framework_tail(
         let original = verified
             .roots()
             .iter()
-            .flat_map(|r| r.inputs())
+            .flat_map(nautilus_event_store::native_trace::VerifiedNativeRoot::inputs)
             .find_map(|input| {
                 let NativeTraceRecord::Complete { callbacks, .. } = input else {
                     return None;
@@ -1675,7 +1728,7 @@ async fn run_actual_registered_framework_tail(
         let timer_begins = verified
             .roots()
             .iter()
-            .flat_map(|r| r.inputs())
+            .flat_map(nautilus_event_store::native_trace::VerifiedNativeRoot::inputs)
             .filter(|input| {
                 matches!(
                     input,
@@ -1694,7 +1747,7 @@ async fn run_actual_registered_framework_tail(
     let lifecycle = verified
         .roots()
         .iter()
-        .flat_map(|root| root.inputs())
+        .flat_map(nautilus_event_store::native_trace::VerifiedNativeRoot::inputs)
         .find_map(|input| {
             if let NativeTraceRecord::Complete { callbacks, .. } = input {
                 callbacks
@@ -1744,21 +1797,12 @@ async fn run_actual_registered_framework_tail(
         Some((
             directory.join("source"),
             instance,
-            identity.journal_run.clone(),
+            identity.journal_run,
             end,
             fingerprint,
         )),
     );
-    install(
-        &mut target,
-        &order,
-        false,
-        manage_stop,
-        complete_market_exit,
-        complete_gtd,
-        fail_historical_stop,
-        historical_clock_fault,
-    );
+    install(&mut target, &order, false, behavior, historical_clock_fault);
     let mut restored = Cache::default();
     restored
         .add_instrument(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt()))
@@ -1940,21 +1984,20 @@ async fn run_actual_registered_framework_tail(
         );
         assert_eq!(actual.time_events, original_business_time_events);
         assert!(!actual.is_exiting());
-        assert_eq!(
-            actual
+        assert!(
+            !actual
                 .clock_rc()
                 .borrow()
                 .timer_names()
                 .iter()
-                .any(|n| n == &format!("MARKET_EXIT_CHECK:{STRATEGY}")),
-            false
+                .any(|n| n == &format!("MARKET_EXIT_CHECK:{STRATEGY}"))
         );
         assert_eq!(actual.state(), ComponentState::Ready);
         if complete_gtd {
             assert_gtd_business_cache(&mut actual);
         }
         if complete_market_exit {
-            assert_managed_business_cache(&mut actual);
+            assert_managed_business_cache(&actual);
             assert_eq!(actual.gtd_order_events, original_business_order_events);
         }
         drop(actual);
@@ -2024,7 +2067,7 @@ fn assert_original_gtd_timer_tail(
     let original = verified
         .roots()
         .iter()
-        .flat_map(|root| root.inputs())
+        .flat_map(nautilus_event_store::native_trace::VerifiedNativeRoot::inputs)
         .find_map(|input| {
             let NativeTraceRecord::Complete {
                 root_sequence,
@@ -2057,7 +2100,7 @@ fn assert_original_gtd_timer_tail(
     let command = verified
         .roots()
         .iter()
-        .flat_map(|root| root.inputs())
+        .flat_map(nautilus_event_store::native_trace::VerifiedNativeRoot::inputs)
         .find_map(|input| {
             let NativeTraceRecord::Begin {
                 input_source: NativeInputSource::TradingCommand,
@@ -2086,10 +2129,10 @@ fn assert_original_gtd_timer_tail(
             Some(command.command_id)
         })
         .expect("actual GTD cancel command never traversed original native execution FIFO");
-    let draws = verified
+    let command_was_drawn = verified
         .roots()
         .iter()
-        .flat_map(|root| root.inputs())
+        .flat_map(nautilus_event_store::native_trace::VerifiedNativeRoot::inputs)
         .filter_map(|input| {
             let NativeTraceRecord::Complete { uuid_draws, .. } = input else {
                 return None;
@@ -2097,14 +2140,14 @@ fn assert_original_gtd_timer_tail(
             Some(uuid_draws)
         })
         .flatten()
-        .collect::<Vec<_>>();
+        .any(|draw| draw == &command);
     assert!(
-        draws.contains(&&command),
+        command_was_drawn,
         "GTD cancel UUID was not an actual original draw"
     );
 }
 
-fn assert_managed_business_cache(actual: &mut FrameworkStrategy) {
+fn assert_managed_business_cache(actual: &FrameworkStrategy) {
     assert!(matches!(
         actual.gtd_order_events.as_slice(),
         [

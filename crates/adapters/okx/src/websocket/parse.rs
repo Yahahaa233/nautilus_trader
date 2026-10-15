@@ -2619,7 +2619,8 @@ mod tests {
         let legacy_restored: FilledQtyCache = serde_json::from_slice(&legacy).unwrap();
         assert_eq!(legacy_restored.get(&open), Some(&Quantity::from("0.03")));
         let value = serde_json::to_value(Quantity::from("0.03")).unwrap();
-        let duplicate = serde_json::json!({"open":{open.as_str():value.clone()},"terminal":[[open.as_str(),value]]});
+        let duplicate =
+            serde_json::json!({"open":{open.as_str():value},"terminal":[[open.as_str(),value]]});
         assert!(serde_json::from_value::<FilledQtyCache>(duplicate).is_err());
     }
 

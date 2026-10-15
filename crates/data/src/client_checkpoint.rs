@@ -14,7 +14,10 @@
 // -------------------------------------------------------------------------------------------------
 
 //! Captures/restores actual native subscription ownership alongside adapter state.
-use super::*;
+use super::{
+    AHashSet, BarType, ClientId, DataClientAdapter, DataType, InstrumentId, SubscribeCommand,
+    SubscriptionKey, Venue,
+};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
@@ -67,6 +70,9 @@ fn unique<T: Eq + std::hash::Hash>(values: Vec<T>) -> Result<AHashSet<T>> {
     Ok(set)
 }
 impl DataClientAdapter {
+    ///
+    /// # Errors
+    /// Returns an error if the current native configuration, subscriptions, routes, or codec state cannot be encoded.
     pub fn running_checkpoint_state(&self) -> Result<serde_json::Value> {
         #[cfg(feature = "defi")]
         ensure!(
@@ -109,6 +115,9 @@ impl DataClientAdapter {
         };
         Ok(serde_json::to_value(snapshot)?)
     }
+    ///
+    /// # Errors
+    /// Returns an error for invalid or changed source configuration, subscriptions, routes, or nonempty actual state.
     pub fn restore_running_checkpoint_state(&mut self, source: &serde_json::Value) -> Result<()> {
         let snapshot: Snapshot = serde_json::from_value(source.clone())?;
         ensure!(

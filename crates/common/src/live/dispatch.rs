@@ -75,6 +75,9 @@ impl<T> DispatchMessage<T> {
     }
 
     /// Borrows the domain payload for the source codec without consuming callback ancestry.
+    ///
+    /// # Panics
+    /// Panics if the message has already been consumed.
     pub fn message(&self) -> &T {
         self.message.as_ref().expect("message is present")
     }
@@ -116,13 +119,42 @@ impl DispatchMessage<TradingCommandMessage> {
     /// Panics if:
     /// - A rooted message is processed outside its owner thread.
     /// - The observer or a command handler panics.
-    pub fn dispatch_trading(mut self, before: impl FnMut(&TradingCommandMessage)) {
+    pub fn dispatch_trading(self, mut before: impl FnMut(&TradingCommandMessage)) {
+        let result: Result<(), std::convert::Infallible> =
+            self.dispatch_trading_with_admission(|message| {
+                before(message);
+                Ok(true)
+            });
+        match result {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+
+    /// Admits each original command and deferred child before endpoint dispatch.
+    ///
+    /// A false admission consumes that message without forwarding it. Admission
+    /// cannot mutate the original command or its protected batch payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an admission error without forwarding the rejected message or any
+    /// remaining deferred children. Previously dispatched ancestors stay applied.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a rooted message is processed outside its owner thread, or if an
+    /// admission callback or endpoint handler panics.
+    pub fn dispatch_trading_with_admission<E>(
+        mut self,
+        before: impl FnMut(&TradingCommandMessage) -> Result<bool, E>,
+    ) -> Result<(), E> {
         let context = self.take_context();
         dispatch_scoped_trading_command(
             self.message.take().expect("message is present"),
             context,
             before,
-        );
+        )
     }
 }
 

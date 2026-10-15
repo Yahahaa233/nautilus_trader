@@ -77,6 +77,9 @@ impl CustomDataTrait for OrderProtectionSource {
 }
 impl OrderProtectionSource {
     /// Validates the observation profile, without assigning an order or authorizing it.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported, inconsistent, or incomplete original protection evidence.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.schema == SOURCE_SCHEMA
@@ -273,6 +276,9 @@ impl ProtectionSourceEmitter {
 
 /// Registers the protection and independent operation ACK source decoders.
 /// This installs a decoder; it supplies no trading or recovery authority.
+///
+/// # Errors
+/// Returns an error if protection or operation acknowledgment decoders conflict with the native data registry.
 pub fn register_source_type() -> anyhow::Result<()> {
     nautilus_model::data::registry::ensure_json_deserializer_registered(
         SOURCE_SCHEMA,

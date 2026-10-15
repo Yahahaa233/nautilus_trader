@@ -256,6 +256,15 @@ impl NativeReadWitnesses {
     }
 }
 
+impl<'a> IntoIterator for &'a NativeReadWitnesses {
+    type Item = &'a NativeReadWitness;
+    type IntoIter = std::slice::Iter<'a, NativeReadWitness>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// A read-only view of the same actual typed capture bound to the current input.
 pub struct NativeReadView<T> {
     witness: NativeReadWitness,
@@ -319,6 +328,8 @@ pub(crate) fn encode_native_ingress(
     source: NativeInputSource,
     input: &dyn std::any::Any,
 ) -> Result<Value> {
+    use crate::live::dispatch::DispatchMessage;
+
     let encode = INGRESS_ENCODER
         .with(|current| {
             current
@@ -329,7 +340,6 @@ pub(crate) fn encode_native_ingress(
         .context("native derived queue codec absent or busy")?;
     // Admission envelopes carry callback ancestry, but original queue evidence
     // encodes only the unchanged domain payload.
-    use crate::live::dispatch::DispatchMessage;
     let input: &dyn std::any::Any = if let Some(envelope) =
         input.downcast_ref::<DispatchMessage<crate::messages::DataEvent>>()
     {
@@ -567,8 +577,7 @@ pub mod scope {
             .try_with(|state| {
                 state
                     .try_borrow()
-                    .map(|state| !state.frames.is_empty())
-                    .unwrap_or(true)
+                    .map_or(true, |state| !state.frames.is_empty())
             })
             .unwrap_or(true)
     }
@@ -808,6 +817,9 @@ pub mod scope {
         }
 
         /// Returns all actual Clock reads in callback and native effect capture order.
+        ///
+        /// # Errors
+        /// Returns an error if capture is absent, reentered, failed, or belongs to another input epoch.
         pub fn clock_reads(&self) -> Result<Vec<super::NativeClockRead>> {
             CURRENT.with(|state| {
                 let state = state
@@ -840,6 +852,9 @@ pub mod scope {
                 Ok(frame.uuid_draws.clone())
             })
         }
+        ///
+        /// # Errors
+        /// Returns an error if queued capture is absent, reentered, failed, or belongs to another input epoch.
         pub fn queued_outputs(&self) -> Result<Vec<super::NativeQueuedOutput>> {
             CURRENT.with(|current| {
                 let state = current
@@ -889,6 +904,9 @@ pub mod scope {
             })
         }
 
+        ///
+        /// # Errors
+        /// Returns an error if capture is absent, reentered, failed, or belongs to another input epoch.
         pub fn output_count(&self) -> Result<u64> {
             CURRENT.with(|state| {
                 let state = state
@@ -1085,6 +1103,9 @@ pub mod historical {
         }
         /// Actual original component state from this already-consumed SDK route.
         /// This read cannot change the target's physical lifecycle or callback gate.
+        ///
+        /// # Errors
+        /// Returns an error if the original route names an unsupported component state.
         pub fn original_component_state(&self) -> Result<crate::enums::ComponentState> {
             use strum::IntoEnumIterator;
             crate::enums::ComponentState::iter()
@@ -1093,13 +1114,19 @@ pub mod historical {
         }
         /// Original native admission, sealed by the SDK producer at Begin. A
         /// legacy or missing witness is unknown, never a current callback permit.
+        ///
+        /// # Errors
+        /// Returns an error if the original admission witness is missing, ambiguous, or malformed.
         pub fn original_callback_admitted(&self) -> Result<bool> {
             self.original_admission()?["admitted"]
                 .as_bool()
                 .context("original component admission is unknown")
         }
-        /// The original observer exception to Component::not_running. It is
+        /// The original observer exception to `Component::not_running`. It is
         /// source evidence, never admission for this physical recovery node.
+        ///
+        /// # Errors
+        /// Returns an error if the original observer witness is missing, ambiguous, or malformed.
         pub fn original_callback_is_observer(&self) -> Result<bool> {
             self.original_admission()?["observer"]
                 .as_bool()
@@ -1213,7 +1240,7 @@ pub mod historical {
     thread_local! { static CURRENT: RefCell<Vec<Rc<RefCell<Frame>>>> = const { RefCell::new(Vec::new()) }; }
 
     /// Scoped callback routing issued by the native reader/replayer. A caller cannot use
-    /// this value to construct a VerifiedNativeRoot or open the execution phase gate.
+    /// this value to construct a `VerifiedNativeRoot` or open the execution phase gate.
     #[must_use]
     pub struct HistoricalInputScope {
         frame: Rc<RefCell<Frame>>,
@@ -1289,6 +1316,9 @@ pub mod historical {
 
         /// Adds a private source-receipt mapping. It never changes the real clock.
         #[allow(clippy::too_many_arguments)]
+        ///
+        /// # Errors
+        /// Returns an error if the original input, callback routes, captured effects, or active historical scope cannot be validated.
         pub fn enter_with_outputs_at(
             source: Rc<dyn Any>,
             input: NativeTraceRecord,
@@ -1558,12 +1588,11 @@ pub mod historical {
     }
     pub(super) fn mark_failure(reason: &str) {
         let _ = CURRENT.try_with(|current| {
-            if let Ok(current) = current.try_borrow() {
-                if let Some(source) = current.last() {
-                    if let Ok(mut source) = source.try_borrow_mut() {
-                        source.fail(reason);
-                    }
-                }
+            if let Ok(current) = current.try_borrow()
+                && let Some(source) = current.last()
+                && let Ok(mut source) = source.try_borrow_mut()
+            {
+                source.fail(reason);
             }
         });
     }
@@ -1591,6 +1620,9 @@ pub mod historical {
     }
     /// Compares the actual native handler's canonical output against its original
     /// source row. A match is consumed locally, never submitted to a new writer.
+    ///
+    /// # Errors
+    /// Returns an error if the native handler output differs from the original row or historical capture is invalid.
     pub fn output(
         topic: &str,
         payload_type: &str,
@@ -1718,7 +1750,7 @@ pub mod historical {
     }
 
     /// Historical risk decisions read a verified source business view. The actual
-    /// native RiskEngine remains Halted until a separate sealed current release.
+    /// native `RiskEngine` remains Halted until a separate sealed current release.
     pub(super) fn risk_state() -> Result<Option<serde_json::Value>> {
         CURRENT.with(|current| {
             let frames = current.try_borrow().context("historical risk scope busy")?;
@@ -1734,7 +1766,7 @@ pub mod historical {
             ))
         })
     }
-    pub(super) fn set_risk_state(value: serde_json::Value) -> Result<bool> {
+    pub(super) fn set_risk_state(value: &serde_json::Value) -> Result<bool> {
         CURRENT.with(|current| {
             let frames = current.try_borrow().context("historical risk scope busy")?;
             if frames.is_empty() {
@@ -1760,7 +1792,7 @@ pub mod historical {
         Verified(bool),
         #[cfg(feature = "live")]
         Retain {
-            receipt: super::NativeIngressReceipt,
+            receipt: Box<super::NativeIngressReceipt>,
             retention: crate::live::ingress::HistoricalQueueRetention,
         },
     }
@@ -1815,7 +1847,7 @@ pub mod historical {
                     "historical queued source cause or original receipt changed"
                 );
                 accepted.then(|| Queued::Retain {
-                    receipt: output.receipt.clone(),
+                    receipt: Box::new(output.receipt.clone()),
                     retention: retention.clone(),
                 })
             } else {
@@ -1845,12 +1877,7 @@ pub mod historical {
 
     pub fn active() -> bool {
         CURRENT
-            .try_with(|current| {
-                current
-                    .try_borrow()
-                    .map(|value| !value.is_empty())
-                    .unwrap_or(true)
-            })
+            .try_with(|current| current.try_borrow().map_or(true, |value| !value.is_empty()))
             .unwrap_or(true)
     }
 
@@ -1902,17 +1929,17 @@ pub mod historical {
             };
             callback(&boundary)
         })();
-        if let Err(error) = outcome {
-            if let Ok(mut frame) = source.try_borrow_mut() {
-                frame.fail(&format!("{error:#}"));
-            }
+        if let Err(error) = outcome
+            && let Ok(mut frame) = source.try_borrow_mut()
+        {
+            frame.fail(&format!("{error:#}"));
         }
         true
     }
 }
 
 /// Captures normal registered Clock reads or returns the verified original read to
-/// historical business callbacks. This does not change AtomicTime or freshness checks.
+/// historical business callbacks. This does not change `AtomicTime` or freshness checks.
 /// # Panics
 /// A changed read poisons the scope and is contained by the native replay owner.
 pub fn native_clock_read<T: Serialize + serde::de::DeserializeOwned>(
@@ -1988,7 +2015,7 @@ pub fn native_transport<T: Serialize>(
         let outcome = transport();
         let recorded = outcome
             .as_ref()
-            .map(|_| ())
+            .copied()
             .map_err(|error| format!("{error:#}"));
         ensure!(
             recorded
@@ -2052,6 +2079,9 @@ pub fn historical_failure(reason: &str) {
 }
 
 /// Returns only the scoped source risk state; it cannot alter live admission.
+///
+/// # Panics
+/// Panics if an active historical risk view is missing or its original state cannot be decoded.
 pub fn native_risk_state<T: Serialize + serde::de::DeserializeOwned + Copy>(actual: T) -> T {
     #[cfg(feature = "live")]
     if let Some(value) = historical::risk_state().expect("historical native risk view missing") {
@@ -2060,13 +2090,16 @@ pub fn native_risk_state<T: Serialize + serde::de::DeserializeOwned + Copy>(actu
     actual
 }
 /// Updates the historical business mirror, never the actual live risk state.
+///
+/// # Panics
+/// Panics if risk state cannot be encoded or an active historical view cannot be updated.
 pub fn set_native_historical_risk_state<T: Serialize>(value: T) -> bool {
     #[cfg(feature = "live")]
     {
-        return historical::set_risk_state(
-            serde_json::to_value(value).expect("risk state encoding failed"),
+        historical::set_risk_state(
+            &serde_json::to_value(value).expect("risk state encoding failed"),
         )
-        .expect("historical native risk view failed");
+        .expect("historical native risk view failed")
     }
     #[cfg(not(feature = "live"))]
     {
@@ -2130,9 +2163,11 @@ mod read_view_tests {
             .unwrap();
             let refreshed_producer = Arc::new(8_u64);
             {
-                let view = scope::current_read_view::<u64>(&token.clone())
+                let cloned_token = token.clone();
+                let view = scope::current_read_view::<u64>(&cloned_token)
                     .unwrap()
                     .unwrap();
+                drop(cloned_token);
                 assert_eq!(*view.value(), 7);
                 assert_eq!(view.witness(), &witness(7));
                 assert_ne!(view.value(), refreshed_producer.as_ref());

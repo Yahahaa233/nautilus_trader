@@ -300,9 +300,12 @@ fn native_bar_framework(
 /// use [`DataActorBinding`] to access component state.
 pub trait DataActor {
     /// Installs only this original object's local historical pubsub routes. This
-    /// must not call ordinary on_start, reset private history, or contact a venue.
-    /// Custom TypedHandler closures must use historical admission on this same owner.
+    /// must not call ordinary `on_start`, reset private history, or contact a venue.
+    /// Custom `TypedHandler` closures must use historical admission on this same owner.
     #[cfg(feature = "live")]
+    ///
+    /// # Errors
+    /// Returns an error when historical local bindings are unsupported or cannot be installed on the original owner.
     fn prepare_native_recovery(
         &mut self,
         _boundary: &crate::recovery_trace::historical::HistoricalReplayPreparation<'_>,
@@ -314,6 +317,9 @@ pub trait DataActor {
     /// replay. Physical recovery permission/lifecycle is not a business snapshot.
     /// Implementations must expose actual private state; unknown fields cannot be stripped.
     #[cfg(feature = "live")]
+    ///
+    /// # Errors
+    /// Returns an error when this component cannot expose its original historical business state.
     fn on_native_recovery_state(&self) -> anyhow::Result<IndexMap<String, Vec<u8>>> {
         anyhow::bail!("registered component has no native historical business-state profile")
     }

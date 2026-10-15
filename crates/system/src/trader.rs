@@ -82,6 +82,11 @@ type ExecutionAlgorithmSubscriptionFn = Box<dyn FnMut() -> anyhow::Result<()>>;
 type PersistedComponentState = IndexMap<String, Vec<u8>>;
 type ComponentStateLoadFn = fn(Ustr, PersistedComponentState) -> anyhow::Result<()>;
 type ComponentStateSaveFn = fn(Ustr) -> anyhow::Result<PersistedComponentState>;
+#[cfg(feature = "live")]
+type NativeComponentStateLoadFn =
+    fn(Ustr, PersistedComponentState, &serde_json::Value, &serde_json::Value) -> anyhow::Result<()>;
+/// A registered owner and its original local clock.
+pub type RegisteredComponentClock = (ComponentId, Rc<RefCell<dyn Clock>>);
 
 #[derive(Clone, Copy)]
 struct ComponentStateCallbacks {
@@ -92,14 +97,7 @@ struct ComponentStateCallbacks {
     #[cfg(feature = "live")]
     native_framework: Option<fn(Ustr) -> anyhow::Result<serde_json::Value>>,
     #[cfg(feature = "live")]
-    native_load: Option<
-        fn(
-            Ustr,
-            PersistedComponentState,
-            &serde_json::Value,
-            &serde_json::Value,
-        ) -> anyhow::Result<()>,
-    >,
+    native_load: Option<NativeComponentStateLoadFn>,
     #[cfg(feature = "live")]
     historical_save: ComponentStateSaveFn,
     #[cfg(feature = "live")]
@@ -292,9 +290,7 @@ impl Trader {
     ///
     /// # Errors
     /// Refuses missing, orphaned, or duplicate component clock identities.
-    pub fn registered_component_clocks(
-        &self,
-    ) -> anyhow::Result<Vec<(ComponentId, Rc<RefCell<dyn Clock>>)>> {
+    pub fn registered_component_clocks(&self) -> anyhow::Result<Vec<RegisteredComponentClock>> {
         let expected: Vec<ComponentId> = self
             .actor_ids
             .iter()
@@ -697,41 +693,11 @@ impl Trader {
         Ok(strategy_id)
     }
 
-    /// Adds a strategy to the trader.
-    ///
-    /// Strategies are registered in both the component registry (for lifecycle management)
-    /// and the actor registry (for data callbacks via msgbus). The strategy's `StrategyCore`
-    /// is also registered with the portfolio for order management.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The trader is not in a valid state for adding components.
-    /// - A strategy with the same ID is already registered.
-    pub fn add_strategy<T>(&mut self, mut strategy: T) -> anyhow::Result<()>
+    fn strategy_time_event_callback<T>(actor_id: Ustr) -> TimeEventCallback
     where
         T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
     {
-        self.validate_actor_or_strategy_registration()?;
-
-        let strategy_id = self.prepare_strategy_for_registration(&mut strategy)?;
-
-        let component_id = strategy.component_id();
-        let clock = self.create_component_clock(component_id);
-
-        // Register strategy core with portfolio for order management
-        StrategyNative::strategy_core_mut(&mut strategy).register(
-            self.trader_id,
-            clock.clone(),
-            self.cache.clone(),
-            self.portfolio.clone(),
-        )?;
-
-        // Register default time event handler for this strategy
-        let actor_id = strategy.actor_id().inner();
-        // The registered owner lives in the current-thread actor registry.
-        // Keep its original callback local and acquire a native binding token.
-        let callback = TimeEventCallback::RustLocal(Rc::new(move |event: TimeEvent| {
+        TimeEventCallback::RustLocal(Rc::new(move |event: TimeEvent| {
             if let Some(mut strategy) = try_get_actor_unchecked::<T>(&actor_id) {
                 log::debug!("{RECV} {event}");
 
@@ -780,7 +746,44 @@ impl Trader {
             } else {
                 log::error!("Strategy {actor_id} not found for time event handling");
             }
-        }));
+        }))
+    }
+
+    /// Adds a strategy to the trader.
+    ///
+    /// Strategies are registered in both the component registry (for lifecycle management)
+    /// and the actor registry (for data callbacks via msgbus). The strategy's `StrategyCore`
+    /// is also registered with the portfolio for order management.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The trader is not in a valid state for adding components.
+    /// - A strategy with the same ID is already registered.
+    pub fn add_strategy<T>(&mut self, mut strategy: T) -> anyhow::Result<()>
+    where
+        T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
+    {
+        self.validate_actor_or_strategy_registration()?;
+
+        let strategy_id = self.prepare_strategy_for_registration(&mut strategy)?;
+
+        let component_id = strategy.component_id();
+        let clock = self.create_component_clock(component_id);
+
+        // Register strategy core with portfolio for order management
+        StrategyNative::strategy_core_mut(&mut strategy).register(
+            self.trader_id,
+            clock.clone(),
+            self.cache.clone(),
+            self.portfolio.clone(),
+        )?;
+
+        // Register default time event handler for this strategy
+        let actor_id = strategy.actor_id().inner();
+        // The registered owner lives in the current-thread actor registry.
+        // Keep its original callback local and acquire a native binding token.
+        let callback = Self::strategy_time_event_callback::<T>(actor_id);
         clock.borrow_mut().register_default_handler(callback);
 
         // Transition to Ready state
@@ -1877,6 +1880,9 @@ impl Trader {
     /// Actual framework-aware strategy business capture. The enclosing node
     /// supplies its completed-root/cache/owner-timer freeze; ordinary component
     /// save/export paths remain unchanged.
+    ///
+    /// # Errors
+    /// Returns an error for active or changing component registration, missing callbacks, or a failed original state capture.
     #[cfg(feature = "live")]
     pub fn collect_native_component_state(
         trader: &Rc<RefCell<Self>>,
@@ -1957,6 +1963,9 @@ impl Trader {
 
     /// Complete limited framework facts from actual registered strategies.
     /// This performs no Clock reads or random draws.
+    ///
+    /// # Errors
+    /// Returns an error if registration changes, a strategy framework callback fails, or the captured state cannot be serialized.
     #[cfg(feature = "live")]
     pub fn collect_native_strategy_framework(
         trader: &Rc<RefCell<Self>>,
@@ -1983,6 +1992,9 @@ impl Trader {
 
     /// Exact source/current framework plus the already restored/frozen owner
     /// schedules. Native cache/configuration checks occur in the same callback.
+    ///
+    /// # Errors
+    /// Returns an error for different framework facts, missing owner schedules, or invalid original timer bindings.
     #[cfg(feature = "live")]
     pub fn verify_native_strategy_framework_timers(
         trader: &Rc<RefCell<Self>>,
@@ -2007,8 +2019,11 @@ impl Trader {
         Ok(())
     }
 
-    /// Internal typed kernel handoff. LiveNode's reader-issued native trace
+    /// Internal typed kernel handoff. `LiveNode`'s reader-issued native trace
     /// entry is the public recovery admission; this routine never starts trader.
+    ///
+    /// # Errors
+    /// Returns an error unless the idle original owners, state identities, framework facts, and timer bindings match exactly.
     #[cfg(feature = "live")]
     pub fn restore_native_component_state(
         trader: &Rc<RefCell<Self>>,
@@ -2283,7 +2298,10 @@ impl Trader {
     }
 
     /// Installs local routes on the actual registered objects, preserving each
-    /// private versioned business snapshot. No component on_start is invoked.
+    /// private versioned business snapshot. No component `on_start` is invoked.
+    ///
+    /// # Errors
+    /// Returns an error if an original callback refuses historical binding, changes private business state, or component registration changes.
     #[cfg(feature = "live")]
     pub fn prepare_native_recovery(
         trader: &Rc<RefCell<Self>>,
@@ -2326,6 +2344,9 @@ impl Trader {
     }
 
     /// Captures the same original object's explicit historical business profile.
+    ///
+    /// # Errors
+    /// Returns an error if an owner cannot save its original historical state or component registration changes during capture.
     #[cfg(feature = "live")]
     pub fn collect_native_recovery_state(
         trader: &Rc<RefCell<Self>>,
@@ -2369,7 +2390,10 @@ impl Trader {
     }
 
     /// Routes only recorded source lifecycle callbacks on their actual registered owners.
-    /// Physical Component admission remains closed; ordinary stop/on_start is not called.
+    /// Physical Component admission remains closed; ordinary `stop`/`on_start` is not called.
+    ///
+    /// # Errors
+    /// Returns an error for unverified history, unsupported or unregistered owners, or a failed recorded lifecycle callback.
     #[cfg(feature = "live")]
     pub fn replay_native_lifecycle(trader: &Rc<RefCell<Self>>) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -2921,12 +2945,44 @@ mod tests {
     #[cfg(feature = "live")]
     nautilus_actor!(FailingHistoricalLifecycleActor);
 
+    #[cfg(feature = "live")]
+    fn original_failed_lifecycle_begin(
+        instance_id: UUID4,
+    ) -> nautilus_common::recovery_trace::NativeTraceRecord {
+        use nautilus_common::recovery_trace::{
+            NativeInputSource, NativeProcessingReceipt, NativeTraceRecord, NativeTraceSource,
+        };
+        NativeTraceRecord::Begin {
+            source: NativeTraceSource {
+                schema_version: 1,
+                node_instance: instance_id,
+                process_incarnation: instance_id,
+                journal_run: "original-failed-lifecycle".into(),
+                logical_run: "original-logical".into(),
+                configuration_digest: "original-config".into(),
+                codec_profile: "original-lifecycle".into(),
+                registered_profile_digest: "two-registered-owners".into(),
+            },
+            root_sequence: 1,
+            input_sequence: 1,
+            stack_parent: None,
+            input_source: NativeInputSource::Lifecycle,
+            phase: "lifecycle".into(),
+            receipt: NativeProcessingReceipt {
+                wall_ns: 1,
+                process_elapsed_ns: 1,
+                ingress: None,
+            },
+            payload: serde_json::json!({"action":"stop.trader"}),
+            read_witnesses: Vec::new(),
+        }
+    }
+
     #[test]
     #[cfg(feature = "live")]
     fn historical_lifecycle_first_owner_failure_returns_original_error_with_pending_routes() {
         use nautilus_common::recovery_trace::{
-            NativeCallbackRoute, NativeInputSource, NativeProcessingReceipt, NativeTraceRecord,
-            NativeTraceSource,
+            NativeCallbackRoute,
             historical::{self, HistoricalInputScope},
         };
         let (bus, cache, portfolio, _data, _risk, _execution, clocks) = create_trader_components();
@@ -2974,30 +3030,7 @@ mod tests {
         // proof, phase release, grant or venue command from the source metadata.
         let scope = HistoricalInputScope::enter(
             Rc::new(()),
-            NativeTraceRecord::Begin {
-                source: NativeTraceSource {
-                    schema_version: 1,
-                    node_instance: instance_id,
-                    process_incarnation: instance_id,
-                    journal_run: "original-failed-lifecycle".into(),
-                    logical_run: "original-logical".into(),
-                    configuration_digest: "original-config".into(),
-                    codec_profile: "original-lifecycle".into(),
-                    registered_profile_digest: "two-registered-owners".into(),
-                },
-                root_sequence: 1,
-                input_sequence: 1,
-                stack_parent: None,
-                input_source: NativeInputSource::Lifecycle,
-                phase: "lifecycle".into(),
-                receipt: NativeProcessingReceipt {
-                    wall_ns: 1,
-                    process_elapsed_ns: 1,
-                    ingress: None,
-                },
-                payload: serde_json::json!({"action":"stop.trader"}),
-                read_witnesses: Vec::new(),
-            },
+            original_failed_lifecycle_begin(instance_id),
             routes,
             Vec::new(),
             Vec::new(),

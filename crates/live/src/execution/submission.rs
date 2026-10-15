@@ -53,7 +53,8 @@ pub enum SubmissionRecoveryPolicy {
 }
 
 /// Recovery path which exhausted its query budget.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubmissionRecoverySource {
     /// The scheduled inflight checker exhausted its retry limit.
     Inflight,
@@ -66,7 +67,8 @@ pub enum SubmissionRecoverySource {
 /// This diagnostic is not an order event and does not change order status.
 /// The live node publishes it after processing reconciliation events.
 /// The manager retains the unresolved submission; exhaustion does not establish a venue outcome.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubmissionRecoveryExhausted {
     /// Trader which submitted the order.
     pub trader_id: TraderId,

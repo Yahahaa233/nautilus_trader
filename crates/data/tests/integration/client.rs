@@ -127,8 +127,8 @@ fn test_checkpoint_subscription_restore_preserves_actual_acquisitions_and_owners
             false,
             false,
             Box::new(MockDataClient::new(
-                clock.clone(),
-                cache.clone(),
+                Rc::<RefCell<VirtualClock>>::clone(&clock),
+                Rc::<RefCell<Cache>>::clone(&cache),
                 client_id,
                 Some(venue),
             )),

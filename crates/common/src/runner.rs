@@ -985,36 +985,42 @@ pub fn drain_trading_cmd_queue() {
     TRADING_CMD_QUEUE.with(|q| {
         let messages: Vec<QueuedTradingCommand> = q.borrow_mut().drain(..).collect();
         for message in messages {
-            dispatch_trading_cmd(message, &mut |_| {});
+            let result: Result<(), std::convert::Infallible> =
+                dispatch_trading_cmd(message, &mut |_| Ok(true));
+            match result {
+                Ok(()) => {}
+                Err(never) => match never {},
+            }
         }
     });
 }
 
 #[cfg(feature = "live")]
-pub(crate) fn dispatch_scoped_trading_command(
+pub(crate) fn dispatch_scoped_trading_command<E>(
     message: TradingCommandMessage,
     context: ChainContext,
-    mut before: impl FnMut(&TradingCommandMessage),
-) {
+    mut before: impl FnMut(&TradingCommandMessage) -> Result<bool, E>,
+) -> Result<(), E> {
     dispatch_trading_cmd(
         QueuedTradingCommand {
             message: Some(message),
             context,
         },
         &mut before,
-    );
+    )
 }
 
-fn dispatch_trading_cmd(
+fn dispatch_trading_cmd<E>(
     message: QueuedTradingCommand,
-    before: &mut impl FnMut(&TradingCommandMessage),
-) {
+    before: &mut impl FnMut(&TradingCommandMessage) -> Result<bool, E>,
+) -> Result<(), E> {
     // Reuse the child buffer so leaf commands need no traversal allocation
-    let mut messages = message.dispatch(before);
+    let mut messages = message.dispatch(before)?;
     messages.reverse();
     while let Some(message) = messages.pop() {
-        messages.extend(message.dispatch(before).into_iter().rev());
+        messages.extend(message.dispatch(before)?.into_iter().rev());
     }
+    Ok(())
 }
 
 struct QueuedTradingCommand {
@@ -1030,10 +1036,15 @@ impl QueuedTradingCommand {
         }
     }
 
-    fn dispatch(mut self, before: &mut impl FnMut(&TradingCommandMessage)) -> Vec<Self> {
+    fn dispatch<E>(
+        mut self,
+        before: &mut impl FnMut(&TradingCommandMessage) -> Result<bool, E>,
+    ) -> Result<Vec<Self>, E> {
         let message = self.message.take().expect("queued command is present");
         self.context.with_chain(|| {
-            before(&message);
+            if !before(&message)? {
+                return Ok(Vec::new());
+            }
 
             let TradingCommandDispatch::Sync(messages) =
                 message.dispatch_with(TradingCommandDispatch::Sync(Vec::new()))
@@ -1041,7 +1052,7 @@ impl QueuedTradingCommand {
                 unreachable!("synchronous dispatch returns scoped commands");
             };
 
-            messages
+            Ok(messages)
         })
     }
 }
@@ -1139,6 +1150,86 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
+
+    #[cfg(feature = "live")]
+    #[rstest]
+    #[case("legacy")]
+    #[case("allow")]
+    #[case("skip_root")]
+    #[case("skip_child")]
+    #[case("error_child")]
+    fn trading_admission_preserves_original_deferred_traversal(#[case] mode: &str) {
+        use crate::{live::dispatch::DispatchMessage, msgbus::TypedIntoHandler};
+
+        fn query(endpoint: MStr<Endpoint>) -> TradingCommandMessage {
+            TradingCommandMessage::new(
+                endpoint,
+                TradingCommand::QueryAccount(QueryAccount::new(
+                    TraderId::from("TRADER-001"),
+                    None,
+                    AccountId::from("SIM-001"),
+                    UUID4::new(),
+                    UnixNanos::from(1),
+                    None,
+                    None,
+                )),
+            )
+        }
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let root_calls = Rc::clone(&calls);
+        msgbus::register_trading_command_endpoint(
+            "ADMISSION.ROOT".into(),
+            TypedIntoHandler::from_with_id("admission-root", move |_: TradingCommand| {
+                root_calls.borrow_mut().push("root");
+                capture_trading_cmd(query("ADMISSION.A".into()));
+                capture_trading_cmd(query("ADMISSION.B".into()));
+            }),
+        );
+        let a_calls = Rc::clone(&calls);
+        msgbus::register_trading_command_endpoint(
+            "ADMISSION.A".into(),
+            TypedIntoHandler::from_with_id("admission-a", move |_: TradingCommand| {
+                a_calls.borrow_mut().push("a");
+                capture_trading_cmd(query("ADMISSION.A1".into()));
+            }),
+        );
+        for (endpoint, label) in [("ADMISSION.A1", "a1"), ("ADMISSION.B", "b")] {
+            let leaf_calls = Rc::clone(&calls);
+            msgbus::register_trading_command_endpoint(
+                endpoint.into(),
+                TypedIntoHandler::from_with_id(endpoint, move |_: TradingCommand| {
+                    leaf_calls.borrow_mut().push(label);
+                }),
+            );
+        }
+        let root = DispatchMessage::from(query("ADMISSION.ROOT".into()));
+        let mut observed = Vec::new();
+        let result: anyhow::Result<()> = if mode == "legacy" {
+            root.dispatch_trading(|message| observed.push(message.endpoint()));
+            Ok(())
+        } else {
+            root.dispatch_trading_with_admission(|message| {
+                let endpoint = message.endpoint();
+                observed.push(endpoint);
+                if endpoint == "ADMISSION.A".into() {
+                    anyhow::ensure!(mode != "error_child", "original child admission failed");
+                    return Ok(mode != "skip_child");
+                }
+                Ok(mode != "skip_root" || endpoint != "ADMISSION.ROOT".into())
+            })
+        };
+        assert_eq!(result.is_err(), mode == "error_child");
+        let expected = match mode {
+            "skip_root" => vec![],
+            "skip_child" => vec!["root", "b"],
+            "error_child" => vec!["root"],
+            _ => vec!["root", "a", "a1", "b"],
+        };
+        assert_eq!(*calls.borrow(), expected);
+        assert_eq!(observed.first(), Some(&"ADMISSION.ROOT".into()));
+        assert!(!trading_cmd_is_dispatching());
+        assert!(trading_cmd_queue_is_empty());
+    }
 
     #[test]
     fn paused_sync_inventory_retains_queues_and_borrows() {

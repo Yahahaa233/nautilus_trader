@@ -130,15 +130,24 @@ pub trait TimerCheckpoint: Debug {
     /// Reopens production only on the same verified boundary.
     fn finish(self: Box<Self>) -> anyhow::Result<()>;
     /// Permanently closes production on the same verified schedule inventory.
+    ///
+    /// # Errors
+    /// Returns an error if terminal checkpoint closure is unsupported or the frozen schedule boundary changed.
     fn finish_terminal(self: Box<Self>) -> anyhow::Result<()> {
         anyhow::bail!("timer terminal checkpoint unsupported")
     }
     /// Temporarily exposes actual time for independent freshness checks while
     /// producer admission stays frozen. It never changes the underlying clock.
+    ///
+    /// # Errors
+    /// Returns an error if the implementation cannot expose the independent clock read view.
     fn pause_read_view(&self) -> anyhow::Result<()> {
         Ok(())
     }
-    /// Restores the same capture-only time view before comparing on_save state.
+    /// Restores the same capture-only time view before comparing `on_save` state.
+    ///
+    /// # Errors
+    /// Returns an error if the implementation cannot restore its capture-only read view.
     fn resume_read_view(&self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -165,7 +174,13 @@ impl TimerCheckpoint for EmptyTimerCheckpoint {
 /// callback IDs select validated source entries, never executable callbacks.
 pub trait RestoredTimerCheckpoint: Debug {
     fn source_inventory(&self) -> &serde_json::Value;
+    ///
+    /// # Errors
+    /// Returns an error if the restored owner, callbacks, or paused schedules changed.
     fn verify(&self) -> anyhow::Result<()>;
+    ///
+    /// # Errors
+    /// Returns an error if the original callback identity, lease, or schedule cannot be restored.
     fn restore_message(
         &self,
         event: TimeEvent,
@@ -175,6 +190,9 @@ pub trait RestoredTimerCheckpoint: Debug {
     /// Materializes only the exact original queued leases before applying the
     /// original terminal closure. The producer remains paused throughout;
     /// counts/configuration/schedules must match the supplied source inventory.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported admission or a mismatch in original schedules and queued messages.
     fn admit_historical_messages(
         &self,
         _inventory: &serde_json::Value,
@@ -184,6 +202,9 @@ pub trait RestoredTimerCheckpoint: Debug {
     }
     /// Restores only Reader-original messages accepted during the current
     /// cancellation boundary. The actual closed callback must still be retained.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported admission or a mismatch in the original cancellation boundary.
     fn admit_historical_cancelled_messages(
         &self,
         _before: &serde_json::Value,
@@ -196,19 +217,31 @@ pub trait RestoredTimerCheckpoint: Debug {
     }
     /// Advances only the already installed owner schedules under their producer pause.
     /// The native reader supplies the original inventory; callback bindings cannot change.
+    ///
+    /// # Errors
+    /// Returns an error if timer advancement is unsupported or the original owner schedules cannot be validated.
     fn apply_historical_inventory(&self, _inventory: &serde_json::Value) -> anyhow::Result<()> {
         anyhow::bail!("historical owner timer advancement unsupported")
     }
     /// Projects actual restored callback IDs to the exact source IDs proved at installation.
+    ///
+    /// # Errors
+    /// Returns an error if source timer projection is unsupported or callback identities cannot be validated.
     fn historical_inventory(&self) -> anyhow::Result<serde_json::Value> {
         anyhow::bail!("historical owner timer projection unsupported")
     }
+    ///
+    /// # Errors
+    /// Returns an error if the restored callback or schedule boundary changed.
     fn refresh_after_historical_dispatch(&self) -> anyhow::Result<()> {
         self.verify()
     }
     /// Refreshes actual timer registrations changed by the original handler.
     /// This preserves the same owner/producer pause; it cannot install a timer
     /// from expected JSON or release callback admission.
+    ///
+    /// # Errors
+    /// Returns an error if registration refresh is unsupported or differs from the original owner inventory.
     fn refresh_from_historical_dispatch(
         &mut self,
         _clock: &dyn Clock,
@@ -216,6 +249,9 @@ pub trait RestoredTimerCheckpoint: Debug {
     ) -> anyhow::Result<()> {
         anyhow::bail!("historical actual timer registration refresh unsupported")
     }
+    ///
+    /// # Errors
+    /// Returns an error if the restored producer cannot resume from its verified paused boundary.
     fn resume(self: Box<Self>) -> anyhow::Result<()>;
 }
 
@@ -226,6 +262,9 @@ pub trait Clock: Debug + Any {
     /// Registers only the actual Portfolio equity-curve factory callback. A
     /// false result preserves ordinary explicit-callback scheduling for clocks
     /// without this recovery profile; it provides no restoration evidence.
+    ///
+    /// # Errors
+    /// Returns an error if the original Portfolio callback binding cannot be registered.
     fn register_portfolio_equity_curve_callback(
         &mut self,
         _binding: PortfolioEquityCurveTimerCallback,
@@ -235,6 +274,9 @@ pub trait Clock: Debug + Any {
     /// Rebuilds validated source schedules with this actual registered clock's
     /// default owner callback. Producers remain paused until the opaque receipt
     /// is consumed. Unknown/named callback contracts fail closed.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported restoration or invalid original schedules and callback bindings.
     fn restore_running_timer_checkpoint(
         &mut self,
         _inventory: &serde_json::Value,

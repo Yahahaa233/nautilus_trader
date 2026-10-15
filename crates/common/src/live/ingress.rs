@@ -289,6 +289,9 @@ impl IngressGate {
     /// Creates an owned channel that preserves actual admission time and FIFO identity.
     /// Retained sender clones share admission; the actual receiver assigns physical FIFO ordinals.
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics if the current Unix timestamp exceeds the native receipt range.
     pub fn native_channel<T>(
         &self,
         source: NativeInputSource,
@@ -528,7 +531,7 @@ impl<T> IngressSender<T> {
                 Ok(Some(crate::recovery_trace::historical::Queued::Retain {
                     receipt,
                     retention,
-                })) => return self.retain_historical(message, receipt, &retention),
+                })) => return self.retain_historical(message, *receipt, &retention),
                 Ok(None) => Some(payload),
                 Err(error) => {
                     crate::recovery_trace::historical_failure(&format!(
@@ -923,7 +926,8 @@ mod tests {
         let (sender, mut receiver) = gate.channel();
         sender.send(1).unwrap();
         let frozen = gate.freeze().unwrap();
-        assert_eq!(sender.clone().send(2).unwrap_err().0, 2);
+        let cloned_sender = sender.clone();
+        assert_eq!(cloned_sender.send(2).unwrap_err().0, 2);
         assert!(frozen.verify().is_err());
         assert!(frozen.finish().is_err());
         assert_eq!(receiver.try_recv().unwrap(), 1);
@@ -1577,10 +1581,7 @@ mod historical_tests {
         );
         let epoch = frozen.epoch;
         frozen.finish_terminal().unwrap();
-        let stale = HistoricalQueueRetention {
-            gate: gate.clone(),
-            epoch,
-        };
+        let stale = HistoricalQueueRetention { gate, epoch };
         assert!(stale.verify().is_err());
         clear_callbacks().unwrap();
     }
@@ -1622,7 +1623,7 @@ mod historical_tests {
             .unwrap();
         let observed = Arc::new(AtomicBool::new(false));
         let waker = std::task::Waker::from(Arc::new(InspectWake {
-            gate: gate.clone(),
+            gate,
             epoch: frozen.epoch,
             observed: observed.clone(),
         }));

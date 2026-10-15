@@ -841,19 +841,19 @@ mod tests {
     fn test_runner_metrics_queue_depths_use_receiver_lengths() {
         let (time_tx, time_rx) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (exec_evt_tx, exec_evt_rx) =
+        let (exec_evt_tx, execution_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (exec_cmd_tx, exec_cmd_rx) =
+        let (exec_cmd_tx, execution_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
-        let (data_evt_tx, data_evt_rx) =
+        let (data_evt_tx, data_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (data_cmd_tx, data_cmd_rx) =
+        let (data_cmd_tx, data_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
         let mut time_rx = crate::runner::SnapshotReceiver::from(time_rx);
-        let mut exec_evt_rx = crate::runner::SnapshotReceiver::from(exec_evt_rx);
-        let mut exec_cmd_rx = crate::runner::SnapshotReceiver::from(exec_cmd_rx);
-        let mut data_evt_rx = crate::runner::SnapshotReceiver::from(data_evt_rx);
-        let mut data_cmd_rx = crate::runner::SnapshotReceiver::from(data_cmd_rx);
+        let mut execution_events = crate::runner::SnapshotReceiver::from(execution_events);
+        let mut execution_commands = crate::runner::SnapshotReceiver::from(execution_commands);
+        let mut data_events = crate::runner::SnapshotReceiver::from(data_events);
+        let mut data_commands = crate::runner::SnapshotReceiver::from(data_commands);
         let metrics = RunnerMetrics::default();
 
         time_tx.send(stub_time_event_handler().into()).unwrap();
@@ -885,17 +885,17 @@ mod tests {
         // Move actual messages out of Tokio storage: metrics must count the
         // retained prefix too, without requiring Clone or consuming callbacks.
         time_rx.stage_for_test().unwrap();
-        exec_evt_rx.stage_for_test().unwrap();
-        exec_cmd_rx.stage_for_test().unwrap();
-        data_evt_rx.stage_for_test().unwrap();
-        data_cmd_rx.stage_for_test().unwrap();
+        execution_events.stage_for_test().unwrap();
+        execution_commands.stage_for_test().unwrap();
+        data_events.stage_for_test().unwrap();
+        data_commands.stage_for_test().unwrap();
         metrics.publish_queue_depths(
             RunnerChannelQueueDepths::from_receivers(
                 &time_rx,
-                &exec_evt_rx,
-                &exec_cmd_rx,
-                &data_evt_rx,
-                &data_cmd_rx,
+                &execution_events,
+                &execution_commands,
+                &data_events,
+                &data_commands,
             ),
             Duration::from_nanos(25),
         );

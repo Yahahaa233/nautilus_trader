@@ -111,7 +111,7 @@ impl<T> DispatchSender<T> {
         match &self.channel {
             DispatchChannel::Plain(sender) => sender.invalidate_snapshot(),
             DispatchChannel::Managed { sender, .. } | DispatchChannel::Dispatch { sender, .. } => {
-                sender.invalidate_snapshot()
+                sender.invalidate_snapshot();
             }
         }
     }
@@ -120,7 +120,7 @@ impl<T> DispatchSender<T> {
         match &self.channel {
             DispatchChannel::Plain(sender) => sender.fail(reason),
             DispatchChannel::Managed { sender, .. } | DispatchChannel::Dispatch { sender, .. } => {
-                sender.fail(reason)
+                sender.fail(reason);
             }
         }
     }
@@ -218,7 +218,9 @@ mod tests {
         assert_eq!(*envelope.message(), 7);
         assert_eq!(envelope.dispatch(|value| value), 7);
         let frozen = gate.freeze().unwrap();
-        assert!(sender.clone().send(8).is_err());
+        let cloned_sender = sender.clone();
+        assert!(cloned_sender.send(8).is_err());
+        assert!(sender.send(9).is_err());
         assert!(receiver.try_recv().is_err());
         assert!(frozen.finish().is_err());
     }
@@ -231,7 +233,9 @@ mod tests {
         sender.send(7).unwrap();
         assert_eq!(receiver.try_recv().unwrap(), 7);
         sender.fail("actual standalone producer failed");
-        assert!(sender.clone().send(8).is_err());
+        let cloned_sender = sender.clone();
+        assert!(cloned_sender.send(8).is_err());
+        assert!(sender.send(9).is_err());
         assert!(receiver.try_recv().is_err());
     }
 }

@@ -2829,7 +2829,7 @@ impl ExecutionEngine {
         log_info!("Submit {order}", color = LogColor::Blue);
 
         if let Err(e) = nautilus_common::recovery_trace::native_transport(
-            &client.client_id().to_string(),
+            client.client_id().as_ref(),
             "execution.submit_order",
             &cmd.clone(),
             || client.submit_order(cmd),
@@ -3000,7 +3000,7 @@ impl ExecutionEngine {
         log_info!("Submit {}", cmd.order_list, color = LogColor::Blue);
 
         if let Err(e) = nautilus_common::recovery_trace::native_transport(
-            &client.client_id().to_string(),
+            client.client_id().as_ref(),
             "execution.submit_order_list",
             &cmd.clone(),
             || client.submit_order_list(cmd),
@@ -3067,7 +3067,7 @@ impl ExecutionEngine {
         );
 
         if let Err(e) = nautilus_common::recovery_trace::native_transport(
-            &client.client_id().to_string(),
+            client.client_id().as_ref(),
             "execution.modify_order",
             &cmd.clone(),
             || client.modify_order(cmd),
@@ -3078,7 +3078,7 @@ impl ExecutionEngine {
 
     fn handle_batch_modify_orders(&self, client: &dyn ExecutionClient, cmd: BatchModifyOrders) {
         if let Err(e) = nautilus_common::recovery_trace::native_transport(
-            &client.client_id().to_string(),
+            client.client_id().as_ref(),
             "execution.batch_modify_orders",
             &cmd.clone(),
             || client.batch_modify_orders(cmd),
@@ -3099,7 +3099,7 @@ impl ExecutionEngine {
         );
 
         if let Err(e) = nautilus_common::recovery_trace::native_transport(
-            &client.client_id().to_string(),
+            client.client_id().as_ref(),
             "execution.cancel_order",
             &cmd.clone(),
             || client.cancel_order(cmd),
@@ -3121,7 +3121,7 @@ impl ExecutionEngine {
         log_info!("Cancel all{side_str}orders", color = LogColor::Blue);
 
         if let Err(e) = nautilus_common::recovery_trace::native_transport(
-            &client.client_id().to_string(),
+            client.client_id().as_ref(),
             "execution.cancel_all_orders",
             &venue_command.clone(),
             || client.cancel_all_orders(venue_command),
@@ -3273,7 +3273,7 @@ impl ExecutionEngine {
         );
 
         if let Err(e) = nautilus_common::recovery_trace::native_transport(
-            &client.client_id().to_string(),
+            client.client_id().as_ref(),
             "execution.batch_cancel_orders",
             &cmd.clone(),
             || client.batch_cancel_orders(cmd),
@@ -3286,7 +3286,7 @@ impl ExecutionEngine {
         log_info!("Query {}", cmd.account_id, color = LogColor::Blue);
 
         if let Err(e) = nautilus_common::recovery_trace::native_transport(
-            &client.client_id().to_string(),
+            client.client_id().as_ref(),
             "execution.query_account",
             &cmd.clone(),
             || client.query_account(cmd),
@@ -3299,7 +3299,7 @@ impl ExecutionEngine {
         log_info!("Query {}", cmd.client_order_id, color = LogColor::Blue);
 
         if let Err(e) = nautilus_common::recovery_trace::native_transport(
-            &client.client_id().to_string(),
+            client.client_id().as_ref(),
             "execution.query_order",
             &cmd.clone(),
             || client.query_order(cmd),

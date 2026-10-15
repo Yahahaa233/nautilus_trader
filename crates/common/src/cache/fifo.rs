@@ -213,6 +213,9 @@ where
 {
     /// Returns exact eviction order and values from a frozen owner checkpoint.
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics if the eviction order contains a key missing from the value index.
     pub fn checkpoint_entries(&self) -> Vec<(K, V)>
     where
         V: Clone,

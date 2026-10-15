@@ -400,7 +400,7 @@ impl SimulatedExchange {
     pub fn skipped_fill_count(&self) -> u64 {
         self.matching_engines
             .values()
-            .map(|matching_engine| matching_engine.skipped_fill_count())
+            .map(OrderMatchingEngine::skipped_fill_count)
             .sum()
     }
 

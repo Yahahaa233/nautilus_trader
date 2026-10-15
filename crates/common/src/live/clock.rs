@@ -63,7 +63,7 @@ struct LiveRestoredTimers {
     cancelled_tokens: BTreeMap<u64, (serde_json::Value, crate::runner::TimeEventCallbackToken)>,
     retained_callbacks: BTreeMap<u64, crate::runner::RetainedTimeEventCallback>,
     inspectors: Vec<TimerInspector>,
-    updaters: BTreeMap<String, Box<dyn Fn(u64, bool) -> anyhow::Result<()>>>,
+    updaters: BTreeMap<String, super::timer::HistoricalScheduleUpdater>,
     restored: std::cell::RefCell<serde_json::Value>,
 }
 impl std::fmt::Debug for LiveRestoredTimers {
@@ -108,7 +108,7 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
         anyhow::ensure!(
             event.name.as_str() == name
                 && event.ts_event.as_u64() <= next
-                && (next - event.ts_event.as_u64()) % interval == 0,
+                && (next - event.ts_event.as_u64()).is_multiple_of(*interval),
             "pending time event does not match its source owner schedule"
         );
         let lease = token
@@ -604,8 +604,8 @@ impl LiveClock {
         Self {
             native_clock_id: nautilus_core::UUID4::new(),
             restored_clock_id: None,
-            checkpoint_gate: Default::default(),
-            checkpoint_read_time: Default::default(),
+            checkpoint_gate: super::checkpoint::CheckpointGate::default(),
+            checkpoint_read_time: std::rc::Rc::default(),
             time: get_atomic_clock_realtime(),
             timers: BTreeMap::new(),
             callbacks: CallbackRegistry::new(),
@@ -890,7 +890,7 @@ impl Clock for LiveClock {
             let id = spec
                 .binding
                 .get("binding_id")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| anyhow::anyhow!("source callback binding missing"))?;
             anyhow::ensure!(
                 id > 0
@@ -898,7 +898,7 @@ impl Clock for LiveClock {
                     && spec
                         .binding
                         .get("owner_thread_only")
-                        .and_then(|v| v.as_bool())
+                        .and_then(serde_json::Value::as_bool)
                         == Some(true),
                 "source callback owner binding invalid"
             );
@@ -1419,7 +1419,7 @@ mod tests {
                 "checkpoint-owned-alert",
                 due,
                 Some(TimeEventCallback::RustLocal(std::rc::Rc::new(move |_| {
-                    called.set(called.get() + 1)
+                    called.set(called.get() + 1);
                 }))),
                 None,
             )
@@ -1857,7 +1857,7 @@ mod tests {
             "accepted_after" => received = captured_after + 1,
             "foreign_clock" => {
                 before["native_clock_id"] =
-                    serde_json::to_value(nautilus_core::UUID4::new()).unwrap()
+                    serde_json::to_value(nautilus_core::UUID4::new()).unwrap();
             }
             _ => {}
         }
@@ -2012,15 +2012,7 @@ mod tests {
                 .into();
         }
         let result = receipt.admit_historical_messages(&desired, &[(event, input_binding, false)]);
-        if fault != "valid" {
-            assert!(result.is_err());
-            assert_eq!(
-                receipt.historical_inventory().unwrap(),
-                before,
-                "missing or changed original leases must fail before mutation"
-            );
-            assert_eq!(calls.get(), 0);
-        } else {
+        if fault == "valid" {
             let mut messages = result.unwrap();
             assert_eq!(messages.len(), 1);
             assert_eq!(receipt.historical_inventory().unwrap(), source_inventory);
@@ -2065,6 +2057,14 @@ mod tests {
                 target_rx.try_recv().is_err(),
                 "no timer event may be regenerated"
             );
+        } else {
+            assert!(result.is_err());
+            assert_eq!(
+                receipt.historical_inventory().unwrap(),
+                before,
+                "missing or changed original leases must fail before mutation"
+            );
+            assert_eq!(calls.get(), 0);
         }
         source.cancel_timers();
         target.cancel_timers();
@@ -2139,7 +2139,7 @@ mod tests {
         match changed {
             "account" => row["callback_profile"]["account_id"] = "OTHER-001".into(),
             "configuration" => {
-                row["callback_profile"]["configuration"]["equity_curve"] = false.into()
+                row["callback_profile"]["configuration"]["equity_curve"] = false.into();
             }
             "factory" => row["callback_profile"]["factory"] = "unregistered_factory".into(),
             "legacy_unknown" => {

@@ -9,6 +9,16 @@ use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc};
 type Encoder = dyn Fn(DispatchSource, &str, &dyn Any) -> Result<DispatchInput>;
 
 /// Partial live ingress instrumentation; this type cannot grant recovery permission.
+#[cfg(feature = "native-tail-replay")]
+type VerifyReadWitnesses =
+    dyn Fn(&[nautilus_common::recovery_trace::NativeReadWitness]) -> Result<()>;
+#[cfg(feature = "native-tail-replay")]
+type CaptureReadWitnesses = dyn Fn(
+    DispatchSource,
+    &str,
+    &dyn Any,
+) -> Result<nautilus_common::recovery_trace::NativeReadWitnesses>;
+
 #[derive(Clone)]
 pub struct NodeDispatchObserver {
     observer: DispatchObserver,
@@ -18,18 +28,9 @@ pub struct NodeDispatchObserver {
     #[cfg(feature = "native-tail-replay")]
     native_trace: Option<nautilus_event_store::native_trace::NativeTraceRecorder>,
     #[cfg(feature = "native-tail-replay")]
-    verify_read_witnesses:
-        Option<Rc<dyn Fn(&[nautilus_common::recovery_trace::NativeReadWitness]) -> Result<()>>>,
+    verify_read_witnesses: Option<Rc<VerifyReadWitnesses>>,
     #[cfg(feature = "native-tail-replay")]
-    read_witnesses: Option<
-        Rc<
-            dyn Fn(
-                DispatchSource,
-                &str,
-                &dyn Any,
-            ) -> Result<nautilus_common::recovery_trace::NativeReadWitnesses>,
-        >,
-    >,
+    read_witnesses: Option<Rc<CaptureReadWitnesses>>,
 }
 impl std::fmt::Debug for NodeDispatchObserver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -229,7 +230,7 @@ impl NodeDispatchObserver {
     + use<> {
         let encoder = Rc::downgrade(&self.encoder);
         move |source, input| {
-            let source = source_dispatch(source)?;
+            let source = source_dispatch(source);
             let encoder = encoder
                 .upgrade()
                 .context("native derived queue codec owner released")?;
@@ -316,9 +317,9 @@ impl NodeDispatchObserver {
 #[cfg(feature = "native-tail-replay")]
 pub(super) fn source_dispatch(
     source: nautilus_common::recovery_trace::NativeInputSource,
-) -> Result<DispatchSource> {
+) -> DispatchSource {
     use nautilus_common::recovery_trace::NativeInputSource as N;
-    Ok(match source {
+    match source {
         N::Time => DispatchSource::Time,
         N::SystemEvent => DispatchSource::SystemEvent,
         N::SystemCommand => DispatchSource::SystemCommand,
@@ -331,7 +332,7 @@ pub(super) fn source_dispatch(
         N::Maintenance => DispatchSource::Maintenance,
         N::Lifecycle => DispatchSource::Lifecycle,
         N::Reconciliation => DispatchSource::Reconciliation,
-    })
+    }
 }
 #[cfg(feature = "native-tail-replay")]
 pub(super) fn native_source(
@@ -400,7 +401,7 @@ impl NodeDispatchGuard {
     #[cfg(feature = "native-tail-replay")]
     pub(super) fn complete_native(mut self, native_effects: serde_json::Value) -> Result<()> {
         if let Some(historical) = self.historical.take() {
-            historical.complete(native_effects)?;
+            historical.complete(&native_effects)?;
             self.observer.complete(
                 self.token
                     .as_ref()

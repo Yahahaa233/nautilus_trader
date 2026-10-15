@@ -220,8 +220,8 @@ impl Default for WsDispatchState {
             pending_cancels: Arc::new(DashMap::new()),
             retained_cancel_contexts: Arc::new(DashMap::new()),
             pending_amends: Arc::new(DashMap::new()),
-            operation_ack_contexts: Default::default(),
-            operation_ack_request_ids: Default::default(),
+            operation_ack_contexts: Arc::default(),
+            operation_ack_request_ids: Arc::default(),
             accepted_venue_order_ids: Mutex::new(FifoCacheMap::new()),
             triggered_orders: DedupCache::new(),
             filled_orders: DedupCache::new(),
@@ -1393,13 +1393,28 @@ pub fn dispatch_ws_message(
                                     );
                                 }
                             } else {
-                                state.pending_cancels.remove(cl_ord_id);
+                                state.pending_cancels.remove_if(cl_ord_id, |_, context| {
+                                    context.cancel_request.is_none()
+                                });
                             }
                         }
-                        OKXWsOperation::BatchCancelOrders
-                        | OKXWsOperation::MassCancel
-                        | OKXWsOperation::CancelAlgos => {
-                            state.pending_cancels.remove(cl_ord_id);
+                        OKXWsOperation::BatchCancelOrders => {
+                            let identity = parse_client_order_id(cl_ord_id)
+                                .and_then(|client| state.order_identity(client));
+                            state.pending_cancels.remove_if(cl_ord_id, |_, context| {
+                                context.cancel_request.is_none()
+                                    || (context.matches_cancel(id.as_deref(), true)
+                                        && context.trader_id == emitter.trader_id()
+                                        && identity.is_some_and(|identity| {
+                                            context.strategy_id == identity.strategy_id
+                                                && context.instrument_id == identity.instrument_id
+                                        }))
+                            });
+                        }
+                        OKXWsOperation::MassCancel | OKXWsOperation::CancelAlgos => {
+                            state.pending_cancels.remove_if(cl_ord_id, |_, context| {
+                                context.cancel_request.is_none()
+                            });
                         }
                         OKXWsOperation::AmendOrder | OKXWsOperation::BatchAmendOrders => {
                             // 接收请求不代表修改成功，等待订单频道确认。
@@ -1455,17 +1470,16 @@ pub fn dispatch_ws_message(
                             .retained_submit_contexts
                             .get(cl_ord_id)
                             .map(|entry| entry.clone());
-                        if let Some(original) = &original {
-                            if op != OKXWsOperation::Order
+                        if let Some(original) = &original
+                            && (op != OKXWsOperation::Order
                                 || data.len() != 1
                                 || !original.matches(id.as_deref(), cl_ord_id, account_id, &ident)
-                                || original.trader_id != emitter.trader_id()
-                            {
-                                log::warn!(
-                                    "Ordinary submit rejection does not match its retained original request"
-                                );
-                                continue;
-                            }
+                                || original.trader_id != emitter.trader_id())
+                        {
+                            log::warn!(
+                                "Ordinary submit rejection does not match its retained original request"
+                            );
+                            continue;
                         }
                         state.remove_order_tracking(client_order_id);
                         state.pending_orders.remove(cl_ord_id);
@@ -1541,7 +1555,12 @@ pub fn dispatch_ws_message(
                                 ts_init,
                                 &serde_json::json!({"request_id":id,"operation":op,"code":code,"message":msg,"data":data,"matched_item":item}),
                             ));
-                        } else if !state.retained_cancel_contexts.contains_key(cl_ord_id) {
+                        } else if !state.retained_cancel_contexts.contains_key(cl_ord_id)
+                            && state
+                                .pending_cancels
+                                .get(cl_ord_id)
+                                .is_none_or(|context| context.cancel_request.is_none())
+                        {
                             state.pending_cancels.remove(cl_ord_id);
                             emitter.emit_order_cancel_rejected_event(
                                 ident.strategy_id,
@@ -1557,8 +1576,21 @@ pub fn dispatch_ws_message(
                             );
                         }
                     }
-                    OKXWsOperation::BatchCancelOrders | OKXWsOperation::MassCancel => {
-                        state.pending_cancels.remove(cl_ord_id);
+                    OKXWsOperation::BatchCancelOrders => {
+                        emit_batch_cancel_rejection(
+                            state,
+                            emitter,
+                            (ident.strategy_id, ident.instrument_id, client_order_id),
+                            venue_order_id,
+                            id.as_deref(),
+                            &reason,
+                            (ts_init, clock),
+                        );
+                    }
+                    OKXWsOperation::MassCancel => {
+                        state
+                            .pending_cancels
+                            .remove_if(cl_ord_id, |_, context| context.cancel_request.is_none());
                         emitter.emit_order_cancel_rejected_event(
                             ident.strategy_id,
                             ident.instrument_id,
@@ -1631,14 +1663,22 @@ pub fn dispatch_ws_message(
                         }
                         emit_send_failed_submit(&failure, state, emitter, clock, client_order_id);
                     }
-                    Some(
-                        OKXWsOperation::CancelOrder
-                        | OKXWsOperation::BatchCancelOrders
-                        | OKXWsOperation::MassCancel
-                        | OKXWsOperation::CancelAlgos,
-                    ) => {
+                    Some(OKXWsOperation::CancelOrder | OKXWsOperation::BatchCancelOrders) => {
+                        emit_send_failed_cancel(
+                            &failure,
+                            state,
+                            emitter,
+                            clock,
+                            client_order_id,
+                            &request_id,
+                            op == Some(OKXWsOperation::BatchCancelOrders),
+                        );
+                    }
+                    Some(OKXWsOperation::MassCancel | OKXWsOperation::CancelAlgos) => {
                         if !is_ambiguous {
-                            state.pending_cancels.remove(key);
+                            state
+                                .pending_cancels
+                                .remove_if(key, |_, context| context.cancel_request.is_none());
                         }
                     }
                     Some(OKXWsOperation::AmendOrder | OKXWsOperation::BatchAmendOrders) => {
@@ -2924,11 +2964,11 @@ fn dispatch_parsed_order_event(
             emitter.send_order_event(OrderEventAny::Triggered(e));
         }
         ParsedOrderEvent::Canceled(mut e) => {
-            if let Some(context) = state.retained_cancel_contexts.get(client_order_id.as_str()) {
-                if let Some(basis) = context.terminal_basis(&e) {
-                    e.causation_id = Some(basis.command_id);
-                    e.command_causation_basis = Some(basis);
-                }
+            if let Some(context) = state.retained_cancel_contexts.get(client_order_id.as_str())
+                && let Some(basis) = context.terminal_basis(&e)
+            {
+                e.causation_id = Some(basis.command_id);
+                e.command_causation_basis = Some(basis);
             }
             ensure_accepted_emitted(
                 client_order_id,
@@ -3438,6 +3478,99 @@ pub fn dispatch_execution_reports(
     }
 }
 
+fn emit_batch_cancel_rejection(
+    state: &WsDispatchState,
+    emitter: &ExecutionEventEmitter,
+    identity: (StrategyId, InstrumentId, ClientOrderId),
+    venue_order_id: Option<VenueOrderId>,
+    request_id: Option<&str>,
+    reason: &str,
+    time: (UnixNanos, &AtomicTime),
+) {
+    let (strategy_id, instrument_id, client_order_id) = identity;
+    let context = state
+        .pending_cancels
+        .get(client_order_id.as_str())
+        .map(|v| v.clone());
+    if let Some(context) = context.filter(|context| context.cancel_request.is_some()) {
+        if context.matches_cancel(request_id, true)
+            && context.trader_id == emitter.trader_id()
+            && context.strategy_id == strategy_id
+            && context.instrument_id == instrument_id
+            && state
+                .pending_cancels
+                .remove_if(client_order_id.as_str(), |_, actual| {
+                    actual.matches_cancel(request_id, true)
+                        && actual.command_id == context.command_id
+                })
+                .is_some()
+        {
+            emitter.send_order_event(context.cancel_rejection(
+                emitter.account_id(),
+                client_order_id,
+                venue_order_id,
+                reason,
+                time.0,
+                time.1,
+            ));
+        }
+    } else {
+        state.pending_cancels.remove(client_order_id.as_str());
+        emitter.emit_order_cancel_rejected_event(
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            venue_order_id,
+            reason,
+            time.0,
+        );
+    }
+}
+
+fn emit_send_failed_cancel(
+    failure: &CommandFailure,
+    state: &WsDispatchState,
+    emitter: &ExecutionEventEmitter,
+    clock: &AtomicTime,
+    client_order_id: ClientOrderId,
+    request_id: &str,
+    batch: bool,
+) {
+    let reason = match failure {
+        CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => reason,
+        CommandFailure::Ambiguous(_) => return,
+    };
+    let Some(identity) = state.order_identity(client_order_id) else {
+        return;
+    };
+    let Some((_, context)) =
+        state
+            .pending_cancels
+            .remove_if(client_order_id.as_str(), |_, context| {
+                context.matches_cancel(Some(request_id), batch)
+                    && context.command_id.is_some()
+                    && context.trader_id == emitter.trader_id()
+                    && context.strategy_id == identity.strategy_id
+                    && context.instrument_id == identity.instrument_id
+            })
+    else {
+        return;
+    };
+    state
+        .retained_cancel_contexts
+        .remove_if(client_order_id.as_str(), |_, original| {
+            original.request_id == request_id && Some(original.command_id) == context.command_id
+        });
+    emitter.send_order_event(context.cancel_rejection(
+        emitter.account_id(),
+        client_order_id,
+        state.accepted_venue_order_id(&client_order_id),
+        reason,
+        clock.get_time_ns(),
+        clock,
+    ));
+}
+
 fn emit_send_failed_submit(
     failure: &CommandFailure,
     state: &WsDispatchState,
@@ -3514,6 +3647,35 @@ pub struct AlgoCancelContext {
     pub instrument_id: InstrumentId,
     pub strategy_id: StrategyId,
     pub venue_order_id: Option<VenueOrderId>,
+    pub command_id: Option<nautilus_core::UUID4>,
+}
+
+impl AlgoCancelContext {
+    pub(crate) fn emit_rejection(
+        &self,
+        emitter: &ExecutionEventEmitter,
+        clock: &'static AtomicTime,
+        reason: &str,
+    ) {
+        let ts_event = clock.get_time_ns();
+        let event_id = nautilus_common::recovery_trace::native_event_uuid();
+        let ts_init = clock.get_time_ns();
+        let mut event = nautilus_model::events::OrderCancelRejected::new(
+            emitter.trader_id(),
+            self.strategy_id,
+            self.instrument_id,
+            self.client_order_id,
+            reason.into(),
+            event_id,
+            ts_event,
+            ts_init,
+            false,
+            self.venue_order_id,
+            Some(emitter.account_id()),
+        );
+        event.causation_id = self.command_id;
+        emitter.send_order_event(OrderEventAny::CancelRejected(event));
+    }
 }
 
 // Contexts must correspond 1:1 with the requests that produced
@@ -3555,15 +3717,7 @@ pub fn emit_algo_cancel_rejections(
 
         if let Some(ctx) = contexts.get(i) {
             let reason = format_order_response_reason(code, msg, "");
-            let ts = clock.get_time_ns();
-            emitter.emit_order_cancel_rejected_event(
-                ctx.strategy_id,
-                ctx.instrument_id,
-                ctx.client_order_id,
-                ctx.venue_order_id,
-                &reason,
-                ts,
-            );
+            ctx.emit_rejection(emitter, clock, &reason);
         } else {
             log::warn!(
                 "Algo cancel rejected but no context at index {i}: \
@@ -4969,6 +5123,7 @@ mod tests {
         pending.insert(
             unrelated.to_string(),
             PendingOrderInfo {
+                cancel_request: None,
                 trader_id: TraderId::from("TRADER-001"),
                 strategy_id,
                 instrument_id,
@@ -5002,6 +5157,7 @@ mod tests {
             pending.insert(
                 client_order_id.to_string(),
                 PendingOrderInfo {
+                    cancel_request: None,
                     trader_id: TraderId::from("TRADER-001"),
                     strategy_id,
                     instrument_id,
@@ -5096,6 +5252,222 @@ mod tests {
                 assert!(!state.order_contexts.contains_key(&client_order_id));
             }
         }
+    }
+
+    fn cancel_causation_fixture() -> (WsDispatchState, ClientOrderId, UUID4) {
+        let state = WsDispatchState::default();
+        let client = ClientOrderId::from("OCANCELCAUSE001");
+        let strategy_id = StrategyId::from("STRATEGY-001");
+        let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
+        let command_id = UUID4::new();
+        state.order_identities.insert(
+            client,
+            OrderIdentity {
+                client_order_id: client,
+                strategy_id,
+                instrument_id,
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
+        );
+        state.pending_cancels.insert(
+            client.to_string(),
+            PendingOrderInfo {
+                trader_id: TraderId::from("TRADER-001"),
+                strategy_id,
+                instrument_id,
+                command_id: Some(command_id),
+                cancel_request: Some(super::super::client::CancelRequest::Batch(
+                    "original-batch-request".into(),
+                )),
+            },
+        );
+        (state, client, command_id)
+    }
+
+    #[rstest]
+    #[case(true, true, None, true)]
+    #[case(false, true, None, false)]
+    #[case(true, false, None, false)]
+    #[case(true, true, Some("trader"), false)]
+    #[case(true, true, Some("strategy"), false)]
+    #[case(true, true, Some("instrument"), false)]
+    fn cancel_send_failure_requires_original_request_and_preserves_ambiguity(
+        #[case] not_sent: bool,
+        #[case] matching: bool,
+        #[case] foreign: Option<&str>,
+        #[case] rejected: bool,
+        #[values(false, true)] batch: bool,
+    ) {
+        let (state, client, command_id) = cancel_causation_fixture();
+        if !batch {
+            state
+                .pending_cancels
+                .get_mut(client.as_str())
+                .unwrap()
+                .cancel_request = Some(super::super::client::CancelRequest::Single(
+                "original-batch-request".into(),
+            ));
+        }
+        if let Some(foreign) = foreign {
+            let mut context = state.pending_cancels.get_mut(client.as_str()).unwrap();
+            match foreign {
+                "trader" => context.trader_id = TraderId::from("FOREIGN-001"),
+                "strategy" => context.strategy_id = StrategyId::from("FOREIGN-001"),
+                "instrument" => context.instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX"),
+                _ => unreachable!(),
+            }
+        }
+        let (emitter, mut receiver) = test_execution_emitter();
+        dispatch_test_message(
+            OKXWsMessage::SendFailed {
+                request_id: "original-batch-request".into(),
+                client_order_ids: vec![client],
+                op: Some(if batch {
+                    OKXWsOperation::CancelOrder
+                } else {
+                    OKXWsOperation::BatchCancelOrders
+                }),
+                error: OKXWsError::ClientError("wrong operation for original request".into()),
+            },
+            &emitter,
+            &state,
+            &AtomicMap::new(),
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "wrong operation cannot acquire another command UUID"
+        );
+        assert!(state.pending_cancels.contains_key(client.as_str()));
+        dispatch_test_message(
+            OKXWsMessage::SendFailed {
+                request_id: if matching {
+                    "original-batch-request"
+                } else {
+                    "stale-request"
+                }
+                .into(),
+                client_order_ids: vec![client],
+                op: Some(if batch {
+                    OKXWsOperation::BatchCancelOrders
+                } else {
+                    OKXWsOperation::CancelOrder
+                }),
+                error: if not_sent {
+                    OKXWsError::ClientError("not transmitted".into())
+                } else {
+                    OKXWsError::SendFailed("outcome unknown".into())
+                },
+            },
+            &emitter,
+            &state,
+            &AtomicMap::new(),
+        );
+        let events = drain_execution_events(&mut receiver);
+        if rejected {
+            assert!(
+                matches!(&events[..], [ExecutionEvent::Order(OrderEventAny::CancelRejected(event))]
+                if event.causation_id == Some(command_id))
+            );
+        } else {
+            assert!(events.is_empty());
+        }
+        assert_eq!(
+            state.pending_cancels.contains_key(client.as_str()),
+            !rejected
+        );
+    }
+
+    #[test]
+    fn batch_cancel_rejection_cannot_consume_a_newer_request_for_the_same_order() {
+        let (state, client, original_command) = cancel_causation_fixture();
+        let (emitter, mut receiver) = test_execution_emitter();
+        let response = |request: &str, code: &str| OKXWsMessage::OrderResponse {
+            id: Some(request.into()),
+            op: OKXWsOperation::BatchCancelOrders,
+            code: "0".into(),
+            msg: String::new(),
+            data: vec![
+                serde_json::json!({"clOrdId":client.as_str(),"ordId":"12345","sCode":code,"sMsg":"refused"}),
+            ],
+        };
+        let mut wrong_op = response("original-batch-request", "51000");
+        if let OKXWsMessage::OrderResponse { op, .. } = &mut wrong_op {
+            *op = OKXWsOperation::CancelOrder;
+        }
+        dispatch_test_message(wrong_op, &emitter, &state, &AtomicMap::new());
+        assert!(receiver.try_recv().is_err());
+        assert!(state.pending_cancels.contains_key(client.as_str()));
+        dispatch_test_message(
+            response("stale-request", "51000"),
+            &emitter,
+            &state,
+            &AtomicMap::new(),
+        );
+        assert!(receiver.try_recv().is_err());
+        assert!(state.pending_cancels.contains_key(client.as_str()));
+        dispatch_test_message(
+            response("original-batch-request", "50004"),
+            &emitter,
+            &state,
+            &AtomicMap::new(),
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "ambiguous venue response cannot reject"
+        );
+        assert!(state.pending_cancels.contains_key(client.as_str()));
+        dispatch_test_message(
+            response("original-batch-request", "51000"),
+            &emitter,
+            &state,
+            &AtomicMap::new(),
+        );
+        let events = drain_execution_events(&mut receiver);
+        assert!(
+            matches!(&events[..], [ExecutionEvent::Order(OrderEventAny::CancelRejected(event))]
+            if event.causation_id == Some(original_command))
+        );
+        let newer_command = UUID4::new();
+        state.pending_cancels.insert(
+            client.to_string(),
+            PendingOrderInfo {
+                trader_id: emitter.trader_id(),
+                strategy_id: StrategyId::from("STRATEGY-001"),
+                instrument_id: InstrumentId::from("ETH-USDT-SWAP.OKX"),
+                command_id: Some(newer_command),
+                cancel_request: Some(super::super::client::CancelRequest::Batch(
+                    "newer-request".into(),
+                )),
+            },
+        );
+        for code in ["0", "51000"] {
+            dispatch_test_message(
+                response("original-batch-request", code),
+                &emitter,
+                &state,
+                &AtomicMap::new(),
+            );
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(
+                state
+                    .pending_cancels
+                    .get(client.as_str())
+                    .unwrap()
+                    .command_id,
+                Some(newer_command)
+            );
+        }
+        dispatch_test_message(
+            response("newer-request", "51000"),
+            &emitter,
+            &state,
+            &AtomicMap::new(),
+        );
+        assert!(
+            matches!(receiver.try_recv().unwrap(), ExecutionEvent::Order(OrderEventAny::CancelRejected(event))
+            if event.causation_id == Some(newer_command))
+        );
     }
 
     #[rstest]
@@ -5235,6 +5607,7 @@ mod tests {
             state.pending_orders.insert(
                 client_order_id.to_string(),
                 PendingOrderInfo {
+                    cancel_request: None,
                     command_id: None,
                     trader_id: TraderId::from("TRADER-001"),
                     strategy_id,

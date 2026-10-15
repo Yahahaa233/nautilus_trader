@@ -31,6 +31,7 @@ pub struct NativeMutationInput {
     payload: serde_json::Value,
 }
 impl NativeMutationInput {
+    #[must_use]
     pub fn kind(&self) -> &str {
         &self.kind
     }
@@ -78,6 +79,9 @@ impl NativeMutationInput {
             payload: decoded.payload,
         })
     }
+    ///
+    /// # Errors
+    /// Returns an error if the native mutation cannot be represented by its canonical source codec.
     pub fn canonical_payload(&self) -> Result<serde_json::Value> {
         Ok(serde_json::to_value(self)?)
     }

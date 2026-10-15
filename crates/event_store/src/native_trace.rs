@@ -264,6 +264,9 @@ impl NativeTraceRecorder {
     }
     /// Captures the same native monotonic reference used for manager ages.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// # Errors
+    /// Returns an error if the recorder, completed frontier, inventory, or pending receipts cannot establish the same native cut.
     pub fn checkpoint_cut_at(
         &self,
         root: u64,
@@ -632,6 +635,9 @@ impl VerifiedNativeRoot {
     }
     /// Builds exact source output expectations for one input from this reader's
     /// verified native closure. Current child capture metadata is never substituted.
+    ///
+    /// # Errors
+    /// Returns an error if output identity, causal order, or canonical source bytes no longer match the verified root.
     pub fn historical_outputs(
         &self,
         input_sequence: u64,
@@ -707,6 +713,9 @@ impl VerifiedNativeTrace {
     }
     /// Only an actual final native checkpoint seals the remaining physical FIFO.
     /// No last completed root alone proves an empty source queue.
+    ///
+    /// # Errors
+    /// Returns an error if the final physical FIFO has no verified checkpoint seal.
     pub fn final_pending(&self) -> Result<&[nautilus_common::recovery_trace::NativePendingInput]> {
         Ok(&self.final_cut()?.pending_inputs)
     }
@@ -714,6 +723,9 @@ impl VerifiedNativeTrace {
     pub const fn initial_cut_sealed(&self) -> bool {
         self.initial_cut_sealed
     }
+    ///
+    /// # Errors
+    /// Returns an error if the final physical FIFO has no verified checkpoint seal.
     pub fn final_cut(&self) -> Result<&NativeTraceCheckpointCut> {
         self.final_cut
             .as_ref()
@@ -759,6 +771,9 @@ impl NativeHistoricalRootReplay {
     }
 
     /// Returns the next original source Begin. A pending Complete cannot be skipped.
+    ///
+    /// # Errors
+    /// Returns an error for a failed, reentered, exhausted, or out-of-order historical input tree.
     pub fn next_begin(&self) -> Result<NativeTraceRecord> {
         let state = self
             .0
@@ -778,6 +793,9 @@ impl NativeHistoricalRootReplay {
     }
     /// Returns the Reader-original Begin for the currently executing input,
     /// including nested inputs. This does not advance its cursor.
+    ///
+    /// # Errors
+    /// Returns an error if the current historical input or its original Begin is unavailable.
     pub fn expected_begin(&self) -> Result<NativeTraceRecord> {
         let state = self
             .0
@@ -801,6 +819,9 @@ impl NativeHistoricalRootReplay {
             .context("historical native source Begin missing")
     }
     /// Returns the expected effects for the currently executing original input.
+    ///
+    /// # Errors
+    /// Returns an error if the current historical input or its original Complete is unavailable.
     pub fn expected_effects(&self) -> Result<Value> {
         let state = self
             .0
@@ -947,7 +968,7 @@ impl NativeHistoricalRootReplay {
         };
         let scope =
             nautilus_common::recovery_trace::historical::HistoricalInputScope::enter_with_outputs_at(
-                state.root.clone(),
+                Rc::<VerifiedNativeRoot>::clone(&state.root),
                 begin.clone(),
                 callbacks.clone(),
                 transports.clone(),
@@ -972,6 +993,9 @@ impl NativeHistoricalRootReplay {
         })
     }
     /// Verifies the entire native root, with no unresolved original child or output.
+    ///
+    /// # Errors
+    /// Returns an error if historical replay failed, is reentered, or has unresolved children or outputs.
     pub fn finish(&self) -> Result<NativeHistoricalRootReceipt> {
         let state = self
             .0
@@ -984,7 +1008,7 @@ impl NativeHistoricalRootReplay {
         Ok(NativeHistoricalRootReceipt {
             source: state.root.source.clone(),
             root: state.root.root_sequence,
-            verified_root: state.root.clone(),
+            verified_root: Rc::<VerifiedNativeRoot>::clone(&state.root),
             final_input: state
                 .root
                 .inputs
@@ -1031,7 +1055,10 @@ pub struct NativeHistoricalInputGuard {
 }
 impl NativeHistoricalInputGuard {
     /// Compares actual original-object/native effects before accepting Complete.
-    pub fn complete(mut self, actual_effects: Value) -> Result<()> {
+    ///
+    /// # Errors
+    /// Returns an error if the current input, output frontier, or actual effects differ from the original completion.
+    pub fn complete(mut self, actual_effects: &Value) -> Result<()> {
         let mut state = self
             .replay
             .0
@@ -1069,7 +1096,7 @@ impl NativeHistoricalInputGuard {
                 );
                 error.context(context)
             })?;
-        if native_effects != &actual_effects {
+        if native_effects != actual_effects {
             // Report only bounded, fixed SDK field names. Actual account/business
             // values and arbitrary witness keys must not leak into error logs.
             let mut changed = [
@@ -1136,10 +1163,10 @@ impl NativeHistoricalInputGuard {
 }
 impl Drop for NativeHistoricalInputGuard {
     fn drop(&mut self) {
-        if !self.completed {
-            if let Ok(mut state) = self.replay.0.try_borrow_mut() {
-                state.failed = true;
-            }
+        if !self.completed
+            && let Ok(mut state) = self.replay.0.try_borrow_mut()
+        {
+            state.failed = true;
         }
     }
 }
@@ -1210,18 +1237,76 @@ impl<B: EventStore> EventStoreReader<B> {
             cut.prefix.sequence > 0 && cut.prefix.sequence <= end && end <= watermark,
             "native trace bounds unavailable"
         );
+        let mut verifier = NativeTailVerifier::new(self, expected, cut, end, watermark);
+        verifier.verify_prefix(manifest.parent_run_id.as_deref())?;
+        verifier.verify_cut()?;
+        verifier.verify_tail()?;
+        verifier.finish()
+    }
+}
+
+struct NativeTailVerifier<'a, B: EventStore> {
+    reader: &'a EventStoreReader<B>,
+    expected: &'a NativeTraceSource,
+    cut: &'a NativeTraceCheckpointCut,
+    end: u64,
+    watermark: u64,
+    prefix_continuation: continuation::PrefixContinuations,
+    known_inputs: BTreeMap<u64, u64>,
+    derived_outputs: BTreeMap<String, nautilus_common::recovery_trace::NativeQueuedOutput>,
+    channel_ordinals: BTreeMap<String, u64>,
+    next_input: u64,
+    next_root: u64,
+    stack: Vec<InputCheck>,
+    root_entries: Vec<EventStoreEntry>,
+    root_records: Vec<NativeTraceRecord>,
+    roots: Vec<VerifiedNativeRoot>,
+    seen_messages: BTreeSet<String>,
+    pending_cut: BTreeMap<String, NativeIngressReceipt>,
+    final_cut: Option<NativeTraceCheckpointCut>,
+    initial_cut_sealed: bool,
+    last_processing_ns: u64,
+}
+impl<'a, B: EventStore> NativeTailVerifier<'a, B> {
+    fn new(
+        reader: &'a EventStoreReader<B>,
+        expected: &'a NativeTraceSource,
+        cut: &'a NativeTraceCheckpointCut,
+        end: u64,
+        watermark: u64,
+    ) -> Self {
+        Self {
+            reader,
+            expected,
+            cut,
+            end,
+            watermark,
+            pending_cut: BTreeMap::new(),
+            prefix_continuation: continuation::PrefixContinuations::new(),
+            known_inputs: BTreeMap::new(),
+            derived_outputs: BTreeMap::new(),
+            channel_ordinals: BTreeMap::new(),
+            next_input: 0,
+            next_root: 0,
+            stack: Vec::new(),
+            root_entries: Vec::new(),
+            root_records: Vec::new(),
+            roots: Vec::new(),
+            seen_messages: BTreeSet::new(),
+            final_cut: None,
+            initial_cut_sealed: false,
+            last_processing_ns: cut.captured_process_elapsed_ns,
+        }
+    }
+    fn verify_prefix(&mut self, parent_run_id: Option<&str>) -> Result<()> {
         let mut prefix_hash = blake3::Hasher::new();
         prefix_hash.update(b"nautilus-native-journal-prefix/v1");
-        prefix_hash.update(&(expected.journal_run.len() as u64).to_be_bytes());
-        prefix_hash.update(expected.journal_run.as_bytes());
-        prefix_hash.update(&cut.prefix.sequence.to_be_bytes());
-        let mut prefix_continuation = continuation::PrefixContinuations::new();
-        let mut known_inputs = BTreeMap::new();
-        let mut prefix_channel_ordinals = BTreeMap::<String, u64>::new();
-        let mut derived_outputs =
-            BTreeMap::<String, nautilus_common::recovery_trace::NativeQueuedOutput>::new();
-        for sequence in 1..=cut.prefix.sequence {
+        prefix_hash.update(&(self.expected.journal_run.len() as u64).to_be_bytes());
+        prefix_hash.update(self.expected.journal_run.as_bytes());
+        prefix_hash.update(&self.cut.prefix.sequence.to_be_bytes());
+        for sequence in 1..=self.cut.prefix.sequence {
             let entry = self
+                .reader
                 .scan_seq(sequence)?
                 .context("native prefix row absent")?;
             ensure!(
@@ -1230,143 +1315,161 @@ impl<B: EventStore> EventStoreReader<B> {
             );
             prefix_hash.update(entry.entry_hash.as_bytes());
             if entry.payload_type.as_str() == NATIVE_REPLAY_CONTINUATION_PAYLOAD_TYPE {
-                let before = self.verified_native_prefix(
-                    expected,
+                let before = self.reader.verified_native_prefix(
+                    self.expected,
                     sequence
                         .checked_sub(1)
                         .context("native replay audit sequence absent")?,
                 )?;
-                prefix_continuation.observe_audit(
+                self.prefix_continuation.observe_audit(
                     &entry,
-                    expected,
-                    manifest.parent_run_id.as_deref(),
-                    before,
+                    self.expected,
+                    parent_run_id,
+                    &before,
                 )?;
             }
             if entry.payload_type.as_str() == NATIVE_TRACE_PAYLOAD_TYPE {
-                let record: NativeTraceRecord = rmp_serde::from_slice(&entry.payload)?;
-                prefix_continuation.observe_trace(&record)?;
-                if let NativeTraceRecord::Complete {
-                    source,
-                    root_sequence,
-                    input_sequence,
-                    queued_outputs,
-                    ..
-                } = &record
-                {
-                    ensure!(source == expected, "native prefix queued source differs");
-                    for output in queued_outputs {
-                        ensure!(
-                            output.receipt.caused_by
-                                == Some(nautilus_common::recovery_trace::NativeInputCause {
-                                    process_incarnation: expected.process_incarnation,
-                                    journal_run: expected.journal_run.clone(),
-                                    root_sequence: *root_sequence,
-                                    input_sequence: *input_sequence,
-                                })
-                                && output.receipt.channel_ordinal == 0,
-                            "native prefix derived ingress cause differs"
-                        );
-                        ensure!(
-                            derived_outputs
-                                .insert(output.receipt.message_id.to_string(), output.clone())
-                                .is_none(),
-                            "native prefix duplicate derived admission"
-                        );
-                    }
-                }
-                if let NativeTraceRecord::Begin {
-                    source,
-                    root_sequence,
-                    input_sequence,
-                    receipt,
-                    payload,
-                    ..
-                } = record
-                {
-                    if let Some(ingress) = &receipt.ingress {
-                        let resumed = prefix_continuation.consume_retained(ingress, &payload)?;
-                        if let Some(cause) = &ingress.caused_by {
-                            ensure!(
-                                resumed
-                                    || (cause.journal_run == expected.journal_run
-                                        && cause.process_incarnation
-                                            == expected.process_incarnation),
-                                "native prefix retained parent cause lacks verified continuation"
-                            );
-                        }
-                        if let Some(previous) = prefix_channel_ordinals
-                            .insert(ingress.channel_id.to_string(), ingress.channel_ordinal)
-                        {
-                            ensure!(
-                                previous.checked_add(1) == Some(ingress.channel_ordinal),
-                                "native prefix FIFO gap"
-                            );
-                        }
-                    }
-                    ensure!(
-                        source == *expected,
-                        "native prefix producer identity mismatch"
-                    );
-                    ensure!(
-                        known_inputs.insert(input_sequence, root_sequence).is_none(),
-                        "native prefix duplicate input"
-                    );
-                }
+                self.observe_prefix_trace(&entry)?;
             }
         }
         ensure!(
-            prefix_hash.finalize().to_hex().as_str() == cut.prefix.entry_hash_digest,
+            prefix_hash.finalize().to_hex().as_str() == self.cut.prefix.entry_hash_digest,
             "native trace prefix changed"
         );
+        Ok(())
+    }
+    fn observe_prefix_trace(&mut self, entry: &EventStoreEntry) -> Result<()> {
+        let record: NativeTraceRecord = rmp_serde::from_slice(&entry.payload)?;
+        self.prefix_continuation.observe_trace(&record)?;
+        if let NativeTraceRecord::Complete {
+            source,
+            root_sequence,
+            input_sequence,
+            queued_outputs,
+            ..
+        } = &record
+        {
+            ensure!(
+                source == self.expected,
+                "native prefix queued source differs"
+            );
+            for output in queued_outputs {
+                ensure!(
+                    output.receipt.caused_by
+                        == Some(nautilus_common::recovery_trace::NativeInputCause {
+                            process_incarnation: self.expected.process_incarnation,
+                            journal_run: self.expected.journal_run.clone(),
+                            root_sequence: *root_sequence,
+                            input_sequence: *input_sequence,
+                        })
+                        && output.receipt.channel_ordinal == 0,
+                    "native prefix derived ingress cause differs"
+                );
+                ensure!(
+                    self.derived_outputs
+                        .insert(output.receipt.message_id.to_string(), output.clone())
+                        .is_none(),
+                    "native prefix duplicate derived admission"
+                );
+            }
+        }
+        self.observe_prefix_begin(record)?;
+        Ok(())
+    }
+    fn observe_prefix_begin(&mut self, record: NativeTraceRecord) -> Result<()> {
+        if let NativeTraceRecord::Begin {
+            source,
+            root_sequence,
+            input_sequence,
+            receipt,
+            payload,
+            ..
+        } = record
+        {
+            if let Some(ingress) = &receipt.ingress {
+                let resumed = self
+                    .prefix_continuation
+                    .consume_retained(ingress, &payload)?;
+                if let Some(cause) = &ingress.caused_by {
+                    ensure!(
+                        resumed
+                            || (cause.journal_run == self.expected.journal_run
+                                && cause.process_incarnation == self.expected.process_incarnation),
+                        "native prefix retained parent cause lacks verified continuation"
+                    );
+                }
+                if let Some(previous) = self
+                    .channel_ordinals
+                    .insert(ingress.channel_id.to_string(), ingress.channel_ordinal)
+                {
+                    ensure!(
+                        previous.checked_add(1) == Some(ingress.channel_ordinal),
+                        "native prefix FIFO gap"
+                    );
+                }
+            }
+            ensure!(
+                source == *self.expected,
+                "native prefix producer identity mismatch"
+            );
+            ensure!(
+                self.known_inputs
+                    .insert(input_sequence, root_sequence)
+                    .is_none(),
+                "native prefix duplicate input"
+            );
+        }
+        Ok(())
+    }
+    fn verify_cut(&mut self) -> Result<()> {
         let cut_entry = self
-            .scan_seq(cut.last_trace_sequence)?
+            .reader
+            .scan_seq(self.cut.last_trace_sequence)?
             .context("native cut completion absent")?;
         ensure!(
-            cut.last_trace_sequence <= cut.prefix.sequence
-                && cut_entry.entry_hash.to_hex() == cut.last_trace_entry_hash
+            self.cut.last_trace_sequence <= self.cut.prefix.sequence
+                && cut_entry.entry_hash.to_hex() == self.cut.last_trace_entry_hash
                 && cut_entry.payload_type.as_str() == NATIVE_TRACE_PAYLOAD_TYPE,
             "native cut completion mismatch"
         );
         let completion: NativeTraceRecord = rmp_serde::from_slice(&cut_entry.payload)?;
         ensure!(
             matches!(completion, NativeTraceRecord::Complete { source, root_sequence, input_sequence, .. }
-            if source == *expected && root_sequence == cut.completed_root && input_sequence == cut.completed_input),
+            if source == *self.expected && root_sequence == self.cut.completed_root && input_sequence == self.cut.completed_input),
             "native cut frontier mismatch"
         );
         ensure!(
-            cut.last_input_sequence >= cut.completed_input
-                && known_inputs.keys().next_back() == Some(&cut.last_input_sequence),
+            self.cut.last_input_sequence >= self.cut.completed_input
+                && self.known_inputs.keys().next_back() == Some(&self.cut.last_input_sequence),
             "native cut latest input mismatch"
         );
-        let mut next_input = cut
+        self.next_input = self
+            .cut
             .last_input_sequence
             .checked_add(1)
             .context("native tail input exhausted")?;
-        let mut next_root = cut
+        self.next_root = self
+            .cut
             .completed_root
             .checked_add(1)
             .context("native tail root exhausted")?;
-        let mut stack = Vec::<InputCheck>::new();
-        let mut root_entries = Vec::new();
-        let mut root_records = Vec::new();
-        let mut roots = Vec::new();
-        let mut seen_messages = BTreeSet::new();
-        let mut channel_ordinals = prefix_channel_ordinals;
-        let mut pending_cut = BTreeMap::new();
-        for receipt in &cut.pending {
+        Ok(())
+    }
+    fn verify_tail(&mut self) -> Result<()> {
+        for receipt in &self.cut.pending {
             ensure!(
-                pending_cut
+                self.pending_cut
                     .insert(receipt.message_id.to_string(), receipt.clone())
                     .is_none(),
                 "native cut duplicate pending receipt"
             );
         }
-        let mut final_cut = None;
-        let mut initial_cut_sealed = false;
-        let mut last_processing_ns = cut.captured_process_elapsed_ns;
-        for sequence in cut.prefix.sequence + 1..=end {
-            let entry = self.scan_seq(sequence)?.context("native tail row absent")?;
+
+        for sequence in self.cut.prefix.sequence + 1..=self.end {
+            let entry = self
+                .reader
+                .scan_seq(sequence)?
+                .context("native tail row absent")?;
             ensure!(
                 entry.seq == sequence && entry.recompute_hash() == entry.entry_hash,
                 "native tail hash mismatch"
@@ -1377,293 +1480,333 @@ impl<B: EventStore> EventStoreReader<B> {
             );
             if entry.payload_type.as_str() == "RunEnded" {
                 ensure!(
-                    stack.is_empty() && sequence == end && entry.headers.native_origin.is_none(),
+                    self.stack.is_empty()
+                        && sequence == self.end
+                        && entry.headers.native_origin.is_none(),
                     "native tail premature RunEnded"
                 );
                 continue;
             }
             if entry.payload_type.as_str() == NATIVE_CHECKPOINT_PAYLOAD_TYPE {
-                ensure!(
-                    stack.is_empty() && entry.headers.native_origin.is_none(),
-                    "checkpoint metadata inside active native input"
-                );
-                let metadata: NativeTraceCheckpointRecord = rmp_serde::from_slice(&entry.payload)?;
-                if sequence == cut.prefix.sequence + 1 {
-                    ensure!(
-                        metadata.cut == *cut,
-                        "initial native cut differs from its actual durable checkpoint"
-                    );
-                    initial_cut_sealed = true;
-                }
-
-                ensure!(
-                    metadata.cut.source == *expected
-                        && metadata.cut.completed_root.checked_add(1) == Some(next_root)
-                        && metadata.cut.last_input_sequence.checked_add(1) == Some(next_input)
-                        && metadata.cut.prefix.sequence.checked_add(1) == Some(sequence),
-                    "native checkpoint metadata frontier mismatch"
-                );
-                let actual = self.verified_native_prefix(expected, metadata.cut.prefix.sequence)?;
-                ensure!(
-                    actual == metadata.cut.prefix,
-                    "native checkpoint metadata prefix changed"
-                );
-                ensure!(
-                    metadata.cut.pending_inputs.len() == metadata.cut.pending.len(),
-                    "native checkpoint pending payload coverage absent"
-                );
-                prefix_continuation.verify_retained_inventory(&metadata.cut.pending_inputs)?;
-                let mut final_ids = BTreeSet::new();
-                for (input, receipt) in metadata
-                    .cut
-                    .pending_inputs
-                    .iter()
-                    .zip(&metadata.cut.pending)
-                {
-                    ensure!(
-                        input.receipt == *receipt
-                            && final_ids.insert(receipt.message_id.to_string())
-                            && !seen_messages.contains(&receipt.message_id.to_string()),
-                        "native checkpoint pending was changed or already processed"
-                    );
-                    if let Some(original) = derived_outputs.get(&receipt.message_id.to_string()) {
-                        let mut origin = original.receipt.clone();
-                        origin.channel_ordinal = receipt.channel_ordinal;
-                        ensure!(
-                            original.accepted
-                                && origin == *receipt
-                                && original.payload == input.payload,
-                            "native final derived FIFO differs from actual admission"
-                        );
-                    }
-                }
-                final_cut = Some(metadata.cut);
+                self.observe_checkpoint(sequence, &entry)?;
                 continue;
             }
             if entry.payload_type.as_str() == NATIVE_TRACE_PAYLOAD_TYPE {
-                ensure!(
-                    entry.headers.native_origin.is_none(),
-                    "native trace row cannot be a derived output"
-                );
-                let record: NativeTraceRecord = rmp_serde::from_slice(&entry.payload)?;
-                match &record {
-                    NativeTraceRecord::Begin {
-                        source,
-                        root_sequence,
-                        input_sequence,
-                        stack_parent,
-                        input_source,
-                        receipt,
-                        payload,
-                        ..
-                    } => {
-                        final_cut = None;
-                        ensure!(
-                            source == expected && *input_sequence == next_input,
-                            "native tail input identity/sequence mismatch"
-                        );
-                        match stack.last() {
-                            Some(parent) => ensure!(
-                                *root_sequence == parent.root
-                                    && *stack_parent == Some(parent.input),
-                                "native tail stack parent mismatch"
-                            ),
-                            None => ensure!(
-                                *root_sequence == next_root && stack_parent.is_none(),
-                                "native tail root mismatch"
-                            ),
-                        }
-                        ensure!(
-                            receipt.process_elapsed_ns >= last_processing_ns,
-                            "native processing clock moved backwards"
-                        );
-                        last_processing_ns = receipt.process_elapsed_ns;
-                        if let Some(ingress) = &receipt.ingress {
-                            let resumed = prefix_continuation.consume_retained(ingress, payload)?;
-                            if let Some(original) =
-                                pending_cut.remove(&ingress.message_id.to_string())
-                            {
-                                ensure!(
-                                    original == *ingress,
-                                    "native cut pending receipt was substituted"
-                                );
-                            }
-                            if let Some(cause) = &ingress.caused_by
-                                && !resumed
-                            {
-                                let admitted = derived_outputs
-                                    .get(&ingress.message_id.to_string())
-                                    .context(
-                                        "derived native input has no original admission output",
-                                    )?;
-                                let mut original = admitted.receipt.clone();
-                                original.channel_ordinal = ingress.channel_ordinal;
-                                ensure!(
-                                    admitted.accepted
-                                        && original == *ingress
-                                        && admitted.payload == *payload
-                                        && known_inputs.get(&cause.input_sequence)
-                                            == Some(&cause.root_sequence),
-                                    "derived native input was changed or originally rejected"
-                                );
-                            }
-                            ensure!(
-                                ingress.input_source == *input_source
-                                    && ingress.channel_ordinal > 0
-                                    && ingress.accepted_wall_ns <= receipt.wall_ns
-                                    && seen_messages.insert(ingress.message_id.to_string()),
-                                "native ingress identity/time mismatch"
-                            );
-                            if let Some(previous) = channel_ordinals
-                                .insert(ingress.channel_id.to_string(), ingress.channel_ordinal)
-                            {
-                                ensure!(
-                                    previous.checked_add(1) == Some(ingress.channel_ordinal),
-                                    "native channel FIFO gap"
-                                );
-                            }
-                            if let Some(cause) = &ingress.caused_by
-                                && !resumed
-                            {
-                                ensure!(
-                                    cause.process_incarnation == expected.process_incarnation
-                                        && cause.journal_run == expected.journal_run
-                                        && known_inputs.get(&cause.input_sequence)
-                                            == Some(&cause.root_sequence),
-                                    "native queued cause absent or foreign"
-                                );
-                            }
-                        }
-                        ensure!(
-                            known_inputs
-                                .insert(*input_sequence, *root_sequence)
-                                .is_none(),
-                            "native input replay duplicate"
-                        );
-                        stack.push(InputCheck {
-                            input: *input_sequence,
-                            root: *root_sequence,
-                            begin_receipt: receipt.clone(),
-                            outputs: 0,
-                        });
-                        next_input = next_input
-                            .checked_add(1)
-                            .context("native input exhausted")?;
-                    }
-                    NativeTraceRecord::Complete {
-                        source,
-                        root_sequence,
-                        input_sequence,
-                        receipt,
-                        output_count,
-                        queued_outputs,
-                        native_effects,
-                        ..
-                    } => {
-                        for output in queued_outputs {
-                            ensure!(
-                                output.receipt.caused_by
-                                    == Some(nautilus_common::recovery_trace::NativeInputCause {
-                                        process_incarnation: expected.process_incarnation,
-                                        journal_run: expected.journal_run.clone(),
-                                        root_sequence: *root_sequence,
-                                        input_sequence: *input_sequence,
-                                    })
-                                    && output.receipt.channel_ordinal == 0
-                                    && output.receipt.accepted_wall_ns <= receipt.wall_ns,
-                                "native derived admission has changed cause or time"
-                            );
-                            ensure!(
-                                derived_outputs
-                                    .insert(output.receipt.message_id.to_string(), output.clone())
-                                    .is_none(),
-                                "duplicate native derived admission identity"
-                            );
-                        }
-                        let input = stack.pop().context("native Complete without Begin")?;
-                        if let Some(value) =
-                            native_effects.get("manager_effects_capture_process_elapsed_ns")
-                        {
-                            let sample = value
-                                .as_u64()
-                                .context("native effects processing sample invalid")?;
-                            ensure!(
-                                input.begin_receipt.process_elapsed_ns <= sample
-                                    && sample <= receipt.process_elapsed_ns,
-                                "native effects processing sample outside input receipts"
-                            );
-                        }
-                        ensure!(
-                            source == expected
-                                && input.input == *input_sequence
-                                && input.root == *root_sequence
-                                && input.outputs == *output_count
-                                && receipt.ingress.is_none()
-                                && receipt.wall_ns >= input.begin_receipt.wall_ns
-                                && receipt.process_elapsed_ns >= last_processing_ns,
-                            "native Complete identity/effect/time mismatch"
-                        );
-                        last_processing_ns = receipt.process_elapsed_ns;
-                        if stack.is_empty() {
-                            next_root =
-                                next_root.checked_add(1).context("native root exhausted")?;
-                        }
-                    }
-                    NativeTraceRecord::Abort { .. } | NativeTraceRecord::Uncovered { .. } => {
-                        anyhow::bail!(
-                            "native source aborted or uncovered; reconciliation required"
-                        );
-                    }
-                }
-                root_records.push(record);
+                self.observe_trace(&entry)?;
             } else {
-                let origin = entry
-                    .headers
-                    .native_origin
-                    .as_ref()
-                    .context("native tail mutation row has no causal join")?;
-                let parent = stack.iter().rev().nth(1).map(|frame| frame.input);
-                let input = stack
-                    .last_mut()
-                    .context("native output outside source scope")?;
-                ensure!(
-                    origin.source == *expected
-                        && origin.input_sequence == input.input
-                        && origin.root_sequence == input.root
-                        && origin.stack_parent == parent
-                        && input.outputs.checked_add(1) == Some(origin.output_ordinal),
-                    "native output causal/ordinal mismatch"
-                );
-                input.outputs = origin.output_ordinal;
+                self.observe_mutation(&entry)?;
             }
-            root_entries.push(entry);
-            if stack.is_empty() {
+            self.root_entries.push(entry);
+            if self.stack.is_empty() {
                 ensure!(
-                    !root_records.is_empty(),
+                    !self.root_records.is_empty(),
                     "native root missing source records"
                 );
-                roots.push(VerifiedNativeRoot {
-                    source: expected.clone(),
-                    root_sequence: next_root - 1,
-                    inputs: std::mem::take(&mut root_records),
-                    entries: std::mem::take(&mut root_entries),
+                self.roots.push(VerifiedNativeRoot {
+                    source: self.expected.clone(),
+                    root_sequence: self.next_root - 1,
+                    inputs: std::mem::take(&mut self.root_records),
+                    entries: std::mem::take(&mut self.root_entries),
                 });
             }
         }
-        let end_prefix = self.verified_native_prefix(expected, end)?;
+        Ok(())
+    }
+    fn observe_checkpoint(&mut self, sequence: u64, entry: &EventStoreEntry) -> Result<()> {
         ensure!(
-            self.high_watermark()? == watermark,
+            self.stack.is_empty() && entry.headers.native_origin.is_none(),
+            "checkpoint metadata inside active native input"
+        );
+        let metadata: NativeTraceCheckpointRecord = rmp_serde::from_slice(&entry.payload)?;
+        if sequence == self.cut.prefix.sequence + 1 {
+            ensure!(
+                metadata.cut == *self.cut,
+                "initial native cut differs from its actual durable checkpoint"
+            );
+            self.initial_cut_sealed = true;
+        }
+
+        ensure!(
+            metadata.cut.source == *self.expected
+                && metadata.cut.completed_root.checked_add(1) == Some(self.next_root)
+                && metadata.cut.last_input_sequence.checked_add(1) == Some(self.next_input)
+                && metadata.cut.prefix.sequence.checked_add(1) == Some(sequence),
+            "native checkpoint metadata frontier mismatch"
+        );
+        let actual = self
+            .reader
+            .verified_native_prefix(self.expected, metadata.cut.prefix.sequence)?;
+        ensure!(
+            actual == metadata.cut.prefix,
+            "native checkpoint metadata prefix changed"
+        );
+        ensure!(
+            metadata.cut.pending_inputs.len() == metadata.cut.pending.len(),
+            "native checkpoint pending payload coverage absent"
+        );
+        self.prefix_continuation
+            .verify_retained_inventory(&metadata.cut.pending_inputs)?;
+        let mut final_ids = BTreeSet::new();
+        for (input, receipt) in metadata
+            .cut
+            .pending_inputs
+            .iter()
+            .zip(&metadata.cut.pending)
+        {
+            ensure!(
+                input.receipt == *receipt
+                    && final_ids.insert(receipt.message_id.to_string())
+                    && !self.seen_messages.contains(&receipt.message_id.to_string()),
+                "native checkpoint pending was changed or already processed"
+            );
+            if let Some(original) = self.derived_outputs.get(&receipt.message_id.to_string()) {
+                let mut origin = original.receipt.clone();
+                origin.channel_ordinal = receipt.channel_ordinal;
+                ensure!(
+                    original.accepted && origin == *receipt && original.payload == input.payload,
+                    "native final derived FIFO differs from actual admission"
+                );
+            }
+        }
+        self.final_cut = Some(metadata.cut);
+        Ok(())
+    }
+    fn observe_trace(&mut self, entry: &EventStoreEntry) -> Result<()> {
+        ensure!(
+            entry.headers.native_origin.is_none(),
+            "native trace row cannot be a derived output"
+        );
+        let record: NativeTraceRecord = rmp_serde::from_slice(&entry.payload)?;
+        match &record {
+            NativeTraceRecord::Begin { .. } => self.observe_begin(&record)?,
+            NativeTraceRecord::Complete { .. } => self.observe_complete(&record)?,
+            NativeTraceRecord::Abort { .. } | NativeTraceRecord::Uncovered { .. } => {
+                anyhow::bail!("native source aborted or uncovered; reconciliation required")
+            }
+        }
+        self.root_records.push(record);
+        Ok(())
+    }
+    fn observe_begin(&mut self, record: &NativeTraceRecord) -> Result<()> {
+        let NativeTraceRecord::Begin {
+            source,
+            root_sequence,
+            input_sequence,
+            stack_parent,
+            input_source,
+            receipt,
+            payload,
+            ..
+        } = record
+        else {
+            unreachable!("Begin dispatcher")
+        };
+        self.final_cut = None;
+        ensure!(
+            source == self.expected && *input_sequence == self.next_input,
+            "native tail input identity/sequence mismatch"
+        );
+        match self.stack.last() {
+            Some(parent) => ensure!(
+                *root_sequence == parent.root && *stack_parent == Some(parent.input),
+                "native tail stack parent mismatch"
+            ),
+            None => ensure!(
+                *root_sequence == self.next_root && stack_parent.is_none(),
+                "native tail root mismatch"
+            ),
+        }
+        ensure!(
+            receipt.process_elapsed_ns >= self.last_processing_ns,
+            "native processing clock moved backwards"
+        );
+        self.last_processing_ns = receipt.process_elapsed_ns;
+        self.observe_ingress(receipt, *input_source, payload)?;
+        ensure!(
+            self.known_inputs
+                .insert(*input_sequence, *root_sequence)
+                .is_none(),
+            "native input replay duplicate"
+        );
+        self.stack.push(InputCheck {
+            input: *input_sequence,
+            root: *root_sequence,
+            begin_receipt: receipt.clone(),
+            outputs: 0,
+        });
+        self.next_input = self
+            .next_input
+            .checked_add(1)
+            .context("native input exhausted")?;
+        Ok(())
+    }
+    fn observe_ingress(
+        &mut self,
+        receipt: &NativeProcessingReceipt,
+        input_source: NativeInputSource,
+        payload: &Value,
+    ) -> Result<()> {
+        if let Some(ingress) = &receipt.ingress {
+            let resumed = self
+                .prefix_continuation
+                .consume_retained(ingress, payload)?;
+            if let Some(original) = self.pending_cut.remove(&ingress.message_id.to_string()) {
+                ensure!(
+                    original == *ingress,
+                    "native cut pending receipt was substituted"
+                );
+            }
+            if let Some(cause) = &ingress.caused_by
+                && !resumed
+            {
+                let admitted = self
+                    .derived_outputs
+                    .get(&ingress.message_id.to_string())
+                    .context("derived native input has no original admission output")?;
+                let mut original = admitted.receipt.clone();
+                original.channel_ordinal = ingress.channel_ordinal;
+                ensure!(
+                    admitted.accepted
+                        && original == *ingress
+                        && admitted.payload == *payload
+                        && self.known_inputs.get(&cause.input_sequence)
+                            == Some(&cause.root_sequence),
+                    "derived native input was changed or originally rejected"
+                );
+            }
+            ensure!(
+                ingress.input_source == input_source
+                    && ingress.channel_ordinal > 0
+                    && ingress.accepted_wall_ns <= receipt.wall_ns
+                    && self.seen_messages.insert(ingress.message_id.to_string()),
+                "native ingress identity/time mismatch"
+            );
+            if let Some(previous) = self
+                .channel_ordinals
+                .insert(ingress.channel_id.to_string(), ingress.channel_ordinal)
+            {
+                ensure!(
+                    previous.checked_add(1) == Some(ingress.channel_ordinal),
+                    "native channel FIFO gap"
+                );
+            }
+            if let Some(cause) = &ingress.caused_by
+                && !resumed
+            {
+                ensure!(
+                    cause.process_incarnation == self.expected.process_incarnation
+                        && cause.journal_run == self.expected.journal_run
+                        && self.known_inputs.get(&cause.input_sequence)
+                            == Some(&cause.root_sequence),
+                    "native queued cause absent or foreign"
+                );
+            }
+        }
+        Ok(())
+    }
+    fn observe_complete(&mut self, record: &NativeTraceRecord) -> Result<()> {
+        let NativeTraceRecord::Complete {
+            source,
+            root_sequence,
+            input_sequence,
+            receipt,
+            output_count,
+            queued_outputs,
+            native_effects,
+            ..
+        } = record
+        else {
+            unreachable!("Complete dispatcher")
+        };
+        for output in queued_outputs {
+            ensure!(
+                output.receipt.caused_by
+                    == Some(nautilus_common::recovery_trace::NativeInputCause {
+                        process_incarnation: self.expected.process_incarnation,
+                        journal_run: self.expected.journal_run.clone(),
+                        root_sequence: *root_sequence,
+                        input_sequence: *input_sequence,
+                    })
+                    && output.receipt.channel_ordinal == 0
+                    && output.receipt.accepted_wall_ns <= receipt.wall_ns,
+                "native derived admission has changed cause or time"
+            );
+            ensure!(
+                self.derived_outputs
+                    .insert(output.receipt.message_id.to_string(), output.clone())
+                    .is_none(),
+                "duplicate native derived admission identity"
+            );
+        }
+        let input = self.stack.pop().context("native Complete without Begin")?;
+        if let Some(value) = native_effects.get("manager_effects_capture_process_elapsed_ns") {
+            let sample = value
+                .as_u64()
+                .context("native effects processing sample invalid")?;
+            ensure!(
+                input.begin_receipt.process_elapsed_ns <= sample
+                    && sample <= receipt.process_elapsed_ns,
+                "native effects processing sample outside input receipts"
+            );
+        }
+        ensure!(
+            source == self.expected
+                && input.input == *input_sequence
+                && input.root == *root_sequence
+                && input.outputs == *output_count
+                && receipt.ingress.is_none()
+                && receipt.wall_ns >= input.begin_receipt.wall_ns
+                && receipt.process_elapsed_ns >= self.last_processing_ns,
+            "native Complete identity/effect/time mismatch"
+        );
+        self.last_processing_ns = receipt.process_elapsed_ns;
+        if self.stack.is_empty() {
+            self.next_root = self
+                .next_root
+                .checked_add(1)
+                .context("native root exhausted")?;
+        }
+        Ok(())
+    }
+    fn observe_mutation(&mut self, entry: &EventStoreEntry) -> Result<()> {
+        let origin = entry
+            .headers
+            .native_origin
+            .as_ref()
+            .context("native tail mutation row has no causal join")?;
+        let parent = self.stack.iter().rev().nth(1).map(|frame| frame.input);
+        let input = self
+            .stack
+            .last_mut()
+            .context("native output outside source scope")?;
+        ensure!(
+            origin.source == *self.expected
+                && origin.input_sequence == input.input
+                && origin.root_sequence == input.root
+                && origin.stack_parent == parent
+                && input.outputs.checked_add(1) == Some(origin.output_ordinal),
+            "native output causal/ordinal mismatch"
+        );
+        input.outputs = origin.output_ordinal;
+        Ok(())
+    }
+    fn finish(self) -> Result<VerifiedNativeTrace> {
+        let end_prefix = self
+            .reader
+            .verified_native_prefix(self.expected, self.end)?;
+        ensure!(
+            self.reader.high_watermark()? == self.watermark,
             "native source changed during tail verification"
         );
         Ok(VerifiedNativeTrace {
-            source: expected.clone(),
-            cut: cut.clone(),
-            roots,
-            incomplete_suffix: root_entries,
-            end_sequence: end,
+            source: self.expected.clone(),
+            cut: self.cut.clone(),
+            roots: self.roots,
+            incomplete_suffix: self.root_entries,
+            end_sequence: self.end,
             end_prefix,
-            final_cut,
-            initial_cut_sealed,
+            final_cut: self.final_cut,
+            initial_cut_sealed: self.initial_cut_sealed,
         })
     }
 }
@@ -1967,7 +2110,7 @@ mod tests {
             )))
         });
         let adapter = BusCaptureAdapter::new(
-            writer.clone(),
+            Arc::clone(&writer),
             Arc::new(registry),
             HaltSignal::new().callback(),
         );
@@ -2079,11 +2222,11 @@ mod tests {
                 .unwrap();
             let (child_at, elapsed) = replay.effects_capture_instant().unwrap();
             assert_eq!(elapsed, Some(child_sample));
-            child.complete(child_effects).unwrap();
+            child.complete(&child_effects).unwrap();
             let (parent_at, elapsed) = replay.effects_capture_instant().unwrap();
             assert_eq!(elapsed, Some(parent_sample));
             assert!(child_at <= parent_at);
-            root.complete(parent_effects).unwrap();
+            root.complete(&parent_effects).unwrap();
             replay.finish().unwrap();
         }
         drop(trace);
@@ -2256,7 +2399,7 @@ mod tests {
             })
         });
         let adapter = BusCaptureAdapter::new(
-            writer.clone(),
+            Arc::clone(&writer),
             Arc::new(registry),
             HaltSignal::new().callback(),
         );
@@ -2289,7 +2432,7 @@ mod tests {
             panic!("missing Complete")
         };
         let scope = HistoricalInputScope::enter_with_outputs(
-            root.clone(),
+            Rc::<VerifiedNativeRoot>::clone(&root),
             begin,
             callbacks.clone(),
             transports.clone(),
@@ -2303,7 +2446,7 @@ mod tests {
             "native.economic".into(),
             &(if change_payload { 18u64 } else { 17u64 }),
             Headers::empty(),
-            UnixNanos::from(999999),
+            UnixNanos::from(999_999),
         );
         assert_eq!(outcome.is_err(), change_payload);
         assert_eq!(scope.finish().is_err(), change_payload);
@@ -2353,7 +2496,7 @@ mod tests {
             panic!("missing Complete")
         };
         let scope = HistoricalInputScope::enter_with_clocks(
-            root.clone(),
+            Rc::<VerifiedNativeRoot>::clone(&root),
             root.inputs()[0].clone(),
             callbacks.clone(),
             transports.clone(),
@@ -2420,7 +2563,7 @@ mod tests {
             assert!(message.contains("owner=source_absent"));
         }
         let error = historical
-            .complete(serde_json::json!({"source_time": original}))
+            .complete(&serde_json::json!({"source_time": original}))
             .unwrap_err();
         let message = format!("{error:#}");
         for expected in [
@@ -2563,10 +2706,10 @@ mod tests {
             )
             .unwrap();
         child
-            .complete(serde_json::json!({"child_effect":17}))
+            .complete(&serde_json::json!({"child_effect":17}))
             .unwrap();
         parent
-            .complete(serde_json::json!({"parent_effect":true}))
+            .complete(&serde_json::json!({"parent_effect":true}))
             .unwrap();
         replay.finish().unwrap()
     }
@@ -2666,7 +2809,9 @@ mod tests {
         let (foreign_original, _foreign_original_writer) = original_continuation_source();
         assert!(audit.verify_original_trace(&foreign_original).is_err());
         audit.verify_recorder(&trace).unwrap();
-        audit.clone().verify_recorder(&trace.clone()).unwrap();
+        let cloned_audit = audit.clone();
+        let cloned_trace = trace.clone();
+        cloned_audit.verify_recorder(&cloned_trace).unwrap();
         let (foreign, _foreign_writer, _foreign_backend, _, _) =
             actual_child_journal(original.source());
         cut(&foreign);
@@ -2676,6 +2821,7 @@ mod tests {
         trace.fail("actual failed continuation owner");
         assert!(halt.is_halted());
         assert!(audit.verify_recorder(&trace).is_err());
+        assert!(cloned_audit.verify_recorder(&cloned_trace).is_err());
     }
 
     #[rstest]
@@ -2831,7 +2977,7 @@ mod tests {
             .unwrap();
         assert!(receiver.try_recv().is_err());
         replay_scope
-            .complete(serde_json::json!({"queued_instrument":true}))
+            .complete(&serde_json::json!({"queued_instrument":true}))
             .unwrap();
         let receipt = replay.finish().unwrap();
         let (child, child_writer, child_backend, child_source, _) =
@@ -2864,6 +3010,7 @@ mod tests {
             )
             .unwrap();
         child_cut.pending_inputs = vec![retained.clone()];
+        assert_eq!(child_cut.pending_inputs, vec![retained]);
         if substitute_inventory {
             child_cut.pending_inputs[0].payload["instrument"]["id"] =
                 Value::String("foreign-inventory-input".into());

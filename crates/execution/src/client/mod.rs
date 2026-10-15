@@ -74,6 +74,9 @@ impl Debug for ExecutionClientAdapter {
 
 impl ExecutionClientAdapter {
     /// Restores replay state without granting execution authorization.
+    ///
+    /// # Errors
+    /// Returns an error if the client does not support restoring the original paused checkpoint.
     pub fn restore_running_checkpoint(
         &mut self,
         inventory: &serde_json::Value,

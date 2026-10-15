@@ -447,7 +447,7 @@ mod recovery_inventory_tests {
             register_response_handler(
                 &correlation,
                 ShareableMessageHandler::from_typed(move |_: &QuotesResponse| {
-                    called.set(called.get() + 1)
+                    called.set(called.get() + 1);
                 }),
             );
             assert_eq!(
@@ -480,7 +480,7 @@ mod recovery_inventory_tests {
                 local_only_recovery_readiness().unwrap(),
                 LocalRecoveryReadiness::Ready
             );
-            with_local_only_recovery_inventory(|guard| guard.verify()).unwrap();
+            with_local_only_recovery_inventory(super::LocalOnlyRecoveryInventory::verify).unwrap();
         })
         .join()
         .unwrap();
@@ -489,6 +489,16 @@ mod recovery_inventory_tests {
     #[test]
     fn local_recovery_readiness_does_not_reclassify_external_busy_or_active_sources() {
         std::thread::spawn(|| {
+            #[derive(Debug)]
+            struct ReadinessHandler(Rc<Cell<bool>>);
+            impl Handler<dyn Any> for ReadinessHandler {
+                fn id(&self) -> ustr::Ustr {
+                    "readiness-handler".into()
+                }
+                fn handle(&self, _: &dyn Any) {
+                    self.0.set(local_only_recovery_readiness().is_err());
+                }
+            }
             let bus = Rc::new(RefCell::new(MessageBus::default()));
             set_message_bus(bus.clone());
             bus.borrow_mut()
@@ -500,16 +510,6 @@ mod recovery_inventory_tests {
             {
                 let _borrow = bus.borrow_mut();
                 assert!(local_only_recovery_readiness().is_err());
-            }
-            #[derive(Debug)]
-            struct ReadinessHandler(Rc<Cell<bool>>);
-            impl Handler<dyn Any> for ReadinessHandler {
-                fn id(&self) -> ustr::Ustr {
-                    "readiness-handler".into()
-                }
-                fn handle(&self, _: &dyn Any) {
-                    self.0.set(local_only_recovery_readiness().is_err());
-                }
             }
             let active_refused = Rc::new(Cell::new(false));
             register_any(
@@ -548,7 +548,7 @@ mod recovery_inventory_tests {
             );
             send_any("capture-handler".into(), &());
             assert!(refused.get());
-            with_local_only_recovery_inventory(|guard| guard.verify()).unwrap();
+            with_local_only_recovery_inventory(super::LocalOnlyRecoveryInventory::verify).unwrap();
         })
         .join()
         .unwrap();

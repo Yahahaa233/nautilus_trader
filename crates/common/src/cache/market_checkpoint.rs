@@ -289,16 +289,18 @@ mod tests {
                 time,
             ))
             .unwrap();
-        let mut bar = Bar::default();
-        bar.bar_type = BarType::from("ETHUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL");
-        bar.open = price;
-        bar.high = price;
-        bar.low = price;
-        bar.close = price;
         // Time bars replace the front at equal ts_event; use distinct native bar times.
         let bar_time = UnixNanos::from(100 + ordinal);
-        bar.ts_event = bar_time;
-        bar.ts_init = bar_time;
+        let bar = Bar {
+            bar_type: BarType::from("ETHUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL"),
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            ts_event: bar_time,
+            ts_init: bar_time,
+            ..Bar::default()
+        };
         cache.add_bar(bar).unwrap();
     }
 

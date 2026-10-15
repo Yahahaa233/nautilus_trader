@@ -735,6 +735,7 @@ impl std::fmt::Debug for RunnerRecoveryCodecRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunnerRecoveryCodecRegistry")
             .field("required", &self.required)
+            .field("timer_identity_bound", &self.timer_identity_bound)
             .field("registered", &self.codecs.keys().collect::<Vec<_>>())
             .field("sealed", &self.sealed)
             .finish()

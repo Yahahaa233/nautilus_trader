@@ -91,6 +91,9 @@ impl OrderManager {
 
     /// Exact limited framework profile. Contingent/local pending commands are
     /// not reconstructible from the cache alone and remain explicitly refused.
+    ///
+    /// # Errors
+    /// Returns an error unless every native order-management collection is empty.
     pub fn empty_native_framework_checkpoint(&self) -> anyhow::Result<serde_json::Value> {
         anyhow::ensure!(
             self.submit_order_commands.is_empty() && self.oto_target_quantities.is_empty(),

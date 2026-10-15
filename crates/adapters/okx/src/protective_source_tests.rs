@@ -22,6 +22,19 @@ use serde_json::{Value, json};
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 use ustr::Ustr;
 
+// Hard assertions are separate from fallible native fixture operations.
+#[track_caller]
+fn require(condition: bool, message: impl FnOnce() -> String) {
+    assert!(condition, "{}", message());
+}
+#[track_caller]
+fn require_eq<L: ?Sized + std::fmt::Debug + PartialEq<R>, R: ?Sized + std::fmt::Debug>(
+    left: &L,
+    right: &R,
+    message: impl FnOnce() -> String,
+) {
+    assert_eq!(left, right, "{}", message());
+}
 fn take_sources(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>) -> Vec<String> {
     let mut result = Vec::new();
     while let Ok(event) = receiver.try_recv() {
@@ -59,9 +72,9 @@ async fn dispatch(
     );
     let mut stream = client.private_stream_state.lock();
     let crate::checkpoint::ExecutionStreamState {
-        fee_cache,
-        filled_qty_cache,
-        order_state_cache,
+        fees: fee_cache,
+        filled_quantities: filled_qty_cache,
+        orders: order_state_cache,
     } = &mut *stream;
     dispatch_ws_message(
         message,
@@ -172,17 +185,38 @@ async fn actual_http_protection_submit_raw_trigger_and_child_fills_keep_original
     .await?;
     let mut sources = take_sources(&mut data_rx);
     let mut events = take_events(&mut event_rx);
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["Submitted"]["type"], "OrderSubmitted");
-    assert_eq!(sources.len(), 1);
+    require_eq(&(events.len()), &(1), String::new);
+    require_eq(
+        &(events[0]["Submitted"]["type"]),
+        &("OrderSubmitted"),
+        String::new,
+    );
+    require_eq(&(sources.len()), &(1), String::new);
     let first: OrderProtectionSource = serde_json::from_str(&sources[0])?;
     let http = first.http.as_ref().unwrap();
-    assert_eq!(http.request_body_json, requests.lock()[0]);
-    assert_eq!(http.response_body_json, response); // whitespace and unknown raw field retained
-    assert!(http.request_ns <= http.received_ns && http.received_ns >= start);
-    assert!(!first.execution_authorized && !first.venue_command_causation_available);
+    require_eq(
+        &(http.request_body_json),
+        &(requests.lock()[0]),
+        String::new,
+    );
+    require_eq(&(http.response_body_json), &(response), String::new); // whitespace and unknown raw field retained
+    require(
+        http.request_ns <= http.received_ns && http.received_ns >= start,
+        || stringify!(http.request_ns <= http.received_ns && http.received_ns >= start).to_owned(),
+    );
+    require(
+        !first.execution_authorized && !first.venue_command_causation_available,
+        || {
+            stringify!(!first.execution_authorized && !first.venue_command_causation_available)
+                .to_owned()
+        },
+    );
     let submitted_request: Value = serde_json::from_str(&http.request_body_json)?;
-    assert_eq!(submitted_request["sz"], order.quantity().to_string());
+    require_eq(
+        &(submitted_request["sz"]),
+        &(order.quantity().to_string()),
+        String::new,
+    );
     let mut template: Value =
         serde_json::from_str(include_str!("../test_data/ws_orders_algo_states.json"))?;
     template["arg"]["uid"] = "123".into();
@@ -219,10 +253,18 @@ async fn actual_http_protection_submit_raw_trigger_and_child_fills_keep_original
     dispatch(&client, serde_json::to_string(&template)?, &instruments).await;
     sources.extend(take_sources(&mut data_rx));
     events.extend(take_events(&mut event_rx));
-    assert!(
+    require(
         events
             .iter()
-            .any(|v| v["Accepted"]["type"] == "OrderAccepted")
+            .any(|v| v["Accepted"]["type"] == "OrderAccepted"),
+        || {
+            stringify!(
+                events
+                    .iter()
+                    .any(|v| v["Accepted"]["type"] == "OrderAccepted")
+            )
+            .to_owned()
+        },
     );
     // Real algorithm update links a unique child. No ACK supplied as a terminal.
     while millis() <= accepted_ms {
@@ -289,31 +331,42 @@ async fn actual_http_protection_submit_raw_trigger_and_child_fills_keep_original
         .iter()
         .filter_map(|v| v.get("Updated"))
         .collect::<Vec<_>>();
-    assert!(!updates.is_empty());
+    require(!updates.is_empty(), || {
+        stringify!(!updates.is_empty()).to_owned()
+    });
     for update in updates {
-        assert_eq!(
-            Decimal::from_str_exact(update["quantity"].as_str().unwrap())?,
-            Decimal::from_str_exact(submitted_request["sz"].as_str().unwrap())?,
-            "actual child binding must preserve the submitted contract unit"
+        require_eq(
+            &(Decimal::from_str_exact(update["quantity"].as_str().unwrap())?),
+            &(Decimal::from_str_exact(submitted_request["sz"].as_str().unwrap())?),
+            || String::from("actual child binding must preserve the submitted contract unit"),
         );
     }
-    assert_eq!(fills.len(), 2);
-    assert_eq!(
-        Decimal::from_str_exact(fills[0]["last_qty"].as_str().unwrap())?,
-        Decimal::new(4, 1)
+    require_eq(&(fills.len()), &(2), String::new);
+    require_eq(
+        &(Decimal::from_str_exact(fills[0]["last_qty"].as_str().unwrap())?),
+        &(Decimal::new(4, 1)),
+        String::new,
     );
-    assert_eq!(fills[1]["trade_id"], "PROTECTION-TRADE2");
-    assert!(
+    require_eq(&(fills[1]["trade_id"]), &("PROTECTION-TRADE2"), String::new);
+    require(
         fills
             .iter()
-            .all(|v| v["venue_order_id"] == "PROTECTION-CHILD")
+            .all(|v| v["venue_order_id"] == "PROTECTION-CHILD"),
+        || {
+            stringify!(
+                fills
+                    .iter()
+                    .all(|v| v["venue_order_id"] == "PROTECTION-CHILD")
+            )
+            .to_owned()
+        },
     );
-    assert_eq!(sources.len(), 5);
+    require_eq(&(sources.len()), &(5), String::new);
     // Raw source is retained on replay/serialization without reconstructing wire JSON.
     for raw in &sources {
         let source: OrderProtectionSource = serde_json::from_str(raw)?;
         source.validate()?;
-        assert_eq!(source.to_json()?, *raw);
+        require_eq(&(source.to_json()?), raw, String::new);
     }
     if let Some(path) = std::env::var_os("METIS_TEST_PROTECTION_SDK_EXPORT_PATH") {
         let path = std::path::PathBuf::from(path);
@@ -452,19 +505,20 @@ async fn actual_algo_cancel_http_ack_is_retained_without_fabricating_terminal() 
         .as_any()
         .downcast_ref::<OrderProtectionSource>()
         .unwrap();
-    assert_eq!(source.kind, "http_cancel_algo");
-    assert_eq!(
-        source.command_payload_json.as_deref(),
-        Some(serde_json::to_string(&original)?.as_str())
+    require_eq(&(source.kind), &("http_cancel_algo"), String::new);
+    require_eq(
+        &(source.command_payload_json.as_deref()),
+        &(Some(serde_json::to_string(&original)?.as_str())),
+        String::new,
     );
-    assert_eq!(
-        source.http.as_ref().unwrap().request_body_json,
-        requests.lock()[0]
+    require_eq(
+        &(source.http.as_ref().unwrap().request_body_json),
+        &(requests.lock()[0]),
+        String::new,
     );
-    assert!(
-        event_rx.try_recv().is_err(),
-        "request ACK fabricated Canceled"
-    );
+    require(event_rx.try_recv().is_err(), || {
+        String::from("request ACK fabricated Canceled")
+    });
     row["state"] = "canceled".into();
     row["uTime"] = (client.clock.get_time_ns().as_u64() / 1_000_000)
         .to_string()
@@ -472,18 +526,25 @@ async fn actual_algo_cancel_http_ack_is_retained_without_fabricating_terminal() 
     frame["data"] = json!([row]);
     dispatch(&client, serde_json::to_string(&frame)?, &instruments).await;
     let actual = take_events(&mut event_rx);
-    assert_eq!(actual.len(), 1);
-    assert_eq!(actual[0]["Canceled"]["type"], "OrderCanceled");
+    require_eq(&(actual.len()), &(1), String::new);
+    require_eq(
+        &(actual[0]["Canceled"]["type"]),
+        &("OrderCanceled"),
+        String::new,
+    );
     let actual_cancel: nautilus_model::events::OrderEventAny =
         serde_json::from_value(actual[0].clone())?;
     let nautilus_model::events::OrderEventAny::Canceled(actual_cancel) = actual_cancel else {
         anyhow::bail!("actual native cancellation variant changed")
     };
-    assert!(
-        actual_cancel.causation_id.is_none(),
-        "venue terminal without request echo gained fabricated causation"
+    require(actual_cancel.causation_id.is_none(), || {
+        String::from("venue terminal without request echo gained fabricated causation")
+    });
+    require_eq(
+        &(actual[0]["Canceled"]["venue_order_id"]),
+        &("CANCEL-PARENT"),
+        String::new,
     );
-    assert_eq!(actual[0]["Canceled"]["venue_order_id"], "CANCEL-PARENT");
     server.abort();
     Ok(())
 }

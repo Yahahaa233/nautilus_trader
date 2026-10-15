@@ -78,7 +78,7 @@ impl CommandStrategy {
         msgbus::subscribe_quotes(
             switchboard::get_quotes_topic(instrument_id()).into(),
             TypedHandler::from(move |quote: &QuoteTick| {
-                get_actor_unchecked::<Self>(&id).handle_quote(quote)
+                get_actor_unchecked::<Self>(&id).handle_quote(quote);
             }),
             None,
         );
@@ -135,9 +135,12 @@ impl DataActor for CommandStrategy {
         self.order_factory_rc()
             .borrow_mut()
             .set_order_list_id_count(
-                v["order_list_count"]
-                    .as_u64()
-                    .context("list count absent")? as usize,
+                usize::try_from(
+                    v["order_list_count"]
+                        .as_u64()
+                        .context("list count absent")?,
+                )
+                .context("list count exceeds native usize")?,
             );
         Ok(())
     }
@@ -250,7 +253,7 @@ impl RunnerRecoveryCodec for CommandCodec {
     fn channel(&self) -> RunnerRecoveryChannel {
         self.0
     }
-    fn codec_id(&self) -> &str {
+    fn codec_id(&self) -> &'static str {
         "actual_registered_uuid_commands.v1"
     }
     fn encode(&self, event: RunnerRecoveryEventRef<'_>) -> Result<serde_json::Value> {
@@ -381,7 +384,7 @@ async fn command_run_case(changed: bool, startup: u8, changed_portfolio: bool) {
     source.add_strategy(CommandStrategy::new()).unwrap();
     *source.kernel.cache.borrow_mut() = cache(&seeds);
     if startup > 0 {
-        queue_original_startup_batch(&mut source, now);
+        queue_original_startup_batch(&source, now);
     }
     let instance = source.kernel.instance_id();
     let trace = source
@@ -462,7 +465,7 @@ async fn command_run_case(changed: bool, startup: u8, changed_portfolio: bool) {
                 }
                 Ok(())
             },
-            |_| Ok(()),
+            |()| Ok(()),
             |_| {},
         )
         .unwrap();
@@ -478,11 +481,13 @@ async fn command_run_case(changed: bool, startup: u8, changed_portfolio: bool) {
             .unwrap();
         loop {
             progressed.notified().await;
-            if observed
-                .borrow()
-                .last()
-                .is_some_and(|cut| cut.0.pending_inputs.is_empty())
-            {
+            if observed.borrow().last().is_some_and(|cut| {
+                let business: serde_json::Value = serde_json::from_slice(
+                    &cut.2.strategies[&StrategyId::from(STRATEGY)]["command_business.v1"],
+                )
+                .expect("actual cut command business snapshot must decode");
+                business["emitted"].as_u64() == Some(1) && cut.0.pending_inputs.is_empty()
+            }) {
                 break;
             }
         }
@@ -537,7 +542,7 @@ async fn command_run_case(changed: bool, startup: u8, changed_portfolio: bool) {
     let stop_callbacks = verified
         .roots()
         .iter()
-        .flat_map(|root| root.inputs())
+        .flat_map(nautilus_event_store::native_trace::VerifiedNativeRoot::inputs)
         .filter_map(|input| match input {
             NativeTraceRecord::Complete { callbacks, .. }
                 if callbacks.iter().any(|route| {
@@ -570,7 +575,7 @@ async fn command_run_case(changed: bool, startup: u8, changed_portfolio: bool) {
         for input in root.inputs() {
             match input {
                 NativeTraceRecord::Complete { uuid_draws, .. } => {
-                    draws.extend(uuid_draws.iter().map(ToString::to_string))
+                    draws.extend(uuid_draws.iter().map(ToString::to_string));
                 }
                 NativeTraceRecord::Begin {
                     input_source: NativeInputSource::TradingCommand,
@@ -652,7 +657,7 @@ async fn command_run_case(changed: bool, startup: u8, changed_portfolio: bool) {
         Some((
             directory.join("source"),
             instance,
-            identity.journal_run.clone(),
+            identity.journal_run,
             end,
             fingerprint,
         )),
@@ -802,7 +807,7 @@ async fn command_run_case(changed: bool, startup: u8, changed_portfolio: bool) {
 
 // All messages are admitted before trace installation, like restored strategy
 // warmup. Receipt identity belongs to the physical channels, never a test DTO.
-fn queue_original_startup_batch(node: &mut LiveNode, now: UnixNanos) {
+fn queue_original_startup_batch(node: &LiveNode, now: UnixNanos) {
     use nautilus_common::messages::data::{SubscribeCommand, subscribe::SubscribeInstruments};
     use nautilus_model::{
         events::{AccountState, OrderAcceptedBatch, OrderSubmittedBatch},
@@ -949,19 +954,18 @@ fn assert_original_startup_receipts(reader: &EventStoreReader<RedbBackend>, pref
             stack_parent,
             ..
         } = record
+            && let Some(receipt) = receipt.ingress
         {
-            if let Some(receipt) = receipt.ingress {
-                assert!(
-                    stack_parent.is_some(),
-                    "startup queue member lost its lifecycle parent"
-                );
-                assert_eq!(receipt.input_source, input_source);
-                ordinals
-                    .entry(receipt.channel_id.to_string())
-                    .or_default()
-                    .push(receipt.channel_ordinal);
-                inputs.push((input_source, payload));
-            }
+            assert!(
+                stack_parent.is_some(),
+                "startup queue member lost its lifecycle parent"
+            );
+            assert_eq!(receipt.input_source, input_source);
+            ordinals
+                .entry(receipt.channel_id.to_string())
+                .or_default()
+                .push(receipt.channel_ordinal);
+            inputs.push((input_source, payload));
         }
     }
     assert_eq!(

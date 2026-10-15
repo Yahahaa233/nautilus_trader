@@ -111,7 +111,7 @@ pub enum OKXWsMessage {
     /// The original private frame and the same parsed message it produced.
     OriginalOrderData {
         payload_json: String,
-        message: Box<OKXWsMessage>,
+        message: Box<Self>,
     },
     /// Exact operation ACK text and raw-inbox receipt time. The parsed response
     /// is the same one produced by that text, not a reconstructed ACK.
@@ -119,7 +119,7 @@ pub enum OKXWsMessage {
         payload_json: String,
         received_ns: u64,
         connection: Option<crate::operation_ack::OrderOperationAckConnection>,
-        message: Box<OKXWsMessage>,
+        message: Box<Self>,
     },
     /// Order book snapshot or update.
     BookData {

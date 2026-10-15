@@ -2246,9 +2246,10 @@ mod schema_invariant_tests {
 
     use super::{
         ArrowSchemaProvider, DecodeFromRecordBatch, EncodeToRecordBatch, FIXED_DECIMAL_PRECISION,
-        FIXED_DECIMAL_SCALE, KEY_IDENTIFIER, QUANTITY_RAW_MAX, decimal_to_arrow, decode_decimal,
-        decode_decimal_price, fixed_decimal_data_type, is_timestamp_field, price_decimal_array,
-        quantity_decimal_array, timestamp_data_type,
+        FIXED_DECIMAL_SCALE, FIXED_PRECISION, FIXED_PRECISION_STANDARD, KEY_IDENTIFIER,
+        QUANTITY_RAW_MAX, decimal_to_arrow, decode_decimal, decode_decimal_price,
+        fixed_decimal_data_type, is_timestamp_field, price_decimal_array, quantity_decimal_array,
+        timestamp_data_type,
     };
 
     #[derive(Clone, Copy, Debug)]
@@ -2436,31 +2437,44 @@ mod schema_invariant_tests {
         );
     }
 
-    #[cfg(not(feature = "high-precision"))]
     #[rstest]
-    fn standard_precision_decode_rejects_nonzero_scale_remainder() {
+    fn decimal_decode_respects_resolved_model_precision() {
         let array = Decimal128Array::from(vec![1_i128])
             .with_precision_and_scale(38, 16)
             .unwrap();
+        let decoded = decode_decimal_price(&array, FIXED_PRECISION, "bid_price", 0);
 
-        let error = decode_decimal_price(&array, 9, "bid_price", 0).unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "Error parsing `bid_price`: row 0: decimal value 1 has nonzero digits beyond build \
-             precision 9",
-        );
+        // Another workspace consumer can enable model/high-precision without
+        // enabling this crate's forwarding feature. Match the same resolved
+        // model constant used by the actual decoder, rather than a local cfg.
+        if FIXED_PRECISION == FIXED_PRECISION_STANDARD {
+            assert_eq!(
+                decoded.unwrap_err().to_string(),
+                "Error parsing `bid_price`: row 0: decimal value 1 has nonzero digits beyond build \
+                 precision 9",
+            );
+        } else {
+            let price = decoded.unwrap();
+            assert_eq!(price.raw(), 1);
+            assert_eq!(price.precision, 16);
+        }
     }
 
-    #[cfg(feature = "high-precision")]
     #[rstest]
-    fn high_precision_decimal_payload_is_bit_exact() {
-        let raw = 1_234_567_890_123_456_i128;
+    fn decimal_payload_is_bit_exact_for_resolved_model_precision() {
+        let raw = 1_234_567_890_123_456;
         let array = price_decimal_array([raw], "price").unwrap();
+        let expected = if FIXED_PRECISION == FIXED_PRECISION_STANDARD {
+            1_234_567_890_123_456_i128 * 10_000_000
+        } else {
+            1_234_567_890_123_456_i128
+        };
 
-        assert_eq!(array.value(0), raw);
+        assert_eq!(array.value(0), expected);
         assert_eq!(
-            decode_decimal_price(&array, 16, "price", 0).unwrap().raw(),
+            decode_decimal_price(&array, FIXED_PRECISION, "price", 0)
+                .unwrap()
+                .raw(),
             raw
         );
     }
@@ -2477,12 +2491,13 @@ mod schema_invariant_tests {
     fn fixed_family_round_trips_multiple_precisions(#[case] family: FixedFamily) {
         round_trip_fixed_family(family, Price::from("1"), Quantity::from("2"));
         round_trip_fixed_family(family, Price::from("1.23456"), Quantity::from("2.34567"));
-        #[cfg(feature = "high-precision")]
-        round_trip_fixed_family(
-            family,
-            Price::from("1.2345678901234567"),
-            Quantity::from("2.3456789012345678"),
-        );
+        if FIXED_PRECISION != FIXED_PRECISION_STANDARD {
+            round_trip_fixed_family(
+                family,
+                Price::from("1.2345678901234567"),
+                Quantity::from("2.3456789012345678"),
+            );
+        }
     }
 
     #[rstest]

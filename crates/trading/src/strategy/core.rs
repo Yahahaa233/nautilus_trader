@@ -162,6 +162,9 @@ pub trait StrategyNative {
 
 impl StrategyCore {
     /// 安装一次原生提交约束；不允许替换已安装的约束。
+    ///
+    /// # Errors
+    /// Returns an error if an interceptor is already installed.
     pub fn set_submission_interceptor(
         &mut self,
         interceptor: Rc<dyn super::SubmissionInterceptor>,

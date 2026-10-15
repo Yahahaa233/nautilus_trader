@@ -57,7 +57,7 @@ pub(super) fn with_registered_timer_inventory_mode<T>(
     let mut inventories = std::collections::BTreeMap::new();
     let mut frozen_clocks = std::collections::BTreeMap::<usize, usize>::new();
     for (index, (id, clock)) in held.iter().enumerate() {
-        let address = Rc::as_ptr(&clocks[index].1) as *const () as usize;
+        let address = Rc::as_ptr(&clocks[index].1).cast::<()>() as usize;
         if let Some(guard_index) = frozen_clocks.get(&address) {
             counts.insert((*id).clone(), clock.timer_count() as u64);
             inventories.insert((*id).clone(), guards[*guard_index].inventory().clone());

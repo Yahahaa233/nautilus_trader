@@ -348,17 +348,17 @@ fn final_drain_records_each_discarded_system_input() {
 
     let (_time_tx, time_rx) =
         tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-    let (system_evt_tx, system_evt_rx) =
+    let (system_evt_tx, system_events) =
         tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemEvent>>();
-    let (system_cmd_tx, system_cmd_rx) =
+    let (system_cmd_tx, system_commands) =
         tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemCommand>>();
-    let (_exec_evt_tx, exec_evt_rx) =
+    let (_exec_evt_tx, execution_events) =
         tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-    let (_exec_cmd_tx, exec_cmd_rx) =
+    let (_exec_cmd_tx, execution_commands) =
         tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
-    let (_data_evt_tx, data_evt_rx) =
+    let (_data_evt_tx, data_events) =
         tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-    let (_data_cmd_tx, data_cmd_rx) =
+    let (_data_cmd_tx, data_commands) =
         tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
 
     system_evt_tx
@@ -375,20 +375,20 @@ fn final_drain_records_each_discarded_system_input() {
     system_cmd_tx.send(stub_system_command().into()).unwrap();
 
     let mut time_rx = crate::runner::SnapshotReceiver::from(time_rx);
-    let mut system_evt_rx = crate::runner::SnapshotReceiver::from(system_evt_rx);
-    let mut system_cmd_rx = crate::runner::SnapshotReceiver::from(system_cmd_rx);
-    let mut exec_evt_rx = crate::runner::SnapshotReceiver::from(exec_evt_rx);
-    let mut exec_cmd_rx = crate::runner::SnapshotReceiver::from(exec_cmd_rx);
-    let mut data_evt_rx = crate::runner::SnapshotReceiver::from(data_evt_rx);
-    let mut data_cmd_rx = crate::runner::SnapshotReceiver::from(data_cmd_rx);
+    let mut system_events = crate::runner::SnapshotReceiver::from(system_events);
+    let mut system_commands = crate::runner::SnapshotReceiver::from(system_commands);
+    let mut execution_events = crate::runner::SnapshotReceiver::from(execution_events);
+    let mut execution_commands = crate::runner::SnapshotReceiver::from(execution_commands);
+    let mut data_events = crate::runner::SnapshotReceiver::from(data_events);
+    let mut data_commands = crate::runner::SnapshotReceiver::from(data_commands);
     node.drain_channels(
         &mut time_rx,
-        &mut system_evt_rx,
-        &mut system_cmd_rx,
-        &mut exec_evt_rx,
-        &mut exec_cmd_rx,
-        &mut data_evt_rx,
-        &mut data_cmd_rx,
+        &mut system_events,
+        &mut system_commands,
+        &mut execution_events,
+        &mut execution_commands,
+        &mut data_events,
+        &mut data_commands,
     );
 
     let discarded_sources: Vec<_> = records
@@ -441,17 +441,17 @@ fn final_drain_discard_record_failure_contains_node_and_stops_remaining_inputs()
 
         let (_time_tx, time_rx) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (system_evt_tx, system_evt_rx) =
+        let (system_evt_tx, system_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemEvent>>();
-        let (system_cmd_tx, system_cmd_rx) =
+        let (system_cmd_tx, system_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<SystemCommand>>();
-        let (_exec_evt_tx, exec_evt_rx) =
+        let (_exec_evt_tx, execution_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
+        let (_exec_cmd_tx, execution_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
-        let (_data_evt_tx, data_evt_rx) =
+        let (_data_evt_tx, data_events) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_data_cmd_tx, data_cmd_rx) =
+        let (_data_cmd_tx, data_commands) =
             tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
 
         system_evt_tx
@@ -468,20 +468,20 @@ fn final_drain_discard_record_failure_contains_node_and_stops_remaining_inputs()
         system_cmd_tx.send(stub_system_command().into()).unwrap();
 
         let mut time_rx = crate::runner::SnapshotReceiver::from(time_rx);
-        let mut system_evt_rx = crate::runner::SnapshotReceiver::from(system_evt_rx);
-        let mut system_cmd_rx = crate::runner::SnapshotReceiver::from(system_cmd_rx);
-        let mut exec_evt_rx = crate::runner::SnapshotReceiver::from(exec_evt_rx);
-        let mut exec_cmd_rx = crate::runner::SnapshotReceiver::from(exec_cmd_rx);
-        let mut data_evt_rx = crate::runner::SnapshotReceiver::from(data_evt_rx);
-        let mut data_cmd_rx = crate::runner::SnapshotReceiver::from(data_cmd_rx);
+        let mut system_events = crate::runner::SnapshotReceiver::from(system_events);
+        let mut system_commands = crate::runner::SnapshotReceiver::from(system_commands);
+        let mut execution_events = crate::runner::SnapshotReceiver::from(execution_events);
+        let mut execution_commands = crate::runner::SnapshotReceiver::from(execution_commands);
+        let mut data_events = crate::runner::SnapshotReceiver::from(data_events);
+        let mut data_commands = crate::runner::SnapshotReceiver::from(data_commands);
         node.drain_channels(
             &mut time_rx,
-            &mut system_evt_rx,
-            &mut system_cmd_rx,
-            &mut exec_evt_rx,
-            &mut exec_cmd_rx,
-            &mut data_evt_rx,
-            &mut data_cmd_rx,
+            &mut system_events,
+            &mut system_commands,
+            &mut execution_events,
+            &mut execution_commands,
+            &mut data_events,
+            &mut data_commands,
         );
 
         assert!(node.dispatch_failure.get());
@@ -490,7 +490,7 @@ fn final_drain_discard_record_failure_contains_node_and_stops_remaining_inputs()
         assert_eq!(attempts.get(), usize::from(!encoder_fails));
         // The command must remain queued after the first failed durable discard.
         // Continuing would erase an unrecorded input and mutate a contained node.
-        assert!(system_cmd_rx.try_recv().is_ok());
+        assert!(system_commands.try_recv().is_ok());
         assert!(
             node.record_shutdown_discarded(
                 crate::dispatch::DispatchSource::SystemCommand,
@@ -898,8 +898,8 @@ fn empty_bootstrap_receipt_requires_real_handoffs_and_never_invents_dispatch() {
                 .is_err()
         );
         node.restore_component_state(&CollectedComponentState {
-            actors: Default::default(),
-            strategies: Default::default(),
+            actors: IndexMap::default(),
+            strategies: IndexMap::default(),
         })
         .unwrap();
         if mode == 2 {
@@ -993,8 +993,8 @@ fn empty_bootstrap_adapter_faults_block_receipt_and_child_checkpoint() {
         // Real production handoffs; never assign the private recovery flags.
         node.restore_native_cache(Cache::default()).unwrap();
         node.restore_component_state(&CollectedComponentState {
-            actors: Default::default(),
-            strategies: Default::default(),
+            actors: IndexMap::default(),
+            strategies: IndexMap::default(),
         })
         .unwrap();
         if mode == 1 {
@@ -1076,7 +1076,7 @@ fn empty_bootstrap_adapter_faults_block_receipt_and_child_checkpoint() {
                     collected.set(collected.get() + 1);
                     Ok(())
                 },
-                |_| {
+                |()| {
                     persisted.set(persisted.get() + 1);
                     Ok(())
                 },

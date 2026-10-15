@@ -37,6 +37,7 @@ fn amendment_acknowledgement_and_order_result_are_separate() {
         state.pending_amends.insert(
             client_id.to_string(),
             PendingOrderInfo {
+                cancel_request: None,
                 trader_id: trader,
                 strategy_id: strategy,
                 instrument_id,
@@ -71,7 +72,7 @@ fn amendment_acknowledgement_and_order_result_are_separate() {
                 &mut fills,
                 &mut orders,
                 clock,
-            )
+            );
         };
         // 请求接收成功和旧请求失败均不能完成当前修改。
         for (id, code) in [(req_id.clone(), "0"), ("old-request".into(), "51000")] {
@@ -79,7 +80,7 @@ fn amendment_acknowledgement_and_order_result_are_separate() {
                 id: Some(id),
                 op: OKXWsOperation::AmendOrder,
                 code: "0".into(),
-                msg: "".into(),
+                msg: String::new(),
                 data: vec![
                     serde_json::json!({"sCode":code,"sMsg":"","clOrdId":client_id.as_str(),"ordId":"123"}),
                 ],
@@ -100,7 +101,7 @@ fn amendment_acknowledgement_and_order_result_are_separate() {
                 id: Some(req_id),
                 op: OKXWsOperation::AmendOrder,
                 code: "1".into(),
-                msg: "".into(),
+                msg: String::new(),
                 data: vec![
                     serde_json::json!({"sCode":"51000","sMsg":"rejected","clOrdId":client_id.as_str(),"ordId":"123"}),
                 ],
@@ -185,6 +186,7 @@ fn algo_amendment_correlates_result_and_preserves_pending_on_unknown() {
         state.pending_amends.insert(
             client_id.to_string(),
             PendingOrderInfo {
+                cancel_request: None,
                 trader_id: trader,
                 strategy_id: strategy,
                 instrument_id,
@@ -219,7 +221,7 @@ fn algo_amendment_correlates_result_and_preserves_pending_on_unknown() {
                 &mut fills,
                 &mut orders,
                 clock,
-            )
+            );
         };
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../../test_data/ws_orders_algo.json")).unwrap();

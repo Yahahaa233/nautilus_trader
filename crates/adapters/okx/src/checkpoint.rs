@@ -353,10 +353,13 @@ impl RetainedInbox<Message> {
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ExecutionStreamState {
-    pub(crate) fee_cache: FeeCache,
+    #[serde(rename = "fee_cache")]
+    pub(crate) fees: FeeCache,
     #[serde(default)]
-    pub(crate) filled_qty_cache: FilledQtyCache,
-    pub(crate) order_state_cache: AHashMap<ClientOrderId, OrderStateSnapshot>,
+    #[serde(rename = "filled_qty_cache")]
+    pub(crate) filled_quantities: FilledQtyCache,
+    #[serde(rename = "order_state_cache")]
+    pub(crate) orders: AHashMap<ClientOrderId, OrderStateSnapshot>,
 }
 
 #[derive(Debug)]

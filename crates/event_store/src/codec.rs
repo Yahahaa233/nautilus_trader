@@ -1107,7 +1107,7 @@ mod tests {
                 correlation_id,
                 causation_id,
             },
-            following: 0x1801020304050607,
+            following: 0x1801_0203_0405_0607,
         };
         let mut old = encode_to_vec(&original).unwrap();
         old[4] = 1; // Original v1 positional body; no native-origin field existed.

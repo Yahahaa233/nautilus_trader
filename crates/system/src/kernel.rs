@@ -133,12 +133,19 @@ pub struct NautilusKernel {
     event_store_replay: bool,
     event_store_seal_blocked: Cell<bool>,
     execution_failure_fence: ExecutionFailureFence,
-    paused_journal_start: Option<PausedJournalStart>,
-    paused_journal_start_used: bool,
+    paused_journal_start: PausedJournalStartup,
     state_save_armed: bool,
     start_attempted: bool,
     #[cfg(feature = "streaming")]
     streaming_writer: Option<(String, StreamingSinkSubscription)>,
+}
+
+#[derive(Debug, Default)]
+enum PausedJournalStartup {
+    #[default]
+    Unopened,
+    Opened(Box<PausedJournalStart>),
+    Consumed,
 }
 
 /// Only the actual paused-open entrypoint can issue this one-start continuation.
@@ -528,8 +535,7 @@ impl NautilusKernel {
             event_store_replay: false,
             event_store_seal_blocked: Cell::new(false),
             execution_failure_fence,
-            paused_journal_start: None,
-            paused_journal_start_used: false,
+            paused_journal_start: PausedJournalStartup::Unopened,
             state_save_armed: false,
             start_attempted: false,
             #[cfg(feature = "streaming")]
@@ -776,6 +782,9 @@ impl NautilusKernel {
     /// A continuation caller must first bind and verify its recovery parent; this
     /// method can also open a fresh journal and does not itself prove restoration.
     /// This deliberately does not perform the legacy event-store cache replay.
+    ///
+    /// # Errors
+    /// Returns an error unless the kernel and clients are unused, admission is halted, and the owned journal opens a healthy fresh run.
     pub fn open_event_store_for_paused_recovery(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.ts_started.is_none()
@@ -827,7 +836,7 @@ impl NautilusKernel {
                 Ok((
                     store.snapshot_anchorer(),
                     PausedJournalStart {
-                        owner_address: std::ptr::from_ref(store) as *const () as usize,
+                        owner_address: std::ptr::from_ref(store).cast::<()>() as usize,
                         run_id: store
                             .run_id()
                             .context("paused Journal run unavailable")?
@@ -840,7 +849,7 @@ impl NautilusKernel {
         match outcome {
             Ok(Ok((anchorer, continuation))) => {
                 execution.set_snapshot_anchorer(anchorer);
-                self.paused_journal_start = Some(continuation);
+                self.paused_journal_start = PausedJournalStartup::Opened(Box::new(continuation));
                 Ok(())
             }
             Ok(Err(error)) => {
@@ -859,21 +868,7 @@ impl NautilusKernel {
         }
     }
 
-    /// Starts the Nautilus system kernel synchronously (for backtest use).
-    pub fn start(&mut self) {
-        if self.paused_journal_start_used {
-            self.shutdown_requested.set(true);
-            let _ = self
-                .prohibit_event_store_seal("paused Journal continuation consumed more than once");
-            log::error!("Paused Journal continuation consumed more than once");
-            return;
-        }
-        self.start_attempted = true;
-        arm_shutdown_on_error(self.config.shutdown_on_error());
-        log::info!("Starting");
-
-        self.event_store_replay = false;
-
+    fn start_event_store(&mut self) -> bool {
         if let Some(event_store) = self.event_store.as_deref_mut() {
             self.exec_engine.borrow_mut().set_snapshot_anchorer(None);
 
@@ -883,17 +878,23 @@ impl NautilusKernel {
 
             if event_store_replay_configured && !self.config.load_state() {
                 log::error!("Event-store replay requires load_state=true");
-                return;
+                return false;
             }
 
-            let continuation = self.paused_journal_start.take();
+            let continuation = match std::mem::take(&mut self.paused_journal_start) {
+                PausedJournalStartup::Opened(continuation) => {
+                    self.paused_journal_start = PausedJournalStartup::Consumed;
+                    Some(continuation)
+                }
+                PausedJournalStartup::Unopened => None,
+                PausedJournalStartup::Consumed => unreachable!("checked before kernel startup"),
+            };
             if let Some(continuation) = &continuation {
-                self.paused_journal_start_used = true;
                 let valid = !self.config.load_state()
                     && !event_store_replay_configured
                     && !event_store.is_halted()
                     && continuation.owner_address
-                        == std::ptr::from_ref(event_store) as *const () as usize
+                        == std::ptr::from_ref(event_store).cast::<()>() as usize
                     && event_store.run_id() == Some(continuation.run_id.as_str())
                     && continuation.components == components
                     && continuation.environment == environment;
@@ -903,7 +904,7 @@ impl NautilusKernel {
                     let _ =
                         event_store.retain_unsealed("paused Journal startup continuation changed");
                     log::error!("Paused Journal startup continuation changed");
-                    return;
+                    return false;
                 }
                 if let Err(error) = event_store.continue_paused_start(
                     self.instance_id,
@@ -916,7 +917,7 @@ impl NautilusKernel {
                     let _ = event_store
                         .retain_unsealed(&format!("paused Journal permit rejected: {error:#}"));
                     log::error!("Paused Journal permit rejected: {error:#}");
-                    return;
+                    return false;
                 }
                 if event_store.run_id() != Some(continuation.run_id.as_str())
                     || event_store.is_halted()
@@ -925,7 +926,7 @@ impl NautilusKernel {
                     self.shutdown_requested.set(true);
                     let _ = event_store
                         .retain_unsealed("paused Journal writer changed during continuation");
-                    return;
+                    return false;
                 }
             }
 
@@ -935,7 +936,7 @@ impl NautilusKernel {
                     event_store.restore_parent_cache(self.instance_id, &mut self.cache.borrow_mut())
             {
                 log::error!("Failed to restore cache from event-store replay source: {e}");
-                return;
+                return false;
             }
 
             if continuation.is_none()
@@ -945,7 +946,7 @@ impl NautilusKernel {
                 self.shutdown_requested.set(true);
                 let _ = event_store.retain_unsealed(&format!("Journal startup failed: {e:#}"));
                 log::error!("Failed to open event-store run: {e}");
-                return;
+                return false;
             }
 
             let anchorer = event_store.snapshot_anchorer();
@@ -953,6 +954,28 @@ impl NautilusKernel {
                 .borrow_mut()
                 .set_snapshot_anchorer(anchorer);
             self.event_store_replay = event_store_replay_configured;
+        }
+
+        true
+    }
+
+    /// Starts the Nautilus system kernel synchronously (for backtest use).
+    pub fn start(&mut self) {
+        if matches!(self.paused_journal_start, PausedJournalStartup::Consumed) {
+            self.shutdown_requested.set(true);
+            let _ = self
+                .prohibit_event_store_seal("paused Journal continuation consumed more than once");
+            log::error!("Paused Journal continuation consumed more than once");
+            return;
+        }
+        self.start_attempted = true;
+        arm_shutdown_on_error(self.config.shutdown_on_error());
+        log::info!("Starting");
+
+        self.event_store_replay = false;
+
+        if !self.start_event_store() {
+            return;
         }
 
         if self.event_store_replay {
@@ -1127,12 +1150,6 @@ impl NautilusKernel {
     /// # Errors
     ///
     /// Returns an error if actor or strategy state cannot be saved.
-    #[allow(unknown_lints)]
-    #[expect(
-        clippy::unused_async,
-        clippy::unused_async_trait_impl,
-        reason = "keeps the public async kernel API shape stable"
-    )]
     pub async fn finalize_stop(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.event_store_seal_blocked.get(),
@@ -1177,6 +1194,9 @@ impl NautilusKernel {
 
     /// Latches failure before teardown. Disposal can never promote this run to
     /// a normal seal; the actual implementation must also suppress its Drop seal.
+    ///
+    /// # Errors
+    /// Returns an error when the owned journal cannot retain its current run unsealed; the kernel prohibition remains latched.
     pub fn prohibit_event_store_seal(&mut self, reason: &str) -> anyhow::Result<()> {
         self.event_store_seal_blocked.set(true);
         self.exec_engine.borrow_mut().set_snapshot_anchorer(None);
@@ -1188,9 +1208,27 @@ impl NautilusKernel {
 
     /// Stops owned engines/timers and saves state while retaining an unsealed
     /// event store when the final boundary failed. Disconnect alone is not seal.
-    #[allow(unknown_lints)]
-    #[expect(clippy::unused_async, reason = "public async shutdown API")]
-    pub async fn finish_stop_without_seal(&mut self) -> anyhow::Result<()> {
+    ///
+    /// # Errors
+    /// The returned future yields an error if component state saving or streaming writer flush fails.
+    ///
+    /// # Panics
+    /// The returned future panics if polled again after it has completed.
+    pub fn finish_stop_without_seal(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + '_ {
+        let mut kernel = Some(self);
+        std::future::poll_fn(move |_| {
+            std::task::Poll::Ready(
+                kernel
+                    .take()
+                    .expect("shutdown future polled after completion")
+                    .finish_stop_without_seal_inner(),
+            )
+        })
+    }
+
+    fn finish_stop_without_seal_inner(&mut self) -> anyhow::Result<()> {
         disarm_shutdown_on_error();
         let save_result = self.save_trader_state();
         self.portfolio.borrow_mut().finalize_equity_curve();
@@ -1993,9 +2031,13 @@ mod lifecycle_tests {
         manifest: Rc<RefCell<Option<(UUID4, RegisteredComponents, Environment)>>>,
     }
 
+    fn forbid_paused_cache_restore() -> ! {
+        panic!("paused opening must not restore cache")
+    }
+
     impl KernelEventStore for PausedRecoveryStore {
         fn restore_parent_cache(&mut self, _: UUID4, _: &mut Cache) -> anyhow::Result<()> {
-            panic!("paused opening must not restore cache")
+            forbid_paused_cache_restore()
         }
         fn open(
             &mut self,

@@ -15,6 +15,32 @@ use nautilus_model::{
     orders::OrderTestBuilder,
 };
 
+// Hard assertions are separate from fallible native fixture operations.
+#[track_caller]
+fn require(condition: bool, message: impl FnOnce() -> String) {
+    assert!(condition, "{}", message());
+}
+#[track_caller]
+fn require_eq<L: ?Sized + std::fmt::Debug + PartialEq<R>, R: ?Sized + std::fmt::Debug>(
+    left: &L,
+    right: &R,
+    message: impl FnOnce() -> String,
+) {
+    assert_eq!(left, right, "{}", message());
+}
+#[track_caller]
+fn require_ne<L: ?Sized + std::fmt::Debug + PartialEq<R>, R: ?Sized + std::fmt::Debug>(
+    left: &L,
+    right: &R,
+    message: impl FnOnce() -> String,
+) {
+    assert_ne!(left, right, "{}", message());
+}
+#[track_caller]
+fn unexpected(message: &str) -> ! {
+    panic!("{message}");
+}
+
 struct ActualCaller {
     client: OKXWebSocketClient,
     actual_stream: Option<std::pin::Pin<Box<dyn futures_util::Stream<Item = OKXWsMessage>>>>,
@@ -188,7 +214,7 @@ impl ActualCaller {
             client,
             actual_stream,
             dispatch,
-            stream_state: Default::default(),
+            stream_state: crate::checkpoint::ExecutionStreamState::default(),
             emitter,
             receiver,
             data_receiver,
@@ -250,9 +276,9 @@ impl ActualCaller {
             AccountId::from("OKX-001"),
             AccountType::Margin,
             &self.instruments,
-            &mut self.stream_state.fee_cache,
-            &mut self.stream_state.filled_qty_cache,
-            &mut self.stream_state.order_state_cache,
+            &mut self.stream_state.fees,
+            &mut self.stream_state.filled_quantities,
+            &mut self.stream_state.orders,
             get_atomic_clock_realtime(),
         );
     }
@@ -332,64 +358,103 @@ async fn actual_submit_wire_and_early_acceptance_keep_original_causation_after_l
 -> anyhow::Result<()> {
     let mut original = ActualCaller::new().await?;
     let submitted = original.events();
-    assert!(
-        matches!(&submitted[..], [OrderEventAny::Submitted(event)] if event.causation_id == Some(original.command_id))
+    require(
+        matches!(&submitted[..], [OrderEventAny::Submitted(event)] if event.causation_id == Some(original.command_id)),
+        || {
+            stringify!(matches!(&submitted[..], [OrderEventAny::Submitted(event)] if event.causation_id == Some(original.command_id))).to_owned()
+        },
     );
     original.live();
     let events = original.events();
-    assert!(
-        matches!(&events[..], [OrderEventAny::Accepted(event)] if event.causation_id == Some(original.command_id))
+    require(
+        matches!(&events[..], [OrderEventAny::Accepted(event)] if event.causation_id == Some(original.command_id)),
+        || {
+            stringify!(matches!(&events[..], [OrderEventAny::Accepted(event)] if event.causation_id == Some(original.command_id))).to_owned()
+        },
     );
-    assert!(
+    require(
         original
             .client
             .retained_submit_contexts
             .get(original.identity.client_order_id.as_str())
             .unwrap()
             .acknowledged_response
-            .is_none()
+            .is_none(),
+        || {
+            stringify!(
+                original
+                    .client
+                    .retained_submit_contexts
+                    .get(original.identity.client_order_id.as_str())
+                    .unwrap()
+                    .acknowledged_response
+                    .is_none()
+            )
+            .to_owned()
+        },
     );
     let OrderEventAny::Accepted(accepted) = &events[0] else {
-        panic!("actual Accepted missing");
+        unexpected("actual Accepted missing");
     };
     let basis = accepted
         .command_causation_basis
         .expect("original Submit association missing");
-    assert_eq!(basis.kind.as_str(), "local_original_submit_identity");
-    assert!(!basis.venue_command_causation_available);
-    assert!(basis.acknowledgement_payload_json.is_none());
+    require_eq(
+        &(basis.kind.as_str()),
+        &("local_original_submit_identity"),
+        String::new,
+    );
+    require(!basis.venue_command_causation_available, || {
+        stringify!(!basis.venue_command_causation_available).to_owned()
+    });
+    require(basis.acknowledgement_payload_json.is_none(), || {
+        stringify!(basis.acknowledgement_payload_json.is_none()).to_owned()
+    });
     let before: serde_json::Value =
         serde_json::from_str(basis.original_terminal_payload_json.as_str())?;
-    assert!(before["causation_id"].is_null() && before["command_causation_basis"].is_null());
-    assert!(
-        original.dispatch.checkpoint_inventory().is_err(),
-        "an outstanding actual request cannot claim a resolved cut"
+    require(
+        before["causation_id"].is_null() && before["command_causation_basis"].is_null(),
+        || {
+            stringify!(
+                before["causation_id"].is_null() && before["command_causation_basis"].is_null()
+            )
+            .to_owned()
+        },
     );
+    require(original.dispatch.checkpoint_inventory().is_err(), || {
+        String::from("an outstanding actual request cannot claim a resolved cut")
+    });
     let req = original.wire["id"].as_str().unwrap().to_owned();
     original.response(&req, "0");
-    assert!(
-        original.events().is_empty(),
-        "operation ACK never emits or replaces Accepted"
-    );
+    require(original.events().is_empty(), || {
+        String::from("operation ACK never emits or replaces Accepted")
+    });
     let source = original.dispatch.checkpoint_inventory()?;
     let restored = WsDispatchState::default();
     restored.restore_checkpoint(&source)?;
-    assert_eq!(restored.checkpoint_inventory()?, source);
+    require_eq(&(restored.checkpoint_inventory()?), &(source), String::new);
     let retained = restored
         .retained_submit_contexts
         .get(original.identity.client_order_id.as_str())
         .unwrap();
-    assert_eq!(retained.command_id, original.command_id);
-    assert_eq!(retained.acknowledged_response.as_ref().unwrap()["id"], req);
+    require_eq(&(retained.command_id), &(original.command_id), String::new);
+    require_eq(
+        &(retained.acknowledged_response.as_ref().unwrap()["id"]),
+        &(req),
+        String::new,
+    );
     drop(retained);
     let mut changed = source.clone();
     changed["retained_submit_contexts"][original.identity.client_order_id.as_str()]["command_id"] =
         UUID4::new().to_string().into();
-    assert!(
+    require_ne(&(changed), &(source), || {
+        String::from("tampering a cloned cut must preserve the original cut")
+    });
+    require(
         WsDispatchState::default()
             .restore_checkpoint(&changed)
             .is_err(),
-        "new UUID cannot reuse old request proof"
+        || String::from("new UUID cannot reuse old request proof"),
     );
     Ok(())
 }
@@ -400,31 +465,65 @@ async fn actual_submit_wrong_request_rejection_cannot_consume_original_and_ack_i
     let mut original = ActualCaller::new().await?;
     original.events();
     original.response("not-the-original-request", "51000");
-    assert!(original.events().is_empty());
-    assert!(
+    require(original.events().is_empty(), || {
+        stringify!(original.events().is_empty()).to_owned()
+    });
+    require(
         original
             .client
             .pending_orders
-            .contains_key(original.identity.client_order_id.as_str())
+            .contains_key(original.identity.client_order_id.as_str()),
+        || {
+            stringify!(
+                original
+                    .client
+                    .pending_orders
+                    .contains_key(original.identity.client_order_id.as_str())
+            )
+            .to_owned()
+        },
     );
     let req = original.wire["id"].as_str().unwrap().to_owned();
     original.response(&req, "0");
-    assert!(original.events().is_empty());
-    assert!(
+    require(original.events().is_empty(), || {
+        stringify!(original.events().is_empty()).to_owned()
+    });
+    require(
         !original
             .client
             .pending_orders
-            .contains_key(original.identity.client_order_id.as_str())
+            .contains_key(original.identity.client_order_id.as_str()),
+        || {
+            stringify!(
+                !original
+                    .client
+                    .pending_orders
+                    .contains_key(original.identity.client_order_id.as_str())
+            )
+            .to_owned()
+        },
     );
-    assert!(
+    require(
         original
             .client
             .retained_submit_contexts
-            .contains_key(original.identity.client_order_id.as_str())
+            .contains_key(original.identity.client_order_id.as_str()),
+        || {
+            stringify!(
+                original
+                    .client
+                    .retained_submit_contexts
+                    .contains_key(original.identity.client_order_id.as_str())
+            )
+            .to_owned()
+        },
     );
     original.live();
-    assert!(
-        matches!(&original.events()[..], [OrderEventAny::Accepted(event)] if event.causation_id == Some(original.command_id))
+    require(
+        matches!(&original.events()[..], [OrderEventAny::Accepted(event)] if event.causation_id == Some(original.command_id)),
+        || {
+            stringify!(matches!(&original.events()[..], [OrderEventAny::Accepted(event)] if event.causation_id == Some(original.command_id))).to_owned()
+        },
     );
     Ok(())
 }
@@ -440,21 +539,45 @@ async fn actual_submit_matched_rejection_preserves_original_uuid_and_foreign_acc
     let [OrderEventAny::Rejected(event)] = &events[..] else {
         anyhow::bail!("actual matched rejection missing");
     };
-    assert_eq!(event.causation_id, Some(rejected.command_id));
+    require_eq(
+        &(event.causation_id),
+        &(Some(rejected.command_id)),
+        String::new,
+    );
     let basis = event
         .command_causation_basis
         .expect("actual request proof missing");
-    assert_eq!(basis.kind.as_str(), "venue_submit_req_id_rejection");
-    assert!(basis.venue_command_causation_available);
-    assert_eq!(basis.request_id.unwrap().as_str(), req);
+    require_eq(
+        &(basis.kind.as_str()),
+        &("venue_submit_req_id_rejection"),
+        String::new,
+    );
+    require(basis.venue_command_causation_available, || {
+        stringify!(basis.venue_command_causation_available).to_owned()
+    });
+    require_eq(&(basis.request_id.unwrap().as_str()), &(req), String::new);
     let acknowledgement: serde_json::Value =
         serde_json::from_str(basis.acknowledgement_payload_json.unwrap().as_str())?;
-    assert_eq!(acknowledgement["id"], req);
-    assert_eq!(acknowledgement["data"][0]["sCode"], "51000");
+    require_eq(&(acknowledgement["id"]), &(req), String::new);
+    require_eq(
+        &(acknowledgement["data"][0]["sCode"]),
+        &("51000"),
+        String::new,
+    );
     let before: serde_json::Value =
         serde_json::from_str(basis.original_terminal_payload_json.as_str())?;
-    assert!(before["causation_id"].is_null() && before["command_causation_basis"].is_null());
-    assert!(rejected.client.retained_submit_contexts.is_empty());
+    require(
+        before["causation_id"].is_null() && before["command_causation_basis"].is_null(),
+        || {
+            stringify!(
+                before["causation_id"].is_null() && before["command_causation_basis"].is_null()
+            )
+            .to_owned()
+        },
+    );
+    require(rejected.client.retained_submit_contexts.is_empty(), || {
+        stringify!(rejected.client.retained_submit_contexts.is_empty()).to_owned()
+    });
     let mut foreign = ActualCaller::new().await?;
     foreign.events();
     foreign
@@ -465,15 +588,27 @@ async fn actual_submit_matched_rejection_preserves_original_uuid_and_foreign_acc
         .account_id = "OKX-FOREIGN".into();
     let req = foreign.wire["id"].as_str().unwrap().to_owned();
     foreign.response(&req, "0");
-    assert!(
+    require(
         foreign
             .client
             .pending_orders
-            .contains_key(foreign.identity.client_order_id.as_str())
+            .contains_key(foreign.identity.client_order_id.as_str()),
+        || {
+            stringify!(
+                foreign
+                    .client
+                    .pending_orders
+                    .contains_key(foreign.identity.client_order_id.as_str())
+            )
+            .to_owned()
+        },
     );
     foreign.live();
-    assert!(
-        matches!(&foreign.events()[..], [OrderEventAny::Accepted(event)] if event.causation_id.is_none())
+    require(
+        matches!(&foreign.events()[..], [OrderEventAny::Accepted(event)] if event.causation_id.is_none()),
+        || {
+            stringify!(matches!(&foreign.events()[..], [OrderEventAny::Accepted(event)] if event.causation_id.is_none())).to_owned()
+        },
     );
     Ok(())
 }
@@ -486,44 +621,68 @@ async fn actual_raw_ack_before_accepted_is_independent_and_preserves_wire_and_re
     let req = caller.wire["id"].as_str().unwrap().to_owned();
     let raw = caller.raw_ack(&req, "0");
     caller.dispatch_raw_ack(raw.clone()).await;
-    assert!(
-        caller.events().is_empty(),
-        "operation success is not Accepted"
-    );
+    require(caller.events().is_empty(), || {
+        String::from("operation success is not Accepted")
+    });
     let sources = caller.ack_sources();
     let [source] = &sources[..] else {
         anyhow::bail!("exactly one raw ACK observation required")
     };
     source.validate()?;
-    assert_eq!(source.websocket_payload_json, raw);
-    assert!(
+    require_eq(&(source.websocket_payload_json), &(raw), String::new);
+    require(
         source.received_ns != 0
             && source.ts_event.as_u64() == source.received_ns
-            && source.ts_init >= source.ts_event
+            && source.ts_init >= source.ts_event,
+        || {
+            stringify!(
+                source.received_ns != 0
+                    && source.ts_event.as_u64() == source.received_ns
+                    && source.ts_init >= source.ts_event
+            )
+            .to_owned()
+        },
     );
     let binding = source.matched_submit.as_ref().unwrap();
-    assert_eq!(binding.command_id, caller.command_id);
-    assert_eq!(binding.identity, caller.identity);
-    assert_eq!(binding.request_id, req);
-    assert_eq!(binding.matched_item_index, Some(0));
-    assert_eq!(
-        binding.matched_item.as_ref().unwrap()["tag"],
-        "original-extra-field"
+    require_eq(&(binding.command_id), &(caller.command_id), String::new);
+    require_eq(&(binding.identity), &(caller.identity), String::new);
+    require_eq(&(binding.request_id), &(req), String::new);
+    require_eq(&(binding.matched_item_index), &(Some(0)), String::new);
+    require_eq(
+        &(binding.matched_item.as_ref().unwrap()["tag"]),
+        &("original-extra-field"),
+        String::new,
     );
     let restored = OrderOperationAckSource::from_json(serde_json::from_str(&source.to_json()?)?)?;
-    assert!(source.eq_arc(restored.as_ref()));
+    require(source.eq_arc(restored.as_ref()), || {
+        stringify!(source.eq_arc(restored.as_ref())).to_owned()
+    });
     caller.live();
     let events = caller.events();
     let [OrderEventAny::Accepted(accepted)] = &events[..] else {
         anyhow::bail!("actual live native Accepted missing")
     };
-    assert_eq!(accepted.causation_id, Some(caller.command_id));
-    assert!(
+    require_eq(
+        &(accepted.causation_id),
+        &(Some(caller.command_id)),
+        String::new,
+    );
+    require(
         accepted
             .command_causation_basis
             .unwrap()
             .acknowledgement_payload_json
-            .is_some()
+            .is_some(),
+        || {
+            stringify!(
+                accepted
+                    .command_causation_basis
+                    .unwrap()
+                    .acknowledgement_payload_json
+                    .is_some()
+            )
+            .to_owned()
+        },
     );
     Ok(())
 }
@@ -538,34 +697,57 @@ async fn actual_raw_ack_after_accepted_never_backfills_original_event_and_export
     let [OrderEventAny::Accepted(event)] = &accepted[..] else {
         anyhow::bail!("original actual Accepted missing")
     };
-    assert!(
+    require(
         event
             .command_causation_basis
             .unwrap()
             .acknowledgement_payload_json
-            .is_none()
+            .is_none(),
+        || {
+            stringify!(
+                event
+                    .command_causation_basis
+                    .unwrap()
+                    .acknowledgement_payload_json
+                    .is_none()
+            )
+            .to_owned()
+        },
     );
     let original_event_bytes = serde_json::to_vec(&accepted)?;
-    assert!(caller.dispatch.checkpoint_inventory().is_err());
+    require(caller.dispatch.checkpoint_inventory().is_err(), || {
+        stringify!(caller.dispatch.checkpoint_inventory().is_err()).to_owned()
+    });
     let req = caller.wire["id"].as_str().unwrap().to_owned();
     let raw = caller.raw_ack(&req, "0");
     caller.dispatch_raw_ack(raw.clone()).await;
-    assert!(caller.events().is_empty());
-    assert_eq!(serde_json::to_vec(&accepted)?, original_event_bytes);
+    require(caller.events().is_empty(), || {
+        stringify!(caller.events().is_empty()).to_owned()
+    });
+    require_eq(
+        &(serde_json::to_vec(&accepted)?),
+        &(original_event_bytes),
+        String::new,
+    );
     let sources = caller.ack_sources();
     let [source] = &sources[..] else {
         anyhow::bail!("late original ACK source missing")
     };
     source.validate()?;
-    assert_eq!(
-        source.matched_submit.as_ref().unwrap().command_id,
-        caller.command_id
+    require_eq(
+        &(source.matched_submit.as_ref().unwrap().command_id),
+        &(caller.command_id),
+        String::new,
     );
-    assert_eq!(source.websocket_payload_json, raw);
+    require_eq(&(source.websocket_payload_json), &(raw), String::new);
     let inventory = caller.dispatch.checkpoint_inventory()?;
     let restored = WsDispatchState::default();
     restored.restore_checkpoint(&inventory)?;
-    assert_eq!(restored.checkpoint_inventory()?, inventory);
+    require_eq(
+        &(restored.checkpoint_inventory()?),
+        &(inventory),
+        String::new,
+    );
     if let Some(path) = std::env::var_os("METIS_TEST_OKX_ACK_EXPORT_PATH") {
         let path = std::path::PathBuf::from(path);
         anyhow::ensure!(
@@ -596,14 +778,27 @@ async fn actual_raw_ack_duplicates_and_foreign_request_retain_observations_witho
         .dispatch_raw_ack(caller.raw_ack("foreign-request", "0"))
         .await;
     let foreign = caller.ack_sources();
-    assert!(foreign[0].matched_submit.is_none());
-    assert!(
+    require(foreign[0].matched_submit.is_none(), || {
+        stringify!(foreign[0].matched_submit.is_none()).to_owned()
+    });
+    require(
         caller
             .client
             .pending_orders
-            .contains_key(caller.identity.client_order_id.as_str())
+            .contains_key(caller.identity.client_order_id.as_str()),
+        || {
+            stringify!(
+                caller
+                    .client
+                    .pending_orders
+                    .contains_key(caller.identity.client_order_id.as_str())
+            )
+            .to_owned()
+        },
     );
-    assert!(caller.events().is_empty());
+    require(caller.events().is_empty(), || {
+        stringify!(caller.events().is_empty()).to_owned()
+    });
     let req = caller.wire["id"].as_str().unwrap().to_owned();
     let raw = caller.raw_ack(&req, "0");
     caller.dispatch_raw_ack(raw.clone()).await;
@@ -616,29 +811,50 @@ async fn actual_raw_ack_duplicates_and_foreign_request_retain_observations_witho
         .clone();
     caller.dispatch_raw_ack(raw.clone()).await;
     let sources = caller.ack_sources();
-    assert_eq!(sources.len(), 2);
-    assert!(
-        sources
-            .iter()
-            .all(|value| value.websocket_payload_json == raw
-                && value.matched_submit.as_ref().unwrap().command_id == caller.command_id)
+    require_eq(&(sources.len()), &(2), String::new);
+    require(
+        sources.iter().all(|value| {
+            value.websocket_payload_json == raw
+                && value.matched_submit.as_ref().unwrap().command_id == caller.command_id
+        }),
+        || {
+            stringify!(
+                sources
+                    .iter()
+                    .all(|value| value.websocket_payload_json == raw
+                        && value.matched_submit.as_ref().unwrap().command_id == caller.command_id)
+            )
+            .to_owned()
+        },
     );
-    assert!(sources[1].received_ns >= sources[0].received_ns);
-    assert_eq!(
-        caller
+    require(sources[1].received_ns >= sources[0].received_ns, || {
+        stringify!(sources[1].received_ns >= sources[0].received_ns).to_owned()
+    });
+    require_eq(
+        &(caller
             .client
             .retained_submit_contexts
             .get(caller.identity.client_order_id.as_str())
             .unwrap()
-            .acknowledged_response,
-        first
+            .acknowledged_response),
+        &(first),
+        String::new,
     );
-    assert!(caller.events().is_empty());
-    assert!(caller.client.pending_orders.is_empty());
+    require(caller.events().is_empty(), || {
+        stringify!(caller.events().is_empty()).to_owned()
+    });
+    require(caller.client.pending_orders.is_empty(), || {
+        stringify!(caller.client.pending_orders.is_empty()).to_owned()
+    });
     caller.live();
-    assert!(matches!(&caller.events()[..], [OrderEventAny::Accepted(_)]));
+    require(
+        matches!(&caller.events()[..], [OrderEventAny::Accepted(_)]),
+        || stringify!(matches!(&caller.events()[..], [OrderEventAny::Accepted(_)])).to_owned(),
+    );
     caller.live();
-    assert!(caller.events().is_empty());
+    require(caller.events().is_empty(), || {
+        stringify!(caller.events().is_empty()).to_owned()
+    });
     Ok(())
 }
 
@@ -653,22 +869,27 @@ async fn actual_raw_ack_rejection_and_foreign_account_keep_exact_original_source
         .await;
     let sources = rejected.ack_sources();
     sources[0].validate()?;
-    assert_eq!(
-        sources[0].matched_submit.as_ref().unwrap().command_id,
-        rejected.command_id
+    require_eq(
+        &(sources[0].matched_submit.as_ref().unwrap().command_id),
+        &(rejected.command_id),
+        String::new,
     );
-    assert_eq!(
-        sources[0]
+    require_eq(
+        &(sources[0]
             .matched_submit
             .as_ref()
             .unwrap()
             .matched_item
             .as_ref()
-            .unwrap()["sCode"],
-        "51000"
+            .unwrap()["sCode"]),
+        &("51000"),
+        String::new,
     );
-    assert!(
-        matches!(&rejected.events()[..], [OrderEventAny::Rejected(value)] if value.causation_id == Some(rejected.command_id))
+    require(
+        matches!(&rejected.events()[..], [OrderEventAny::Rejected(value)] if value.causation_id == Some(rejected.command_id)),
+        || {
+            stringify!(matches!(&rejected.events()[..], [OrderEventAny::Rejected(value)] if value.causation_id == Some(rejected.command_id))).to_owned()
+        },
     );
     let mut foreign = ActualCaller::new().await?;
     foreign.events();
@@ -680,28 +901,48 @@ async fn actual_raw_ack_rejection_and_foreign_account_keep_exact_original_source
         .account_id = "OKX-FOREIGN".into();
     let req = foreign.wire["id"].as_str().unwrap().to_owned();
     foreign.dispatch_raw_ack(foreign.raw_ack(&req, "0")).await;
-    assert!(foreign.ack_sources()[0].matched_submit.is_none());
-    assert!(
+    require(foreign.ack_sources()[0].matched_submit.is_none(), || {
+        stringify!(foreign.ack_sources()[0].matched_submit.is_none()).to_owned()
+    });
+    require(
         foreign
             .client
             .pending_orders
-            .contains_key(foreign.identity.client_order_id.as_str())
+            .contains_key(foreign.identity.client_order_id.as_str()),
+        || {
+            stringify!(
+                foreign
+                    .client
+                    .pending_orders
+                    .contains_key(foreign.identity.client_order_id.as_str())
+            )
+            .to_owned()
+        },
     );
-    assert!(foreign.events().is_empty());
+    require(foreign.events().is_empty(), || {
+        stringify!(foreign.events().is_empty()).to_owned()
+    });
     let mut empty = ActualCaller::new().await?;
     empty.events();
     let raw = serde_json::json!({"id":empty.wire["id"],"op":"order","code":"50000","msg":"actual top failure","data":[]}).to_string();
     empty.dispatch_raw_ack(raw.clone()).await;
     let sources = empty.ack_sources();
     sources[0].validate()?;
-    assert_eq!(sources[0].websocket_payload_json, raw);
+    require_eq(&(sources[0].websocket_payload_json), &(raw), String::new);
     let binding = sources[0].matched_submit.as_ref().unwrap();
-    assert!(binding.matched_item.is_none() && binding.matched_item_index.is_none());
-    assert!(
-        empty.events().is_empty(),
-        "item-free ACK cannot invent an order rejection"
+    require(
+        binding.matched_item.is_none() && binding.matched_item_index.is_none(),
+        || {
+            stringify!(binding.matched_item.is_none() && binding.matched_item_index.is_none())
+                .to_owned()
+        },
     );
-    assert!(empty.dispatch.checkpoint_inventory().is_err());
+    require(empty.events().is_empty(), || {
+        String::from("item-free ACK cannot invent an order rejection")
+    });
+    require(empty.dispatch.checkpoint_inventory().is_err(), || {
+        stringify!(empty.dispatch.checkpoint_inventory().is_err()).to_owned()
+    });
     Ok(())
 }
 
@@ -713,43 +954,82 @@ async fn actual_terminal_before_raw_ack_keeps_unresolved_request_and_retires_onl
     caller.live();
     caller.events();
     caller.terminal();
-    assert!(matches!(&caller.events()[..], [OrderEventAny::Canceled(_)]));
-    assert!(
+    require(
+        matches!(&caller.events()[..], [OrderEventAny::Canceled(_)]),
+        || stringify!(matches!(&caller.events()[..], [OrderEventAny::Canceled(_)])).to_owned(),
+    );
+    require(
         caller
             .dispatch
-            .contains_terminal(&caller.identity.client_order_id)
+            .contains_terminal(&caller.identity.client_order_id),
+        || {
+            stringify!(
+                caller
+                    .dispatch
+                    .contains_terminal(&caller.identity.client_order_id)
+            )
+            .to_owned()
+        },
     );
-    assert!(
+    require(
         caller
             .client
             .pending_orders
-            .contains_key(caller.identity.client_order_id.as_str())
+            .contains_key(caller.identity.client_order_id.as_str()),
+        || {
+            stringify!(
+                caller
+                    .client
+                    .pending_orders
+                    .contains_key(caller.identity.client_order_id.as_str())
+            )
+            .to_owned()
+        },
     );
-    assert!(
+    require(
         caller
             .client
             .retained_submit_contexts
-            .contains_key(caller.identity.client_order_id.as_str())
+            .contains_key(caller.identity.client_order_id.as_str()),
+        || {
+            stringify!(
+                caller
+                    .client
+                    .retained_submit_contexts
+                    .contains_key(caller.identity.client_order_id.as_str())
+            )
+            .to_owned()
+        },
     );
-    assert!(
-        caller.dispatch.checkpoint_inventory().is_err(),
-        "unresolved terminal request must not make a resolved cut"
-    );
+    require(caller.dispatch.checkpoint_inventory().is_err(), || {
+        String::from("unresolved terminal request must not make a resolved cut")
+    });
     let req = caller.wire["id"].as_str().unwrap().to_owned();
     caller.dispatch_raw_ack(caller.raw_ack(&req, "0")).await;
     let sources = caller.ack_sources();
     sources[0].validate()?;
-    assert_eq!(
-        sources[0].matched_submit.as_ref().unwrap().command_id,
-        caller.command_id
+    require_eq(
+        &(sources[0].matched_submit.as_ref().unwrap().command_id),
+        &(caller.command_id),
+        String::new,
     );
-    assert!(caller.events().is_empty());
-    assert!(caller.client.pending_orders.is_empty());
-    assert!(caller.client.retained_submit_contexts.is_empty());
+    require(caller.events().is_empty(), || {
+        stringify!(caller.events().is_empty()).to_owned()
+    });
+    require(caller.client.pending_orders.is_empty(), || {
+        stringify!(caller.client.pending_orders.is_empty()).to_owned()
+    });
+    require(caller.client.retained_submit_contexts.is_empty(), || {
+        stringify!(caller.client.retained_submit_contexts.is_empty()).to_owned()
+    });
     let inventory = caller.dispatch.checkpoint_inventory()?;
     let restored = WsDispatchState::default();
     restored.restore_checkpoint(&inventory)?;
-    assert_eq!(restored.checkpoint_inventory()?, inventory);
+    require_eq(
+        &(restored.checkpoint_inventory()?),
+        &(inventory),
+        String::new,
+    );
     Ok(())
 }
 
@@ -770,25 +1050,51 @@ async fn actual_raw_ack_capture_failure_latches_original_gate_and_cannot_resolve
         .bind(sender.clone().into());
     let req = caller.wire["id"].as_str().unwrap().to_owned();
     caller.dispatch_raw_ack(caller.raw_ack(&req, "0")).await;
-    assert!(caller.events().is_empty());
-    assert!(caller.dispatch.protection_sources.verify().is_err());
+    require(caller.events().is_empty(), || {
+        stringify!(caller.events().is_empty()).to_owned()
+    });
+    require(caller.dispatch.protection_sources.verify().is_err(), || {
+        stringify!(caller.dispatch.protection_sources.verify().is_err()).to_owned()
+    });
     let first = gate.verify().unwrap_err().to_string();
-    assert!(first.contains("original operation ACK source persistence failed"));
+    require(
+        first.contains("original operation ACK source persistence failed"),
+        || {
+            stringify!(first.contains("original operation ACK source persistence failed"))
+                .to_owned()
+        },
+    );
     sender.fail("later secondary failure");
-    assert_eq!(gate.verify().unwrap_err().to_string(), first);
-    assert!(gate.freeze().is_err());
-    assert!(caller.dispatch.checkpoint_inventory().is_err());
-    assert!(
+    require_eq(
+        &(gate.verify().unwrap_err().to_string()),
+        &(first),
+        String::new,
+    );
+    require(gate.freeze().is_err(), || {
+        stringify!(gate.freeze().is_err()).to_owned()
+    });
+    require(caller.dispatch.checkpoint_inventory().is_err(), || {
+        stringify!(caller.dispatch.checkpoint_inventory().is_err()).to_owned()
+    });
+    require(
         caller
             .client
             .pending_orders
-            .contains_key(caller.identity.client_order_id.as_str())
+            .contains_key(caller.identity.client_order_id.as_str()),
+        || {
+            stringify!(
+                caller
+                    .client
+                    .pending_orders
+                    .contains_key(caller.identity.client_order_id.as_str())
+            )
+            .to_owned()
+        },
     );
     caller.live();
-    assert!(
-        caller.events().is_empty(),
-        "failed source must not admit another business dispatch"
-    );
+    require(caller.events().is_empty(), || {
+        String::from("failed source must not admit another business dispatch")
+    });
     Ok(())
 }
 
@@ -972,11 +1278,12 @@ async fn actual_modify_raw_ack_before_and_after_updated_preserves_original_comma
             .await?;
         let request_text = wire.request().await?;
         let request: serde_json::Value = serde_json::from_str(&request_text)?;
-        assert_eq!(
-            request["id"],
-            command.command_id.to_string().replace('-', "")
+        require_eq(
+            &(request["id"]),
+            &(command.command_id.to_string().replace('-', "")),
+            String::new,
         );
-        assert_eq!(request["args"][0]["newSz"], "0.04");
+        require_eq(&(request["args"][0]["newSz"]), &("0.04"), String::new);
         let update = caller.management_order_frame("live", request["id"].as_str());
         let mut original_updated = None;
         if after_updated {
@@ -986,16 +1293,19 @@ async fn actual_modify_raw_ack_before_and_after_updated_preserves_original_comma
             let [OrderEventAny::Updated(event)] = events.as_slice() else {
                 anyhow::bail!("actual Updated missing: {events:?}")
             };
-            assert_eq!(event.causation_id, Some(command.command_id));
+            require_eq(
+                &(event.causation_id),
+                &(Some(command.command_id)),
+                String::new,
+            );
             original_updated = Some(serde_json::to_vec(&events)?);
         }
         let raw = caller.management_raw_ack(&request, "0");
         wire.frames.send(raw.clone())?;
         caller.next_actual_frame().await?;
-        assert!(
-            caller.events().is_empty(),
-            "raw ACK cannot create or replace Updated"
-        );
+        require(caller.events().is_empty(), || {
+            String::from("raw ACK cannot create or replace Updated")
+        });
         let sources = caller.ack_sources();
         let [source] = sources.as_slice() else {
             anyhow::bail!("actual Modify ACK source missing")
@@ -1005,42 +1315,67 @@ async fn actual_modify_raw_ack_before_and_after_updated_preserves_original_comma
             .matched_modify
             .as_ref()
             .expect("original Modify binding absent");
-        assert_eq!(
-            serde_json::from_str::<nautilus_common::messages::execution::ModifyOrder>(
-                &binding.command_payload_json
-            )?,
-            command
+        require_eq(
+            &(serde_json::from_str::<nautilus_common::messages::execution::ModifyOrder>(
+                &binding.command_payload_json,
+            )?),
+            &(command),
+            String::new,
         );
-        assert_eq!(binding.request_payload_json, request_text);
-        assert_eq!(source.websocket_payload_json, raw);
-        assert!(source.matched_submit.is_none() && source.matched_cancel.is_none());
-        assert!(caller.client.operation_ack_contexts.lock().is_empty());
-        if !after_updated {
-            assert!(
+        require_eq(
+            &(binding.request_payload_json),
+            &(request_text),
+            String::new,
+        );
+        require_eq(&(source.websocket_payload_json), &(raw), String::new);
+        require(
+            source.matched_submit.is_none() && source.matched_cancel.is_none(),
+            || {
+                stringify!(source.matched_submit.is_none() && source.matched_cancel.is_none())
+                    .to_owned()
+            },
+        );
+        require(
+            caller.client.operation_ack_contexts.lock().is_empty(),
+            || stringify!(caller.client.operation_ack_contexts.lock().is_empty()).to_owned(),
+        );
+        if after_updated {
+            require(original_updated.is_some(), || {
+                stringify!(original_updated.is_some()).to_owned()
+            });
+        } else {
+            require(
                 caller
                     .client
                     .pending_amends
                     .contains_key(caller.identity.client_order_id.as_str()),
-                "ACK is not amendment result"
+                || String::from("ACK is not amendment result"),
             );
             wire.frames.send(update)?;
             caller.next_actual_frame().await?;
-            assert!(
-                matches!(&caller.events()[..],[OrderEventAny::Updated(event)] if event.causation_id==Some(command.command_id))
+            require(
+                matches!(&caller.events()[..],[OrderEventAny::Updated(event)] if event.causation_id==Some(command.command_id)),
+                || {
+                    stringify!(matches!(&caller.events()[..],[OrderEventAny::Updated(event)] if event.causation_id==Some(command.command_id))).to_owned()
+                },
             );
-        } else {
-            assert!(original_updated.is_some());
         }
         let mut forged = source.clone();
         forged.matched_modify.as_mut().unwrap().command_id = UUID4::new();
-        assert!(forged.validate().is_err());
+        require(forged.validate().is_err(), || {
+            stringify!(forged.validate().is_err()).to_owned()
+        });
         let mut forged = source.clone();
         forged.matched_modify.as_mut().unwrap().request_payload_json =
             request_text.replace("0.04", "0.05");
-        assert!(forged.validate().is_err());
+        require(forged.validate().is_err(), || {
+            stringify!(forged.validate().is_err()).to_owned()
+        });
         let mut forged = source.clone();
         forged.connection.as_mut().unwrap().epoch += 1;
-        assert!(forged.validate().is_err());
+        require(forged.validate().is_err(), || {
+            stringify!(forged.validate().is_err()).to_owned()
+        });
         caller.client.close().await?;
     }
     Ok(())
@@ -1068,20 +1403,24 @@ async fn actual_cancel_raw_ack_after_terminal_preserves_native_original_and_expo
     wire.frames
         .send(caller.management_raw_ack(&modify_request, "0"))?;
     caller.next_actual_frame().await?;
-    assert!(
-        caller.events().is_empty(),
-        "Modify ACK alone cannot emit Updated"
-    );
+    require(caller.events().is_empty(), || {
+        String::from("Modify ACK alone cannot emit Updated")
+    });
     let modify_sources = caller.ack_sources();
-    assert_eq!(modify_sources.len(), 1);
+    require_eq(&(modify_sources.len()), &(1), String::new);
     modify_sources[0].validate()?;
-    assert!(modify_sources[0].matched_modify.is_some());
+    require(modify_sources[0].matched_modify.is_some(), || {
+        stringify!(modify_sources[0].matched_modify.is_some()).to_owned()
+    });
     wire.frames
         .send(caller.management_order_frame("live", modify_request["id"].as_str()))?;
     caller.next_actual_frame().await?;
     let original_updated = caller.events();
-    assert!(
-        matches!(&original_updated[..],[OrderEventAny::Updated(event)] if event.causation_id==Some(modify.command_id))
+    require(
+        matches!(&original_updated[..],[OrderEventAny::Updated(event)] if event.causation_id==Some(modify.command_id)),
+        || {
+            stringify!(matches!(&original_updated[..],[OrderEventAny::Updated(event)] if event.causation_id==Some(modify.command_id))).to_owned()
+        },
     );
     caller.ack_sources();
     let command = caller.cancellation();
@@ -1093,7 +1432,7 @@ async fn actual_cancel_raw_ack_after_terminal_preserves_native_original_and_expo
         .await?;
     let request_text = wire.request().await?;
     let request: serde_json::Value = serde_json::from_str(&request_text)?;
-    assert_eq!(request["op"], "cancel-order");
+    require_eq(&(request["op"]), &("cancel-order"), String::new);
     wire.frames
         .send(caller.management_order_frame("canceled", None))?;
     caller.next_actual_frame().await?;
@@ -1101,19 +1440,21 @@ async fn actual_cancel_raw_ack_after_terminal_preserves_native_original_and_expo
     let [OrderEventAny::Canceled(event)] = originals.as_slice() else {
         anyhow::bail!("actual terminal original missing: {originals:?}")
     };
-    assert!(
-        event.causation_id.is_none(),
-        "late ACK cannot pre-exist terminal"
-    );
+    require(event.causation_id.is_none(), || {
+        String::from("late ACK cannot pre-exist terminal")
+    });
     let original_bytes = serde_json::to_vec(&originals)?;
     let raw = caller.management_raw_ack(&request, "0");
     wire.frames.send(raw.clone())?;
     caller.next_actual_frame().await?;
-    assert!(
-        caller.events().is_empty(),
-        "ACK after terminal cannot backfill or re-emit Canceled"
+    require(caller.events().is_empty(), || {
+        String::from("ACK after terminal cannot backfill or re-emit Canceled")
+    });
+    require_eq(
+        &(serde_json::to_vec(&originals)?),
+        &(original_bytes),
+        String::new,
     );
-    assert_eq!(serde_json::to_vec(&originals)?, original_bytes);
     let sources = caller.ack_sources();
     let [source] = sources.as_slice() else {
         anyhow::bail!("actual Cancel raw source missing")
@@ -1123,22 +1464,38 @@ async fn actual_cancel_raw_ack_after_terminal_preserves_native_original_and_expo
         .matched_cancel
         .as_ref()
         .expect("original Cancel ACK absent");
-    assert_eq!(
-        serde_json::from_str::<nautilus_common::messages::execution::CancelOrder>(
-            &binding.command_payload_json
-        )?,
-        command
+    require_eq(
+        &(serde_json::from_str::<nautilus_common::messages::execution::CancelOrder>(
+            &binding.command_payload_json,
+        )?),
+        &(command),
+        String::new,
     );
-    assert_eq!(binding.routed_venue_order_id, routed.venue_order_id);
-    assert_eq!(binding.request_payload_json, request_text);
-    assert_eq!(source.websocket_payload_json, raw);
-    assert!(caller.client.operation_ack_contexts.lock().is_empty());
+    require_eq(
+        &(binding.routed_venue_order_id),
+        &(routed.venue_order_id),
+        String::new,
+    );
+    require_eq(
+        &(binding.request_payload_json),
+        &(request_text),
+        String::new,
+    );
+    require_eq(&(source.websocket_payload_json), &(raw), String::new);
+    require(
+        caller.client.operation_ack_contexts.lock().is_empty(),
+        || stringify!(caller.client.operation_ack_contexts.lock().is_empty()).to_owned(),
+    );
     wire.frames.send(raw)?;
     caller.next_actual_frame().await?;
     let duplicates = caller.ack_sources();
-    assert_eq!(duplicates.len(), 1);
-    assert!(duplicates[0].matched_cancel.is_none());
-    assert!(caller.events().is_empty());
+    require_eq(&(duplicates.len()), &(1), String::new);
+    require(duplicates[0].matched_cancel.is_none(), || {
+        stringify!(duplicates[0].matched_cancel.is_none()).to_owned()
+    });
+    require(caller.events().is_empty(), || {
+        stringify!(caller.events().is_empty()).to_owned()
+    });
     if let Some(path) = std::env::var_os("METIS_TEST_OKX_MANAGEMENT_ACK_EXPORT_PATH") {
         let path = std::path::PathBuf::from(path);
         anyhow::ensure!(
@@ -1181,7 +1538,7 @@ async fn actual_management_raw_foreign_request_identity_and_recovery_context_can
     let request_text = wire.request().await?;
     let request: serde_json::Value = serde_json::from_str(&request_text)?;
     let original = caller.client.operation_ack_contexts.lock().clone();
-    assert_eq!(original.len(), 1);
+    require_eq(&(original.len()), &(1), String::new);
     for field in ["id", "clOrdId", "ordId"] {
         let mut raw: serde_json::Value =
             serde_json::from_str(&caller.management_raw_ack(&request, "0"))?;
@@ -1196,12 +1553,25 @@ async fn actual_management_raw_foreign_request_identity_and_recovery_context_can
             .await
             .map_err(|error| anyhow::anyhow!("foreign {field} raw ACK phase: {error:#}"))?;
         let observations = caller.ack_sources();
-        assert_eq!(observations.len(), 1);
-        assert!(
-            observations[0].matched_modify.is_none() && observations[0].matched_cancel.is_none()
+        require_eq(&(observations.len()), &(1), String::new);
+        require(
+            observations[0].matched_modify.is_none() && observations[0].matched_cancel.is_none(),
+            || {
+                stringify!(
+                    observations[0].matched_modify.is_none()
+                        && observations[0].matched_cancel.is_none()
+                )
+                .to_owned()
+            },
         );
-        assert!(caller.events().is_empty());
-        assert_eq!(caller.client.operation_ack_contexts.lock().len(), 1);
+        require(caller.events().is_empty(), || {
+            stringify!(caller.events().is_empty()).to_owned()
+        });
+        require_eq(
+            &(caller.client.operation_ack_contexts.lock().len()),
+            &(1),
+            String::new,
+        );
     }
     // A valid early native Updated removes the ordinary pending outcome, not
     // the still-unreceived raw ACK request context.
@@ -1211,27 +1581,46 @@ async fn actual_management_raw_foreign_request_identity_and_recovery_context_can
         .next_actual_frame()
         .await
         .map_err(|error| anyhow::anyhow!("original early Updated phase: {error:#}"))?;
-    assert!(matches!(&caller.events()[..], [OrderEventAny::Updated(_)]));
+    require(
+        matches!(&caller.events()[..], [OrderEventAny::Updated(_)]),
+        || stringify!(matches!(&caller.events()[..], [OrderEventAny::Updated(_)])).to_owned(),
+    );
     caller.ack_sources();
     let cut = caller.dispatch.checkpoint_inventory()?;
     let restored = WsDispatchState::default();
     restored.restore_checkpoint(&cut)?;
-    assert_eq!(restored.checkpoint_inventory()?, cut);
+    require_eq(&(restored.checkpoint_inventory()?), &(cut), String::new);
     let req = request["id"].as_str().unwrap();
     let mut changed = cut.clone();
     changed["operation_ack_contexts"][req]["binding"]["command_id"] =
         UUID4::new().to_string().into();
-    assert!(
+    require(
         WsDispatchState::default()
             .restore_checkpoint(&changed)
-            .is_err()
+            .is_err(),
+        || {
+            stringify!(
+                WsDispatchState::default()
+                    .restore_checkpoint(&changed)
+                    .is_err()
+            )
+            .to_owned()
+        },
     );
     let mut changed = cut.clone();
     changed["operation_ack_contexts"][req]["binding"]["instrument_id_code"] = 99999.into();
-    assert!(
+    require(
         WsDispatchState::default()
             .restore_checkpoint(&changed)
-            .is_err()
+            .is_err(),
+        || {
+            stringify!(
+                WsDispatchState::default()
+                    .restore_checkpoint(&changed)
+                    .is_err()
+            )
+            .to_owned()
+        },
     );
     // An old socket/epoch cannot satisfy the current request. Preserve the raw
     // observation without promoting it or consuming the pending original.
@@ -1249,19 +1638,34 @@ async fn actual_management_raw_foreign_request_identity_and_recovery_context_can
         .next_actual_frame()
         .await
         .map_err(|error| anyhow::anyhow!("foreign socket epoch raw ACK phase: {error:#}"))?;
-    assert!(caller.ack_sources()[0].matched_modify.is_none());
-    assert_eq!(caller.client.operation_ack_contexts.lock().len(), 1);
+    require(caller.ack_sources()[0].matched_modify.is_none(), || {
+        stringify!(caller.ack_sources()[0].matched_modify.is_none()).to_owned()
+    });
+    require_eq(
+        &(caller.client.operation_ack_contexts.lock().len()),
+        &(1),
+        String::new,
+    );
     *caller.client.operation_ack_contexts.lock() = original;
     wire.frames.send(caller.management_raw_ack(&request, "0"))?;
     caller
         .next_actual_frame()
         .await
         .map_err(|error| anyhow::anyhow!("restored original context raw ACK phase: {error:#}"))?;
-    assert!(caller.ack_sources()[0].matched_modify.is_some());
-    assert!(caller.events().is_empty());
-    assert!(caller.client.operation_ack_contexts.lock().is_empty());
+    require(caller.ack_sources()[0].matched_modify.is_some(), || {
+        stringify!(caller.ack_sources()[0].matched_modify.is_some()).to_owned()
+    });
+    require(caller.events().is_empty(), || {
+        stringify!(caller.events().is_empty()).to_owned()
+    });
+    require(
+        caller.client.operation_ack_contexts.lock().is_empty(),
+        || stringify!(caller.client.operation_ack_contexts.lock().is_empty()).to_owned(),
+    );
     let recorded_ids = caller.client.operation_ack_request_ids.lock().clone();
-    assert!(recorded_ids.contains(req));
+    require(recorded_ids.contains(req), || {
+        stringify!(recorded_ids.contains(req)).to_owned()
+    });
     caller
         .client
         .modify_order_with_command(
@@ -1283,17 +1687,33 @@ async fn actual_management_raw_foreign_request_identity_and_recovery_context_can
     let [OrderEventAny::ModifyRejected(rejected)] = rejections.as_slice() else {
         anyhow::bail!("duplicate original command did not reach the native rejection path");
     };
-    assert_eq!(rejected.causation_id, Some(command.command_id));
-    assert!(
+    require_eq(
+        &(rejected.causation_id),
+        &(Some(command.command_id)),
+        String::new,
+    );
+    require(
         rejected
             .reason
             .as_str()
-            .contains("original operation ACK capacity or duplicate command")
+            .contains("original operation ACK capacity or duplicate command"),
+        || {
+            stringify!(
+                rejected
+                    .reason
+                    .as_str()
+                    .contains("original operation ACK capacity or duplicate command")
+            )
+            .to_owned()
+        },
     );
-    assert!(wire.requests.try_recv().is_err());
-    assert_eq!(
-        *caller.client.operation_ack_request_ids.lock(),
-        recorded_ids
+    require(wire.requests.try_recv().is_err(), || {
+        stringify!(wire.requests.try_recv().is_err()).to_owned()
+    });
+    require_eq(
+        &(*caller.client.operation_ack_request_ids.lock()),
+        &(recorded_ids),
+        String::new,
     );
     caller.client.close().await?;
     Ok(())

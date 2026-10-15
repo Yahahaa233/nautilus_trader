@@ -109,6 +109,7 @@ impl RecoveryReleaseBoundary<'_> {
     }
 }
 
+type ValidateRelease = dyn Fn(&RecoveryReleaseBoundary<'_>) -> Result<()>;
 type Round = dyn Fn() -> Result<()>;
 type Attest = dyn Fn(&RecoveryObservationBoundary<'_>) -> Result<Option<Box<dyn Any>>>;
 type Arm = dyn Fn(&RecoveryObservationBoundary<'_>, Box<dyn Any>) -> Result<Box<dyn Any>>;
@@ -123,7 +124,7 @@ pub(super) struct RecoveryObservationRegistration {
     attest: Rc<Attest>,
     arm: Rc<Arm>,
     before_start: Rc<BeforeStart>,
-    validate_release: Rc<dyn Fn(&RecoveryReleaseBoundary<'_>) -> Result<()>>,
+    validate_release: Rc<ValidateRelease>,
     pub(super) fence: Rc<dyn Fn(&str)>,
     admission: Option<RecoveryObservationAdmission>,
     execution_gate: Option<RecoveryObservationExecutionGate>,
@@ -150,7 +151,7 @@ impl LiveNode {
     /// application receipt and may only arm transient component startup branches.
     /// `before_trader_start` may perform a privately reconciled caller-owned
     /// position release while native cache/component state remains immutable.
-    /// Ordinary restored actor/strategy on_start runs once afterwards under the
+    /// Ordinary restored actor/strategy `on_start` runs once afterwards under the
     /// native execution phase gate. All errors permanently fence execution.
     ///
     /// # Errors
@@ -315,7 +316,7 @@ impl LiveNode {
         let ids = registration
             .observer_ids
             .iter()
-            .map(|id| id.inner())
+            .map(nautilus_model::identifiers::ActorId::inner)
             .collect::<Vec<_>>();
         registration.admission = Some(RecoveryObservationAdmission::enter(&ids)?);
         registration.execution_gate = Some(

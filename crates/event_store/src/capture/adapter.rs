@@ -251,7 +251,7 @@ impl BusCaptureAdapter {
 
         #[cfg(feature = "live")]
         if nautilus_common::recovery_trace::historical_active() {
-            let mut semantic_headers = headers.clone();
+            let mut semantic_headers = headers;
             if semantic_headers.native_origin.is_some() {
                 let reason = "historical caller cannot assign source provenance".to_owned();
                 self.fail_stop_reason(HaltReason::CaptureEncoding(reason.clone()));

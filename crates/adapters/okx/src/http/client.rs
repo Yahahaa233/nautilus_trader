@@ -48,7 +48,10 @@ use std::{
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use jiff::Timestamp;
-use nautilus_common::{cache::InstrumentLookupError, live::dst::time};
+use nautilus_common::{
+    cache::InstrumentLookupError,
+    live::{checkpoint::CheckpointGate, dst::time},
+};
 use nautilus_core::{
     AtomicMap, AtomicTime, UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND, env::get_or_env_var,
     string::secret::REDACTED, time::get_atomic_clock_realtime,
@@ -339,7 +342,7 @@ mod tests {
             .unwrap();
             assert_eq!(sweep.complete, complete, "{limit:?}/{size}");
             assert_eq!(sweep.items.len(), kept);
-            assert_eq!(calls, if limit == Some(0) { 0 } else { 1 });
+            assert_eq!(calls, i32::from(limit != Some(0)));
         }
     }
 
@@ -370,7 +373,7 @@ mod tests {
     #[tokio::test]
     async fn pending_pages_reject_duplicates_invalid_ids_and_oversized_pages() {
         for page in [
-            vec!["".to_owned()],
+            vec![String::new()],
             vec!["same".to_owned(); 2],
             (0..101).map(|n| n.to_string()).collect(),
         ] {
@@ -1236,7 +1239,7 @@ impl OKXRawHttpClient {
         let retry_manager = RetryManager::new(retry_config);
 
         Ok(Self {
-            checkpoint_gate: Default::default(),
+            checkpoint_gate: CheckpointGate::default(),
             clock: get_atomic_clock_realtime(),
             base_url: base_url.unwrap_or(OKX_HTTP_URL.to_string()),
             client: HttpClient::builder()
@@ -1290,7 +1293,7 @@ impl OKXRawHttpClient {
         let retry_manager = RetryManager::new(retry_config);
 
         Ok(Self {
-            checkpoint_gate: Default::default(),
+            checkpoint_gate: CheckpointGate::default(),
             clock: get_atomic_clock_realtime(),
             base_url,
             client: HttpClient::builder()
@@ -6568,6 +6571,9 @@ impl OKXHttpClient {
     }
 
     /// Retains the actual HTTP body; item/top-level failures remain source facts.
+    ///
+    /// # Errors
+    /// Returns an error for encoding, transport, venue response, or missing original HTTP source.
     pub async fn place_algo_order_with_source(
         &self,
         request: OKXPlaceAlgoOrderRequest,
@@ -6681,6 +6687,9 @@ impl OKXHttpClient {
     }
 
     /// <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-post-cancel-algo-order>
+    ///
+    /// # Errors
+    /// Returns an error for encoding, transport, or venue rejection of an algo cancellation.
     pub async fn cancel_algo_orders(
         &self,
         requests: Vec<OKXCancelAlgoOrderRequest>,
@@ -6805,6 +6814,9 @@ impl OKXHttpClient {
     }
 
     /// <https://www.okx.com/docs-v5/en/#order-book-trading-algo-trading-post-amend-algo-order>
+    ///
+    /// # Errors
+    /// Returns an error for encoding, transport, venue response, or an empty amendment response.
     pub async fn amend_algo_order(
         &self,
         request: OKXAmendAlgoOrderRequest,
@@ -7206,29 +7218,27 @@ impl OKXHttpClient {
         callback_spread: Option<String>,
         activation_price: Option<Price>,
     ) -> Result<OKXPlaceAlgoOrderResponse, OKXHttpError> {
-        let request = self
-            .build_algo_order_request(
-                instrument_id,
-                td_mode,
-                client_order_id,
-                order_side,
-                order_type,
-                quantity,
-                trigger_price,
-                trigger_type,
-                limit_price,
-                reduce_only,
-                close_fraction,
-                callback_ratio,
-                callback_spread,
-                activation_price,
-            )
-            .await?;
+        let request = self.build_algo_order_request(
+            instrument_id,
+            td_mode,
+            client_order_id,
+            order_side,
+            order_type,
+            quantity,
+            trigger_price,
+            trigger_type,
+            limit_price,
+            reduce_only,
+            close_fraction,
+            callback_ratio,
+            callback_spread,
+            activation_price,
+        )?;
         self.place_algo_order(request).await
     }
 
     #[expect(clippy::too_many_arguments)]
-    async fn build_algo_order_request(
+    fn build_algo_order_request(
         &self,
         instrument_id: InstrumentId,
         td_mode: OKXTradeMode,
@@ -7420,6 +7430,9 @@ impl OKXHttpClient {
     /// Uses the same signed body as the ordinary conditional producer, retaining
     /// the complete received body even for an explicit venue rejection.
     #[expect(clippy::too_many_arguments)]
+    ///
+    /// # Errors
+    /// Returns an error for invalid domain order terms, encoding, transport, venue response, or missing original HTTP source.
     pub async fn place_algo_order_with_domain_types_and_source(
         &self,
         instrument_id: InstrumentId,
@@ -7443,24 +7456,22 @@ impl OKXHttpClient {
         ),
         OKXHttpError,
     > {
-        let request = self
-            .build_algo_order_request(
-                instrument_id,
-                td_mode,
-                client_order_id,
-                order_side,
-                order_type,
-                quantity,
-                trigger_price,
-                trigger_type,
-                limit_price,
-                reduce_only,
-                close_fraction,
-                callback_ratio,
-                callback_spread,
-                activation_price,
-            )
-            .await?;
+        let request = self.build_algo_order_request(
+            instrument_id,
+            td_mode,
+            client_order_id,
+            order_side,
+            order_type,
+            quantity,
+            trigger_price,
+            trigger_type,
+            limit_price,
+            reduce_only,
+            close_fraction,
+            callback_ratio,
+            callback_spread,
+            activation_price,
+        )?;
         self.place_algo_order_with_source(request).await
     }
 

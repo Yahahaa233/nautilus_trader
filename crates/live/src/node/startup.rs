@@ -57,7 +57,7 @@ impl StartupPending {
     }
 }
 
-/// No handler runs while the connection future owns an engine RefMut. Retained
+/// No handler runs while the connection future owns an engine `RefMut`. Retained
 /// dequeue evidence is published only immediately before its actual dispatch.
 pub(super) async fn buffer_startup_events<F: std::future::Future>(
     future: F,

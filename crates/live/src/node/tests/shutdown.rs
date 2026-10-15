@@ -387,16 +387,19 @@ fn shutdown_node(
         .quantity(Quantity::from("1.000"))
         .price(Price::from("100.00"))
         .build();
-    node.observe_exec_command_before_dispatch(&TradingCommand::SubmitOrder(
-        SubmitOrder::from_order(
-            &order,
-            node.trader_id(),
-            Some(client_id),
-            None,
-            UUID4::new(),
-            UnixNanos::default(),
-        ),
-    ));
+    assert!(
+        node.observe_exec_command_before_dispatch(&TradingCommand::SubmitOrder(
+            SubmitOrder::from_order(
+                &order,
+                node.trader_id(),
+                Some(client_id),
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+            ),
+        ))
+        .unwrap()
+    );
     node.kernel
         .cache
         .borrow_mut()

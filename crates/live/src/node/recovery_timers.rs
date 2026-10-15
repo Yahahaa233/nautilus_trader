@@ -69,6 +69,9 @@ fn event_identity(message: &TimeEventMessage) -> serde_json::Value {
 #[derive(Debug, Clone)]
 pub struct RetainedRecoveryTimerHandoff(Rc<RefCell<TimerProgress>>);
 impl RetainedRecoveryTimerHandoff {
+    ///
+    /// # Errors
+    /// Returns an error if the registered timer owner or source progress cannot be validated.
     pub fn progress(&self) -> Result<serde_json::Value> {
         Ok(serde_json::to_value(&*self.0.try_borrow()?)?)
     }
@@ -475,7 +478,7 @@ impl RetainedNodeTimers {
     }
     #[cfg(feature = "native-tail-replay")]
     pub(super) fn historical_time_message(
-        &mut self,
+        &self,
         witness: &nautilus_common::recovery_trace::NativeReadWitness,
     ) -> Result<TimeEventMessage> {
         ensure!(
@@ -628,6 +631,9 @@ impl LiveNode {
     /// Rebuilds exact actual owner-clock schedules and retains callbacks until
     /// sealed recovered startup. The source frontier must already be installed
     /// by native cache/component replay. No queue ACK is a processed ACK.
+    ///
+    /// # Errors
+    /// Returns an error if original schedules or registered timer owners cannot be restored.
     pub fn restore_registered_timer_checkpoint(
         &mut self,
         source: BTreeMap<String, serde_json::Value>,
@@ -663,7 +669,7 @@ impl LiveNode {
         let mut clock_addresses = BTreeSet::new();
         for clock in clocks.values() {
             ensure!(
-                clock_addresses.insert(Rc::as_ptr(clock) as *const () as usize),
+                clock_addresses.insert(Rc::as_ptr(clock).cast::<()>() as usize),
                 "aliased owner clocks do not have a unique recovery callback contract"
             );
         }
@@ -765,7 +771,7 @@ impl LiveNode {
         receivers: &mut RunningReceivers<'_>,
     ) -> Result<()> {
         if let Some(timers) = self.recovery_timers.as_mut() {
-            timers.handoff_after_start(receivers.time_evt_rx)?;
+            timers.handoff_after_start(receivers.time_events)?;
         }
         Ok(())
     }
@@ -797,7 +803,9 @@ mod tests {
         struct SourceSender(mpsc::Sender<(TimeEventMessage, u64)>);
         impl TimeEventSender for SourceSender {
             fn send(&self, message: TimeEventMessage) {
-                let accepted = nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64;
+                let accepted =
+                    u64::try_from(nautilus_core::time::duration_since_unix_epoch().as_nanos())
+                        .unwrap();
                 self.0.send((message, accepted)).unwrap();
             }
         }
@@ -807,7 +815,7 @@ mod tests {
             fn channel(&self) -> RunnerRecoveryChannel {
                 RunnerRecoveryChannel::TimeEvent
             }
-            fn codec_id(&self) -> &str {
+            fn codec_id(&self) -> &'static str {
                 "actual_cross_owner_retained_timer.v1"
             }
             fn encode(&self, input: RunnerRecoveryEventRef<'_>) -> Result<serde_json::Value> {
@@ -900,7 +908,8 @@ mod tests {
             native_continuation: None,
             progress,
         };
-        let captured = nautilus_core::time::duration_since_unix_epoch().as_nanos() as u64;
+        let captured =
+            u64::try_from(nautilus_core::time::duration_since_unix_epoch().as_nanos()).unwrap();
         if fault == "changed_binding" {
             admissions[1].1 += 9999;
         }
@@ -958,7 +967,7 @@ mod tests {
                 message.message().native_input_callback_binding(),
                 original.checkpoint_callback_binding()
             );
-            assert!(message.dispatch(|message| message.dispatch()));
+            assert!(message.dispatch(TimeEventMessage::dispatch));
         }
         assert_eq!(
             *calls.borrow(),
@@ -1045,7 +1054,7 @@ mod tests {
             progress.progress().unwrap()["events"][event.event_id.to_string()]["phase"],
             "received"
         );
-        assert!(actual.dispatch(|actual| actual.dispatch()));
+        assert!(actual.dispatch(TimeEventMessage::dispatch));
         timers.processed(event.event_id).unwrap();
         assert_eq!(calls.get(), 1);
         assert_eq!(

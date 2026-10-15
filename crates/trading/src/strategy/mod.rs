@@ -622,7 +622,7 @@ fn native_cancel_market_exit_framework<S: Strategy + StrategyNative + ?Sized>(
 
 fn native_expire_gtd_framework<S: Strategy + StrategyNative + ?Sized>(
     strategy: &mut S,
-    event: TimeEvent,
+    event: &TimeEvent,
 ) -> anyhow::Result<()> {
     let timer_name = event.name;
     let Some(client_order_id) = timer_name
@@ -696,6 +696,9 @@ pub trait Strategy: DataActor {
     /// captures this opaque value from the same actual registered object; it is
     /// not execution authority and never reads a Clock or generates a UUID.
     #[cfg(feature = "live")]
+    ///
+    /// # Errors
+    /// Returns an error if this strategy cannot capture its original business state against the supplied native framework.
     fn on_native_framework_checkpoint(
         &self,
         _framework: &NativeStrategyFrameworkCheckpoint,
@@ -704,8 +707,11 @@ pub trait Strategy: DataActor {
     }
 
     /// SDK native restore callback after exact source framework installation.
-    /// Ordinary on_load remains independent and cannot mint this opaque value.
+    /// Ordinary `on_load` remains independent and cannot mint this opaque value.
     #[cfg(feature = "live")]
+    ///
+    /// # Errors
+    /// Returns an error if this strategy cannot restore its original business state against the supplied native framework.
     fn on_native_framework_checkpoint_load(
         &mut self,
         state: indexmap::IndexMap<String, Vec<u8>>,
@@ -870,7 +876,8 @@ pub trait Strategy: DataActor {
 
         let first_order = orders.first();
         let order_inits: Vec<_> = orders.iter().map(|o| o.init_event().clone()).collect();
-        let exec_algorithm_id = first_order.and_then(|o| o.exec_algorithm_id());
+        let exec_algorithm_id =
+            first_order.and_then(nautilus_model::orders::Order::exec_algorithm_id);
 
         let command = SubmitOrderList::new(
             trader_id,
@@ -921,14 +928,14 @@ pub trait Strategy: DataActor {
             }
         }
 
-        if let Some(prepared) = prepared {
-            if let Err(error) = prepared.bind(&TradingCommand::SubmitOrderList(command.clone())) {
-                for order in &orders {
-                    publish_order_initialized(order);
-                }
-                self.deny_order_list(&orders, Ustr::from(&format!("提交绑定失败：{error}")));
-                return Err(error);
+        if let Some(prepared) = prepared
+            && let Err(error) = prepared.bind(&TradingCommand::SubmitOrderList(command.clone()))
+        {
+            for order in &orders {
+                publish_order_initialized(order);
             }
+            self.deny_order_list(&orders, Ustr::from(&format!("提交绑定失败：{error}")));
+            return Err(error);
         }
 
         for order in &orders {
@@ -1065,16 +1072,16 @@ pub trait Strategy: DataActor {
         if !self.mark_order_pending_update_with_causation(&order, Some(command.command_id))? {
             return Ok(());
         }
-        if let Some(prepared) = prepared {
-            if let Err(error) = prepared.bind(&TradingCommand::ModifyOrder(command.clone())) {
-                reject_unsubmitted_modification(
-                    StrategyNative::strategy_core_mut(self),
-                    &order,
-                    &command,
-                    Ustr::from(&format!("改单绑定失败：{error}")),
-                )?;
-                return Err(error);
-            }
+        if let Some(prepared) = prepared
+            && let Err(error) = prepared.bind(&TradingCommand::ModifyOrder(command.clone()))
+        {
+            reject_unsubmitted_modification(
+                StrategyNative::strategy_core_mut(self),
+                &order,
+                &command,
+                Ustr::from(&format!("改单绑定失败：{error}")),
+            )?;
+            return Err(error);
         }
 
         if order.emulation_trigger().is_some() || order.is_emulated() {
@@ -1432,7 +1439,10 @@ pub trait Strategy: DataActor {
         self.mark_order_pending_update_with_causation(order, None)
     }
 
-    /// Preserves the UUID minted before the local PendingUpdate transition.
+    /// Preserves the UUID minted before the local `PendingUpdate` transition.
+    ///
+    /// # Errors
+    /// Returns an error if the cached native order cannot accept the original pending modification transition.
     fn mark_order_pending_update_with_causation(
         &mut self,
         order: &OrderAny,
@@ -1490,6 +1500,9 @@ pub trait Strategy: DataActor {
     {
         self.mark_order_pending_cancel_with_command(order, None)
     }
+    ///
+    /// # Errors
+    /// Returns an error if the cached native order cannot accept the original pending cancellation transition.
     fn mark_order_pending_cancel_with_command(
         &mut self,
         order: &OrderAny,
@@ -2822,7 +2835,7 @@ pub trait Strategy: DataActor {
             if nautilus_common::recovery_trace::historical::dispatch_if_active(
                 &component_id,
                 "strategy.expire_gtd_order.default",
-                |_boundary| native_expire_gtd_framework(self, event.clone()),
+                |_boundary| native_expire_gtd_framework(self, &event),
             ) {
                 return;
             }
@@ -2841,7 +2854,7 @@ pub trait Strategy: DataActor {
                 return;
             }
         }
-        if let Err(error) = native_expire_gtd_framework(self, event) {
+        if let Err(error) = native_expire_gtd_framework(self, &event) {
             log::error!("Native default expire_gtd_order failed: {error:#}");
             nautilus_common::recovery_trace::historical_failure(&format!("{error:#}"));
         }
@@ -3005,12 +3018,12 @@ where
         cache.add_order(order.clone(), position_id, client_id, true)?;
     }
 
-    if let Some(prepared) = prepared {
-        if let Err(error) = prepared.bind(&TradingCommand::SubmitOrder(command.clone())) {
-            publish_order_initialized(order);
-            strategy.deny_order(order, Ustr::from(&format!("提交绑定失败：{error}")));
-            return Err(error);
-        }
+    if let Some(prepared) = prepared
+        && let Err(error) = prepared.bind(&TradingCommand::SubmitOrder(command.clone()))
+    {
+        publish_order_initialized(order);
+        strategy.deny_order(order, Ustr::from(&format!("提交绑定失败：{error}")));
+        return Err(error);
     }
 
     publish_order_initialized(order);
@@ -3429,7 +3442,7 @@ mod tests {
             let mut timers = original.clone();
             match fault {
                 "configuration" => {
-                    value["configuration"]["market_exit_interval_ms"] = serde_json::json!(1)
+                    value["configuration"]["market_exit_interval_ms"] = serde_json::json!(1);
                 }
                 "timer_interval" => timers["timers"][0]["interval_ns"] = serde_json::json!(1),
                 _ => timers["timers"] = serde_json::json!([]),
@@ -3503,7 +3516,7 @@ mod tests {
         receipt.verify_current(&target.core).unwrap();
         assert!(target.has_gtd_expiry_timer(&order.client_order_id()));
         let (mut rejected, _, _rejected_receiver) =
-            native_registered_framework_fixture(config.clone(), cache.clone());
+            native_registered_framework_fixture(config.clone(), cache);
         let mut changed = original.clone();
         changed["timers"][0]["stop_time_ns"] = serde_json::json!(expiry.as_u64() + 1);
         assert!(
@@ -8623,10 +8636,8 @@ mod tests {
         failure: u8,
         commands: Rc<RefCell<Vec<TradingCommand>>>,
     }
-    impl SubmissionInterceptor for SubmissionTestHook {
-        fn prepare(&self, command: &TradingCommand) -> anyhow::Result<Box<dyn PreparedSubmission>> {
-            self.timeline.borrow_mut().push("prepare");
-            self.commands.borrow_mut().push(command.clone());
+    impl SubmissionTestHook {
+        fn assert_original_cache_before_prepare(&self, command: &TradingCommand) {
             for id in &self.ids {
                 if matches!(command, TradingCommand::ModifyOrder(_)) {
                     assert_eq!(
@@ -8637,6 +8648,13 @@ mod tests {
                     assert!(!self.cache.borrow().order_exists(id));
                 }
             }
+        }
+    }
+    impl SubmissionInterceptor for SubmissionTestHook {
+        fn prepare(&self, command: &TradingCommand) -> anyhow::Result<Box<dyn PreparedSubmission>> {
+            self.timeline.borrow_mut().push("prepare");
+            self.commands.borrow_mut().push(command.clone());
+            self.assert_original_cache_before_prepare(command);
             anyhow::ensure!(self.failure != 1, "准备拒绝");
             Ok(Box::new(PreparedTestHook {
                 cache: self.cache.clone(),
@@ -8654,8 +8672,8 @@ mod tests {
         failure: u8,
         command: String,
     }
-    impl PreparedSubmission for PreparedTestHook {
-        fn bind(self: Box<Self>, command: &TradingCommand) -> anyhow::Result<()> {
+    impl PreparedTestHook {
+        fn assert_bound_command_and_cache(&self, command: &TradingCommand) {
             assert_eq!(self.command, format!("{command:?}"));
             self.timeline.borrow_mut().push("bind");
             for id in &self.ids {
@@ -8668,6 +8686,11 @@ mod tests {
                     }
                 );
             }
+        }
+    }
+    impl PreparedSubmission for PreparedTestHook {
+        fn bind(self: Box<Self>, command: &TradingCommand) -> anyhow::Result<()> {
+            self.assert_bound_command_and_cache(command);
             anyhow::ensure!(self.failure != 2, "绑定拒绝");
             Ok(())
         }
@@ -8688,7 +8711,10 @@ mod tests {
                     } else {
                         vec![make_initialized_market_order("HOOK-1")]
                     };
-                    let ids: Vec<_> = orders.iter().map(|o| o.client_order_id()).collect();
+                    let ids: Vec<_> = orders
+                        .iter()
+                        .map(nautilus_model::orders::Order::client_order_id)
+                        .collect();
                     let cache = strategy.core.cache_rc();
                     let timeline = Rc::new(RefCell::new(Vec::new()));
                     let hook = Rc::new(SubmissionTestHook {

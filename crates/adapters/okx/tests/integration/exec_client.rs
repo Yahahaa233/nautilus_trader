@@ -730,6 +730,7 @@ async fn test_explicit_venue_modify_rejection_emits_order_modify_rejected() {
     .await;
     assert_eq!(state.opened.load(Ordering::Relaxed), 2);
     assert_eq!(state.closed.load(Ordering::Relaxed), 2);
+    let stale_response_json = stale_response.to_string();
     let mut stale_originals = 0;
     let mut bound_originals = 0;
     while let Ok(event) = original_sources.try_recv() {
@@ -747,7 +748,7 @@ async fn test_explicit_venue_modify_rejection_emits_order_modify_rejected() {
         assert_eq!(source.trader_id, TraderId::from("TESTER-001"));
         assert_eq!(source.adapter_account_id, AccountId::from("OKX-001"));
         assert!(source.matched_submit.is_none() && source.matched_cancel.is_none());
-        if source.websocket_payload_json == stale_response.to_string() {
+        if source.websocket_payload_json == stale_response_json {
             assert!(source.matched_modify.is_none());
             stale_originals += 1;
         }
@@ -2587,6 +2588,7 @@ fn make_algo_cancel_response(
 
 fn make_algo_cancel_context(cid: &str) -> AlgoCancelContext {
     AlgoCancelContext {
+        command_id: None,
         client_order_id: ClientOrderId::new(cid),
         instrument_id: InstrumentId::from("ETH-USDT-SWAP.OKX"),
         strategy_id: StrategyId::from("STRATEGY-001"),
@@ -2708,6 +2710,10 @@ fn test_algo_cancel_rejection_emits_for_nonzero_scode() {
             assert_eq!(event.client_order_id, ClientOrderId::new("O-001"));
             assert_eq!(event.venue_order_id, Some(VenueOrderId::new("v-algo-1")));
             assert_eq!(event.reason, Ustr::from("OKX error 51000: Order not found"));
+            assert!(
+                event.causation_id.is_none(),
+                "legacy context cannot invent an original command"
+            );
         }
         other => panic!("Expected one OrderCancelRejected, was {other:?}"),
     }
@@ -2737,16 +2743,22 @@ fn test_algo_cancel_rejection_mixed_batch() {
         make_algo_cancel_response("algo-2", "51000", "Not found"),
         make_algo_cancel_response("algo-3", "0", ""),
     ];
-    let contexts = vec![
+    let command_id = UUID4::new();
+    let mut contexts = vec![
         make_algo_cancel_context("O-001"),
         make_algo_cancel_context("O-002"),
         make_algo_cancel_context("O-003"),
     ];
+    contexts[1].command_id = Some(command_id);
 
     emit_algo_cancel_rejections(&responses, &contexts, &emitter, clock);
 
     let events = drain_events(&mut rx);
     assert_eq!(events.len(), 1, "only one rejection in the batch");
+    assert!(
+        matches!(&events[..], [ExecutionEvent::Order(OrderEventAny::CancelRejected(event))]
+        if event.client_order_id == contexts[1].client_order_id && event.causation_id == Some(command_id))
+    );
 }
 
 #[rstest]
@@ -2830,6 +2842,7 @@ async fn test_cancel_algo_order_venue_rejection_emits_order_cancel_rejected() {
         OrderEventAny::CancelRejected(rejected) => {
             assert_eq!(rejected.client_order_id, client_order_id);
             assert_eq!(rejected.venue_order_id, Some(venue_order_id));
+            assert_eq!(rejected.causation_id, Some(command_id));
             assert_eq!(
                 rejected.reason,
                 Ustr::from("OKX error 51000: Parameter algoId error")

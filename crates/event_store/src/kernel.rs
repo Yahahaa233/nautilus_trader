@@ -1722,9 +1722,7 @@ impl KernelEventStoreTrait for EventStoreLifecycle {
         &self,
     ) -> Option<nautilus_system::event_store::EventStoreFailureRetention> {
         let session = self.session.as_ref()?;
-        if session.writer.is_none() {
-            return None;
-        }
+        session.writer.as_ref()?;
         let halt = self.halt.clone();
         Some(
             nautilus_system::event_store::EventStoreFailureRetention::new(move |reason| {
@@ -2707,6 +2705,128 @@ mod tests {
         );
     }
 
+    struct ExternalParentAssertions<'a> {
+        source_dir: &'a TempDir,
+        source_instance: UUID4,
+        target_instance: UUID4,
+        source_id: &'a str,
+        watermark: u64,
+        fingerprint: &'a str,
+    }
+
+    impl ExternalParentAssertions<'_> {
+        fn assert_invalid_bindings(&self, child: &mut EventStoreLifecycle) {
+            assert!(
+                child
+                    .bind_external_parent(
+                        self.source_dir.path(),
+                        self.target_instance,
+                        self.source_id,
+                        self.watermark,
+                        self.fingerprint
+                    )
+                    .is_err()
+            );
+            assert!(
+                child
+                    .bind_external_parent(
+                        self.source_dir.path(),
+                        self.source_instance,
+                        self.source_id,
+                        self.watermark + 1,
+                        self.fingerprint
+                    )
+                    .is_err()
+            );
+            assert!(
+                child
+                    .bind_external_parent(
+                        self.source_dir.path(),
+                        self.source_instance,
+                        self.source_id,
+                        self.watermark,
+                        "incorrect"
+                    )
+                    .is_err()
+            );
+        }
+        fn assert_bound_state(&self, child: &mut EventStoreLifecycle) {
+            assert_eq!(child.parent_run_id(), Some(self.source_id));
+            assert!(
+                child
+                    .bind_external_parent(
+                        self.source_dir.path(),
+                        self.source_instance,
+                        self.source_id,
+                        self.watermark,
+                        self.fingerprint
+                    )
+                    .is_err()
+            );
+            assert!(
+                child
+                    .restore_parent_cache(self.target_instance, &mut Cache::default())
+                    .is_err()
+            );
+        }
+        fn assert_open_and_seal(&self, child: &mut EventStoreLifecycle) {
+            assert!(
+                child
+                    .bind_external_parent(
+                        self.source_dir.path(),
+                        self.source_instance,
+                        self.source_id,
+                        self.watermark,
+                        self.fingerprint
+                    )
+                    .is_err()
+            );
+            child.seal(30_000u64.into());
+            assert!(
+                child
+                    .open(
+                        self.target_instance,
+                        &RegisteredComponents::default(),
+                        Environment::Backtest
+                    )
+                    .is_err()
+            );
+        }
+        fn assert_replay_rejected(&self, replay: &mut EventStoreLifecycle) {
+            assert!(
+                replay
+                    .bind_external_parent(
+                        self.source_dir.path(),
+                        self.source_instance,
+                        self.source_id,
+                        self.watermark,
+                        self.fingerprint,
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    fn assert_external_condition(condition: bool) {
+        assert!(condition);
+    }
+
+    fn assert_external_equal<T: std::fmt::Debug + PartialEq>(actual: &T, expected: &T) {
+        assert_eq!(actual, expected);
+    }
+
+    fn assert_external_distinct<T: std::fmt::Debug + PartialEq>(actual: &T, expected: &T) {
+        assert_ne!(actual, expected);
+    }
+
+    fn assert_external_equal_with_message<T: std::fmt::Debug + PartialEq>(
+        actual: &T,
+        expected: &T,
+        message: &str,
+    ) {
+        assert_eq!(actual, expected, "{message}");
+    }
+
     #[test]
     fn external_parent_continuation_verifies_source_and_persists_lineage() -> anyhow::Result<()> {
         let source_dir = TempDir::new()?;
@@ -2745,39 +2865,15 @@ mod tests {
             )
         };
         let mut child = new_lifecycle(target_instance, make_config(target_dir.path().into()))?;
-        assert!(
-            child
-                .bind_external_parent(
-                    source_dir.path(),
-                    target_instance,
-                    &source_id,
-                    watermark,
-                    &fingerprint
-                )
-                .is_err()
-        );
-        assert!(
-            child
-                .bind_external_parent(
-                    source_dir.path(),
-                    source_instance,
-                    &source_id,
-                    watermark + 1,
-                    &fingerprint
-                )
-                .is_err()
-        );
-        assert!(
-            child
-                .bind_external_parent(
-                    source_dir.path(),
-                    source_instance,
-                    &source_id,
-                    watermark,
-                    "incorrect"
-                )
-                .is_err()
-        );
+        let checks = ExternalParentAssertions {
+            source_dir: &source_dir,
+            source_instance,
+            target_instance,
+            source_id: &source_id,
+            watermark,
+            fingerprint: &fingerprint,
+        };
+        checks.assert_invalid_bindings(&mut child);
         child.bind_external_parent(
             source_dir.path(),
             source_instance,
@@ -2785,87 +2881,44 @@ mod tests {
             watermark,
             &fingerprint,
         )?;
-        assert_eq!(child.parent_run_id(), Some(source_id.as_str()));
-        assert!(
-            child
-                .bind_external_parent(
-                    source_dir.path(),
-                    source_instance,
-                    &source_id,
-                    watermark,
-                    &fingerprint
-                )
-                .is_err()
-        );
-        assert!(
-            child
-                .restore_parent_cache(target_instance, &mut Cache::default())
-                .is_err()
-        );
+        checks.assert_bound_state(&mut child);
         child.open(
             target_instance,
             &RegisteredComponents::default(),
             Environment::Backtest,
         )?;
         let child_id = child.run_id().unwrap().to_owned();
-        assert!(
-            child
-                .bind_external_parent(
-                    source_dir.path(),
-                    source_instance,
-                    &source_id,
-                    watermark,
-                    &fingerprint
-                )
-                .is_err()
-        );
-        child.seal(30_000u64.into());
-        assert!(
-            child
-                .open(
-                    target_instance,
-                    &RegisteredComponents::default(),
-                    Environment::Backtest
-                )
-                .is_err()
-        );
+        checks.assert_open_and_seal(&mut child);
         let backend =
             RedbBackend::open_sealed(target_dir.path(), &target_instance.to_string(), &child_id)?;
         let manifest = backend.manifest()?;
-        assert_eq!(manifest.parent_run_id.as_deref(), Some(source_id.as_str()));
-        assert_eq!(manifest.instance_id, target_instance.to_string());
-        assert_eq!(
-            backend.scan_seq(1)?.unwrap().payload_type.as_str(),
-            "RunStarted"
+        assert_external_equal(
+            &manifest.parent_run_id.as_deref(),
+            &Some(source_id.as_str()),
         );
-        assert!(
+        assert_external_equal(&manifest.instance_id, &target_instance.to_string());
+        assert_external_equal(
+            &backend.scan_seq(1)?.unwrap().payload_type.as_str(),
+            &"RunStarted",
+        );
+        assert_external_condition(
             crate::verifier::Verifier::new(Box::new(backend))
                 .verify()?
-                .is_clean()
+                .is_clean(),
         );
-        assert_eq!(
-            EventStoreLifecycle::sealed_run_fingerprint(
+        assert_external_equal(
+            &EventStoreLifecycle::sealed_run_fingerprint(
                 source_dir.path(),
                 source_instance,
                 &source_id,
-                watermark
+                watermark,
             )?,
-            fingerprint
+            &fingerprint,
         );
         let mut replay_config = make_config(target_dir.path().into());
         replay_config.replay_from_run_id = Some(source_id.clone());
         let mut replay = new_lifecycle(UUID4::new(), replay_config)?;
-        assert!(
-            replay
-                .bind_external_parent(
-                    source_dir.path(),
-                    source_instance,
-                    &source_id,
-                    watermark,
-                    &fingerprint
-                )
-                .is_err()
-        );
+        checks.assert_replay_rejected(&mut replay);
         Ok(())
     }
 
@@ -2910,14 +2963,14 @@ mod tests {
             watermark,
             &fingerprint,
         )?;
-        assert!(
+        assert_external_condition(
             child
                 .open(
                     UUID4::new(),
                     &RegisteredComponents::default(),
-                    Environment::Backtest
+                    Environment::Backtest,
                 )
-                .is_err()
+                .is_err(),
         );
         // Replace a sealed source with a different valid journal retaining the same identity
         // and watermark. Integrity alone must not substitute for the original content proof.
@@ -2948,16 +3001,16 @@ mod tests {
             &source_id,
             watermark,
         )?;
-        assert_ne!(changed, fingerprint);
-        assert_eq!(
-            EventStoreLifecycle::sealed_backend_fingerprint(
+        assert_external_distinct(&changed, &fingerprint);
+        assert_external_equal_with_message(
+            &EventStoreLifecycle::sealed_backend_fingerprint(
                 Box::new(verified_handle),
                 source_instance,
                 &source_id,
-                watermark
+                watermark,
             )?,
-            fingerprint,
-            "already-validated source handle must not adopt a replacement path's fingerprint"
+            &fingerprint,
+            "already-validated source handle must not adopt a replacement path's fingerprint",
         );
         let error = child
             .open(
@@ -2966,8 +3019,8 @@ mod tests {
                 Environment::Backtest,
             )
             .unwrap_err();
-        assert!(error.to_string().contains("contents changed"));
-        assert!(child.run_id().is_none());
+        assert_external_condition(error.to_string().contains("contents changed"));
+        assert_external_condition(child.run_id().is_none());
         Ok(())
     }
 

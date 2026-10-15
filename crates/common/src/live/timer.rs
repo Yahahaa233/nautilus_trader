@@ -106,6 +106,8 @@ pub struct LiveTimer {
     sender: Option<Arc<dyn TimeEventSender>>,
 }
 
+pub(crate) type HistoricalScheduleUpdater = Box<dyn Fn(u64, bool) -> anyhow::Result<()>>;
+
 impl LiveTimer {
     /// The actual registered clock supplies this identity synchronously before
     /// start. Async tasks never infer a dispatch owner from ambient context.
@@ -196,9 +198,7 @@ impl LiveTimer {
 
     /// Mutates the same published task schedule only while its actual producer is paused.
     /// It cannot create a callback, change its owner, or move a deadline backwards.
-    pub(crate) fn historical_schedule_updater(
-        &self,
-    ) -> anyhow::Result<Box<dyn Fn(u64, bool) -> anyhow::Result<()>>> {
+    pub(crate) fn historical_schedule_updater(&self) -> anyhow::Result<HistoricalScheduleUpdater> {
         let state = self
             .task_state
             .clone()
@@ -221,7 +221,7 @@ impl LiveTimer {
             anyhow::ensure!(
                 previous == state.next_time_ns.load(atomic::Ordering::SeqCst)
                     && desired >= previous
-                    && (desired - previous) % interval == 0,
+                    && (desired - previous).is_multiple_of(interval),
                 "historical timer schedule moved backwards or changed interval"
             );
             anyhow::ensure!(
@@ -294,7 +294,7 @@ impl LiveTimer {
         };
 
         Self {
-            checkpoint_gate: Default::default(),
+            checkpoint_gate: super::checkpoint::CheckpointGate::default(),
             callback_source: "named_or_explicit_unsupported",
             callback_profile: None,
             owner_clock_id: None,

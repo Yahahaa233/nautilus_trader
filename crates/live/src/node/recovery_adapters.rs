@@ -69,6 +69,9 @@ impl LiveNode {
     /// Installs complete supported native engine state at the source checkpoint
     /// frontier before replaying later inputs. Actual offline elapsed time ages
     /// native recency; it cannot refresh approval/account facts or replay queues.
+    ///
+    /// # Errors
+    /// Returns an error if original native engine state or its paused restoration boundary cannot be verified.
     pub fn restore_registered_engine_checkpoint(
         &mut self,
         manager: &serde_json::Value,
@@ -127,6 +130,9 @@ impl LiveNode {
     /// Installs supported source state into actual registered fresh adapters.
     /// JSON is replay data; the installed private native frontier remains the
     /// authority for restoration. Fresh UID/account/market proofs are separate.
+    ///
+    /// # Errors
+    /// Returns an error if original adapter state or its paused restoration boundary cannot be verified.
     pub fn restore_registered_adapter_checkpoint(
         &mut self,
         adapters: &BTreeMap<String, serde_json::Value>,
@@ -303,15 +309,15 @@ mod tests {
         target
             .exec_manager
             .register_inflight(ClientOrderId::from("TAIL-AFTER-CUT"));
-        assert!(
+        assert_eq!(
             target
                 .exec_manager
                 .checkpoint_inventory(nautilus_common::live::dst::time::Instant::now())
                 .unwrap()["order_inflight_checks"]
                 .as_array()
                 .unwrap()
-                .len()
-                == 1
+                .len(),
+            1
         );
     }
 }

@@ -105,13 +105,13 @@ pub use super::{
 use super::{
     recency::RecencyMap,
     reconciliation::{
-        FillKey, InflightCheck, PositionQuantityComparison, PositionReconciliationState,
-        PositionReportShape, ReconciliationFillQueue, RetainedFillState,
-        create_orphan_fill_order_report, create_position_reconciliation_report,
-        create_reconciliation_canceled, distinct_position_reports, has_active_inferred_fill,
-        is_exact_order_match, position_avg_px, position_qty_aggregates,
-        resolve_inferred_fill_commission, responsible_client_ids, should_project_fill,
-        sort_reconciliation_events, terminal_report_has_missing_fills,
+        FillKey, InflightCheck, PendingCommandCheck, PendingCommandKind,
+        PositionQuantityComparison, PositionReconciliationState, PositionReportShape,
+        ReconciliationFillQueue, RetainedFillState, create_orphan_fill_order_report,
+        create_position_reconciliation_report, create_reconciliation_canceled,
+        distinct_position_reports, has_active_inferred_fill, is_exact_order_match, position_avg_px,
+        position_qty_aggregates, resolve_inferred_fill_commission, responsible_client_ids,
+        should_project_fill, sort_reconciliation_events, terminal_report_has_missing_fills,
     },
     submission::{SubmissionRecoveryExhausted, SubmissionRecoveryPolicy, SubmissionRecoverySource},
 };
@@ -123,8 +123,10 @@ static TAG_VENUE: LazyLock<Ustr> = LazyLock::new(|| Ustr::from("VENUE"));
 static TAG_RECONCILIATION: LazyLock<Ustr> = LazyLock::new(|| Ustr::from(RECONCILIATION_ORDER_TAG));
 
 const LOG_SAMPLES_MAX: usize = 5;
+const MAX_NATIVE_MANAGER_ENTRIES: usize = 1_000_000;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SubmissionRecoveryState {
     trader_id: TraderId,
     client_id: Option<ClientId>,
@@ -244,10 +246,20 @@ impl ExecutionManager {
             .order_inflight_checks
             .iter()
             .map(|(id, state)| {
-                Ok(serde_json::json!({"client_order_id":id,
+                let mut row = serde_json::json!({"client_order_id":id,
                 "submitted_age_ns":age(state.submitted_at)?,
                 "retry_count":state.retry_count,
-                "last_query_age_ns":state.last_query_at.map(age).transpose()?}))
+                "last_query_age_ns":state.last_query_at.map(age).transpose()?});
+                // Keep Trace.v1's existing shape for entries without mutation provenance.
+                anyhow::ensure!(
+                    state.commands.len() <= MAX_NATIVE_MANAGER_ENTRIES,
+                    "oversized native mutation dispatch entries"
+                );
+                if !preserve_pending || !state.commands.is_empty() {
+                    row["commands"] = serde_json::to_value(&state.commands)?;
+                    row["missing_query_exhausted"] = state.missing_query_exhausted.into();
+                }
+                Ok(row)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let positions = self
@@ -261,8 +273,13 @@ impl ExecutionManager {
                 }})
             })
             .collect::<Vec<_>>();
-        Ok(serde_json::json!({
-            "schema": if preserve_pending {"NautilusExecutionManagerTrace.v1"} else {"NautilusExecutionManagerCheckpoint.v2"},
+        anyhow::ensure!(
+            self.submissions.len() <= MAX_NATIVE_MANAGER_ENTRIES
+                && self.submission_exhaustions.len() <= MAX_NATIVE_MANAGER_ENTRIES,
+            "oversized native submission recovery entries"
+        );
+        let mut inventory = serde_json::json!({
+            "schema": if preserve_pending {"NautilusExecutionManagerTrace.v1"} else {"NautilusExecutionManagerCheckpoint.v3"},
             "configuration":self.config,
             "captured_at_ns":self.timestamp_ns().as_u64(),
             "monotonic_offsets":"age_ns_at_common_boundary",
@@ -280,7 +297,18 @@ impl ExecutionManager {
             "position_activity_revisions":self.position_activity_revisions.iter().collect::<Vec<_>>(),
             "position_recon":positions,
             "position_recon_tolerances":self.position_recon_tolerances,
-        }))
+        });
+        // Trace.v1 keeps its original empty shape. Nonempty private recovery facts
+        // are part of the source effect and cannot disappear during checkpoint restore.
+        if !preserve_pending || !self.submissions.is_empty() {
+            inventory["submissions"] =
+                serde_json::to_value(self.submissions.iter().collect::<Vec<_>>())?;
+        }
+        if !preserve_pending || !self.submission_exhaustions.is_empty() {
+            inventory["submission_exhaustions"] =
+                serde_json::to_value(&self.submission_exhaustions)?;
+        }
+        Ok(inventory)
     }
 
     /// Installs actual checkpoint state before recovery-tail event dispatch.
@@ -292,6 +320,28 @@ impl ExecutionManager {
         downtime_ns: u64,
         at: dst::time::Instant,
     ) -> anyhow::Result<()> {
+        fn pairs<K: Eq + std::hash::Hash, V>(
+            source: Vec<(K, V)>,
+        ) -> anyhow::Result<IndexMap<K, V>> {
+            anyhow::ensure!(
+                source.len() <= MAX_NATIVE_MANAGER_ENTRIES,
+                "oversized native manager entries"
+            );
+            let len = source.len();
+            let map = source.into_iter().collect::<IndexMap<_, _>>();
+            anyhow::ensure!(map.len() == len, "duplicate native manager identity");
+            Ok(map)
+        }
+        fn set<K: Eq + std::hash::Hash>(source: Vec<K>) -> anyhow::Result<IndexSet<K>> {
+            anyhow::ensure!(
+                source.len() <= MAX_NATIVE_MANAGER_ENTRIES,
+                "oversized native manager set"
+            );
+            let len = source.len();
+            let set = source.into_iter().collect::<IndexSet<_>>();
+            anyhow::ensure!(set.len() == len, "duplicate native manager identity");
+            Ok(set)
+        }
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Inflight {
@@ -299,6 +349,10 @@ impl ExecutionManager {
             submitted_age_ns: u64,
             retry_count: u32,
             last_query_age_ns: Option<u64>,
+            #[serde(default)]
+            commands: Vec<PendingCommandCheck>,
+            #[serde(default)]
+            missing_query_exhausted: bool,
         }
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -316,6 +370,10 @@ impl ExecutionManager {
             monotonic_offsets: String,
             order_activity: Vec<(ClientOrderId, u64)>,
             order_inflight_checks: Vec<Inflight>,
+            #[serde(default)]
+            submissions: Vec<(ClientOrderId, SubmissionRecoveryState)>,
+            #[serde(default)]
+            submission_exhaustions: Vec<SubmissionRecoveryExhausted>,
             order_query_recency: Vec<(ClientOrderId, u64)>,
             order_query_pending: Vec<ClientOrderId>,
             order_recon_retries: Vec<(ClientOrderId, u32)>,
@@ -329,14 +387,94 @@ impl ExecutionManager {
             position_recon: Vec<PositionState>,
             position_recon_tolerances: IndexMap<AccountId, Decimal>,
         }
+        if source["schema"] == "NautilusExecutionManagerCheckpoint.v2" {
+            anyhow::ensure!(
+                source
+                    .as_object()
+                    .is_some_and(|value| !value.contains_key("submissions")
+                        && !value.contains_key("submission_exhaustions")),
+                "legacy manager profile contains v3 submission recovery fields"
+            );
+            anyhow::ensure!(
+                self.cache
+                    .borrow()
+                    .orders(None, None, None, None, None)
+                    .iter()
+                    .all(|order| order.is_closed()),
+                "legacy manager profile cannot prove active cached submission recovery"
+            );
+            anyhow::ensure!(
+                source["order_inflight_checks"]
+                    .as_array()
+                    .is_some_and(|rows| rows.iter().all(|row| {
+                        row.as_object().is_some_and(|row| {
+                            !row.contains_key("commands")
+                                && !row.contains_key("missing_query_exhausted")
+                        })
+                    })),
+                "legacy manager profile contains v3 mutation provenance fields"
+            );
+        }
+        if source["schema"] == "NautilusExecutionManagerCheckpoint.v3" {
+            anyhow::ensure!(
+                source
+                    .as_object()
+                    .is_some_and(|value| value.contains_key("submissions")
+                        && value.contains_key("submission_exhaustions")),
+                "native manager v3 submission recovery fields missing"
+            );
+            // Serde accepts an absent Option as None. A v3 identity must instead
+            // preserve the explicit original client ownership, including null.
+            anyhow::ensure!(
+                source["submissions"]
+                    .as_array()
+                    .is_some_and(|rows| rows.iter().all(|row| {
+                        row.as_array().is_some_and(|pair| {
+                            pair.len() == 2
+                                && pair[1]
+                                    .as_object()
+                                    .is_some_and(|state| state.contains_key("client_id"))
+                        })
+                    }))
+                    && source["submission_exhaustions"]
+                        .as_array()
+                        .is_some_and(|rows| {
+                            rows.iter().all(|row| {
+                                row.as_object()
+                                    .is_some_and(|diagnostic| diagnostic.contains_key("client_id"))
+                            })
+                        }),
+                "native manager v3 explicit submission client identity missing"
+            );
+            anyhow::ensure!(
+                source["order_inflight_checks"]
+                    .as_array()
+                    .is_some_and(|rows| rows.iter().all(|row| {
+                        row.as_object().is_some_and(|row| {
+                            row.contains_key("commands")
+                                && row.contains_key("missing_query_exhausted")
+                        })
+                    })),
+                "native manager v3 mutation provenance fields missing"
+            );
+        }
         let snapshot: Snapshot = serde_json::from_value(source.clone())?;
+        anyhow::ensure!(
+            snapshot.schema != "NautilusExecutionManagerCheckpoint.v2"
+                || self.config.submission_recovery_policy
+                    != SubmissionRecoveryPolicy::RetainUnresolved
+                || snapshot.order_inflight_checks.is_empty(),
+            "legacy retained inflight state has no reliable mutation provenance"
+        );
         anyhow::ensure!(
             snapshot.captured_at_ns > 0,
             "native manager capture time missing"
         );
         anyhow::ensure!(
-            snapshot.schema == "NautilusExecutionManagerCheckpoint.v2"
-                && snapshot.monotonic_offsets == "age_ns_at_common_boundary"
+            matches!(
+                snapshot.schema.as_str(),
+                "NautilusExecutionManagerCheckpoint.v2" | "NautilusExecutionManagerCheckpoint.v3"
+            ) && snapshot.monotonic_offsets == "age_ns_at_common_boundary"
                 && serde_json::to_value(&snapshot.configuration)?
                     == serde_json::to_value(&self.config)?
                 && snapshot.order_query_pending.is_empty(),
@@ -356,25 +494,6 @@ impl ExecutionManager {
                 "native manager already owns state: {key}"
             );
         }
-        fn pairs<K: Eq + std::hash::Hash, V>(
-            source: Vec<(K, V)>,
-        ) -> anyhow::Result<IndexMap<K, V>> {
-            anyhow::ensure!(
-                source.len() <= 1_000_000,
-                "oversized native manager entries"
-            );
-            let len = source.len();
-            let map = source.into_iter().collect::<IndexMap<_, _>>();
-            anyhow::ensure!(map.len() == len, "duplicate native manager identity");
-            Ok(map)
-        }
-        fn set<K: Eq + std::hash::Hash>(source: Vec<K>) -> anyhow::Result<IndexSet<K>> {
-            anyhow::ensure!(source.len() <= 1_000_000, "oversized native manager set");
-            let len = source.len();
-            let set = source.into_iter().collect::<IndexSet<_>>();
-            anyhow::ensure!(set.len() == len, "duplicate native manager identity");
-            Ok(set)
-        }
         let age = |value: u64| -> anyhow::Result<dst::time::Instant> {
             let value = value
                 .checked_add(downtime_ns)
@@ -384,6 +503,50 @@ impl ExecutionManager {
         };
         let mut inflight = Vec::new();
         for value in snapshot.order_inflight_checks {
+            let order = self.get_order(value.client_order_id);
+            let legacy = snapshot.schema == "NautilusExecutionManagerCheckpoint.v2";
+            anyhow::ensure!(
+                !legacy || (value.commands.is_empty() && !value.missing_query_exhausted),
+                "legacy manager profile cannot claim mutation provenance"
+            );
+            anyhow::ensure!(
+                !order.as_ref().is_some_and(|order| matches!(
+                    order.status(),
+                    OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                )) || !value.commands.is_empty(),
+                "active pending command lacks a native dispatch boundary"
+            );
+            let mut command_ids = IndexSet::new();
+            let mut unknown_commands = 0usize;
+            anyhow::ensure!(
+                value.commands.len() <= MAX_NATIVE_MANAGER_ENTRIES
+                    && (!value.missing_query_exhausted || !value.commands.is_empty()),
+                "invalid bounded native mutation dispatch set"
+            );
+            for command in &value.commands {
+                match (command.kind, command.command_id) {
+                    (PendingCommandKind::Unknown, None) => unknown_commands += 1,
+                    (PendingCommandKind::Modify | PendingCommandKind::Cancel, Some(id)) => {
+                        anyhow::ensure!(
+                            command_ids.insert(id),
+                            "duplicate native mutation command UUID"
+                        );
+                    }
+                    _ => anyhow::bail!("native mutation kind and command UUID differ"),
+                }
+            }
+            anyhow::ensure!(
+                unknown_commands <= 1,
+                "duplicate unknown native mutation provenance"
+            );
+            for command in &value.commands {
+                anyhow::ensure!(
+                    order
+                        .as_ref()
+                        .is_some_and(|order| Self::command_boundary_matches(order, command)),
+                    "native mutation dispatch boundary does not match cached event history"
+                );
+            }
             anyhow::ensure!(
                 value
                     .last_query_age_ns
@@ -396,8 +559,27 @@ impl ExecutionManager {
                     submitted_at: age(value.submitted_age_ns)?,
                     retry_count: value.retry_count,
                     last_query_at: value.last_query_age_ns.map(age).transpose()?,
+                    commands: value.commands,
+                    missing_query_exhausted: value.missing_query_exhausted,
                 },
             ));
+        }
+        if self.config.submission_recovery_policy == SubmissionRecoveryPolicy::RetainUnresolved {
+            let cache = self.cache.borrow();
+            for order in cache.orders(None, None, None, None, None) {
+                if matches!(
+                    order.status(),
+                    OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                ) {
+                    anyhow::ensure!(
+                        inflight
+                            .iter()
+                            .any(|(id, check)| *id == order.client_order_id()
+                                && !check.commands.is_empty()),
+                        "cached pending command has no persisted native dispatch provenance"
+                    );
+                }
+            }
         }
         let mut positions = Vec::new();
         for value in snapshot.position_recon {
@@ -436,8 +618,80 @@ impl ExecutionManager {
             RecencyMap::from_checkpoint(snapshot.position_activity, at, downtime_ns)?;
         let position_activity_revisions = pairs(snapshot.position_activity_revisions)?;
         let position_recon = pairs(positions)?;
+        let submissions = pairs(snapshot.submissions)?;
+        for (id, state) in &submissions {
+            self.validate_submission_identity(
+                *id,
+                state.trader_id,
+                state.strategy_id,
+                state.instrument_id,
+                state.client_id,
+            )?;
+            anyhow::ensure!(
+                state.exhausted
+                    || state.venue_confirmed
+                    || self.submission_is_acknowledged(*id)
+                    || order_inflight_checks.contains_key(id),
+                "active native submission lost its original recovery budget"
+            );
+        }
+        anyhow::ensure!(
+            snapshot.submission_exhaustions.len() <= MAX_NATIVE_MANAGER_ENTRIES,
+            "oversized native submission diagnostics"
+        );
+        let mut diagnostic_ids = IndexSet::new();
+        for diagnostic in &snapshot.submission_exhaustions {
+            anyhow::ensure!(
+                diagnostic_ids.insert(diagnostic.client_order_id),
+                "duplicate native submission exhaustion diagnostic"
+            );
+            self.validate_submission_identity(
+                diagnostic.client_order_id,
+                diagnostic.trader_id,
+                diagnostic.strategy_id,
+                diagnostic.instrument_id,
+                diagnostic.client_id,
+            )?;
+            let budget = match diagnostic.source {
+                SubmissionRecoverySource::Inflight => self.config.inflight_max_retries,
+                SubmissionRecoverySource::MissingOrder => self.config.open_check_missing_retries,
+            };
+            anyhow::ensure!(
+                diagnostic.retry_count >= budget,
+                "native submission diagnostic precedes original budget exhaustion"
+            );
+            if let Some(state) = submissions.get(&diagnostic.client_order_id) {
+                anyhow::ensure!(
+                    state.exhausted,
+                    "native submission diagnostic lacks exhausted state"
+                );
+            } else {
+                anyhow::ensure!(
+                    self.submission_is_acknowledged(diagnostic.client_order_id),
+                    "native unacknowledged exhaustion lost its submission identity"
+                );
+            }
+        }
+        {
+            let cache = self.cache.borrow();
+            for order in cache.orders(None, None, None, None, None) {
+                let id = order.client_order_id();
+                if self.submission_retention_enabled(id, None)
+                    && !self.config.filtered_client_order_ids.contains(&id)
+                    && order.status() == OrderStatus::Submitted
+                    && Self::submission_is_unacknowledged(&order)
+                {
+                    anyhow::ensure!(
+                        submissions.contains_key(&id),
+                        "native unacknowledged submission identity missing"
+                    );
+                }
+            }
+        }
         self.order_activity = order_activity;
         self.order_inflight_checks = order_inflight_checks;
+        self.submissions = submissions;
+        self.submission_exhaustions = snapshot.submission_exhaustions;
         self.order_query_recency = order_query_recency;
         self.order_recon_retries = order_recon_retries;
         self.order_coverage_unresolved = order_coverage_unresolved;
@@ -449,6 +703,33 @@ impl ExecutionManager {
         self.position_activity_revisions = position_activity_revisions;
         self.position_recon = position_recon;
         self.position_recon_tolerances = snapshot.position_recon_tolerances;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "node", feature = "dispatch-observer"))]
+    fn validate_submission_identity(
+        &self,
+        id: ClientOrderId,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_id: Option<ClientId>,
+    ) -> anyhow::Result<()> {
+        let order = self.get_order(id).ok_or_else(|| {
+            anyhow::anyhow!("native submission recovery has no cached order: {id}")
+        })?;
+        anyhow::ensure!(
+            order.trader_id() == trader_id
+                && order.strategy_id() == strategy_id
+                && order.instrument_id() == instrument_id,
+            "native submission recovery identity differs from cached order"
+        );
+        if let Some(client_id) = client_id {
+            anyhow::ensure!(
+                self.cache.borrow().client_id(&id).copied() == Some(client_id),
+                "native submission recovery client ownership differs"
+            );
+        }
         Ok(())
     }
 
@@ -507,30 +788,259 @@ impl ExecutionManager {
     /// Registers an inflight command at dispatch, starting its recovery budget.
     ///
     /// Skips filtered orders and preserves an active submission's remaining budget.
-    /// Submission identity and duplicate suppression require [`Self::register_submission`].
+    /// Compatibility callers do not identify a mutation kind, so retention requires a
+    /// subsequent applied terminal result. Node dispatch uses the typed methods below.
     pub fn register_inflight(&mut self, client_order_id: ClientOrderId) {
-        self.confirm_submission_outcome(&client_order_id);
+        self.register_inflight_without_provenance(client_order_id);
+        if self.config.submission_recovery_policy == SubmissionRecoveryPolicy::RetainUnresolved {
+            let Some(order) = self.get_order(client_order_id) else {
+                return;
+            };
+            if let Some(check) = self.order_inflight_checks.get_mut(&client_order_id)
+                && !check
+                    .commands
+                    .iter()
+                    .any(|command| command.kind == PendingCommandKind::Unknown)
+            {
+                let mut boundary =
+                    Self::command_boundary(&order, PendingCommandKind::Unknown, None);
+                if check.commands.len() == MAX_NATIVE_MANAGER_ENTRIES {
+                    // The compatibility API cannot return an admission error. Preserve a
+                    // conservative aggregate rather than certifying an unrecorded intent away.
+                    boundary.applied_event_count = check.commands[0].applied_event_count;
+                    boundary.applied_event_id = check.commands[0].applied_event_id;
+                    check.commands[0] = boundary;
+                } else {
+                    check.commands.push(boundary);
+                }
+            }
+        }
+    }
 
+    fn register_inflight_without_provenance(&mut self, client_order_id: ClientOrderId) {
+        self.confirm_submission_outcome(&client_order_id);
         if self.config.submission_recovery_policy == SubmissionRecoveryPolicy::RetainUnresolved
-            && self.order_inflight_checks.contains_key(&client_order_id)
-            && self.get_order(client_order_id).is_some_and(|order| {
-                matches!(
-                    order.status(),
-                    OrderStatus::PendingUpdate | OrderStatus::PendingCancel
-                )
-            })
+            && self
+                .order_inflight_checks
+                .get(&client_order_id)
+                .is_some_and(|check| {
+                    !check.commands.is_empty()
+                        || self.get_order(client_order_id).is_some_and(|order| {
+                            matches!(
+                                order.status(),
+                                OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                            )
+                        })
+                })
         {
             return;
         }
-
         if self.submission_recovery_pending(client_order_id)
             && (self.order_inflight_checks.contains_key(&client_order_id)
                 || self.submission_is_retained(client_order_id))
         {
             return;
         }
-
         self.start_inflight_check(client_order_id);
+    }
+
+    /// Admits an actual modify dispatch, returning false for an already registered UUID.
+    ///
+    /// # Errors
+    /// Returns an error for conflicting UUID ownership, missing native history, or full inventory.
+    pub(crate) fn register_modify_inflight(
+        &mut self,
+        client_order_id: ClientOrderId,
+        command_id: UUID4,
+    ) -> anyhow::Result<bool> {
+        self.register_command_inflight(client_order_id, command_id, PendingCommandKind::Modify)
+    }
+
+    /// Admits an actual cancel dispatch, returning false for an already registered UUID.
+    ///
+    /// # Errors
+    /// Returns an error for conflicting UUID ownership, missing native history, or full inventory.
+    pub(crate) fn register_cancel_inflight(
+        &mut self,
+        client_order_id: ClientOrderId,
+        command_id: UUID4,
+    ) -> anyhow::Result<bool> {
+        self.register_command_inflight(client_order_id, command_id, PendingCommandKind::Cancel)
+    }
+
+    fn register_command_inflight(
+        &mut self,
+        client_order_id: ClientOrderId,
+        command_id: UUID4,
+        kind: PendingCommandKind,
+    ) -> anyhow::Result<bool> {
+        self.confirm_submission_outcome(&client_order_id);
+        if let Some(command) = self
+            .order_inflight_checks
+            .get(&client_order_id)
+            .and_then(|check| {
+                check
+                    .commands
+                    .iter()
+                    .find(|command| command.command_id == Some(command_id))
+            })
+        {
+            anyhow::ensure!(
+                command.kind == kind,
+                "same mutation UUID reused for a different command kind"
+            );
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            self.order_inflight_checks
+                .get(&client_order_id)
+                .is_none_or(|check| check.commands.len() < MAX_NATIVE_MANAGER_ENTRIES),
+            "native mutation dispatch capacity exceeded"
+        );
+        let order = self
+            .get_order(client_order_id)
+            .ok_or_else(|| anyhow::anyhow!("mutation dispatch has no cached native order"))?;
+        let command = Self::command_boundary(&order, kind, Some(command_id));
+        let retained = self.submission_is_retained(client_order_id);
+        let has_commands = self.has_pending_commands(client_order_id);
+        if !has_commands {
+            self.register_inflight_without_provenance(client_order_id);
+        }
+        if !self.order_inflight_checks.contains_key(&client_order_id) {
+            self.start_inflight_check(client_order_id);
+            if retained && let Some(check) = self.order_inflight_checks.get_mut(&client_order_id) {
+                check.retry_count = self.config.inflight_max_retries;
+            }
+        }
+        let check = self
+            .order_inflight_checks
+            .get_mut(&client_order_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("mutation dispatch cannot install native inflight provenance")
+            })?;
+        check.commands.push(command);
+        Ok(true)
+    }
+
+    fn command_boundary(
+        order: &OrderAny,
+        kind: PendingCommandKind,
+        command_id: Option<UUID4>,
+    ) -> PendingCommandCheck {
+        PendingCommandCheck {
+            kind,
+            command_id,
+            applied_event_count: order.events().len(),
+            applied_event_id: Some(Self::order_event_id(order.last_event())),
+        }
+    }
+
+    fn order_event_id(event: &OrderEventAny) -> UUID4 {
+        match event {
+            OrderEventAny::Initialized(event) => event.event_id,
+            OrderEventAny::Denied(event) => event.event_id,
+            OrderEventAny::Emulated(event) => event.event_id,
+            OrderEventAny::Released(event) => event.event_id,
+            OrderEventAny::Submitted(event) => event.event_id,
+            OrderEventAny::Accepted(event) => event.event_id,
+            OrderEventAny::Rejected(event) => event.event_id,
+            OrderEventAny::Canceled(event) => event.event_id,
+            OrderEventAny::Expired(event) => event.event_id,
+            OrderEventAny::Triggered(event) => event.event_id,
+            OrderEventAny::PendingUpdate(event) => event.event_id,
+            OrderEventAny::PendingCancel(event) => event.event_id,
+            OrderEventAny::ModifyRejected(event) => event.event_id,
+            OrderEventAny::CancelRejected(event) => event.event_id,
+            OrderEventAny::Updated(event) => event.event_id,
+            OrderEventAny::Filled(event) => event.event_id,
+            OrderEventAny::FillVoided(event) => event.event_id,
+        }
+    }
+
+    fn command_boundary_matches(order: &OrderAny, command: &PendingCommandCheck) -> bool {
+        let events = order.events();
+        command.applied_event_count > 0
+            && events
+                .get(command.applied_event_count - 1)
+                .is_some_and(|event| Some(Self::order_event_id(event)) == command.applied_event_id)
+    }
+
+    fn has_pending_commands(&self, client_order_id: ClientOrderId) -> bool {
+        self.order_inflight_checks
+            .get(&client_order_id)
+            .is_some_and(|check| !check.commands.is_empty())
+    }
+
+    fn retains_pending_command(&self, client_order_id: ClientOrderId) -> bool {
+        self.config.submission_recovery_policy == SubmissionRecoveryPolicy::RetainUnresolved
+            && (self.has_pending_commands(client_order_id)
+                || self.get_order(client_order_id).is_some_and(|order| {
+                    matches!(
+                        order.status(),
+                        OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                    )
+                }))
+    }
+
+    fn confirm_pending_command_outcome(&mut self, client_order_id: ClientOrderId) {
+        let Some(check) = self.order_inflight_checks.get(&client_order_id) else {
+            return;
+        };
+        if check.commands.is_empty() {
+            return;
+        }
+        let Some(order) = self.get_order(client_order_id) else {
+            return;
+        };
+        let events = order.events();
+        let unresolved: Vec<_> = check
+            .commands
+            .iter()
+            .filter(|command| {
+                if !Self::command_boundary_matches(&order, command) {
+                    return true;
+                }
+                let before = &events[..command.applied_event_count];
+                !events[command.applied_event_count..].iter().any(|event| {
+                    if before.iter().any(|previous| {
+                        Self::order_event_id(previous) == Self::order_event_id(event)
+                    }) {
+                        return false;
+                    }
+                    match event {
+                        OrderEventAny::Updated(event) => {
+                            command.kind == PendingCommandKind::Modify
+                                && command.command_id.is_some()
+                                && event.causation_id == command.command_id
+                        }
+                        OrderEventAny::ModifyRejected(event) => {
+                            command.kind == PendingCommandKind::Modify
+                                && command.command_id.is_some()
+                                && event.causation_id == command.command_id
+                        }
+                        OrderEventAny::CancelRejected(event) => {
+                            command.kind == PendingCommandKind::Cancel
+                                && command.command_id.is_some()
+                                && event.causation_id == command.command_id
+                        }
+                        OrderEventAny::Canceled(_)
+                        | OrderEventAny::Rejected(_)
+                        | OrderEventAny::Denied(_)
+                        | OrderEventAny::Expired(_)
+                        | OrderEventAny::Filled(_) => order.is_closed(),
+                        _ => false,
+                    }
+                })
+            })
+            .cloned()
+            .collect();
+        if let Some(check) = self.order_inflight_checks.get_mut(&client_order_id) {
+            check.commands = unresolved;
+            if check.commands.is_empty() {
+                check.missing_query_exhausted = false;
+                self.clear_recon_tracking(&client_order_id, true);
+            }
+        }
     }
 
     /// Registers a submission's identity before execution dispatch or cache insertion.
@@ -577,6 +1087,8 @@ impl ExecutionManager {
                 submitted_at: nautilus_common::recovery_trace::scope::effective_activity_instant(),
                 retry_count: 0,
                 last_query_at: None,
+                commands: Vec::new(),
+                missing_query_exhausted: false,
             },
         );
 
@@ -651,23 +1163,23 @@ impl ExecutionManager {
             .filter(|client_order_id| self.submission_recovery_pending(*client_order_id))
             .collect();
         if self.config.submission_recovery_policy == SubmissionRecoveryPolicy::RetainUnresolved {
-            unresolved.extend(self.order_inflight_checks.keys().copied().filter(|id| {
-                self.get_order(*id).is_some_and(|order| {
-                    matches!(
-                        order.status(),
-                        OrderStatus::PendingUpdate | OrderStatus::PendingCancel
-                    )
-                })
-            }));
+            unresolved.extend(
+                self.order_inflight_checks
+                    .keys()
+                    .copied()
+                    .filter(|id| self.retains_pending_command(*id)),
+            );
         }
         unresolved.into_iter().collect()
     }
 
     /// Retires submission recovery after a native outcome has been applied.
     ///
-    /// An acknowledgement ends the submission budget, including recovery for commands
-    /// dispatched before acknowledgement. A later command starts its own inflight check.
+    /// An acknowledgement retires the original submission identity. An actual mutation
+    /// dispatched before that acknowledgement keeps the existing shared budget and its
+    /// own applied-event boundary until its native outcome is observed.
     pub fn confirm_submission_outcome(&mut self, client_order_id: &ClientOrderId) {
+        self.confirm_pending_command_outcome(*client_order_id);
         let Some(submission) = self.submissions.get(client_order_id) else {
             return;
         };
@@ -675,6 +1187,14 @@ impl ExecutionManager {
         let venue_confirmed = submission.venue_confirmed;
 
         if !self.submission_is_acknowledged(*client_order_id) {
+            return;
+        }
+
+        if self.config.submission_recovery_policy == SubmissionRecoveryPolicy::RetainUnresolved
+            && self.has_pending_commands(*client_order_id)
+        {
+            self.submissions.shift_remove(client_order_id);
+            self.record_local_activity(*client_order_id);
             return;
         }
 
@@ -795,6 +1315,11 @@ impl ExecutionManager {
     /// native state or a matching venue report acknowledges it. Exhaustion removes timers
     /// and query bookkeeping but preserves the unresolved submission identity.
     pub fn clear_recon_tracking(&mut self, client_order_id: &ClientOrderId, drop_last_query: bool) {
+        if self.config.submission_recovery_policy == SubmissionRecoveryPolicy::RetainUnresolved
+            && self.has_pending_commands(*client_order_id)
+        {
+            return;
+        }
         let pending = self.submission_recovery_pending(*client_order_id);
         if pending && !self.submission_is_retained(*client_order_id) {
             return;
@@ -2132,19 +2657,15 @@ impl ExecutionManager {
                 continue;
             }
 
-            let retain_pending_command = self.config.submission_recovery_policy
-                == SubmissionRecoveryPolicy::RetainUnresolved
-                && self.get_order(client_order_id).is_some_and(|order| {
-                    matches!(
-                        order.status(),
-                        OrderStatus::PendingUpdate | OrderStatus::PendingCancel
-                    )
-                });
+            let retain_pending_command = self.retains_pending_command(client_order_id);
             if retain_pending_command
                 && self
                     .order_inflight_checks
                     .get(&client_order_id)
-                    .is_some_and(|check| check.retry_count >= self.config.inflight_max_retries)
+                    .is_some_and(|check| {
+                        check.retry_count >= self.config.inflight_max_retries
+                            || check.missing_query_exhausted
+                    })
             {
                 continue;
             }
@@ -2178,6 +2699,9 @@ impl ExecutionManager {
                     continue;
                 }
 
+                if retain_pending_command {
+                    continue;
+                }
                 let ts_now = self.clock.borrow().timestamp_ns();
 
                 if let Some(order) = self.get_order(client_order_id) {
@@ -2193,12 +2717,6 @@ impl ExecutionManager {
                             }
                         }
                         OrderStatus::PendingUpdate | OrderStatus::PendingCancel => {
-                            if retain_pending_command {
-                                log::warn!(
-                                    "Command recovery exhausted for {client_order_id}, retaining pending command until venue evidence"
-                                );
-                                continue;
-                            }
                             // Generate cancellation for orders stuck in pending modify/cancel
                             result
                                 .events
@@ -2582,14 +3100,7 @@ impl ExecutionManager {
             // still knows the order: reset the missing-order ladder so only consecutive misses
             // accumulate. A still-pending retained command needs its own definitive outcome;
             // merely seeing the original open order must not restart that command's budget.
-            let pending_command = self.config.submission_recovery_policy
-                == SubmissionRecoveryPolicy::RetainUnresolved
-                && self.get_order(client_order_id).is_some_and(|order| {
-                    matches!(
-                        order.status(),
-                        OrderStatus::PendingUpdate | OrderStatus::PendingCancel
-                    )
-                });
+            let pending_command = self.retains_pending_command(client_order_id);
             if !pending_command {
                 self.order_recon_retries.shift_remove(&client_order_id);
             }
@@ -2847,7 +3358,9 @@ impl ExecutionManager {
             self.remove_targeted_order_queries(&[client_order_id]);
 
             if let Some(report) = result.report {
-                self.order_recon_retries.shift_remove(&client_order_id);
+                if !self.retains_pending_command(client_order_id) {
+                    self.order_recon_retries.shift_remove(&client_order_id);
+                }
                 self.order_coverage_warnings.shift_remove(&client_order_id);
 
                 let Some(order) = self.get_order(client_order_id) else {
@@ -3645,7 +4158,11 @@ impl ExecutionManager {
                 submission.venue_confirmed = true;
             }
 
-            self.clear_recon_tracking(&client_order_id, false);
+            if self.config.submission_recovery_policy != SubmissionRecoveryPolicy::RetainUnresolved
+                || !self.has_pending_commands(client_order_id)
+            {
+                self.clear_recon_tracking(&client_order_id, false);
+            }
             self.record_local_activity(client_order_id);
             return true;
         }
@@ -3787,13 +4304,14 @@ impl ExecutionManager {
         if self.submission_is_retained(client_order_id) {
             return None;
         }
-        if self.config.submission_recovery_policy == SubmissionRecoveryPolicy::RetainUnresolved
-            && matches!(
-                order.status(),
-                OrderStatus::PendingUpdate | OrderStatus::PendingCancel
-            )
-            && self.recon_check_retry_count(&client_order_id)
-                >= self.config.open_check_missing_retries
+        if self.retains_pending_command(client_order_id)
+            && self
+                .order_inflight_checks
+                .get(&client_order_id)
+                .is_some_and(|check| {
+                    check.retry_count >= self.config.inflight_max_retries
+                        || check.missing_query_exhausted
+                })
         {
             return None;
         }
@@ -3867,6 +4385,12 @@ impl ExecutionManager {
             return events;
         }
 
+        if self.has_pending_commands(client_order_id) {
+            if let Some(check) = self.order_inflight_checks.get_mut(&client_order_id) {
+                check.missing_query_exhausted = true;
+            }
+            return events;
+        }
         let retries = self.recon_check_retry_count(&client_order_id);
         let ts_now = self.clock.borrow().timestamp_ns();
 
@@ -6985,6 +7509,7 @@ mod tests {
         #[values(false, true)] retain: bool,
     ) {
         let id = ClientOrderId::from("O-UNKNOWN-COMMAND");
+        let command_id = UUID4::new();
         let venue_id = VenueOrderId::from("V-UNKNOWN-COMMAND");
         let account = AccountId::from("TEST-001");
         let instrument = crypto_perpetual_ethusdt().id();
@@ -7031,7 +7556,11 @@ mod tests {
         };
         let mut manager =
             ExecutionManager::new(clock.clone(), cache.clone(), config.clone()).unwrap();
-        manager.register_inflight(id);
+        if pending_status == OrderStatus::PendingCancel {
+            assert!(manager.register_cancel_inflight(id, command_id).unwrap());
+        } else {
+            assert!(manager.register_modify_inflight(id, command_id).unwrap());
+        }
         manager
             .order_inflight_checks
             .get_mut(&id)
@@ -7050,7 +7579,11 @@ mod tests {
         assert!(result.events.is_empty());
         assert_eq!(cache.borrow().order(&id).unwrap().status(), pending_status);
         assert_eq!(manager.order_inflight_checks[&id].retry_count, 1);
-        manager.register_inflight(id);
+        if pending_status == OrderStatus::PendingCancel {
+            assert!(!manager.register_cancel_inflight(id, command_id).unwrap());
+        } else {
+            assert!(!manager.register_modify_inflight(id, command_id).unwrap());
+        }
         assert_eq!(manager.order_inflight_checks[&id].retry_count, 1);
         #[cfg(feature = "node")]
         assert_eq!(manager.unresolved_submission_ids(), vec![id]);
@@ -7109,7 +7642,7 @@ mod tests {
             manager = restored;
         }
         let current = cache.borrow().order_owned(&id).unwrap();
-        let outcome = if pending_status == OrderStatus::PendingCancel {
+        let mut outcome = if pending_status == OrderStatus::PendingCancel {
             TestOrderEventStubs::canceled(&current, account, Some(venue_id))
         } else {
             OrderEventAny::Updated(
@@ -7125,6 +7658,9 @@ mod tests {
                     .build(),
             )
         };
+        if let OrderEventAny::Updated(update) = &mut outcome {
+            update.causation_id = Some(command_id);
+        }
         cache.borrow_mut().update_order(&outcome).unwrap();
         manager
             .order_inflight_checks
@@ -7143,6 +7679,921 @@ mod tests {
                 OrderStatus::Accepted
             }
         );
+    }
+
+    fn pending_command_fixture(
+        native_ack: bool,
+    ) -> (
+        ExecutionManager,
+        Rc<RefCell<Cache>>,
+        OrderAny,
+        InstrumentAny,
+    ) {
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        clock.borrow().set_time(UnixNanos::from(1_000u64));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(ClientOrderId::from("O-COMMAND-BOUNDARY"))
+            .instrument_id(instrument.id())
+            .quantity(Quantity::from("10.0"))
+            .price(Price::from("100.0"))
+            .build();
+        let account = AccountId::from("TEST-001");
+        let submitted = TestOrderEventStubs::submitted(&order, account);
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(ClientId::from("TEST")), false)
+            .unwrap();
+        cache.borrow_mut().update_order(&submitted).unwrap();
+        if native_ack {
+            let current = cache
+                .borrow()
+                .order_owned(&order.client_order_id())
+                .unwrap();
+            let accepted = TestOrderEventStubs::accepted(
+                &current,
+                account,
+                VenueOrderId::from("V-COMMAND-BOUNDARY"),
+            );
+            cache.borrow_mut().update_order(&accepted).unwrap();
+        }
+        let mut manager = ExecutionManager::new(
+            clock,
+            cache.clone(),
+            ExecutionManagerConfig {
+                inflight_threshold_ms: 100,
+                inflight_max_retries: 2,
+                open_check_threshold_ns: DurationNanos::ZERO,
+                open_check_missing_retries: 1,
+                submission_recovery_policy: SubmissionRecoveryPolicy::RetainUnresolved,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        if !native_ack {
+            manager.register_submission(order.init_event(), Some(ClientId::from("TEST")));
+        }
+        (manager, cache, order, instrument)
+    }
+
+    fn apply_pending_command(cache: &Rc<RefCell<Cache>>, order: &OrderAny, cancel: bool) {
+        let event = if cancel {
+            OrderEventAny::PendingCancel(
+                OrderPendingCancelSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .account_id(AccountId::from("TEST-001"))
+                    .build(),
+            )
+        } else {
+            OrderEventAny::PendingUpdate(
+                OrderPendingUpdateSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .account_id(AccountId::from("TEST-001"))
+                    .build(),
+            )
+        };
+        cache.borrow_mut().update_order(&event).unwrap();
+    }
+
+    #[rstest]
+    fn test_submitted_reports_preserve_actual_mutation_and_late_applied_outcome(
+        #[values(false, true)] cancel: bool,
+        #[values(false, true)] native_ack: bool,
+    ) {
+        let (mut manager, cache, order, instrument) = pending_command_fixture(native_ack);
+        let id = order.client_order_id();
+        let command_id = UUID4::new();
+        if cancel {
+            assert!(manager.register_cancel_inflight(id, command_id).unwrap());
+        } else {
+            assert!(manager.register_modify_inflight(id, command_id).unwrap());
+        }
+        let original_start = manager.order_inflight_checks[&id].submitted_at;
+        manager
+            .order_inflight_checks
+            .get_mut(&id)
+            .unwrap()
+            .retry_count = 1;
+        apply_pending_command(&cache, &order, cancel);
+        let report = OrderStatusReport::new(
+            AccountId::from("TEST-001"),
+            instrument.id(),
+            Some(id),
+            VenueOrderId::from("V-COMMAND-BOUNDARY"),
+            OrderSide::Buy.into(),
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            OrderStatus::Submitted,
+            order.quantity(),
+            Quantity::from("0.0"),
+            UnixNanos::from(1_000),
+            UnixNanos::from(1_000),
+            UnixNanos::from(1_000),
+            None,
+        )
+        .with_price(Price::from("100.0"));
+        for _ in 0..2 {
+            manager.observe_execution_report(&ExecutionReport::Order(Box::new(report.clone())));
+            manager.confirm_submission_outcome(&id);
+            assert_eq!(
+                manager.order_inflight_checks[&id].submitted_at,
+                original_start
+            );
+            assert_eq!(manager.order_inflight_checks[&id].retry_count, 1);
+            assert_eq!(manager.order_inflight_checks[&id].commands.len(), 1);
+        }
+        let current = cache.borrow().order_owned(&id).unwrap();
+        let fill = TestOrderEventStubs::filled(
+            &current,
+            &instrument,
+            Some(TradeId::from("T-PARTIAL-COMMAND")),
+            None,
+            Some(Price::from("100.0")),
+            Some(Quantity::from("1.0")),
+            Some(LiquiditySide::Taker),
+            Some(Money::from("0 USDT")),
+            None,
+            Some(AccountId::from("TEST-001")),
+        );
+        cache.borrow_mut().update_order(&fill).unwrap();
+        manager.confirm_submission_outcome(&id);
+        assert_eq!(
+            cache.borrow().order(&id).unwrap().filled_qty(),
+            Quantity::from("1.0")
+        );
+        assert_eq!(manager.order_inflight_checks[&id].commands.len(), 1);
+        #[cfg(feature = "node")]
+        assert_eq!(manager.unresolved_submission_ids(), vec![id]);
+        manager
+            .order_inflight_checks
+            .get_mut(&id)
+            .unwrap()
+            .retry_count = 2;
+        #[cfg(all(feature = "node", feature = "dispatch-observer"))]
+        {
+            let at = dst::time::Instant::now();
+            let snapshot = manager.checkpoint_inventory(at).unwrap();
+            assert_eq!(snapshot["schema"], "NautilusExecutionManagerCheckpoint.v3");
+            let mut restored =
+                ExecutionManager::new(manager.clock.clone(), cache.clone(), manager.config.clone())
+                    .unwrap();
+            restored
+                .restore_checkpoint_inventory_at(&snapshot, 0, at)
+                .unwrap();
+            assert_eq!(
+                restored.trace_effects_inventory(at).unwrap(),
+                manager.trace_effects_inventory(at).unwrap()
+            );
+            manager = restored;
+        }
+        if cancel {
+            assert!(!manager.register_cancel_inflight(id, command_id).unwrap());
+        } else {
+            assert!(!manager.register_modify_inflight(id, command_id).unwrap());
+        }
+        assert_eq!(
+            manager.order_inflight_checks[&id].submitted_at,
+            original_start
+        );
+        assert_eq!(manager.order_inflight_checks[&id].retry_count, 2);
+        let exhausted = manager.check_inflight_orders();
+        assert!(exhausted.events.is_empty() && exhausted.queries.is_empty());
+        let current = cache.borrow().order_owned(&id).unwrap();
+        let mut outcome = if cancel {
+            TestOrderEventStubs::canceled(
+                &current,
+                AccountId::from("TEST-001"),
+                Some(VenueOrderId::from("V-COMMAND-BOUNDARY")),
+            )
+        } else {
+            OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .trader_id(current.trader_id())
+                    .strategy_id(current.strategy_id())
+                    .instrument_id(current.instrument_id())
+                    .client_order_id(id)
+                    .account_id(AccountId::from("TEST-001"))
+                    .venue_order_id(VenueOrderId::from("V-COMMAND-BOUNDARY"))
+                    .quantity(current.quantity())
+                    .price(Price::from("101.0"))
+                    .build(),
+            )
+        };
+        if let OrderEventAny::Updated(update) = &mut outcome {
+            update.causation_id = Some(command_id);
+        }
+        // Observing an event before the engine applies it cannot certify its outcome.
+        manager.observe_order_event(&outcome);
+        manager.confirm_submission_outcome(&id);
+        assert!(manager.has_pending_commands(id));
+        cache.borrow_mut().update_order(&outcome).unwrap();
+        manager.confirm_submission_outcome(&id);
+        assert!(!manager.order_inflight_checks.contains_key(&id));
+        #[cfg(feature = "node")]
+        assert!(manager.unresolved_submission_ids().is_empty());
+    }
+
+    #[rstest]
+    fn test_overlapping_mutations_keep_other_kind_until_its_own_applied_result(
+        #[values(false, true)] cancel_reject_first: bool,
+    ) {
+        use nautilus_model::events::order::spec::{
+            OrderCancelRejectedSpec, OrderModifyRejectedSpec,
+        };
+        let (mut manager, cache, order, _) = pending_command_fixture(true);
+        let id = order.client_order_id();
+        let modify_id = UUID4::new();
+        let cancel_id = UUID4::new();
+        assert!(manager.register_modify_inflight(id, modify_id).unwrap());
+        apply_pending_command(&cache, &order, false);
+        let original_start = manager.order_inflight_checks[&id].submitted_at;
+        assert!(manager.register_cancel_inflight(id, cancel_id).unwrap());
+        apply_pending_command(&cache, &order, true);
+        assert_eq!(manager.order_inflight_checks[&id].commands.len(), 2);
+        assert_eq!(
+            manager.order_inflight_checks[&id].submitted_at,
+            original_start
+        );
+        let mut modify_reject = OrderEventAny::ModifyRejected(
+            OrderModifyRejectedSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(id)
+                .account_id(AccountId::from("TEST-001"))
+                .build(),
+        );
+        let mut cancel_reject = OrderEventAny::CancelRejected(
+            OrderCancelRejectedSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(id)
+                .account_id(AccountId::from("TEST-001"))
+                .build(),
+        );
+        if let OrderEventAny::ModifyRejected(event) = &mut modify_reject {
+            event.causation_id = Some(modify_id);
+        }
+        if let OrderEventAny::CancelRejected(event) = &mut cancel_reject {
+            event.causation_id = Some(cancel_id);
+        }
+        let outcomes = if cancel_reject_first {
+            [cancel_reject, modify_reject]
+        } else {
+            [modify_reject, cancel_reject]
+        };
+        cache.borrow_mut().update_order(&outcomes[0]).unwrap();
+        manager.confirm_submission_outcome(&id);
+        assert_eq!(manager.order_inflight_checks[&id].commands.len(), 1);
+        assert_eq!(
+            manager.order_inflight_checks[&id].commands[0].kind,
+            if cancel_reject_first {
+                PendingCommandKind::Modify
+            } else {
+                PendingCommandKind::Cancel
+            }
+        );
+        #[cfg(feature = "node")]
+        assert_eq!(manager.unresolved_submission_ids(), vec![id]);
+        cache.borrow_mut().update_order(&outcomes[1]).unwrap();
+        manager.confirm_submission_outcome(&id);
+        assert!(!manager.has_pending_commands(id));
+        assert!(!manager.order_inflight_checks.contains_key(&id));
+    }
+
+    #[cfg(all(feature = "node", feature = "dispatch-observer"))]
+    fn exhaust_original_submission(manager: &mut ExecutionManager, id: ClientOrderId) {
+        let check = manager.order_inflight_checks.get_mut(&id).unwrap();
+        check.submitted_at = dst::time::Instant::now() - Duration::from_secs(1);
+        check.retry_count = manager.config.inflight_max_retries - 1;
+        let result = manager.check_inflight_orders();
+        assert!(result.events.is_empty() && result.queries.is_empty());
+        assert!(manager.submissions[&id].exhausted);
+        assert!(!manager.order_inflight_checks.contains_key(&id));
+        assert_eq!(manager.submission_exhaustions.len(), 1);
+    }
+
+    #[cfg(all(feature = "node", feature = "dispatch-observer"))]
+    #[rstest]
+    fn test_exhausted_submission_restore_keeps_unknown_budget_and_diagnostic_once(
+        #[values(false, true)] diagnostic_already_taken: bool,
+        #[values(false, true)] late_fill: bool,
+    ) {
+        let (mut source, cache, order, instrument) = pending_command_fixture(false);
+        let id = order.client_order_id();
+        exhaust_original_submission(&mut source, id);
+        let original_diagnostic = source.submission_exhaustions[0].clone();
+        if diagnostic_already_taken {
+            assert_eq!(
+                source.take_submission_recovery_exhaustions(),
+                vec![original_diagnostic.clone()]
+            );
+        }
+        let at = dst::time::Instant::now();
+        let snapshot = source.checkpoint_inventory(at).unwrap();
+        let mut restored =
+            ExecutionManager::new(source.clock.clone(), cache.clone(), source.config.clone())
+                .unwrap();
+        restored
+            .restore_checkpoint_inventory_at(&snapshot, 1_000_000_000, dst::time::Instant::now())
+            .unwrap();
+        assert_eq!(restored.submissions[&id], source.submissions[&id]);
+        assert_eq!(restored.unresolved_submission_ids(), vec![id]);
+        assert!(restored.order_inflight_checks.is_empty());
+        restored.register_submission(order.init_event(), Some(ClientId::from("TEST")));
+        assert!(
+            restored.order_inflight_checks.is_empty(),
+            "duplicate registration must not restart an exhausted budget"
+        );
+        let result = restored.check_inflight_orders();
+        assert!(result.events.is_empty() && result.queries.is_empty());
+        assert_eq!(
+            restored.take_submission_recovery_exhaustions(),
+            if diagnostic_already_taken {
+                Vec::new()
+            } else {
+                vec![original_diagnostic]
+            }
+        );
+        assert!(restored.take_submission_recovery_exhaustions().is_empty());
+        let drained = restored
+            .checkpoint_inventory(dst::time::Instant::now())
+            .unwrap();
+        let mut twice =
+            ExecutionManager::new(source.clock.clone(), cache.clone(), source.config.clone())
+                .unwrap();
+        twice
+            .restore_checkpoint_inventory_at(&drained, 0, dst::time::Instant::now())
+            .unwrap();
+        assert!(twice.take_submission_recovery_exhaustions().is_empty());
+        assert_eq!(twice.unresolved_submission_ids(), vec![id]);
+        let outcome = if late_fill {
+            TestOrderEventStubs::filled(
+                &order,
+                &instrument,
+                Some(TradeId::from("T-LATE-RESTORED-SUBMIT")),
+                None,
+                Some(Price::from("100.0")),
+                Some(Quantity::from("1.0")),
+                Some(LiquiditySide::Taker),
+                Some(Money::from("0 USDT")),
+                None,
+                Some(AccountId::from("TEST-001")),
+            )
+        } else {
+            TestOrderEventStubs::accepted(
+                &order,
+                AccountId::from("TEST-001"),
+                VenueOrderId::from("V-COMMAND-BOUNDARY"),
+            )
+        };
+        twice.observe_order_event(&outcome);
+        cache.borrow_mut().update_order(&outcome).unwrap();
+        twice.confirm_submission_outcome(&id);
+        assert!(!twice.submissions.contains_key(&id));
+        assert!(twice.unresolved_submission_ids().is_empty());
+        let result = twice.check_inflight_orders();
+        assert!(result.events.is_empty() && result.queries.is_empty());
+        assert!(twice.take_submission_recovery_exhaustions().is_empty());
+    }
+
+    #[cfg(all(feature = "node", feature = "dispatch-observer"))]
+    #[rstest]
+    fn test_report_only_submission_confirmation_survives_restore_without_becoming_unknown(
+        #[values(false, true)] exhausted_before_report: bool,
+    ) {
+        let (mut source, cache, order, instrument) = pending_command_fixture(false);
+        let id = order.client_order_id();
+        if exhausted_before_report {
+            exhaust_original_submission(&mut source, id);
+        }
+        let report = ExecutionReport::Order(Box::new(
+            OrderStatusReport::new(
+                AccountId::from("TEST-001"),
+                instrument.id(),
+                Some(id),
+                VenueOrderId::from("V-COMMAND-BOUNDARY"),
+                OrderSide::Buy.into(),
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                OrderStatus::Submitted,
+                order.quantity(),
+                Quantity::from("0.0"),
+                UnixNanos::from(1_000),
+                UnixNanos::from(1_000),
+                UnixNanos::from(1_000),
+                None,
+            )
+            .with_price(Price::from("100.0")),
+        ));
+        source.observe_execution_report(&report);
+        assert_eq!(
+            cache.borrow().order(&id).unwrap().status(),
+            OrderStatus::Submitted
+        );
+        assert!(source.submissions[&id].venue_confirmed);
+        assert_eq!(source.submissions[&id].exhausted, exhausted_before_report);
+        let pending_diagnostics = source.submission_exhaustions.clone();
+        assert!(source.unresolved_submission_ids().is_empty());
+        let at = dst::time::Instant::now();
+        let snapshot = source.checkpoint_inventory(at).unwrap();
+        let mut restored =
+            ExecutionManager::new(source.clock.clone(), cache.clone(), source.config.clone())
+                .unwrap();
+        restored
+            .restore_checkpoint_inventory_at(&snapshot, 0, at)
+            .unwrap();
+        assert!(restored.submissions[&id].venue_confirmed);
+        restored.register_submission(order.init_event(), Some(ClientId::from("TEST")));
+        assert!(restored.unresolved_submission_ids().is_empty());
+        assert!(restored.order_inflight_checks.is_empty());
+        assert_eq!(
+            restored.take_submission_recovery_exhaustions(),
+            pending_diagnostics
+        );
+        assert!(restored.take_submission_recovery_exhaustions().is_empty());
+        let command_id = UUID4::new();
+        assert!(restored.register_modify_inflight(id, command_id).unwrap());
+        let dispatch_start = restored.order_inflight_checks[&id].submitted_at;
+        apply_pending_command(&cache, &order, false);
+        restored.observe_execution_report(&report);
+        assert_eq!(
+            restored.order_inflight_checks[&id].submitted_at,
+            dispatch_start
+        );
+        assert_eq!(
+            restored.order_inflight_checks[&id].commands[0].command_id,
+            Some(command_id)
+        );
+        assert_eq!(restored.unresolved_submission_ids(), vec![id]);
+        assert_eq!(restored.order_inflight_checks[&id].retry_count, 0);
+        assert_eq!(restored.submissions[&id].exhausted, exhausted_before_report);
+        assert!(restored.submissions[&id].venue_confirmed);
+        let after_command = restored
+            .checkpoint_inventory(dst::time::Instant::now())
+            .unwrap();
+        let mut twice =
+            ExecutionManager::new(source.clock.clone(), cache, source.config.clone()).unwrap();
+        twice
+            .restore_checkpoint_inventory_at(&after_command, 0, dst::time::Instant::now())
+            .unwrap();
+        assert_eq!(twice.order_inflight_checks[&id].retry_count, 0);
+        assert_eq!(twice.submissions[&id].exhausted, exhausted_before_report);
+        assert!(twice.submissions[&id].venue_confirmed);
+        assert_eq!(twice.unresolved_submission_ids(), vec![id]);
+    }
+
+    #[cfg(all(feature = "node", feature = "dispatch-observer"))]
+    #[test]
+    fn test_client_retention_restore_requires_original_submission_identity() {
+        let (original, cache, order, _) = pending_command_fixture(false);
+        let id = order.client_order_id();
+        let client_id = ClientId::from("TEST");
+        let account_id = AccountId::from("TEST-001");
+        let mut config = original.config.clone();
+        config.submission_recovery_policy = SubmissionRecoveryPolicy::ResolveLocally;
+        let mut source =
+            ExecutionManager::new(original.clock.clone(), cache.clone(), config.clone()).unwrap();
+        // This is the exact client/account registration installed by retaining
+        // ExecutionClients; it overrides the global local-resolution policy.
+        source.submission_retention.insert(client_id, account_id);
+        source.register_submission(order.init_event(), Some(client_id));
+        assert!(source.submissions.contains_key(&id));
+        let at = dst::time::Instant::now();
+        let snapshot = source.checkpoint_inventory(at).unwrap();
+        let mut restored =
+            ExecutionManager::new(original.clock.clone(), cache.clone(), config.clone()).unwrap();
+        restored.submission_retention.insert(client_id, account_id);
+        restored
+            .restore_checkpoint_inventory_at(&snapshot, 0, at)
+            .unwrap();
+        assert_eq!(restored.submissions[&id], source.submissions[&id]);
+        assert_eq!(restored.unresolved_submission_ids(), vec![id]);
+        assert_eq!(
+            restored.order_inflight_checks[&id].submitted_at,
+            source.order_inflight_checks[&id].submitted_at
+        );
+
+        let mut omitted = snapshot;
+        omitted["submissions"] = serde_json::json!([]);
+        let mut rejected = ExecutionManager::new(original.clock, cache, config).unwrap();
+        rejected.submission_retention.insert(client_id, account_id);
+        assert!(
+            rejected
+                .restore_checkpoint_inventory_at(&omitted, 0, at)
+                .is_err()
+        );
+        assert!(rejected.submissions.is_empty());
+        assert!(rejected.order_inflight_checks.is_empty());
+    }
+
+    #[cfg(all(feature = "node", feature = "dispatch-observer"))]
+    #[rstest]
+    #[case("missing_states")]
+    #[case("missing_diagnostics")]
+    #[case("identity")]
+    #[case("client")]
+    #[case("duplicate_state")]
+    #[case("missing_cache")]
+    #[case("diagnostic_identity")]
+    #[case("diagnostic_budget")]
+    #[case("duplicate_diagnostic")]
+    #[case("missing_identity")]
+    #[case("missing_client_field")]
+    #[case("missing_diagnostic_client_field")]
+    fn test_submission_restore_rejects_unproven_state_without_partial_install(
+        #[case] corruption: &str,
+    ) {
+        let (mut source, cache, order, _) = pending_command_fixture(false);
+        let id = order.client_order_id();
+        exhaust_original_submission(&mut source, id);
+        let at = dst::time::Instant::now();
+        let mut snapshot = source.checkpoint_inventory(at).unwrap();
+        let mut restore_cache = cache;
+        match corruption {
+            "missing_states" => {
+                snapshot.as_object_mut().unwrap().remove("submissions");
+            }
+            "missing_diagnostics" => {
+                snapshot
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("submission_exhaustions");
+            }
+            "identity" => {
+                snapshot["submissions"][0][1]["trader_id"] =
+                    serde_json::to_value(TraderId::from("OTHER-001")).unwrap();
+            }
+            "client" => {
+                snapshot["submissions"][0][1]["client_id"] =
+                    serde_json::to_value(ClientId::from("FOREIGN")).unwrap();
+            }
+            "duplicate_state" => {
+                let duplicate = snapshot["submissions"][0].clone();
+                snapshot["submissions"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(duplicate);
+            }
+            "missing_cache" => {
+                restore_cache = Rc::new(RefCell::new(Cache::default()));
+            }
+            "diagnostic_identity" => {
+                snapshot["submission_exhaustions"][0]["client_order_id"] =
+                    serde_json::to_value(ClientOrderId::from("FOREIGN")).unwrap();
+            }
+            "diagnostic_budget" => {
+                snapshot["submission_exhaustions"][0]["retry_count"] = 0.into();
+            }
+            "duplicate_diagnostic" => {
+                let duplicate = snapshot["submission_exhaustions"][0].clone();
+                snapshot["submission_exhaustions"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(duplicate);
+            }
+            "missing_identity" => {
+                snapshot["submissions"] = serde_json::json!([]);
+            }
+            "missing_client_field" => {
+                snapshot["submissions"][0][1]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("client_id");
+            }
+            "missing_diagnostic_client_field" => {
+                snapshot["submission_exhaustions"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("client_id");
+            }
+            _ => unreachable!(),
+        }
+        let mut restored =
+            ExecutionManager::new(source.clock.clone(), restore_cache, source.config.clone())
+                .unwrap();
+        assert!(
+            restored
+                .restore_checkpoint_inventory_at(&snapshot, 0, at)
+                .is_err()
+        );
+        assert!(restored.submissions.is_empty());
+        assert!(restored.submission_exhaustions.is_empty());
+        assert!(restored.order_inflight_checks.is_empty());
+        assert!(restored.order_recon_retries.is_empty());
+    }
+
+    #[cfg(all(feature = "node", feature = "dispatch-observer"))]
+    #[rstest]
+    fn test_legacy_profile_cannot_claim_empty_submit_recovery_from_active_cache(
+        #[values(false, true)] partial: bool,
+    ) {
+        let (mut source, cache, order, instrument) = pending_command_fixture(false);
+        exhaust_original_submission(&mut source, order.client_order_id());
+        if partial {
+            let fill = TestOrderEventStubs::filled(
+                &order,
+                &instrument,
+                Some(TradeId::from("T-LEGACY-PARTIAL")),
+                None,
+                Some(Price::from("100.0")),
+                Some(Quantity::from("1.0")),
+                Some(LiquiditySide::Taker),
+                Some(Money::from("0 USDT")),
+                None,
+                Some(AccountId::from("TEST-001")),
+            );
+            cache.borrow_mut().update_order(&fill).unwrap();
+        }
+        let at = dst::time::Instant::now();
+        let mut legacy = source.checkpoint_inventory(at).unwrap();
+        legacy["schema"] = "NautilusExecutionManagerCheckpoint.v2".into();
+        legacy.as_object_mut().unwrap().remove("submissions");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("submission_exhaustions");
+        assert!(
+            legacy["order_inflight_checks"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let mut restored =
+            ExecutionManager::new(source.clock.clone(), cache, source.config.clone()).unwrap();
+        assert!(
+            restored
+                .restore_checkpoint_inventory_at(&legacy, 0, at)
+                .is_err()
+        );
+        assert!(restored.submissions.is_empty());
+    }
+
+    fn command_update(order: &OrderAny, causation_id: Option<UUID4>, price: &str) -> OrderEventAny {
+        let mut event = OrderUpdatedSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(order.client_order_id())
+            .account_id(AccountId::from("TEST-001"))
+            .venue_order_id(VenueOrderId::from("V-COMMAND-BOUNDARY"))
+            .quantity(order.quantity())
+            .price(Price::from(price))
+            .build();
+        event.causation_id = causation_id;
+        OrderEventAny::Updated(event)
+    }
+
+    #[rstest]
+    fn test_distinct_modify_uuids_require_own_causation_without_restarting_budget(
+        #[values(false, true)] reject_second_first: bool,
+    ) {
+        use nautilus_model::events::order::spec::OrderModifyRejectedSpec;
+        let (mut manager, cache, order, _) = pending_command_fixture(true);
+        let id = order.client_order_id();
+        let first = UUID4::new();
+        let second = UUID4::new();
+        assert!(manager.register_modify_inflight(id, first).unwrap());
+        apply_pending_command(&cache, &order, false);
+        let original_start = manager.order_inflight_checks[&id].submitted_at;
+        manager
+            .order_inflight_checks
+            .get_mut(&id)
+            .unwrap()
+            .retry_count = 1;
+        assert!(manager.register_modify_inflight(id, second).unwrap());
+        assert!(!manager.register_modify_inflight(id, first).unwrap());
+        assert!(!manager.register_modify_inflight(id, second).unwrap());
+        assert!(manager.register_cancel_inflight(id, first).is_err());
+        assert_eq!(manager.order_inflight_checks[&id].commands.len(), 2);
+        assert_eq!(
+            manager.order_inflight_checks[&id].submitted_at,
+            original_start
+        );
+        assert_eq!(manager.order_inflight_checks[&id].retry_count, 1);
+        for cause in [None, Some(UUID4::new())] {
+            let update = command_update(&order, cause, "100.5");
+            cache.borrow_mut().update_order(&update).unwrap();
+            manager.confirm_submission_outcome(&id);
+            assert_eq!(manager.order_inflight_checks[&id].commands.len(), 2);
+        }
+        #[cfg(all(feature = "node", feature = "dispatch-observer"))]
+        {
+            let at = dst::time::Instant::now();
+            let checkpoint = manager.checkpoint_inventory(at).unwrap();
+            let mut restored =
+                ExecutionManager::new(manager.clock.clone(), cache.clone(), manager.config.clone())
+                    .unwrap();
+            restored
+                .restore_checkpoint_inventory_at(&checkpoint, 0, at)
+                .unwrap();
+            assert_eq!(
+                restored.trace_effects_inventory(at).unwrap(),
+                manager.trace_effects_inventory(at).unwrap()
+            );
+            assert!(!restored.register_modify_inflight(id, first).unwrap());
+            assert!(!restored.register_modify_inflight(id, second).unwrap());
+            manager = restored;
+        }
+        let first_update = command_update(&order, Some(first), "101.0");
+        let mut second_reject = OrderModifyRejectedSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(id)
+            .account_id(AccountId::from("TEST-001"))
+            .build();
+        second_reject.causation_id = Some(second);
+        let second_reject = OrderEventAny::ModifyRejected(second_reject);
+        let outcomes = if reject_second_first {
+            [second_reject, first_update]
+        } else {
+            [first_update, second_reject]
+        };
+        cache.borrow_mut().update_order(&outcomes[0]).unwrap();
+        manager.confirm_submission_outcome(&id);
+        assert_eq!(manager.order_inflight_checks[&id].commands.len(), 1);
+        assert_eq!(
+            manager.order_inflight_checks[&id].commands[0].command_id,
+            Some(if reject_second_first { first } else { second })
+        );
+        assert_eq!(
+            manager.order_inflight_checks[&id].submitted_at,
+            original_start
+        );
+        assert_eq!(manager.order_inflight_checks[&id].retry_count, 1);
+        #[cfg(feature = "node")]
+        assert_eq!(manager.unresolved_submission_ids(), vec![id]);
+        cache.borrow_mut().update_order(&outcomes[1]).unwrap();
+        manager.confirm_submission_outcome(&id);
+        assert!(!manager.order_inflight_checks.contains_key(&id));
+    }
+
+    #[test]
+    fn test_terminal_close_resolves_all_actual_mutation_uuids() {
+        let (mut manager, cache, order, _) = pending_command_fixture(true);
+        let id = order.client_order_id();
+        assert!(manager.register_modify_inflight(id, UUID4::new()).unwrap());
+        apply_pending_command(&cache, &order, false);
+        assert!(manager.register_modify_inflight(id, UUID4::new()).unwrap());
+        assert!(manager.register_cancel_inflight(id, UUID4::new()).unwrap());
+        apply_pending_command(&cache, &order, true);
+        assert_eq!(manager.order_inflight_checks[&id].commands.len(), 3);
+        let canceled = TestOrderEventStubs::canceled(
+            &order,
+            AccountId::from("TEST-001"),
+            Some(VenueOrderId::from("V-COMMAND-BOUNDARY")),
+        );
+        cache.borrow_mut().update_order(&canceled).unwrap();
+        manager.confirm_submission_outcome(&id);
+        assert!(!manager.order_inflight_checks.contains_key(&id));
+        #[cfg(feature = "node")]
+        assert!(manager.unresolved_submission_ids().is_empty());
+    }
+
+    #[test]
+    fn test_mutation_uuid_admission_is_scoped_to_original_order() {
+        let (mut manager, cache, order, instrument) = pending_command_fixture(true);
+        let first = order.client_order_id();
+        let second = ClientOrderId::from("O-COMMAND-BOUNDARY-SECOND");
+        insert_accepted_limit_order(
+            &cache,
+            second,
+            VenueOrderId::from("V-SECOND"),
+            instrument.id(),
+            ClientId::from("TEST"),
+        );
+        let command = UUID4::new();
+        assert!(manager.register_modify_inflight(first, command).unwrap());
+        assert!(manager.register_modify_inflight(second, command).unwrap());
+        assert_eq!(
+            manager.order_inflight_checks[&first].commands[0].command_id,
+            Some(command)
+        );
+        assert_eq!(
+            manager.order_inflight_checks[&second].commands[0].command_id,
+            Some(command)
+        );
+        assert!(
+            manager
+                .register_cancel_inflight(ClientOrderId::from("ABSENT"), UUID4::new())
+                .is_err()
+        );
+        assert!(
+            !manager
+                .order_inflight_checks
+                .contains_key(&ClientOrderId::from("ABSENT"))
+        );
+    }
+
+    #[cfg(all(feature = "node", feature = "dispatch-observer"))]
+    #[rstest]
+    #[case("legacy")]
+    #[case("missing_row")]
+    #[case("wrong_event")]
+    #[case("duplicate_uuid")]
+    #[case("missing_uuid")]
+    fn test_pending_checkpoint_rejects_missing_or_forged_dispatch_provenance(
+        #[case] corruption: &str,
+    ) {
+        let (mut source, cache, order, _) = pending_command_fixture(true);
+        let id = order.client_order_id();
+        assert!(source.register_modify_inflight(id, UUID4::new()).unwrap());
+        apply_pending_command(&cache, &order, false);
+        let at = dst::time::Instant::now();
+        let mut snapshot = source.checkpoint_inventory(at).unwrap();
+        match corruption {
+            "legacy" => {
+                snapshot["schema"] = "NautilusExecutionManagerCheckpoint.v2".into();
+                snapshot.as_object_mut().unwrap().remove("submissions");
+                snapshot
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("submission_exhaustions");
+                snapshot["order_inflight_checks"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("commands");
+                snapshot["order_inflight_checks"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("missing_query_exhausted");
+            }
+            "missing_row" => {
+                snapshot["order_inflight_checks"] = serde_json::json!([]);
+            }
+            "wrong_event" => {
+                snapshot["order_inflight_checks"][0]["commands"][0]["applied_event_id"] =
+                    serde_json::to_value(UUID4::new()).unwrap();
+            }
+            "missing_uuid" => {
+                snapshot["order_inflight_checks"][0]["commands"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("command_id");
+            }
+            "duplicate_uuid" => {
+                let duplicate = snapshot["order_inflight_checks"][0]["commands"][0].clone();
+                snapshot["order_inflight_checks"][0]["commands"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(duplicate);
+            }
+            _ => unreachable!(),
+        }
+        let mut restored =
+            ExecutionManager::new(source.clock.clone(), cache, source.config.clone()).unwrap();
+        assert!(
+            restored
+                .restore_checkpoint_inventory_at(&snapshot, 0, at)
+                .is_err()
+        );
+        assert!(restored.order_inflight_checks.is_empty());
+        assert!(restored.order_recon_retries.is_empty());
+    }
+
+    #[test]
+    fn test_first_missing_query_is_not_inferred_from_shared_inflight_retry_counter() {
+        let (mut manager, cache, order, _) = pending_command_fixture(true);
+        let id = order.client_order_id();
+        assert!(manager.register_modify_inflight(id, UUID4::new()).unwrap());
+        apply_pending_command(&cache, &order, false);
+        manager
+            .order_inflight_checks
+            .get_mut(&id)
+            .unwrap()
+            .retry_count = 1;
+        manager.order_recon_retries.insert(id, 1);
+        assert!(manager.prepare_missing_order_query(id).is_some());
+        manager.order_query_pending.insert(id);
+        let events = manager.reconcile_targeted_order_reports(
+            vec![TargetedOrderReportResult {
+                client_order_id: id,
+                client_id: None,
+                report: None,
+                fills: Vec::new(),
+                coverage_complete: true,
+            }],
+            &[],
+        );
+        assert!(events.is_empty());
+        assert!(manager.order_query_pending.is_empty());
+        assert!(manager.order_inflight_checks[&id].missing_query_exhausted);
+        for _ in 0..3 {
+            assert!(manager.prepare_missing_order_query(id).is_none());
+            let result = manager.check_inflight_orders();
+            assert!(result.events.is_empty() && result.queries.is_empty());
+        }
+        assert_eq!(manager.order_inflight_checks[&id].retry_count, 1);
+        assert!(manager.has_pending_commands(id));
     }
 
     #[rstest]

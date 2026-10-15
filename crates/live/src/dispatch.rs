@@ -29,6 +29,9 @@ pub(crate) async fn drain_callbacks() -> Result<bool, CallbackDispatchError> {
     Ok(pending)
 }
 
+#[cfg(feature = "dispatch-observer")]
+pub use crate::dispatch_observer::*;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -54,6 +57,3 @@ pub(crate) mod tests {
         );
     }
 }
-
-#[cfg(feature = "dispatch-observer")]
-pub use crate::dispatch_observer::*;

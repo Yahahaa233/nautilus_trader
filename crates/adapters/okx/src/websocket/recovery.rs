@@ -15,7 +15,12 @@
 
 //! Restores actual socket replay state without reusing historical session ACKs.
 
-use super::*;
+use super::{
+    AHashMap, AHashSet, Arc, Debug, Duration, InstrumentAny, InstrumentId, OKX_WS_TOPIC_DELIMITER,
+    OKXGreeksType, OKXInstrumentType, OKXSubscriptionArg, OKXWebSocketClient, OKXWsChannel,
+    Ordering, SubscriptionState, Ustr, Value, subscription_arg_batches, subscription_args,
+    topic_from_subscription_arg,
+};
 use anyhow::{Context as _, Result, ensure};
 use std::collections::BTreeMap;
 
@@ -269,7 +274,7 @@ impl OKXWebSocketClient {
             loop {
                 ensure!(
                     self.is_active()
-                        && (!self.credential.is_some() || self.auth_tracker.is_authenticated()),
+                        && (self.credential.is_none() || self.auth_tracker.is_authenticated()),
                     "fresh socket authentication or active connection changed"
                 );
                 if canonical_confirmed(&self.subscriptions_state) == recovery.confirmed

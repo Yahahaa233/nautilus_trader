@@ -1,5 +1,11 @@
 //! Child Journal audit of verified historical replay; never a second economic input.
-use super::*;
+use super::{
+    BTreeMap, Bytes, Context, Deserialize, DurableEntryAcknowledgment, DurableJournalPrefix,
+    EntryDraft, EventStoreEntry, HaltReason, Headers, NativeHistoricalRootReceipt,
+    NativeIngressReceipt, NativeTraceRecord, NativeTraceRecorder, NativeTraceSource, Rc, Result,
+    Serialize, UnixNanos, Ustr, Value, VerifiedNativeRoot, VerifiedNativeTrace, ensure,
+    nanos_since_unix_epoch,
+};
 use nautilus_common::recovery_trace::NativePendingInput;
 
 pub const NATIVE_REPLAY_CONTINUATION_PAYLOAD_TYPE: &str = "NativeRecoveryReplayContinuation.v1";
@@ -408,7 +414,7 @@ impl PrefixContinuations {
         entry: &EventStoreEntry,
         expected: &NativeTraceSource,
         parent_run: Option<&str>,
-        actual_prefix: DurableJournalPrefix,
+        actual_prefix: &DurableJournalPrefix,
     ) -> Result<()> {
         ensure!(
             !self.continued && self.stack.is_empty() && entry.headers.native_origin.is_none(),
@@ -428,7 +434,7 @@ impl PrefixContinuations {
                 && record.child.codec_profile == record.original.codec_profile
                 && record.child.registered_profile_digest
                     == record.original.registered_profile_digest
-                && record.child_prefix == actual_prefix
+                && record.child_prefix == *actual_prefix
                 && record.child_prefix.sequence.checked_add(1) == Some(entry.seq)
                 && record.original_cut_prefix.run_id == record.original.journal_run
                 && record.original_end_prefix.run_id == record.original.journal_run

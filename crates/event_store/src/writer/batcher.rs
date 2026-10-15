@@ -134,26 +134,15 @@ pub(super) fn run(
     // Recover the next seq from the backend so a writer attached to an existing run
     // continues from the durable high-watermark rather than colliding with already-
     // committed entries.
-    let mut next_seq = match backend.high_watermark() {
-        Ok(hwm) => hwm + 1,
-        Err(e) => {
-            halt.fire(HaltReason::from_backend_error(&e));
-            return;
-        }
+    let Some(mut next_seq) = initial_next_sequence(backend.as_ref(), &halt) else {
+        return;
     };
 
     let mut batch: Vec<AppendEntry> = Vec::with_capacity(config.max_batch_entries);
     let mut batch_deadline: Option<Instant> = None;
 
     loop {
-        let recv_result = match batch_deadline {
-            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            Some(deadline) => {
-                let now = Instant::now();
-                let remaining = deadline.saturating_duration_since(now);
-                rx.recv_timeout(remaining)
-            }
-        };
+        let recv_result = receive_before_deadline(&rx, batch_deadline);
 
         match recv_result {
             Ok(WriterMessage::Entry { draft, ts_publish }) => {
@@ -182,23 +171,13 @@ pub(super) fn run(
                 let run_ended_append = build_append_entry(run_ended, now, next_seq);
                 batch.push(run_ended_append);
 
-                let flush_ok = flush(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref());
-                if !flush_ok {
-                    let _ = ack.send(Err(EventStoreError::Backend(
-                        "writer fail-stopped before seal".to_string(),
-                    )));
-                    return;
-                }
-
-                let seal_result = backend.seal(crate::manifest::RunStatus::Ended);
-                let final_result = match seal_result {
-                    Ok(()) => Ok(high_watermark.load(Ordering::Acquire)),
-                    Err(e) => {
-                        halt.fire(HaltReason::from_backend_error(&e));
-                        Err(e)
-                    }
-                };
-                let _ = ack.send(final_result);
+                seal_run(
+                    backend.as_mut(),
+                    &mut batch,
+                    &halt,
+                    high_watermark.as_ref(),
+                    &ack,
+                );
                 return;
             }
             Ok(WriterMessage::Flush { ack }) => {
@@ -209,19 +188,13 @@ pub(super) fn run(
                 let _ = ack.send(Ok(high_watermark.load(Ordering::Acquire)));
                 batch_deadline = None;
             }
-            Ok(WriterMessage::RecordSnapshotAnchor {
-                blob_ref,
-                content_hash,
-                ack,
-            }) => {
-                if !record_snapshot_anchor(
+            Ok(message @ WriterMessage::RecordSnapshotAnchor { .. }) => {
+                if !record_snapshot_message(
                     backend.as_mut(),
                     &mut batch,
                     &halt,
                     high_watermark.as_ref(),
-                    blob_ref,
-                    content_hash,
-                    &ack,
+                    message,
                 ) {
                     return;
                 }
@@ -233,44 +206,22 @@ pub(super) fn run(
                     let _ = ack.send(Err(EventStoreError::Closed));
                     return;
                 }
-                let result = super::read_durable_prefix(backend.as_ref());
-                let failed = result.is_err();
-                if let Err(e) = &result {
-                    halt.fire(HaltReason::from_backend_error(e));
-                }
-                let _ = ack.send(result);
-                if failed {
+                if !acknowledge_durable_prefix(backend.as_ref(), &halt, &ack) {
                     return;
                 }
                 batch_deadline = None;
             }
-            Ok(WriterMessage::AppendDurable {
-                draft,
-                ts_publish,
-                ack,
-                timing,
-            }) => {
-                timing.mark(1);
-                let append = build_append_entry(draft, ts_publish, next_seq);
-                let acknowledgment = super::DurableEntryAcknowledgment {
-                    sequence: append.entry.seq,
-                    entry_hash: append.entry.entry_hash,
-                };
-                // The pending prefix and this entry retain their original order and
-                // share one Immediate transaction. ACK still follows the backend's
-                // durable commit and committed-suffix verification. A separate prefix
-                // flush only adds a second sync to the same acknowledgment budget.
-                batch.push(append);
-                next_seq += 1;
-                let _probe = super::AppendProbeGuard::enter(Arc::clone(&timing));
-                if let Err(error) =
-                    commit_batch(backend.as_mut(), &mut batch, &halt, high_watermark.as_ref())
-                {
-                    let _ = ack.send(Err(error));
+            Ok(message @ WriterMessage::AppendDurable { .. }) => {
+                if !commit_durable_message(
+                    backend.as_mut(),
+                    &mut batch,
+                    &halt,
+                    high_watermark.as_ref(),
+                    &mut next_seq,
+                    message,
+                ) {
                     return;
                 }
-                timing.mark(6);
-                let _ = ack.send(Ok(acknowledgment));
                 batch_deadline = None;
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -289,6 +240,104 @@ pub(super) fn run(
             }
         }
     }
+}
+
+#[cfg(not(madsim))]
+fn initial_next_sequence(backend: &dyn EventStore, halt: &HaltSink) -> Option<u64> {
+    match backend.high_watermark() {
+        Ok(hwm) => Some(hwm + 1),
+        Err(e) => {
+            halt.fire(HaltReason::from_backend_error(&e));
+            None
+        }
+    }
+}
+
+#[cfg(not(madsim))]
+fn record_snapshot_message(
+    backend: &mut dyn EventStore,
+    batch: &mut Vec<AppendEntry>,
+    halt: &HaltSink,
+    high_watermark: &AtomicU64,
+    message: WriterMessage,
+) -> bool {
+    let WriterMessage::RecordSnapshotAnchor {
+        blob_ref,
+        content_hash,
+        ack,
+    } = message
+    else {
+        unreachable!("snapshot message dispatcher")
+    };
+    record_snapshot_anchor(
+        backend,
+        batch,
+        halt,
+        high_watermark,
+        blob_ref,
+        content_hash,
+        &ack,
+    )
+}
+
+#[cfg(not(madsim))]
+fn receive_before_deadline(
+    rx: &Receiver<WriterMessage>,
+    batch_deadline: Option<Instant>,
+) -> Result<WriterMessage, RecvTimeoutError> {
+    match batch_deadline {
+        None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        Some(deadline) => {
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            rx.recv_timeout(remaining)
+        }
+    }
+}
+
+#[cfg(not(madsim))]
+fn acknowledge_durable_prefix(
+    backend: &dyn EventStore,
+    halt: &HaltSink,
+    ack: &SyncSender<Result<super::DurableJournalPrefix, EventStoreError>>,
+) -> bool {
+    let result = super::read_durable_prefix(backend);
+    let failed = result.is_err();
+    if let Err(e) = &result {
+        halt.fire(HaltReason::from_backend_error(e));
+    }
+    let _ = ack.send(result);
+    if failed {
+        return false;
+    }
+    true
+}
+
+#[cfg(not(madsim))]
+fn seal_run(
+    backend: &mut dyn EventStore,
+    batch: &mut Vec<AppendEntry>,
+    halt: &HaltSink,
+    high_watermark: &AtomicU64,
+    ack: &SyncSender<Result<u64, EventStoreError>>,
+) {
+    let flush_ok = flush(backend, batch, halt, high_watermark);
+    if !flush_ok {
+        let _ = ack.send(Err(EventStoreError::Backend(
+            "writer fail-stopped before seal".to_string(),
+        )));
+        return;
+    }
+
+    let seal_result = backend.seal(crate::manifest::RunStatus::Ended);
+    let final_result = match seal_result {
+        Ok(()) => Ok(high_watermark.load(Ordering::Acquire)),
+        Err(e) => {
+            halt.fire(HaltReason::from_backend_error(&e));
+            Err(e)
+        }
+    };
+    let _ = ack.send(final_result);
 }
 
 #[cfg(not(madsim))]
@@ -362,6 +411,47 @@ fn drain_pending(rx: &Receiver<WriterMessage>, batch: &mut Vec<AppendEntry>, nex
 
 /// Commits the current batch, advances the high-watermark mirror on success, or fires the
 /// halt callback on backend failure. Returns `true` if the writer loop should continue.
+#[cfg(not(madsim))]
+fn commit_durable_message(
+    backend: &mut dyn EventStore,
+    batch: &mut Vec<AppendEntry>,
+    halt: &HaltSink,
+    high_watermark: &AtomicU64,
+    next_seq: &mut u64,
+    message: WriterMessage,
+) -> bool {
+    let WriterMessage::AppendDurable {
+        draft,
+        ts_publish,
+        ack,
+        timing,
+    } = message
+    else {
+        unreachable!("durable message dispatcher")
+    };
+    timing.mark(1);
+    let append = build_append_entry(draft, ts_publish, *next_seq);
+    let acknowledgment = super::DurableEntryAcknowledgment {
+        sequence: append.entry.seq,
+        entry_hash: append.entry.entry_hash,
+    };
+    // The pending prefix and this entry retain their original order and
+    // share one Immediate transaction. ACK still follows the backend's
+    // durable commit and committed-suffix verification. A separate prefix
+    // flush only adds a second sync to the same acknowledgment budget.
+    batch.push(append);
+    *next_seq += 1;
+    let _probe = super::AppendProbeGuard::enter(Arc::clone(&timing));
+    if let Err(error) = commit_batch(backend, batch, halt, high_watermark) {
+        let _ = ack.send(Err(error));
+        return false;
+    }
+    timing.mark(6);
+    let _ = ack.send(Ok(acknowledgment));
+
+    true
+}
+
 #[cfg(not(madsim))]
 fn flush(
     backend: &mut dyn EventStore,
