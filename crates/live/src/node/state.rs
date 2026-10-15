@@ -14,11 +14,12 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::sync::{
-    Arc, RwLock,
+    Arc, OnceLock, RwLock,
     atomic::{AtomicU8, AtomicU64, Ordering},
 };
 
 use nautilus_common::live::ingress::IngressGate;
+use nautilus_core::transmission::TransmissionGate;
 
 use super::metrics::{RunnerMetrics, RunnerMetricsSnapshot};
 
@@ -140,6 +141,7 @@ pub(super) enum RunningTransition {
 pub struct LiveNodeHandle {
     ingress: IngressGate,
     control: Arc<AtomicU8>,
+    transmission: Arc<OnceLock<TransmissionGate>>,
     checkpoint_requested: Arc<AtomicU64>,
     startup_reconciliation: Arc<RwLock<Option<StartupReconciliationObservation>>>,
     pub(crate) metrics: Arc<RunnerMetrics>,
@@ -168,6 +170,7 @@ impl LiveNodeHandle {
         Self {
             ingress,
             control: Arc::new(AtomicU8::new(NodeState::Idle.as_u8())),
+            transmission: Arc::new(OnceLock::new()),
             checkpoint_requested: Arc::new(AtomicU64::new(0)),
             startup_reconciliation: Arc::new(RwLock::new(None)),
             metrics: Arc::new(RunnerMetrics::default()),
@@ -273,6 +276,9 @@ impl LiveNodeHandle {
     }
 
     fn set_state(&self, state: NodeState) {
+        if matches!(state, NodeState::ShuttingDown | NodeState::Stopped) {
+            self.fence_transmissions();
+        }
         self.ingress.with_lifecycle_transition(|| {
             let _ = self
                 .control
@@ -308,9 +314,42 @@ impl LiveNodeHandle {
 
     /// Signals the node to stop.
     pub fn stop(&self) {
+        self.fence_transmissions();
         self.ingress.with_lifecycle_transition(|| {
             self.control.fetch_or(STOP_REQUESTED, Ordering::AcqRel);
         });
+    }
+
+    /// Bind a process-private transmission veto before admitting commands.
+    ///
+    /// Stop and shutdown permanently refuse this gate's queued and future
+    /// transmissions; the binding never grants execution authority. Clones share
+    /// one binding. A replacement refuses both gates rather than detaching the
+    /// original. Binding after a stop also refuses already captured permits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this node already has a transmission binding.
+    pub fn bind_transmission_gate(&self, gate: TransmissionGate) -> anyhow::Result<()> {
+        if let Err(replacement) = self.transmission.set(gate) {
+            replacement.revoke();
+            self.fence_transmissions();
+            anyhow::bail!("native node transmission gate already bound");
+        }
+        // Stop may race the binding: stop fences an installed gate before
+        // publishing its request, and this check catches an earlier request.
+        if self.should_stop()
+            || matches!(self.state(), NodeState::ShuttingDown | NodeState::Stopped)
+        {
+            self.fence_transmissions();
+        }
+        Ok(())
+    }
+
+    pub(super) fn fence_transmissions(&self) {
+        if let Some(gate) = self.transmission.get() {
+            gate.revoke();
+        }
     }
 }
 
@@ -335,6 +374,75 @@ impl EngineConnectionStatus {
 #[cfg(test)]
 mod ingress_tests {
     use super::*;
+
+    #[test]
+    fn native_stop_refuses_queued_transport_without_runner_poll() {
+        let handle = LiveNodeHandle::new();
+        let gate = TransmissionGate::default();
+        handle.bind_transmission_gate(gate.clone()).unwrap();
+        let queued = gate.capture();
+        assert!(queued.can_transmit());
+        let stopper = handle.clone();
+        std::thread::spawn(move || stopper.stop()).join().unwrap();
+        assert!(handle.should_stop());
+        assert!(!queued.can_transmit());
+        assert!(!gate.capture().can_transmit());
+    }
+
+    #[test]
+    fn late_binding_to_stopped_node_never_revives_transport() {
+        for transition in [
+            LiveNodeHandle::stop,
+            LiveNodeHandle::set_shutting_down,
+            LiveNodeHandle::set_stopped,
+        ] {
+            let handle = LiveNodeHandle::new();
+            transition(&handle);
+            let gate = TransmissionGate::default();
+            let queued = gate.capture();
+            handle.bind_transmission_gate(gate.clone()).unwrap();
+            handle.set_starting();
+            gate.invalidate();
+            assert!(!queued.can_transmit());
+            assert!(!gate.capture().can_transmit());
+        }
+    }
+
+    #[test]
+    fn replacing_node_transport_binding_refuses_both_gates() {
+        let handle = LiveNodeHandle::new();
+        let first = TransmissionGate::default();
+        handle.bind_transmission_gate(first.clone()).unwrap();
+        let queued = first.capture();
+        let replacement = TransmissionGate::default();
+        let other = replacement.capture();
+        assert!(handle.bind_transmission_gate(replacement.clone()).is_err());
+        assert!(!queued.can_transmit());
+        assert!(!other.can_transmit());
+        assert!(!first.capture().can_transmit());
+        assert!(!replacement.capture().can_transmit());
+    }
+
+    #[test]
+    fn shutdown_fences_transport_while_residual_ingress_stays_open() {
+        for transition in [
+            LiveNodeHandle::set_shutting_down,
+            LiveNodeHandle::set_stopped,
+        ] {
+            let ingress = IngressGate::new();
+            let handle = LiveNodeHandle::with_ingress(ingress.clone());
+            let gate = TransmissionGate::default();
+            handle.bind_transmission_gate(gate.clone()).unwrap();
+            let queued = gate.capture();
+            let (sender, mut receiver) = ingress.channel();
+            transition(&handle);
+            assert!(!queued.can_transmit());
+            assert!(!gate.capture().can_transmit());
+            ingress.verify_open().unwrap();
+            sender.send(42).unwrap();
+            assert_eq!(receiver.try_recv().unwrap(), 42);
+        }
+    }
 
     #[test]
     fn cloned_node_handle_stop_invalidates_shared_capture() {

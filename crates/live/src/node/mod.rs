@@ -4130,6 +4130,10 @@ impl LiveNode {
     }
 
     fn initiate_shutdown(&mut self) {
+        // Fence before lifecycle encoding, persistence and stop callbacks can
+        // await or spawn work. Historical stop replay invokes Trader's replay
+        // handler directly and does not enter this current-process boundary.
+        self.handle.fence_transmissions();
         #[cfg(feature = "dispatch-observer")]
         let input = match self.native_lifecycle_input("stop.trader") {
             Ok(input) => input,

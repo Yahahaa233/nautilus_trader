@@ -1802,6 +1802,12 @@ async fn run_actual_registered_framework_tail(
             fingerprint,
         )),
     );
+    let target_process_gate = nautilus_core::transmission::TransmissionGate::default();
+    target
+        .handle()
+        .bind_transmission_gate(target_process_gate.clone())
+        .unwrap();
+    let target_admission = target_process_gate.capture();
     install(&mut target, &order, false, behavior, historical_clock_fault);
     let mut restored = Cache::default();
     restored
@@ -1912,6 +1918,12 @@ async fn run_actual_registered_framework_tail(
         },
         |_, _| anyhow::bail!("fixture has no retained input"),
     );
+    if result.is_ok() {
+        assert!(
+            target_admission.can_transmit(),
+            "original stop lifecycle must not revoke the new target process gate"
+        );
+    }
     if changed || fail_historical_stop || !historical_clock_fault.is_empty() {
         assert!(result.is_err());
         if !historical_clock_fault.is_empty() {
