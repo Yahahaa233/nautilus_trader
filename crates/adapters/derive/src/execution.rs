@@ -5806,7 +5806,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_private_stream_closure_marks_disconnected_without_terminal_events() {
-        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut events) =
+            tokio::sync::mpsc::unbounded_channel::<nautilus_common::messages::ExecutionEvent>();
         nautilus_common::live::runner::replace_exec_event_sender(sender);
         let client = DeriveExecutionClient::new(test_core(), test_config()).unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -7796,7 +7797,8 @@ mod tests {
     #[case("stream")]
     fn test_undelivered_trade_survives_authoritative_sender_reinstallation(#[case] source: &str) {
         use nautilus_common::live::runner::replace_exec_event_sender;
-        let (first_tx, first_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (first_tx, first_rx) =
+            tokio::sync::mpsc::unbounded_channel::<nautilus_common::messages::ExecutionEvent>();
         replace_exec_event_sender(first_tx);
         let mut client = DeriveExecutionClient::new(test_core(), test_config()).unwrap();
         drop(first_rx);

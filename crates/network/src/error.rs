@@ -22,6 +22,10 @@ use thiserror::Error;
 /// Error type for send operations in network clients.
 #[derive(Clone, Error, Debug)]
 pub enum SendError {
+    /// The command control generation changed before the write began.
+    #[error("send failed: execution transmission refused before write")]
+    TransmissionRefused,
+
     /// The send input is invalid.
     #[error("send failed: invalid input ({0})")]
     InvalidInput(String),

@@ -139,6 +139,7 @@ impl From<anyhow::Error> for BinanceSpotHttpError {
 impl From<HttpClientError> for BinanceSpotHttpError {
     fn from(err: HttpClientError) -> Self {
         match err {
+            HttpClientError::NotSent(msg) => Self::Canceled(msg),
             HttpClientError::TimeoutError(msg) => Self::Timeout(msg),
             HttpClientError::InvalidProxy(msg) | HttpClientError::ClientBuildError(msg) => {
                 Self::NetworkError(msg)
@@ -158,6 +159,13 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn test_refused_transmission_is_canceled_without_retry() {
+        let error = BinanceSpotHttpError::from(HttpClientError::NotSent("revoked".into()));
+        assert!(!error.is_retryable());
+        assert!(matches!(error, BinanceSpotHttpError::Canceled(ref reason) if reason == "revoked"));
+    }
 
     fn venue_error(code: i64, status: u16) -> BinanceSpotHttpError {
         BinanceSpotHttpError::BinanceError {

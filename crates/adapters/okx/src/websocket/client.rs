@@ -3132,6 +3132,7 @@ impl OKXWebSocketClient {
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize batch orders: {e}")))?;
 
         let cmd = HandlerCommand::Send {
+            transmission_permit: nautilus_network::transmission::current(),
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_BATCH_ORDER.to_vec()),
             request_id: Some(request_id),
@@ -3170,6 +3171,7 @@ impl OKXWebSocketClient {
         }
 
         let cmd = HandlerCommand::Send {
+            transmission_permit: nautilus_network::transmission::current(),
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_BATCH_CANCEL.to_vec()),
             request_id: Some(request_id.clone()),
@@ -3282,6 +3284,7 @@ impl OKXWebSocketClient {
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize batch amend: {e}")))?;
 
         let cmd = HandlerCommand::Send {
+            transmission_permit: nautilus_network::transmission::current(),
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_BATCH_AMEND.to_vec()),
             request_id: Some(request_id),
@@ -3696,6 +3699,7 @@ impl OKXWebSocketClient {
         );
 
         let cmd = HandlerCommand::Send {
+            transmission_permit: nautilus_network::transmission::current(),
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_ORDER.to_vec()),
             request_id: Some(request_id),
@@ -3893,6 +3897,7 @@ impl OKXWebSocketClient {
         }
 
         let cmd = HandlerCommand::Send {
+            transmission_permit: nautilus_network::transmission::current(),
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_AMEND.to_vec()),
             request_id: Some(request_id),
@@ -4106,6 +4111,7 @@ impl OKXWebSocketClient {
             }
         }
         let cmd = HandlerCommand::Send {
+            transmission_permit: nautilus_network::transmission::current(),
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_CANCEL.to_vec()),
             request_id: Some(request_id.clone()),
@@ -4217,6 +4223,7 @@ impl OKXWebSocketClient {
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize mass cancel: {e}")))?;
 
         let cmd = HandlerCommand::Send {
+            transmission_permit: nautilus_network::transmission::current(),
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_MASS_CANCEL.to_vec()),
             request_id: Some(request_id),
@@ -4674,6 +4681,7 @@ impl OKXWebSocketClient {
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize algo order: {e}")))?;
 
         let cmd = HandlerCommand::Send {
+            transmission_permit: nautilus_network::transmission::current(),
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_ALGO_ORDER.to_vec()),
             request_id: Some(request_id),
@@ -4742,6 +4750,7 @@ impl OKXWebSocketClient {
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize cancel algo: {e}")))?;
 
         let cmd = HandlerCommand::Send {
+            transmission_permit: nautilus_network::transmission::current(),
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_ALGO_CANCEL.to_vec()),
             request_id: Some(request_id),

@@ -795,6 +795,11 @@ impl InnerHttpClient {
         let duration = timeout_secs.map(Duration::from_secs).or(self.timeout);
         let deadline = duration.map(|duration| crate::dst::time::Instant::now() + duration);
         let operation = async {
+            if !crate::transmission::can_transmit() {
+                return Err(HttpClientError::NotSent(
+                    "execution control generation changed".into(),
+                ));
+            }
             #[cfg(all(feature = "simulation", madsim))]
             let (response, connection) = self.simulation.send(request, &url).await?;
             #[cfg(not(all(feature = "simulation", madsim)))]

@@ -122,6 +122,7 @@ pub(crate) enum WriterCommand {
     Heartbeat(Message),
     /// Sends once if the active connection still owns the message.
     SendOnConnection {
+        transmission_permit: Option<nautilus_core::transmission::TransmissionPermit>,
         message: Message,
         connection_epoch: u64,
         response_tx: tokio::sync::oneshot::Sender<Result<(), SendError>>,

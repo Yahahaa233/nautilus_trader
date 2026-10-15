@@ -61,6 +61,10 @@ pub const DEFAULT_HALT_THRESHOLD: Duration = Duration::from_millis(250);
 pub(super) struct AppendTiming {
     start: std::time::Instant,
     stage: std::sync::atomic::AtomicU8,
+    tail_step: std::sync::atomic::AtomicU8,
+    sync_active_since_ns: std::sync::atomic::AtomicU64,
+    sync_total_ns: std::sync::atomic::AtomicU64,
+    sync_completed: std::sync::atomic::AtomicU64,
     times: [std::sync::atomic::AtomicU64; 6],
 }
 
@@ -70,6 +74,10 @@ impl AppendTiming {
         Self {
             start: std::time::Instant::now(),
             stage: std::sync::atomic::AtomicU8::new(0),
+            tail_step: std::sync::atomic::AtomicU8::new(0),
+            sync_active_since_ns: std::sync::atomic::AtomicU64::new(0),
+            sync_total_ns: std::sync::atomic::AtomicU64::new(0),
+            sync_completed: std::sync::atomic::AtomicU64::new(0),
             times: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -97,7 +105,7 @@ impl AppendTiming {
                 .then(|| times[index].saturating_sub(times[index - 1]))
         };
         format!(
-            "phase={} queued_ns={:?} build_and_prefix_ns={:?} encode_ns={:?} write_ns={:?} commit_ns={:?} backend_tail_ns={:?} elapsed_ns={}",
+            "phase={} queued_ns={:?} build_and_prefix_ns={:?} encode_ns={:?} write_ns={:?} commit_ns={:?} backend_tail_ns={:?} elapsed_ns={} tail_step={} sync_completed={} sync_total_ns={} sync_active_elapsed_ns={:?}",
             [
                 "queued",
                 "build",
@@ -114,6 +122,23 @@ impl AppendTiming {
             delta(4),
             delta(5),
             self.elapsed().as_nanos(),
+            [
+                "not_entered",
+                "suffix_read",
+                "suffix_decode_hash",
+                "prefix_metadata",
+                "completed"
+            ][usize::from(self.tail_step.load(Ordering::Acquire))],
+            self.sync_completed.load(Ordering::Acquire),
+            self.sync_total_ns.load(Ordering::Acquire),
+            match self.sync_active_since_ns.load(Ordering::Acquire) {
+                0 => None,
+                start => Some(
+                    u64::try_from(self.elapsed().as_nanos())
+                        .unwrap_or(u64::MAX)
+                        .saturating_sub(start)
+                ),
+            },
         )
     }
 }
@@ -152,6 +177,45 @@ pub(crate) fn mark_backend_phase(stage: u8) {
     });
     #[cfg(madsim)]
     let _ = stage;
+}
+
+// Refine the existing timeout diagnostic without changing ACK timing or durability.
+pub(crate) fn mark_backend_tail_step(step: u8) {
+    #[cfg(not(madsim))]
+    ACTIVE_APPEND_TIMING.with(|slot| {
+        if let Some(timing) = slot.borrow().as_ref() {
+            timing
+                .tail_step
+                .store(step, std::sync::atomic::Ordering::Release);
+        }
+    });
+    #[cfg(madsim)]
+    let _ = step;
+}
+
+// Bookends around the actual backend sync_data call. Wall time includes any
+// scheduling delay; this is diagnostic evidence, never proof of a device cause.
+pub(crate) fn mark_backend_sync(entering: bool) {
+    #[cfg(not(madsim))]
+    ACTIVE_APPEND_TIMING.with(|slot| {
+        use std::sync::atomic::Ordering;
+        if let Some(timing) = slot.borrow().as_ref() {
+            let now = u64::try_from(timing.elapsed().as_nanos())
+                .unwrap_or(u64::MAX)
+                .max(1);
+            if entering {
+                timing.sync_active_since_ns.store(now, Ordering::Release);
+            } else {
+                let start = timing.sync_active_since_ns.swap(0, Ordering::AcqRel);
+                timing
+                    .sync_total_ns
+                    .fetch_add(now.saturating_sub(start), Ordering::AcqRel);
+                timing.sync_completed.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    });
+    #[cfg(madsim)]
+    let _ = entering;
 }
 
 /// Configuration knobs for the writer.

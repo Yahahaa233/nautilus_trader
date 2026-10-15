@@ -96,6 +96,7 @@ pub enum HandlerCommand {
     },
     /// Send a pre-serialized payload (used for order operations).
     Send {
+        transmission_permit: Option<nautilus_core::transmission::TransmissionPermit>,
         payload: String,
         rate_limit_keys: Option<Vec<Ustr>>,
         request_id: Option<String>,
@@ -466,6 +467,7 @@ impl OKXWsFeedHandler {
                             let _ = completion.send(result);
                         }
                         HandlerCommand::Send {
+                            transmission_permit,
                             payload,
                             rate_limit_keys,
                             request_id,
@@ -473,9 +475,13 @@ impl OKXWsFeedHandler {
                             op,
                             operation_ack,
                         } => {
-                            let sent=if let Some(original)=operation_ack.as_ref() {
-                                self.send_original_operation(payload,rate_limit_keys.as_deref(),original).await
-                            } else {self.send_on_connection(payload,rate_limit_keys.as_deref()).await};
+                            let sent = nautilus_network::transmission::scope(transmission_permit, async {
+                                if let Some(original) = operation_ack.as_ref() {
+                                    self.send_original_operation(payload, rate_limit_keys.as_deref(), original).await
+                                } else {
+                                    self.send_on_connection(payload, rate_limit_keys.as_deref()).await
+                                }
+                            }).await;
                             if let Err(e) = sent {
                                 log::debug!("Failed to send message: error={e}");
 
@@ -1076,7 +1082,8 @@ fn should_retry_replay_safe_error(error: &OKXWsError) -> bool {
         | OKXWsError::NoActiveClient
         | OKXWsError::HandlerUnavailable(_)
         | OKXWsError::TransportSend(
-            SendError::InvalidInput(_)
+            SendError::TransmissionRefused
+            | SendError::InvalidInput(_)
             | SendError::BufferFull
             | SendError::Closed
             | SendError::WriteTimeout
@@ -1174,6 +1181,7 @@ mod tests {
             payload: SecretString::from(payload.to_string()),
         };
         let send = HandlerCommand::Send {
+            transmission_permit: None,
             payload: payload.to_string(),
             rate_limit_keys: None,
             request_id: None,

@@ -222,7 +222,8 @@ mod tests {
 
     #[rstest]
     fn test_diff_no_emit_when_unchanged() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<nautilus_common::messages::DataEvent>();
         let id = InstrumentId::from("BTCUSDT.BINANCE");
 
         let mut cached = AHashMap::new();

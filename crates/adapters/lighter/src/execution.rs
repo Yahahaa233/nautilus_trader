@@ -4557,7 +4557,8 @@ fn classify_lighter_ws_command_failure(action: &str, error: &LighterWsError) -> 
             | SendError::BufferFull
             | SendError::Closed
             | SendError::Timeout
-            | SendError::ConnectionChanged,
+            | SendError::ConnectionChanged
+            | SendError::TransmissionRefused,
         )
         | LighterWsError::Authentication(_)
         | LighterWsError::Client(_) => CommandFailure::not_sent(reason),
@@ -7224,6 +7225,7 @@ mod tests {
     )]
     #[case::buffer_full(LighterWsError::Transport(SendError::BufferFull), "NotSent")]
     #[case::closed(LighterWsError::Transport(SendError::Closed), "NotSent")]
+    #[case::refused(LighterWsError::Transport(SendError::TransmissionRefused), "NotSent")]
     #[case::connection_changed(LighterWsError::Transport(SendError::ConnectionChanged), "NotSent")]
     #[case::wait_timeout(LighterWsError::Transport(SendError::Timeout), "NotSent")]
     #[case::authentication(

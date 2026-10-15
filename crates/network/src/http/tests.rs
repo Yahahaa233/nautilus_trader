@@ -1052,3 +1052,53 @@ async fn read_headers(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Strin
     }
     String::from_utf8(bytes).unwrap()
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn transmission_generation_refuses_queued_http_before_receiver() {
+    use nautilus_core::transmission::TransmissionGate;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/order", listener.local_addr().unwrap());
+    let client = HttpClient::builder()
+        .use_system_proxy(false)
+        .build()
+        .unwrap();
+    let gate = TransmissionGate::default();
+    let request = crate::transmission::scope(
+        Some(gate.capture()),
+        client.request(Method::POST, url.clone(), None, None, None, None, None),
+    );
+    gate.invalidate();
+    assert!(matches!(request.await, Err(HttpClientError::NotSent(_))));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let head = read_headers(&mut stream).await;
+        assert!(head.starts_with("POST /order "));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let response = crate::transmission::scope(
+        Some(gate.capture()),
+        client.request(Method::POST, url.clone(), None, None, None, None, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status.as_u16(), 200);
+    peer.await.unwrap();
+    let captured = gate.capture();
+    gate.revoke();
+    assert!(matches!(
+        crate::transmission::scope(
+            Some(captured),
+            client.request(Method::POST, url, None, None, None, None, None)
+        )
+        .await,
+        Err(HttpClientError::NotSent(_))
+    ));
+}

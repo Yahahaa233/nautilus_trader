@@ -22,6 +22,10 @@ use std::error::Error;
 /// Includes generic transport errors, timeouts, and proxy configuration errors.
 #[derive(thiserror::Error, Debug)]
 pub enum HttpClientError {
+    /// The original command was refused before entering transport.
+    #[error("HTTP request not sent: {0}")]
+    NotSent(String),
+
     #[error("HTTP error occurred: {0}")]
     Error(String),
 

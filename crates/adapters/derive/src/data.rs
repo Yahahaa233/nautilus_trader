@@ -2608,7 +2608,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_public_stream_closure_marks_disconnected() {
-        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut events) =
+            tokio::sync::mpsc::unbounded_channel::<nautilus_common::messages::DataEvent>();
         replace_data_event_sender(sender);
         let client =
             DeriveDataClient::new(*DERIVE_CLIENT_ID, DeriveDataClientConfig::default()).unwrap();

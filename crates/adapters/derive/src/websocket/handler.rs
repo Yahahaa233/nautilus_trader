@@ -564,7 +564,8 @@ fn send_error_to_derive(error: &SendError) -> DeriveWsError {
         | SendError::BufferFull
         | SendError::Closed
         | SendError::Timeout
-        | SendError::ConnectionChanged => {
+        | SendError::ConnectionChanged
+        | SendError::TransmissionRefused => {
             log::warn!("Derive WebSocket request was not sent: {error}");
             DeriveWsError::NotConnected
         }
@@ -622,6 +623,7 @@ mod tests {
     #[case(SendError::Closed, false)]
     #[case(SendError::Timeout, false)]
     #[case(SendError::ConnectionChanged, false)]
+    #[case(SendError::TransmissionRefused, false)]
     #[case(SendError::BrokenPipe("lost connection".to_string()), true)]
     #[case(SendError::WriteTimeout, true)]
     fn test_send_error_preserves_write_ambiguity(

@@ -85,6 +85,7 @@ pub mod serialization;
 pub mod shared;
 pub mod string;
 pub mod time;
+pub mod transmission;
 pub mod uuid;
 
 #[cfg(feature = "ffi")]

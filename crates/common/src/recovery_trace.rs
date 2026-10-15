@@ -1173,6 +1173,7 @@ pub mod historical {
         #[cfg(feature = "live")]
         queue_retention: Option<crate::live::ingress::HistoricalQueueRetention>,
         native_risk_state: Option<serde_json::Value>,
+        completed_timer_dispatch: Option<(nautilus_core::UUID4, u64)>,
     }
     impl Frame {
         fn fail(&mut self, reason: &str) {
@@ -1364,6 +1365,7 @@ pub mod historical {
                 #[cfg(feature = "live")]
                 queue_retention: None,
                 native_risk_state,
+                completed_timer_dispatch: None,
             }));
             CURRENT.with(|current| {
                 let mut current = current
@@ -1746,6 +1748,96 @@ pub mod historical {
                 anyhow::bail!("{failure}");
             }
             Ok(frame.routes.get(frame.next).cloned())
+        })
+    }
+
+    // Issued only after the actual owner-thread message ran successfully. This
+    // accounts for that message's released lease when it cancels its own timer;
+    // dropping a queued lease never creates this receipt.
+    pub(crate) fn note_completed_timer_dispatch(
+        clock_id: Option<nautilus_core::UUID4>,
+        binding: Option<u64>,
+        event: &crate::timer::TimeEvent,
+    ) -> Result<()> {
+        let result = CURRENT.with(|current| {
+            let current = current
+                .try_borrow()
+                .context("historical timer scope busy")?;
+            let Some(frame) = current.last() else {
+                return Ok(());
+            };
+            let mut frame = frame
+                .try_borrow_mut()
+                .context("historical timer input busy")?;
+            // Preserve the first original callback failure. The native owner
+            // reports it through its existing scope check; no success receipt
+            // is issued for an already failed input.
+            if frame.failure.is_some() {
+                return Ok(());
+            }
+            let NativeTraceRecord::Begin {
+                input_source: super::NativeInputSource::Time,
+                read_witnesses,
+                ..
+            } = &frame.input
+            else {
+                return Ok(());
+            };
+            let clock_id = clock_id.context("actual historical timer clock absent")?;
+            let binding = binding.context("actual historical timer source binding absent")?;
+            let mut witnesses = read_witnesses
+                .iter()
+                .filter(|w| w.component_id == "native:timers");
+            let witness = witnesses
+                .next()
+                .context("original timer input witness absent")?;
+            let input = &witness.payload["input"];
+            let owner = input["owner"]
+                .as_str()
+                .context("original timer owner absent")?;
+            let matches_event = |value: &serde_json::Value| {
+                value["event_id"] == serde_json::json!(event.event_id)
+                    && value["name"].as_str() == Some(event.name.as_str())
+                    && value["ts_event"].as_u64() == Some(event.ts_event.as_u64())
+                    && value["ts_init"].as_u64() == Some(event.ts_init.as_u64())
+            };
+            ensure!(
+                witnesses.next().is_none()
+                    && witness.profile == "actual_registered_owner_timer_input.v1"
+                    && witness.source_version == "native_actual_registered_clock.v1"
+                    && witness.payload["inventory"][owner]["native_clock_id"]
+                        == serde_json::json!(clock_id)
+                    && input["binding"]["binding_id"].as_u64() == Some(binding)
+                    && input["binding"]["kind"] == "registered_owner_thread"
+                    && matches_event(&input["event"])
+                    && frame.completed_timer_dispatch.is_none(),
+                "actual historical timer dispatch differs from original input"
+            );
+            frame.completed_timer_dispatch = Some((clock_id, binding));
+            Ok(())
+        });
+        if let Err(error) = &result {
+            mark_failure(&format!("{error:#}"));
+        }
+        result
+    }
+
+    pub(crate) fn completed_timer_dispatch_count(
+        clock_id: nautilus_core::UUID4,
+        binding: u64,
+    ) -> Result<u64> {
+        CURRENT.with(|current| {
+            let current = current
+                .try_borrow()
+                .context("historical timer scope busy")?;
+            let Some(frame) = current.last() else {
+                return Ok(0);
+            };
+            let frame = frame.try_borrow().context("historical timer input busy")?;
+            ensure!(frame.failure.is_none(), "historical timer input failed");
+            Ok(u64::from(
+                frame.completed_timer_dispatch == Some((clock_id, binding)),
+            ))
         })
     }
 

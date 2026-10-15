@@ -2350,6 +2350,7 @@ pub(crate) fn should_retry_lighter_ws_error(error: &LighterWsError) -> bool {
             | SendError::BufferFull
             | SendError::Closed
             | SendError::ConnectionChanged
+            | SendError::TransmissionRefused
             | SendError::BrokenPipe(_)
             | SendError::WriteTimeout => false,
         },
@@ -4708,6 +4709,10 @@ mod tests {
     #[case::parse_does_not_retry(LighterWsError::Parse("bad json".into()), false)]
     #[case::client_does_not_retry(LighterWsError::Client("no active WebSocket client".into()), false)]
     #[case::transport_closed_does_not_retry(LighterWsError::Transport(SendError::Closed), false)]
+    #[case::transport_refused_does_not_retry(
+        LighterWsError::Transport(SendError::TransmissionRefused),
+        false
+    )]
     #[case::transport_invalid_input_does_not_retry(
         LighterWsError::Transport(SendError::InvalidInput("pong payload too large".into())),
         false

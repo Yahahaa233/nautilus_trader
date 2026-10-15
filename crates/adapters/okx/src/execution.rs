@@ -484,7 +484,7 @@ impl OKXExecutionClient {
         let rpi_taker_access = get_param_as_bool(cmd.params.as_ref(), "rpi_taker_access");
         let rpi_px_round = get_param_as_bool(cmd.params.as_ref(), "rpi_px_round");
 
-        self.spawn_task("submit_order", async move {
+        self.spawn_trading_task("submit_order", async move {
             let result = ws_private
                 .submit_order_with_context(
                     Some(original),
@@ -542,6 +542,7 @@ impl OKXExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let context = OrderContext::from(&order);
+        let command_id = cmd.command_id;
 
         self.ws_dispatch_state
             .order_identities
@@ -559,7 +560,7 @@ impl OKXExecutionClient {
         let rpi_taker_access = get_param_as_bool(cmd.params.as_ref(), "rpi_taker_access");
         let rpi_px_round = get_param_as_bool(cmd.params.as_ref(), "rpi_px_round");
 
-        self.spawn_task("submit_order_http", async move {
+        self.spawn_trading_task("submit_order_http", async move {
             let result = http_client
                 .place_order_with_domain_types(
                     instrument_id,
@@ -586,13 +587,12 @@ impl OKXExecutionClient {
                 .await;
 
             if let Err(e) = result {
-                emit_submit_failure(
+                emit_submit_failure_with_causation(
                     classify_okx_http_failure(&e),
                     &emitter,
                     clock,
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
+                    (strategy_id, instrument_id, client_order_id),
+                    Some(command_id),
                 );
                 return Err(anyhow::Error::new(e).context("submit order failed"));
             }
@@ -614,6 +614,7 @@ impl OKXExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let context = OrderContext::from(&order);
+        let command_id = cmd.command_id;
 
         let client_order_id = context.identity.client_order_id;
         let strategy_id = context.identity.strategy_id;
@@ -678,7 +679,7 @@ impl OKXExecutionClient {
         let dispatch_state = Arc::clone(&self.ws_dispatch_state);
         let original_command = serde_json::to_string(cmd)?;
 
-        self.spawn_task("submit_algo_order", async move {
+        self.spawn_trading_task("submit_algo_order", async move {
             let result = http_client
                 .place_algo_order_with_domain_types_and_source(
                     instrument_id,
@@ -735,13 +736,12 @@ impl OKXExecutionClient {
                         );
                         let failure = classify_okx_http_failure(&error);
                         dispatch_state.resolve_algo_submit_failure(client_order_id, &failure);
-                        emit_submit_failure(
+                        emit_submit_failure_with_causation(
                             failure,
                             &emitter,
                             clock,
-                            strategy_id,
-                            instrument_id,
-                            client_order_id,
+                            (strategy_id, instrument_id, client_order_id),
+                            Some(command_id),
                         );
                         return Err(anyhow::Error::new(error));
                     }
@@ -757,13 +757,12 @@ impl OKXExecutionClient {
                 Err(e) => {
                     let failure = classify_okx_http_failure(&e);
                     dispatch_state.resolve_algo_submit_failure(client_order_id, &failure);
-                    emit_submit_failure(
+                    emit_submit_failure_with_causation(
                         failure,
                         &emitter,
                         clock,
-                        strategy_id,
-                        instrument_id,
-                        client_order_id,
+                        (strategy_id, instrument_id, client_order_id),
+                        Some(command_id),
                     );
                     return Err(anyhow::Error::new(e).context("submit algo order failed"));
                 }
@@ -834,7 +833,7 @@ impl OKXExecutionClient {
             let command = cmd.clone();
             let emitter = self.emitter.clone();
             let clock = self.clock;
-            self.spawn_task("modify_algo_order", async move {
+            self.spawn_trading_task("modify_algo_order", async move {
                 let failure = match http.amend_algo_order(request).await {
                     Err(error) => Some(classify_okx_http_failure(&error)),
                     Ok(response) => response
@@ -906,7 +905,7 @@ impl OKXExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         let sources = self.ws_dispatch_state.protection_sources.clone();
-        self.spawn_task("modify_algo_order", async move {
+        self.spawn_trading_task("modify_algo_order", async move {
             // 查询负责识别实际交易所类型；查询失败时尚未发送修改，可明确拒绝。
             let request = match http
                 .raw_client()
@@ -1262,6 +1261,21 @@ impl OKXExecutionClient {
                 .entry(client_order_id)
                 .or_insert(order_identity);
         }
+    }
+
+    fn spawn_trading_task<F>(&self, description: &'static str, fut: F)
+    where
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let permit = self
+            .config
+            .transmission_gate
+            .as_ref()
+            .map(nautilus_core::transmission::TransmissionGate::capture);
+        self.spawn_task(
+            description,
+            nautilus_network::transmission::scope(permit, fut),
+        );
     }
 
     fn spawn_task<F>(&self, description: &'static str, fut: F)
@@ -2526,7 +2540,7 @@ impl ExecutionClient for OKXExecutionClient {
         let client_order_ids: Vec<_> = cmd.order_list.client_order_ids;
         let dispatch_state = Arc::clone(&self.ws_dispatch_state);
 
-        self.spawn_task("batch_submit_orders", async move {
+        self.spawn_trading_task("batch_submit_orders", async move {
             let result = ws_private
                 .batch_submit_orders(batch_orders)
                 .await;
@@ -2629,7 +2643,7 @@ impl ExecutionClient for OKXExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
 
-        self.spawn_task("modify_order", async move {
+        self.spawn_trading_task("modify_order", async move {
             let result = ws_private
                 .modify_order_with_command(
                     &cmd,
@@ -3860,23 +3874,6 @@ fn is_okx_http_modify_rejection(error: &OKXHttpError) -> bool {
         classify_okx_http_failure(error),
         CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_)
     )
-}
-
-fn emit_submit_failure(
-    failure: CommandFailure,
-    emitter: &ExecutionEventEmitter,
-    clock: &'static AtomicTime,
-    strategy_id: StrategyId,
-    instrument_id: InstrumentId,
-    client_order_id: ClientOrderId,
-) {
-    emit_submit_failure_with_causation(
-        failure,
-        emitter,
-        clock,
-        (strategy_id, instrument_id, client_order_id),
-        None,
-    );
 }
 
 fn emit_submit_failure_with_causation(
@@ -6610,3 +6607,138 @@ mod tests {
 #[cfg(test)]
 #[path = "protective_source_tests.rs"]
 mod protective_source_tests;
+
+#[cfg(test)]
+mod transmission_fence_tests {
+    use super::*;
+    use axum::{Json, Router, routing::post};
+    use nautilus_common::cache::Cache;
+    use nautilus_core::{UUID4, transmission::TransmissionGate};
+    use nautilus_model::{
+        orders::OrderTestBuilder,
+        types::{Price, Quantity},
+    };
+    use std::{cell::RefCell, rc::Rc, sync::atomic::AtomicUsize};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_algo_http_is_not_sent_and_rejection_keeps_original_command() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let router = Router::new().route("/api/v5/trade/order-algo", post(move |Json(body): Json<serde_json::Value>| {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Json(serde_json::json!({"code":"0","msg":"","data":[{"algoId":"3796251408639365120",
+                    "algoClOrdId":body["algoClOrdId"],"sCode":"0","sMsg":""}]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service())
+                .await
+                .unwrap();
+        });
+        let gate = TransmissionGate::default();
+        let config = OKXExecutionClientConfig {
+            api_key: Some("test_key".into()),
+            api_secret: Some("test_secret".into()),
+            api_passphrase: Some("test_pass".into()),
+            base_url_http: Some(base_url),
+            transmission_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let core = ExecutionClientCore::new(
+            "TESTER-001".into(),
+            "OKX-TEST".into(),
+            *OKX_VENUE,
+            OmsType::Netting,
+            config.account_id,
+            AccountType::Margin,
+            None,
+            cache.clone(),
+        );
+        let mut client = OKXExecutionClient::new(core, config).unwrap();
+        let (event_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(event_tx);
+        let make_order = |id: &str| {
+            OrderTestBuilder::new(OrderType::StopLimit)
+                .client_order_id(id.into())
+                .strategy_id("S-FENCE-001".into())
+                .instrument_id("BTC-USDT-SWAP.OKX".into())
+                .quantity(Quantity::from("0.01"))
+                .price(Price::from("94900"))
+                .trigger_price(Price::from("95000"))
+                .build()
+        };
+        let order = make_order("FENCEBLOCK001");
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        let command_id = UUID4::new();
+        let command = SubmitOrder::from_order(
+            &order,
+            "TESTER-001".into(),
+            None,
+            None,
+            command_id,
+            UnixNanos::default(),
+        );
+        client.submit_order(command).unwrap();
+        gate.invalidate();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            nautilus_common::messages::ExecutionEvent::Order(
+                nautilus_model::events::OrderEventAny::Submitted(_)
+            )
+        ));
+        let rejection = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let nautilus_common::messages::ExecutionEvent::Order(
+            nautilus_model::events::OrderEventAny::Rejected(rejected),
+        ) = rejection
+        else {
+            panic!("expected original NotSent rejection, got {rejection:?}");
+        };
+        assert_eq!(rejected.causation_id, Some(command_id));
+        assert_eq!(rejected.client_order_id, order.client_order_id());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let allowed = make_order("FENCEALLOW002");
+        cache
+            .borrow_mut()
+            .add_order(allowed.clone(), None, None, false)
+            .unwrap();
+        client
+            .submit_order(SubmitOrder::from_order(
+                &allowed,
+                "TESTER-001".into(),
+                None,
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+            ))
+            .unwrap();
+        nautilus_common::testing::wait_until_async(
+            || async { requests.load(std::sync::atomic::Ordering::SeqCst) == 1 },
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        gate.revoke();
+        server.abort();
+    }
+
+    #[test]
+    fn private_transmission_gate_cannot_be_deserialized_as_execution_authority() {
+        assert!(
+            serde_json::from_value::<OKXExecutionClientConfig>(
+                serde_json::json!({"transmission_gate":{}})
+            )
+            .is_err()
+        );
+    }
+}

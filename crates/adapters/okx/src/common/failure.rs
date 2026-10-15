@@ -51,7 +51,9 @@ pub fn classify_okx_http_failure(error: &OKXHttpError) -> CommandFailure {
         | OKXHttpError::ValidationError(_)
         | OKXHttpError::RequestSerialization(_)
         | OKXHttpError::HttpClientError(
-            HttpClientError::InvalidProxy(_) | HttpClientError::ClientBuildError(_),
+            HttpClientError::InvalidProxy(_)
+            | HttpClientError::ClientBuildError(_)
+            | HttpClientError::NotSent(_),
         ) => CommandFailure::NotSent(reason),
         OKXHttpError::OkxError { error_code, .. }
         | OKXHttpError::RetryableOkxError { error_code, .. } => {
@@ -79,7 +81,8 @@ pub fn classify_okx_ws_failure(error: &OKXWsError) -> CommandFailure {
         | OKXWsError::NoActiveClient
         | OKXWsError::HandlerUnavailable(_)
         | OKXWsError::TransportSend(
-            SendError::InvalidInput(_)
+            SendError::TransmissionRefused
+            | SendError::InvalidInput(_)
             | SendError::BufferFull
             | SendError::Closed
             | SendError::Timeout
@@ -101,6 +104,22 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[test]
+    fn transmission_refusal_is_not_sent_for_http_and_websocket() {
+        let http = OKXHttpError::HttpClientError(HttpClientError::NotSent(
+            "original control generation changed".into(),
+        ));
+        assert!(matches!(
+            classify_okx_http_failure(&http),
+            CommandFailure::NotSent(_)
+        ));
+        let ws = OKXWsError::TransportSend(SendError::TransmissionRefused);
+        assert!(matches!(
+            classify_okx_ws_failure(&ws),
+            CommandFailure::NotSent(_)
+        ));
+    }
 
     #[rstest]
     #[case::parameter_reject("51000", "Parameter state error", true)]

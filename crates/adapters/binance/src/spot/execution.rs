@@ -5920,7 +5920,8 @@ mod tests {
     async fn test_cancel_all_orders_with_side_and_empty_cache_sends_nothing() {
         let (base_url, hits) = start_cancel_reject_server().await;
         let (mut client, _cache) = test_execution_client(base_url);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<nautilus_common::messages::ExecutionEvent>();
         client.emitter.set_sender(tx);
 
         client

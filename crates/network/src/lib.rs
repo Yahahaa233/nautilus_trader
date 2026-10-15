@@ -104,6 +104,7 @@ pub mod net;
 pub mod ratelimiter;
 pub mod retry;
 pub mod socket;
+pub mod transmission;
 pub mod transport;
 pub mod websocket;
 

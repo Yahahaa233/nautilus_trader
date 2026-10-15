@@ -2095,7 +2095,8 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn chained_book_commands_run_in_issue_order() {
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, _receiver) =
+            tokio::sync::mpsc::unbounded_channel::<nautilus_common::messages::DataEvent>();
         replace_data_event_sender(sender);
 
         let config = BinanceDataClientConfig {

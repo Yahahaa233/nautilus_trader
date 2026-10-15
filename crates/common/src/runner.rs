@@ -529,6 +529,8 @@ impl TimeEventMessage {
     /// Returns `true` when a callback was dispatched. Cleanup messages and
     /// wrong-thread registered messages return `false`.
     pub fn dispatch(self) -> bool {
+        #[cfg(feature = "live")]
+        let source_binding = self.native_source_binding_id;
         let Self {
             event, dispatch, ..
         } = self;
@@ -553,7 +555,19 @@ impl TimeEventMessage {
                 });
 
                 if let Some(callback) = callback {
+                    #[cfg(feature = "live")]
+                    let original_event = event.clone();
                     TimeEventHandler::new(event, callback).run();
+                    #[cfg(feature = "live")]
+                    if let Err(error) =
+                        crate::recovery_trace::historical::note_completed_timer_dispatch(
+                            lease.0.owner_clock_id.get().copied(),
+                            source_binding,
+                            &original_event,
+                        )
+                    {
+                        log::error!("Historical timer completion refused: {error:#}");
+                    }
                     true
                 } else {
                     log::error!("Dropping time event with an unregistered callback token");

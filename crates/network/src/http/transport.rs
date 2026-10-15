@@ -134,6 +134,11 @@ impl Service<Request<Full<Bytes>>> for Client {
             let mut retries = 0;
 
             loop {
+                if !crate::transmission::can_transmit() {
+                    return Err(HttpClientError::NotSent(
+                        "execution control generation changed".into(),
+                    ));
+                }
                 match client.request(request.clone()).await {
                     Ok(response) => return Ok(response),
                     Err(e) if retries < 2 && retryable(&e) => retries += 1,

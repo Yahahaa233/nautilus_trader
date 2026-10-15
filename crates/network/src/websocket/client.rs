@@ -2123,6 +2123,7 @@ impl WebSocketClientInner {
                                 }
                             }
                             WriterCommand::SendOnConnection {
+                                transmission_permit,
                                 message,
                                 connection_epoch: expected_epoch,
                                 response_tx,
@@ -2133,6 +2134,13 @@ impl WebSocketClientInner {
                                     continue;
                                 }
 
+                                if transmission_permit
+                                    .as_ref()
+                                    .is_some_and(|permit| !permit.can_transmit())
+                                {
+                                    _ = response_tx.send(Err(SendError::TransmissionRefused));
+                                    continue;
+                                }
                                 let send_result = dst::time::timeout(
                                     Duration::from_secs(WRITE_TIMEOUT_SECS),
                                     active_writer.send(message),
@@ -3478,6 +3486,7 @@ impl WebSocketClient {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::Text(data.into()),
                 connection_epoch,
                 response_tx,
@@ -8194,6 +8203,7 @@ mod rust_tests {
         let (sentinel_tx, sentinel_rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::text("sentinel-1"),
                 connection_epoch: 1,
                 response_tx: sentinel_tx,
@@ -8211,6 +8221,7 @@ mod rust_tests {
         let (sentinel_tx, sentinel_rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::text("sentinel-2"),
                 connection_epoch: 1,
                 response_tx: sentinel_tx,
@@ -8864,6 +8875,7 @@ mod rust_tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::text("ownership-bound"),
                 connection_epoch: 0,
                 response_tx,
@@ -8923,6 +8935,7 @@ mod rust_tests {
             let (sentinel_tx, sentinel_rx) = tokio::sync::oneshot::channel();
             writer_tx
                 .send_control(WriterCommand::SendOnConnection {
+                    transmission_permit: crate::transmission::current(),
                     message: Message::text(name),
                     connection_epoch: 1,
                     response_tx: sentinel_tx,
@@ -9393,6 +9406,7 @@ mod rust_tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::text("doomed"),
                 connection_epoch: 0,
                 response_tx,
@@ -9432,6 +9446,86 @@ mod rust_tests {
         write_task.await.unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn transmission_generation_reaches_final_writer_before_frame_send() {
+        use nautilus_core::transmission::TransmissionGate;
+        let server = RecordingServer::setup().await;
+        let url = format!("ws://127.0.0.1:{}", server.port);
+        let (writer, _reader) = WebSocketClientInner::connect_with_server(
+            &url,
+            vec![],
+            TransportBackend::Tungstenite,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let connection_state = Arc::new(AtomicU8::new(ConnectionMode::Active.as_u8()));
+        let state_notify = Arc::new(tokio::sync::Notify::new());
+        let (writer_tx, writer_rx) = crate::writer::channel(crate::writer::DEFAULT_WRITER_CAPACITY);
+        let write_task = WebSocketClientInner::spawn_write_task(
+            Arc::clone(&connection_state),
+            Arc::clone(&state_notify),
+            Arc::new(AtomicBool::new(true)),
+            writer,
+            writer_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(OnceLock::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        let gate = TransmissionGate::default();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        writer_tx
+            .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: Some(gate.capture()),
+                message: Message::text("old-scope"),
+                connection_epoch: 0,
+                response_tx,
+            })
+            .unwrap();
+        gate.invalidate();
+        assert!(matches!(
+            response_rx.await.unwrap(),
+            Err(SendError::TransmissionRefused)
+        ));
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        writer_tx
+            .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: Some(gate.capture()),
+                message: Message::text("current-scope"),
+                connection_epoch: 0,
+                response_tx,
+            })
+            .unwrap();
+        response_rx.await.unwrap().unwrap();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        writer_tx
+            .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: Some(gate.capture()),
+                message: Message::text("revoked-scope"),
+                connection_epoch: 0,
+                response_tx,
+            })
+            .unwrap();
+        gate.revoke();
+        assert!(matches!(
+            response_rx.await.unwrap(),
+            Err(SendError::TransmissionRefused)
+        ));
+        wait_until_async(
+            || async { server.messages().await.len() == 1 },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(server.messages().await, vec!["current-scope"]);
+        connection_state.store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
+        state_notify.notify_waiters();
+        drop(writer_tx);
+        write_task.abort();
+    }
+
     #[tokio::test]
     async fn send_on_connection_rejects_stale_epoch_without_replay() {
         let server = RecordingServer::setup().await;
@@ -9466,6 +9560,7 @@ mod rust_tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::text("epoch-0"),
                 connection_epoch: 0,
                 response_tx,
@@ -9477,6 +9572,7 @@ mod rust_tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::text("during-reconnect"),
                 connection_epoch: 0,
                 response_tx,
@@ -9507,6 +9603,7 @@ mod rust_tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::text("stale"),
                 connection_epoch: 0,
                 response_tx,
@@ -9520,6 +9617,7 @@ mod rust_tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::text("epoch-1"),
                 connection_epoch: 1,
                 response_tx,
@@ -9548,6 +9646,7 @@ mod rust_tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::text("stale-after-second-reconnect"),
                 connection_epoch: 1,
                 response_tx,
@@ -9561,6 +9660,7 @@ mod rust_tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::text("epoch-2"),
                 connection_epoch: 2,
                 response_tx,
@@ -9694,6 +9794,7 @@ mod rust_tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::text("authenticate"),
                 connection_epoch: 1,
                 response_tx,
@@ -9807,6 +9908,7 @@ mod rust_tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::text("authenticate"),
                 connection_epoch: 1,
                 response_tx,
@@ -9939,6 +10041,7 @@ mod rust_tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         writer_tx
             .send_control(WriterCommand::SendOnConnection {
+                transmission_permit: crate::transmission::current(),
                 message: Message::text("authenticate"),
                 connection_epoch: 1,
                 response_tx,

@@ -514,7 +514,8 @@ fn assert_private_key(credential: &Credential, expected: &str) {
 }
 
 fn create_data_client(config: LighterDataClientConfig) -> LighterDataClient {
-    let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, _receiver) =
+        tokio::sync::mpsc::unbounded_channel::<nautilus_common::messages::DataEvent>();
     replace_data_event_sender(sender);
     LighterDataClient::new(ClientId::new("LIGHTER"), config).unwrap()
 }

@@ -310,12 +310,19 @@ impl crate::clock::RestoredTimerCheckpoint for LiveRestoredTimers {
             let interval = registration["interval_ns"]
                 .as_u64()
                 .context("cancelled interval absent")?;
+            let consumed = crate::recovery_trace::historical::completed_timer_dispatch_count(
+                self.clock_id.unwrap_or(self.actual_clock_id),
+                *binding,
+            )?;
+            let before_count = (state & !closed)
+                .checked_add(consumed)
+                .context("cancelled original timer lease count overflow")?;
             anyhow::ensure!(
                 registration == original
                     && original["status"] == "active"
                     && original["callback_kind"] == "registered_owner_thread"
                     && state & closed != 0
-                    && original["binding"]["state"].as_u64() == Some(state & !closed)
+                    && original["binding"]["state"].as_u64() == Some(before_count)
                     && !after["timers"]
                         .as_array()
                         .context("original after timers absent")?
@@ -1707,12 +1714,15 @@ mod tests {
     #[case("idle_accepted_after")]
     #[case("idle_foreign_clock")]
     #[case("idle_duplicate_original")]
+    #[case("consumed_current")]
+    #[case("consumed_changed_count")]
     fn actual_cancelled_timer_restores_only_original_late_queued_lease(#[case] fault: &str) {
         use crate::recovery_trace::{
             NativeInputSource, NativeProcessingReceipt, NativeTraceRecord, NativeTraceSource,
             historical::HistoricalInputScope,
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let consumed_current = fault.starts_with("consumed_");
         let idle_before = fault.starts_with("idle_");
         let fault = fault.strip_prefix("idle_").unwrap_or(fault);
         let (source_tx, source_rx) = mpsc::channel();
@@ -1822,15 +1832,23 @@ mod tests {
                 root_sequence: 1,
                 input_sequence: 1,
                 stack_parent: None,
-                input_source: NativeInputSource::Lifecycle,
+                input_source: if consumed_current { NativeInputSource::Time } else { NativeInputSource::Lifecycle },
                 phase: "ShuttingDown".into(),
                 receipt: NativeProcessingReceipt {
                     wall_ns: captured_before,
                     process_elapsed_ns: 1,
                     ingress: None,
                 },
-                payload: serde_json::json!({"kind":"stop.trader"}),
-                read_witnesses: Vec::new(),
+                payload: if consumed_current {
+                    let event=original_queued[0].event();
+                    // The application codec need not serialize callback data;
+                    // the SDK-owned witness below binds the actual timer.
+                    serde_json::json!({"name":event.name,"event_id":event.event_id,"ts_event":event.ts_event,"ts_init":event.ts_init})
+                } else { serde_json::json!({"kind":"stop.trader"}) },
+                read_witnesses: if consumed_current { vec![crate::recovery_trace::NativeReadWitness {
+                    component_id:"native:timers".into(),profile:"actual_registered_owner_timer_input.v1".into(),source_version:"native_actual_registered_clock.v1".into(),
+                    payload:{let event=original_queued[0].event();serde_json::json!({"inventory":{"component:actual":original_before},"input":{"owner":"component:actual","binding":original_queued[0].native_input_callback_binding(),"event":{"name":event.name,"event_id":event.event_id,"ts_event":event.ts_event,"ts_init":event.ts_init}}})},
+                }] } else { Vec::new() },
             },
             Vec::new(),
             Vec::new(),
@@ -1840,6 +1858,11 @@ mod tests {
         let actual_token = target.timers[&Ustr::from("late-during-cancel")]
             .registered_checkpoint_token()
             .unwrap();
+        if consumed_current {
+            assert!(first_target.remove(0).dispatch());
+            assert_eq!(calls.get(), 1);
+        }
+        let mut scope = Some(scope);
         target.cancel_timer("late-during-cancel");
         receipt
             .refresh_from_historical_dispatch(&target, &after)
@@ -1853,6 +1876,7 @@ mod tests {
             "changed_binding" => original_binding += 9999,
             "changed_event" => event.ts_event += DurationNanos::new(1),
             "changed_profile" => before["timers"][0]["callback_source"] = "foreign.profile".into(),
+            "consumed_changed_count" => before["timers"][0]["binding"]["state"] = 0.into(),
             "accepted_before" => received = captured_before,
             "accepted_after" => received = captured_after + 1,
             "foreign_clock" => {
@@ -1869,7 +1893,7 @@ mod tests {
             captured_before,
             captured_after,
         );
-        if fault == "valid" || fault == "duplicate_original" {
+        if fault == "valid" || fault == "duplicate_original" || fault == "consumed_current" {
             let mut messages = result.unwrap();
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].event(), late.event());
@@ -1879,7 +1903,7 @@ mod tests {
             );
             assert_eq!(
                 actual_token.checkpoint_inventory()["state"].as_u64(),
-                Some((1u64 << 63) | (original_count + 1))
+                Some((1u64 << 63) | (original_count + 1 - u64::from(consumed_current)))
             );
             assert!(
                 receipt
@@ -1899,6 +1923,11 @@ mod tests {
                         .is_err()
                 );
             }
+            if consumed_current {
+                // The cancelled queued event belongs to the next input, not
+                // another dispatch within the just-completed original input.
+                scope.take().unwrap().finish().unwrap();
+            }
             for original in first_target {
                 assert!(original.dispatch());
             }
@@ -1909,11 +1938,13 @@ mod tests {
                 result.is_err(),
                 "changed original {fault} supplied a callback"
             );
-            assert_eq!(calls.get(), 0);
+            assert_eq!(calls.get(), u64::from(consumed_current));
         }
         assert_eq!(target.timer_count(), 0);
         assert_eq!(receipt.historical_inventory().unwrap(), after);
-        scope.finish().unwrap();
+        if let Some(scope) = scope {
+            scope.finish().unwrap();
+        }
         assert!(target.timer_names().is_empty());
         drop((receipt, original_queued, late));
     }

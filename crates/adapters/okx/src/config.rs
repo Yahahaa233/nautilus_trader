@@ -203,6 +203,9 @@ impl OKXDataClientConfig {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.okx")
 )]
 pub struct OKXExecutionClientConfig {
+    /// Process-private veto; cannot be loaded from configuration or recovery.
+    #[serde(skip)]
+    pub transmission_gate: Option<nautilus_core::transmission::TransmissionGate>,
     /// The account ID for the client.
     #[builder(default = AccountId::from("OKX-001"))]
     pub account_id: AccountId,

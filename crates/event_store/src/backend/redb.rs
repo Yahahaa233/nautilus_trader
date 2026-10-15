@@ -206,7 +206,9 @@ impl StorageBackend for OwnedStorageBackend {
         result
     }
     fn sync_data(&self) -> io::Result<()> {
+        crate::writer::mark_backend_sync(true);
         let result = self.inner.sync_data();
+        crate::writer::mark_backend_sync(false);
         if result.is_err() {
             self.epoch.failed.store(true, Ordering::SeqCst);
         }
@@ -932,7 +934,9 @@ impl EventStore for RedbBackend {
                             "native prefix owner disappeared".into(),
                         ));
                     }
+                    crate::writer::mark_backend_tail_step(3);
                     state.refresh_prefix_generation()?;
+                    crate::writer::mark_backend_tail_step(4);
                 }
                 Err(error) => {
                     state.prefix_failed.set(true);
@@ -1209,6 +1213,7 @@ fn verify_committed_suffix(
     entries: &[AppendEntry],
     encoded: &[Vec<u8>],
 ) -> Result<Vec<EntryHash>, EventStoreError> {
+    crate::writer::mark_backend_tail_step(1);
     let txn = state.db.begin_read()?;
     let table = txn.open_table(ENTRIES_TABLE).map_err(map_table_err)?;
     let mut hashes = Vec::new();
@@ -1226,6 +1231,7 @@ fn verify_committed_suffix(
                 "native committed suffix bytes changed".into(),
             ));
         }
+        crate::writer::mark_backend_tail_step(2);
         let actual = codec::decode_from_slice::<EventStoreEntry>(bytes)
             .map_err(|e| EventStoreError::Corrupted(format!("native committed suffix: {e}")))?;
         check_embedded_seq(append.entry.seq, &actual)?;
