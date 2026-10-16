@@ -79,6 +79,11 @@ pub(super) enum WriterMessage {
     DurablePrefix {
         ack: SyncSender<Result<super::DurableJournalPrefix, EventStoreError>>,
     },
+    /// Reads a previously acknowledged row without committing the pending batch.
+    ReadOriginalEntry {
+        sequence: u64,
+        ack: SyncSender<Result<super::OriginalJournalEntry, EventStoreError>>,
+    },
     /// Appends one exact row after earlier queued drafts commit.
     AppendDurable {
         draft: EntryDraft,
@@ -167,9 +172,7 @@ pub(super) fn run(
             Ok(WriterMessage::Close { run_ended, ack }) => {
                 drain_pending(&rx, &mut batch, &mut next_seq);
 
-                let now = clock.get_time_ns();
-                let run_ended_append = build_append_entry(run_ended, now, next_seq);
-                batch.push(run_ended_append);
+                batch.push(build_append_entry(run_ended, clock.get_time_ns(), next_seq));
 
                 seal_run(
                     backend.as_mut(),
@@ -210,6 +213,11 @@ pub(super) fn run(
                     return;
                 }
                 batch_deadline = None;
+            }
+            Ok(WriterMessage::ReadOriginalEntry { sequence, ack }) => {
+                if !acknowledge_original_entry(backend.as_ref(), sequence, &halt, &ack) {
+                    return;
+                }
             }
             Ok(message @ WriterMessage::AppendDurable { .. }) => {
                 if !commit_durable_message(
@@ -402,11 +410,33 @@ fn drain_pending(rx: &Receiver<WriterMessage>, batch: &mut Vec<AppendEntry>, nex
             WriterMessage::DurablePrefix { ack } => {
                 let _ = ack.send(Err(EventStoreError::Closed));
             }
+            WriterMessage::ReadOriginalEntry { ack, .. } => {
+                let _ = ack.send(Err(EventStoreError::Closed));
+            }
             WriterMessage::AppendDurable { ack, .. } => {
                 let _ = ack.send(Err(EventStoreError::Closed));
             }
         }
     }
+}
+
+/// Acknowledges an already durable original without committing pending drafts.
+/// Returns whether the writer may continue after checking the actual source.
+#[cfg(not(madsim))]
+fn acknowledge_original_entry(
+    backend: &dyn EventStore,
+    sequence: u64,
+    halt: &HaltSink,
+    ack: &SyncSender<Result<super::OriginalJournalEntry, EventStoreError>>,
+) -> bool {
+    let result = super::read_original_entry(backend, sequence);
+    if let Err(error) = &result {
+        halt.fire(HaltReason::from_backend_error(error));
+        let _ = ack.send(result);
+        return false;
+    }
+    let _ = ack.send(result);
+    true
 }
 
 /// Commits the current batch, advances the high-watermark mirror on success, or fires the

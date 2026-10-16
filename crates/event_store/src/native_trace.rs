@@ -136,6 +136,38 @@ impl NativeTraceRecorder {
         Ok(state.source.clone())
     }
 
+    /// Reads an exact already durable row from this recorder's actual writer.
+    /// No caller-selected run, append, flush, native input or permission is accepted.
+    ///
+    /// # Errors
+    /// Refuses failed or retired owners, an unacknowledged sequence, changed source,
+    /// a foreign backend run and missing or corrupt original bytes.
+    pub fn read_original_entry(
+        &self,
+        sequence: u64,
+    ) -> Result<crate::writer::OriginalJournalEntry> {
+        let (source, writer) = {
+            let state = self
+                .0
+                .try_borrow()
+                .context("native trace recorder reentered")?;
+            state.check()?;
+            (
+                state.source.clone(),
+                state
+                    .writer
+                    .upgrade()
+                    .context("native trace writer retired")?,
+            )
+        };
+        let original = writer.read_durable_entry(sequence)?;
+        ensure!(
+            original.run_id() == source.journal_run && self.source()? == source,
+            "original entry does not belong to this actual native source"
+        );
+        Ok(original)
+    }
+
     /// Acknowledges the exact original native input before synchronous effects run.
     /// Callers must use a real node producer, not an output row or cache replay closure.
     ///
@@ -1959,6 +1991,39 @@ mod tests {
         trace
             .checkpoint_cut(1, 1, "actual-inventory".into(), vec![])
             .unwrap()
+    }
+
+    #[test]
+    fn original_entry_read_retains_actual_native_bytes_and_frontier_without_a_new_root() {
+        let (trace, writer, memory, source, _) = actual_journal();
+        let _cut = cut(&trace);
+        let before = writer.high_watermark();
+        let expected = memory.scan_seq(1).unwrap().unwrap();
+        let original = trace.read_original_entry(1).unwrap();
+        assert_eq!(original.run_id(), source.journal_run);
+        assert_eq!(original.high_watermark(), before);
+        assert_eq!(original.entry(), &expected);
+        assert_eq!(writer.high_watermark(), before);
+        assert_eq!(trace.source().unwrap(), source);
+        assert!(memory.latest_snapshot_anchor().unwrap().is_none());
+    }
+
+    #[test]
+    fn original_entry_read_refuses_a_foreign_declared_source_and_retired_writer() {
+        let (trace, writer, _, mut source, halt) = actual_journal();
+        let _cut = cut(&trace);
+        source.journal_run = "foreign-declared-journal".into();
+        let foreign = NativeTraceRecorder::new(source, &writer, halt, None).unwrap();
+        assert!(foreign.read_original_entry(1).is_err());
+        assert!(trace.read_original_entry(1).is_ok());
+        assert!(trace.read_original_entry(0).is_err());
+        assert!(
+            trace
+                .read_original_entry(writer.high_watermark() + 1)
+                .is_err()
+        );
+        drop(writer);
+        assert!(trace.read_original_entry(1).is_err());
     }
 
     fn bound_observation(token: &NativeReadProducerToken) -> NativeReadWitnesses {

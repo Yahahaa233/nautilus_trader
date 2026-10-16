@@ -103,7 +103,7 @@ impl PortfolioEquityCurveTimerCallback {
 
     // Tests here verify registry/FIFO mechanics with local counters. Production
     // can only obtain this binding from the private original Portfolio factory.
-    #[cfg(all(test, feature = "live"))]
+    #[cfg(all(test, feature = "live", not(all(feature = "simulation", madsim))))]
     pub(crate) fn with_counter_for_test(
         account: nautilus_model::identifiers::AccountId,
         configuration: &impl serde::Serialize,

@@ -54,6 +54,87 @@ pub const DEFAULT_MAX_BATCH_LATENCY: Duration = Duration::from_millis(5);
 /// Default submit-side stall ceiling that fires the halt callback.
 pub const DEFAULT_HALT_THRESHOLD: Duration = Duration::from_millis(250);
 
+/// An exact committed row read by the backend-owning writer. This observation
+/// neither acknowledges a new write nor grants execution or recovery authority.
+#[derive(Clone, Debug)]
+pub struct OriginalJournalEntry {
+    run_id: String,
+    high_watermark: u64,
+    entry: crate::entry::EventStoreEntry,
+}
+
+impl OriginalJournalEntry {
+    /// Actual backend run, independent of caller-supplied JSON or filenames.
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// Actual durable frontier at the read, without flushing pending drafts.
+    #[must_use]
+    pub const fn high_watermark(&self) -> u64 {
+        self.high_watermark
+    }
+
+    /// Exact row with its original sequence, payload, headers and canonical hash.
+    #[must_use]
+    pub const fn entry(&self) -> &crate::entry::EventStoreEntry {
+        &self.entry
+    }
+}
+
+fn read_original_entry(
+    backend: &dyn crate::backend::EventStore,
+    sequence: u64,
+) -> Result<OriginalJournalEntry, crate::error::EventStoreError> {
+    use crate::error::EventStoreError;
+    let manifest = backend.manifest()?;
+    let high_watermark = backend.high_watermark()?;
+    if sequence == 0 || sequence > high_watermark || manifest.high_watermark != high_watermark {
+        return Err(EventStoreError::Backend(
+            "original entry is outside the actual durable prefix".into(),
+        ));
+    }
+    let index = usize::try_from(sequence - 1)
+        .map_err(|_| EventStoreError::Backend("original sequence cannot be indexed".into()))?;
+    let expected_hash = backend
+        .verified_append_only_entry_hashes()?
+        .map(|hashes| {
+            hashes
+                .get(index)
+                .copied()
+                .ok_or_else(|| EventStoreError::Corrupted("owned original hash is absent".into()))
+        })
+        .transpose()?;
+    let entry = backend.scan_seq(sequence)?.ok_or_else(|| {
+        EventStoreError::Corrupted(format!("original durable entry {sequence} is absent"))
+    })?;
+    if entry.seq != sequence {
+        return Err(EventStoreError::SeqMismatch {
+            table_key: sequence,
+            embedded_seq: entry.seq,
+        });
+    }
+    if entry.recompute_hash() != entry.entry_hash
+        || expected_hash.is_some_and(|hash| hash != entry.entry_hash)
+    {
+        return Err(EventStoreError::HashMismatch { seq: sequence });
+    }
+    let current_hash = backend
+        .verified_append_only_entry_hashes()?
+        .and_then(|hashes| hashes.get(index).copied());
+    if current_hash != expected_hash {
+        return Err(EventStoreError::Corrupted(
+            "owned original generation changed during read".into(),
+        ));
+    }
+    Ok(OriginalJournalEntry {
+        run_id: manifest.run_id,
+        high_watermark,
+        entry,
+    })
+}
+
 /// Monotonic timing shared with the waiter, including the phase active at timeout.
 /// This diagnostic carries no journal payload and never establishes durable completion.
 #[cfg(not(madsim))]
@@ -588,6 +669,34 @@ mod imp {
             )
         }
 
+        /// Reads one already durable original through the existing writer queue.
+        /// Pending drafts are not flushed and no row, anchor or permission is created.
+        ///
+        /// # Errors
+        /// Refuses invalid sequences, halt, closure, the original request deadline,
+        /// absent rows and backend integrity failures. Integrity failures halt the writer.
+        pub fn read_durable_entry(
+            &self,
+            sequence: u64,
+        ) -> Result<super::OriginalJournalEntry, EventStoreError> {
+            if self.halted.load(Ordering::Acquire) {
+                return Err(EventStoreError::Closed);
+            }
+            if sequence == 0 || sequence > self.high_watermark() {
+                return Err(EventStoreError::Backend(
+                    "original entry is outside the acknowledged durable prefix".into(),
+                ));
+            }
+            let tx = self.tx.as_ref().ok_or(EventStoreError::Closed)?;
+            let (ack, ack_rx) = mpsc::sync_channel(1);
+            self.request_ack(
+                tx,
+                WriterMessage::ReadOriginalEntry { sequence, ack },
+                &ack_rx,
+                "original durable entry",
+            )
+        }
+
         /// Appends and acknowledges the exact actual backend row.
         ///
         /// # Errors
@@ -1032,6 +1141,31 @@ mod imp {
             super::read_durable_prefix(inner.backend.as_ref())
         }
 
+        /// Reads the actual synchronous backend without appending or sealing.
+        ///
+        /// # Errors
+        /// Refuses closure, invalid sequences and corrupt originals.
+        pub fn read_durable_entry(
+            &self,
+            sequence: u64,
+        ) -> Result<super::OriginalJournalEntry, EventStoreError> {
+            let mut inner = self.inner.lock();
+            if inner.closed {
+                return Err(EventStoreError::Closed);
+            }
+            if sequence == 0 || sequence > self.high_watermark() {
+                return Err(EventStoreError::Backend(
+                    "original entry is outside the acknowledged durable prefix".into(),
+                ));
+            }
+            let result = super::read_original_entry(inner.backend.as_ref(), sequence);
+            if let Err(error) = &result {
+                (self.halt)(HaltReason::from_backend_error(error));
+                inner.closed = true;
+            }
+            result
+        }
+
         /// Appends and acknowledges the exact synchronous backend row.
         ///
         /// # Errors
@@ -1212,12 +1346,23 @@ mod tests {
     /// Wraps `MemoryBackend` so tests can read the same instance the writer thread
     /// commits into.
     #[derive(Debug)]
-    struct SharedMemory(Arc<Mutex<MemoryBackend>>, Arc<AtomicUsize>);
+    struct SharedMemory(
+        Arc<Mutex<MemoryBackend>>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    );
 
     impl SharedMemory {
         fn new() -> (Self, Arc<Mutex<MemoryBackend>>) {
             let arc = Arc::new(Mutex::new(MemoryBackend::new()));
-            (Self(Arc::clone(&arc), Arc::new(AtomicUsize::new(0))), arc)
+            (
+                Self(
+                    Arc::clone(&arc),
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+                arc,
+            )
         }
     }
 
@@ -1242,7 +1387,29 @@ mod tests {
         }
 
         fn scan_seq(&self, seq: u64) -> Result<Option<EventStoreEntry>, EventStoreError> {
-            self.0.lock().scan_seq(seq)
+            let mut entry = self.0.lock().scan_seq(seq)?;
+            match self.2.load(Ordering::SeqCst) {
+                1 => return Ok(None),
+                2 => {
+                    if let Some(entry) = &mut entry {
+                        entry.payload = Bytes::from_static(b"changed-original");
+                    }
+                }
+                3 => {
+                    if let Some(entry) = &mut entry {
+                        entry.seq += 1;
+                        entry.entry_hash = entry.recompute_hash();
+                    }
+                }
+                4 => {
+                    self.2.store(5, Ordering::SeqCst);
+                    while self.2.load(Ordering::SeqCst) == 5 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                _ => {}
+            }
+            Ok(entry)
         }
 
         fn lookup(&self, kind: IndexKind, key: &str) -> Result<Option<u64>, EventStoreError> {
@@ -1275,6 +1442,190 @@ mod tests {
         fn high_watermark(&self) -> Result<u64, EventStoreError> {
             self.0.lock().high_watermark()
         }
+    }
+
+    #[test]
+    fn original_entry_read_does_not_flush_pending_entries_or_create_a_new_anchor() {
+        let (backend, memory) = SharedMemory::new();
+        memory.lock().open_run(manifest("original-read")).unwrap();
+        let commits = Arc::clone(&backend.1);
+        let halt_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&halt_calls);
+        let writer = EventStoreWriter::spawn(
+            Box::new(backend),
+            get_atomic_clock_static(),
+            Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+            WriterConfig {
+                max_batch_entries: 1024,
+                max_batch_latency: Duration::from_secs(3600),
+                ..WriterConfig::default()
+            },
+        )
+        .unwrap();
+        let first = writer.append_durable(entry_draft(10)).unwrap();
+        writer.submit(entry_draft(20)).unwrap();
+        let original = writer.read_durable_entry(first.sequence()).unwrap();
+        let expected_hwm = if cfg!(madsim) { 2 } else { 1 };
+        assert_eq!(original.run_id(), "original-read");
+        assert_eq!(original.entry().seq, first.sequence());
+        assert_eq!(original.entry().entry_hash, first.entry_hash());
+        assert_eq!(
+            original.entry().payload,
+            Bytes::from_static(b"\x01\x02\x03\x04")
+        );
+        assert_eq!(original.high_watermark(), expected_hwm);
+        assert_eq!(writer.high_watermark(), expected_hwm);
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            usize::try_from(expected_hwm).unwrap()
+        );
+        assert!(memory.lock().latest_snapshot_anchor().unwrap().is_none());
+        assert!(writer.read_durable_entry(0).is_err());
+        assert!(writer.read_durable_entry(expected_hwm + 1).is_err());
+        assert_eq!(halt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(writer.flush().unwrap(), 2);
+        assert_eq!(writer.close(run_ended_draft()).unwrap(), 3);
+    }
+
+    #[rstest]
+    fn original_entry_read_timeout_latches_original_budget_after_late_backend_response(
+        captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
+    ) {
+        let (halt, captured) = captured_halt;
+        let (backend, shared) = SharedMemory::new();
+        let read_gate = Arc::clone(&backend.2);
+        shared
+            .lock()
+            .open_run(manifest("original-read-timeout"))
+            .unwrap();
+        let config = WriterConfig::default();
+        let threshold = config.halt_threshold;
+        assert_eq!(threshold, Duration::from_millis(250));
+        let writer =
+            EventStoreWriter::spawn(Box::new(backend), get_atomic_clock_static(), halt, config)
+                .unwrap();
+        writer.append_durable(entry_draft(10)).unwrap();
+        let original = shared.lock().scan_seq(1).unwrap().unwrap();
+        read_gate.store(4, Ordering::SeqCst);
+        let result = writer.read_durable_entry(1);
+        let entered = read_gate.load(Ordering::SeqCst);
+        let refused_read = writer.read_durable_entry(1);
+        let refused_submit = writer.submit(entry_draft(20));
+        // Always release before assertions; Drop joins the actual late reader.
+        read_gate.store(0, Ordering::SeqCst);
+        drop(writer);
+
+        assert_eq!(entered, 5, "actual backend read must have entered its gate");
+        assert!(matches!(result, Err(EventStoreError::Backend(ref message))
+            if message.contains("original durable entry ack stalled")));
+        assert!(matches!(refused_read, Err(EventStoreError::Closed)));
+        assert!(matches!(refused_submit, Err(SubmitError::Closed)));
+        let reasons = captured.lock();
+        assert_eq!(
+            reasons.len(),
+            1,
+            "late read cannot clear or refire the first halt"
+        );
+        assert_backpressure_stall(reasons.first(), threshold);
+        assert_eq!(shared.lock().high_watermark().unwrap(), 1);
+        assert_eq!(shared.lock().scan_seq(1).unwrap().unwrap(), original);
+        assert!(shared.lock().latest_snapshot_anchor().unwrap().is_none());
+    }
+
+    #[test]
+    fn original_entry_read_preserves_actual_redb_primary_bytes_before_close() {
+        let mut root = tempfile::tempdir().unwrap();
+        root.disable_cleanup(true);
+        eprintln!("original-entry-redb-fixture={}", root.path().display());
+        let mut backend = crate::backend::RedbBackend::new(root.path());
+        backend.open_run(manifest("original-redb-read")).unwrap();
+        let path = backend.current_path().unwrap().to_owned();
+        let writer = EventStoreWriter::spawn(
+            Box::new(backend),
+            get_atomic_clock_static(),
+            halt::noop_halt(),
+            WriterConfig::default(),
+        )
+        .unwrap();
+        let ack = writer.append_durable(entry_draft(10)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let original = writer.read_durable_entry(ack.sequence()).unwrap();
+        assert_eq!(original.run_id(), "original-redb-read");
+        assert_eq!(original.high_watermark(), ack.sequence());
+        assert_eq!(original.entry().entry_hash, ack.entry_hash());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(writer.high_watermark(), ack.sequence());
+        writer.close(run_ended_draft()).unwrap();
+    }
+
+    #[test]
+    fn original_entry_read_refuses_a_replaced_redb_named_generation() {
+        let mut root = tempfile::tempdir().unwrap();
+        root.disable_cleanup(true);
+        eprintln!(
+            "original-entry-redb-generation-fixture={}",
+            root.path().display()
+        );
+        let mut backend = crate::backend::RedbBackend::new(root.path());
+        backend
+            .open_run(manifest("original-redb-generation"))
+            .unwrap();
+        let path = backend.current_path().unwrap().to_owned();
+        let writer = EventStoreWriter::spawn(
+            Box::new(backend),
+            get_atomic_clock_static(),
+            halt::noop_halt(),
+            WriterConfig::default(),
+        )
+        .unwrap();
+        writer.append_durable(entry_draft(10)).unwrap();
+        let retained = path.with_extension("retained-original-redb");
+        std::fs::rename(&path, &retained).unwrap();
+        std::fs::write(&path, b"replacement remains preserved").unwrap();
+        assert!(writer.read_durable_entry(1).is_err());
+        assert!(retained.is_file());
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"replacement remains preserved"
+        );
+        assert_eq!(writer.high_watermark(), 1);
+    }
+
+    #[rstest]
+    #[case(1)]
+    #[case(2)]
+    #[case(3)]
+    fn original_entry_read_detects_missing_bytes_hash_and_embedded_sequence(#[case] fault: usize) {
+        let (backend, memory) = SharedMemory::new();
+        memory
+            .lock()
+            .open_run(manifest("original-read-corruption"))
+            .unwrap();
+        let fault_switch = Arc::clone(&backend.2);
+        let halt_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&halt_calls);
+        let writer = EventStoreWriter::spawn(
+            Box::new(backend),
+            get_atomic_clock_static(),
+            Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+            WriterConfig::default(),
+        )
+        .unwrap();
+        writer.append_durable(entry_draft(10)).unwrap();
+        fault_switch.store(fault, Ordering::SeqCst);
+        assert!(writer.read_durable_entry(1).is_err());
+        assert_eq!(writer.high_watermark(), 1);
+        assert_eq!(halt_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            writer.read_durable_entry(1),
+            Err(EventStoreError::Closed)
+        ));
+        assert_eq!(halt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(memory.lock().high_watermark().unwrap(), 1);
     }
 
     #[rstest]
@@ -2387,7 +2738,10 @@ mod tests {
 #[cfg(test)]
 #[cfg(madsim)]
 mod madsim_tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     use bytes::Bytes;
     use indexmap::IndexMap;
@@ -2436,12 +2790,15 @@ mod madsim_tests {
     }
 
     #[derive(Debug)]
-    struct SharedMemory(Arc<Mutex<MemoryBackend>>);
+    struct SharedMemory(Arc<Mutex<MemoryBackend>>, Arc<AtomicBool>);
 
     impl SharedMemory {
         fn new() -> (Self, Arc<Mutex<MemoryBackend>>) {
             let arc = Arc::new(Mutex::new(MemoryBackend::new()));
-            (Self(Arc::clone(&arc)), arc)
+            (
+                Self(Arc::clone(&arc), Arc::new(AtomicBool::new(false))),
+                arc,
+            )
         }
     }
 
@@ -2464,6 +2821,9 @@ mod madsim_tests {
         }
 
         fn scan_seq(&self, seq: u64) -> Result<Option<EventStoreEntry>, EventStoreError> {
+            if self.1.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             self.0.lock().scan_seq(seq)
         }
 
@@ -2527,5 +2887,73 @@ mod madsim_tests {
             backend.latest_snapshot_anchor().expect("latest anchor"),
             Some(anchor),
         );
+    }
+
+    #[rstest]
+    fn original_entry_read_under_madsim_preserves_rows_manifest_and_anchor() {
+        let (backend, shared) = SharedMemory::new();
+        shared.lock().open_run(manifest("sim-original")).unwrap();
+        let writer = EventStoreWriter::spawn(
+            Box::new(backend),
+            get_atomic_clock_static(),
+            noop_halt(),
+            WriterConfig::default(),
+        )
+        .unwrap();
+        let first = writer.append_durable(entry_draft(10)).unwrap();
+        writer.submit(entry_draft(20)).unwrap();
+        let before = shared.lock().manifest().unwrap();
+        let expected = shared.lock().scan_seq(first.sequence()).unwrap().unwrap();
+        let original = writer.read_durable_entry(first.sequence()).unwrap();
+        assert_eq!(original.run_id(), "sim-original");
+        assert_eq!(original.high_watermark(), 2);
+        assert_eq!(original.entry(), &expected);
+        assert_eq!(original.entry().entry_hash, first.entry_hash());
+        assert_eq!(shared.lock().manifest().unwrap(), before);
+        assert_eq!(shared.lock().high_watermark().unwrap(), 2);
+        assert!(shared.lock().latest_snapshot_anchor().unwrap().is_none());
+        assert!(writer.read_durable_entry(0).is_err());
+        assert!(writer.read_durable_entry(3).is_err());
+        assert!(writer.read_durable_entry(1).is_ok());
+        writer.close(entry_draft(30)).unwrap();
+    }
+
+    #[rstest]
+    fn original_entry_read_under_madsim_latches_missing_original_once() {
+        let (backend, shared) = SharedMemory::new();
+        let missing = Arc::clone(&backend.1);
+        shared
+            .lock()
+            .open_run(manifest("sim-missing-original"))
+            .unwrap();
+        let halts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&halts);
+        let writer = EventStoreWriter::spawn(
+            Box::new(backend),
+            get_atomic_clock_static(),
+            Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+            WriterConfig::default(),
+        )
+        .unwrap();
+        writer.append_durable(entry_draft(10)).unwrap();
+        let expected = shared.lock().scan_seq(1).unwrap().unwrap();
+        assert!(writer.read_durable_entry(0).is_err());
+        assert_eq!(halts.load(Ordering::SeqCst), 0);
+        missing.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            writer.read_durable_entry(1),
+            Err(EventStoreError::Corrupted(_))
+        ));
+        missing.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            writer.read_durable_entry(1),
+            Err(EventStoreError::Closed)
+        ));
+        assert_eq!(halts.load(Ordering::SeqCst), 1);
+        assert_eq!(writer.high_watermark(), 1);
+        assert_eq!(shared.lock().scan_seq(1).unwrap().unwrap(), expected);
+        assert!(shared.lock().latest_snapshot_anchor().unwrap().is_none());
     }
 }

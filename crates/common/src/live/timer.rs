@@ -759,7 +759,16 @@ impl TimerDriver {
 
     fn reset_at(&mut self, start: Instant) {
         match self {
-            Self::Fixed { timer, .. } => timer.reset_at(start),
+            Self::Fixed { timer, .. } => {
+                #[cfg(not(all(feature = "simulation", madsim)))]
+                timer.reset_at(start);
+                #[cfg(all(feature = "simulation", madsim))]
+                {
+                    let behavior = timer.missed_tick_behavior();
+                    *timer = dst::time::interval_at(start, timer.period());
+                    timer.set_missed_tick_behavior(behavior);
+                }
+            }
             Self::Scheduled { sleep, .. } => *sleep = None,
         }
     }
@@ -979,6 +988,37 @@ mod tests {
         fn next_after(&self, time_ns: UnixNanos, index: &mut u64) -> Option<UnixNanos> {
             *index = (time_ns.as_u64() - 100) / 10 + 1;
             Some(UnixNanos::from(100 + *index * 10))
+        }
+    }
+
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+    async fn fixed_timer_reset_preserves_period_policy_and_future_deadline() {
+        use crate::live::dst::time::{Duration, Instant, MissedTickBehavior, interval_at};
+
+        for behavior in [
+            MissedTickBehavior::Burst,
+            MissedTickBehavior::Delay,
+            MissedTickBehavior::Skip,
+        ] {
+            let period = Duration::from_millis(37);
+            let mut timer = interval_at(Instant::now(), period);
+            timer.set_missed_tick_behavior(behavior);
+            let mut driver = TimerDriver::Fixed {
+                timer,
+                interval_ns: nautilus_core::DurationNanos::new(37_000_000),
+            };
+            driver.reset_at(Instant::now() + Duration::from_secs(3_600));
+            let TimerDriver::Fixed { timer, .. } = &mut driver else {
+                unreachable!()
+            };
+            assert_eq!(timer.period(), period);
+            assert_eq!(timer.missed_tick_behavior(), behavior);
+            futures::future::poll_fn(|cx| {
+                assert!(timer.poll_tick(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
         }
     }
 
