@@ -154,6 +154,8 @@ pub mod config;
 
 #[cfg(feature = "plugin")]
 pub mod plugin;
+#[cfg(all(feature = "strategy-plugin", feature = "native-tail-replay"))]
+pub mod plugin_recovery;
 
 #[cfg(feature = "dispatch-observer")]
 mod dispatch;
@@ -4581,6 +4583,12 @@ impl LiveNode {
     #[must_use]
     pub const fn kernel(&self) -> &NautilusKernel {
         &self.kernel
+    }
+
+    /// Returns the actual immutable node configuration used by this instance.
+    #[must_use]
+    pub const fn config(&self) -> &LiveNodeConfig {
+        &self.config
     }
 
     /// Gets an exclusive reference to the underlying kernel.

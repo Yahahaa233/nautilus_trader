@@ -32,6 +32,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::strategy::{Strategy, StrategyConfig, StrategyCore};
 
+mod adapter;
+#[cfg(feature = "live")]
+pub mod historical;
+
 /// Explicit native routing and bounds, supplied by the server's admitted
 /// deployment. Guests cannot select another client, account or instrument.
 #[derive(Clone, Debug)]
@@ -65,6 +69,13 @@ pub struct PluginStrategy {
     core: StrategyCore,
     guest: Rc<RefCell<GuestInstance>>,
     scope: PluginScope,
+    adapter: adapter::AdapterState,
+    #[cfg(feature = "live")]
+    historical_verifier: Option<Rc<dyn historical::PluginHistoricalVerifier>>,
+    #[cfg(feature = "live")]
+    historical_prepared: bool,
+    #[cfg(feature = "live")]
+    historical_failed: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +141,7 @@ impl PluginStrategy {
                 "plugin.identity".into(),
                 serde_json::to_vec(&self.checkpoint_identity())?,
             ),
+            ("plugin.adapter".into(), serde_json::to_vec(&self.adapter)?),
         ])))
     }
 
@@ -201,6 +213,13 @@ impl PluginStrategy {
             core: StrategyCore::new_checked(config)?,
             guest: Rc::new(RefCell::new(guest)),
             scope,
+            adapter: adapter::AdapterState::default(),
+            #[cfg(feature = "live")]
+            historical_verifier: None,
+            #[cfg(feature = "live")]
+            historical_prepared: false,
+            #[cfg(feature = "live")]
+            historical_failed: false,
         })
     }
 
@@ -302,8 +321,10 @@ impl PluginStrategy {
                 );
                 if operation == HostOperation::Subscribe {
                     self.subscribe_bars(request.bar_type, Some(self.scope.client_id), None);
+                    self.adapter.subscribed_bars.insert(request.bar_type);
                 } else {
                     self.unsubscribe_bars(request.bar_type, Some(self.scope.client_id), None);
+                    self.adapter.subscribed_bars.remove(&request.bar_type);
                 }
                 Ok(Vec::new())
             }
@@ -445,6 +466,18 @@ impl PluginStrategy {
 
     fn fault_callback(&mut self, error: &anyhow::Error) {
         log::error!("Plugin callback failed: {error:#}");
+        #[cfg(feature = "live")]
+        if nautilus_common::recovery_trace::historical::active() {
+            // The original failure is latched in the guest; the target remains
+            // physically Ready while source callback effects are verified.
+            // Replay the actual cleanup, never a Ready -> Fault transition.
+            if let Err(cleanup) = DataActor::on_fault(self) {
+                self.historical_failed = true;
+                log::error!("Historical plugin cleanup failed: {cleanup:#}; original: {error:#}");
+            }
+            self.release_subscriptions();
+            return;
+        }
         if self.is_faulted() {
             return;
         }
@@ -520,7 +553,33 @@ crate::nautilus_strategy!(PluginStrategy, {
 });
 
 impl DataActor for PluginStrategy {
+    #[cfg(feature = "live")]
+    fn prepare_native_recovery(
+        &mut self,
+        boundary: &nautilus_common::recovery_trace::historical::HistoricalReplayPreparation<'_>,
+    ) -> Result<()> {
+        self.prepare_historical(boundary)
+    }
+
+    #[cfg(feature = "live")]
+    fn on_native_recovery_state(&self) -> Result<IndexMap<String, Vec<u8>>> {
+        self.historical_snapshot()
+    }
+
+    #[cfg(feature = "live")]
+    fn on_native_recovery_input(
+        &mut self,
+        boundary: &nautilus_common::recovery_trace::historical::HistoricalInputBoundary<'_>,
+        input: &dyn std::any::Any,
+    ) -> Result<()> {
+        self.historical_input(boundary, input)
+    }
+
     fn start_inhibited(&self) -> bool {
+        #[cfg(feature = "live")]
+        if self.historical_failed {
+            return true;
+        }
         self.guest.borrow().is_faulted()
     }
 
@@ -563,6 +622,8 @@ impl DataActor for PluginStrategy {
                 clock.cancel_timer(&name);
             }
         }
+        drop(clock);
+        self.adapter.subscribed_bars.clear();
         Ok(())
     }
 
@@ -611,14 +672,30 @@ impl DataActor for PluginStrategy {
                 "plugin.identity".into(),
                 serde_json::to_vec(&self.checkpoint_identity())?,
             ),
+            ("plugin.adapter".into(), serde_json::to_vec(&self.adapter)?),
         ]))
     }
 
     fn on_load(&mut self, mut state: IndexMap<String, Vec<u8>>) -> Result<()> {
         ensure!(
-            state.len() == 2,
+            matches!(state.len(), 2 | 3),
             "incomplete or unknown plugin checkpoint members"
         );
+        let adapter = if let Some(raw) = state.swap_remove("plugin.adapter") {
+            let adapter: adapter::AdapterState = serde_json::from_slice(&raw)?;
+            adapter.validate(&self.scope)?;
+            adapter
+        } else {
+            // ABI-1 timer-only checkpoints predate adapter inventories. Their
+            // empty declared bar domain proves that no bar route can be lost.
+            // Other legacy checkpoints require a separately qualified migration.
+            ensure!(
+                self.scope.bar_types.is_empty(),
+                "legacy plugin checkpoint lacks its native subscription inventory"
+            );
+            adapter::AdapterState::default()
+        };
+        ensure!(state.len() == 2, "unknown plugin checkpoint member");
         let identity: CheckpointIdentity = serde_json::from_slice(
             &state
                 .swap_remove("plugin.identity")
@@ -636,12 +713,14 @@ impl DataActor for PluginStrategy {
                 .map_err(|error| {
                     anyhow::anyhow!("plugin terminal restore: {}", error.message_string())
                 })?;
+            self.adapter = adapter;
             return Ok(());
         }
         let payload = state
             .swap_remove("plugin.state")
             .context("plugin checkpoint state missing")?;
         self.invoke(CallbackKind::Restore, &payload)?;
+        self.adapter = adapter;
         Ok(())
     }
 }

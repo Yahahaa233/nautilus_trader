@@ -4,7 +4,7 @@ The `nautilus-plugin` crate defines the artifact contract for NautilusTrader plu
 independently compiled Rust `cdylib` that identifies itself with a versioned manifest and exchanges
 values across a C-ABI boundary. The original artifact metadata and boundary primitives remain
 available independently. This managed fork also provides an opt-in encoded strategy component and a
-trusted GNU library loader, described below. They are independent of the private Nautilus Pro host;
+trusted GNU/Darwin library loader, described below. They are independent of the private Nautilus Pro host;
 the legacy generic Live plug-in entry does not acquire strategy loading support implicitly.
 
 :::warning
@@ -111,8 +111,11 @@ adapter. An algorithm therefore needs no dependency on `StrategyCore` to use the
 Native market, historical-bar, order, position and timer callbacks enter the encoded Event hook.
 A reported event failure or contained panic faults that actual actor, retains the first guest error,
 releases its own timers/subscriptions and leaves unrelated actors with their own native state.
-Save produces algorithm bytes plus configuration/descriptor/schema identity; Restore checks that
-identity. A failed guest instead produces a distinct bounded terminal-failure record, without
+Save produces algorithm bytes, configuration/descriptor/schema identity and the adapter's actual
+subscription inventory; Restore checks those complete fields before use. Legacy component-only
+checkpoints without a subscription inventory are accepted only when their declared bar domain is
+empty. Other upgrades require an explicit qualified migration. A failed guest instead produces a
+distinct bounded terminal-failure record, without
 claiming that its partially mutated opaque state is resumable. Only an unused physical guest can
 retain that failure during restore; native startup inhibition keeps it inactive while unrelated
 components start normally. Explicit native starts also refuse an inhibited component. This
@@ -125,7 +128,30 @@ A two-process component-state test does not prove a complete order/portfolio/ris
 or production recovery qualification. Those remain requirements of the application's common
 native checkpoint and journal path.
 
-### GNU library admission and lifetime
+### Reader-verified historical callbacks
+
+With `native-tail-replay` and `strategy-plugin`, the Live owner supplies
+`node::plugin_recovery::ReaderVerifiedPluginRecovery` before registering a `PluginStrategy`.
+Trading depends only on its verifier interface; it does not add an event-store dependency cycle.
+Preparation requires the actual Journal reader's `VerifiedNativeTrace` and compares this owner's
+whole private state, native factory/framework facts and restored subscription inventory with its
+original cut. Local route installation does not call ordinary Start or contact a venue.
+
+Every historical callback verifies the actual `VerifiedNativeRoot`, source identity, root inventory,
+whole original Begin and component owner. The native driver still owns clock/UUID/output/queue
+comparison and suppresses transport. Historical plugin error/panic cleanup keeps the target
+physically Ready, retains the original guest failure and inhibits later startup; it does not attempt
+an invalid Ready-to-Fault physical transition. Missing/unrelated proofs, changed state and unsupported
+input profiles fail recovery and retain the failure. A verified historical cut never creates a
+current execution grant or clears a process transmission veto.
+
+The private `strategy_contract_host --history-source/--history-restore` fixture uses real sealed
+Journals and different PIDs for normal, original Generic and original Panic scenarios. Actual exact
+state/decision/UUID/clock/routing comparisons and source/configuration/state refusals are bounded
+conformance evidence. They do not qualify nonflat portfolios, venue protection, economic ledgers or
+an application's production recovery integration.
+
+### Platform library admission and lifetime
 
 The `host` feature exposes `LibraryRegistry` on x86-64 GNU Linux. Its unsafe `load_admitted` entry
 requires an already-reviewed managed publication and constructor/dependency provenance. It refuses
@@ -141,8 +167,22 @@ metadata. Loaded/failed library identities share a fixed registry capacity. Trus
 not a malicious-code sandbox: process supervision must handle memory corruption, native aborts and
 unbounded blocking.
 
+On ARM64 Darwin, the same `strategy::library_loader` path verifies the Mach-O layout, explicit
+system dependency set and actual OS signature admission. The host supplies a private directory.
+The loader creates a named readonly copy, closes its writable descriptor, checks its inode and exact
+bytes, protects the directory and loads via its retained descriptor. The named file, descriptor and
+loader handle remain live until process exit. Darwin signing policy requires named backing; this is
+trusted same-UID host custody and does not claim GNU memfd sealing or adversarial native-code isolation.
+
+Both platform parsers bound virtual mappings and reject overlapping/unbounded images. Each host
+registry conservatively charges copied bytes and mapped images across successful and failed loads.
+The host retains one registry for the process lifetime; dropping it does not recycle resident capacity.
+
 The `contract_counter`, `contract_interval` and `strategy_contract_host` examples are private
 non-financial conformance fixtures. They use one actual LiveNode and native clocks, with no venue
 clients and an interceptor that rejects every attempted submit. Their descriptors explicitly mark
 them as research-only fixtures. They do not supply the application's complete strategy publisher,
 BacktestID binding, execution authority or production acceptance.
+`strategy_contract_research_host` runs the same two dynamic algorithms in one actual BacktestEngine
+with virtual clocks and the same native submission refusal. It is also conformance evidence, not
+trading eligibility or a completed research report.

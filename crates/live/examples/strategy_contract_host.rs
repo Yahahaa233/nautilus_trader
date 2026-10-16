@@ -11,6 +11,15 @@
 //! cdylibs share one actual LiveNode, native clocks and submission interception.
 //! This is not a Metis production qualification, account or execution grant.
 
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    target_arch = "x86_64",
+    feature = "native-tail-replay"
+))]
+#[path = "strategy_contract_host/history.rs"]
+mod history;
+
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 mod gnu {
     use anyhow::{Context, Result, bail, ensure};
@@ -191,7 +200,7 @@ mod gnu {
         Ok(snapshot)
     }
 
-    fn install_guests(
+    pub(super) fn install_guests(
         node: &mut LiveNode,
         counter: LoadedLibrary,
         interval: LoadedLibrary,
@@ -251,6 +260,10 @@ mod gnu {
                     configuration_sha256: hash(configuration),
                 },
             )?;
+            #[cfg(feature = "native-tail-replay")]
+            strategy.set_historical_verifier(Rc::new(
+                nautilus_live::node::plugin_recovery::ReaderVerifiedPluginRecovery::default(),
+            ))?;
             strategy
                 .strategy_core_mut()
                 .set_submission_interceptor(Rc::new(NoGrant {
@@ -430,8 +443,32 @@ mod gnu {
         )
     }
 
+    pub(super) fn load_libraries(args: &[String]) -> Result<[LoadedLibrary; 2]> {
+        ensure!(args.len() >= 4, "native fixture library arguments absent");
+        let mut registry = LibraryRegistry::new(2, 64 * 1024 * 1024)
+            .map_err(|e| anyhow::anyhow!("{}", e.message_string()))?;
+        let counter = File::open(&args[0])?;
+        let interval = File::open(&args[2])?;
+        // SAFETY: the private VPS driver verifies complete build/source receipts,
+        // root-owned immutable publication and constructor provenance first.
+        let counter = unsafe { registry.load_admitted(&counter, decode_hash(&args[1])?, 0) }
+            .map_err(|e| anyhow::anyhow!("{}", e.message_string()))?;
+        // SAFETY: the same verified fixture publication applies to this image
+        let interval = unsafe { registry.load_admitted(&interval, decode_hash(&args[3])?, 0) }
+            .map_err(|e| anyhow::anyhow!("{}", e.message_string()))?;
+        drop(registry);
+        Ok([counter, interval])
+    }
+
     pub(super) fn run() -> Result<()> {
         let args = std::env::args().skip(1).collect::<Vec<_>>();
+        #[cfg(feature = "native-tail-replay")]
+        if args
+            .first()
+            .is_some_and(|mode| mode.starts_with("--history-"))
+        {
+            return super::history::run(&args);
+        }
         ensure!(
             (4..=6).contains(&args.len()),
             "expected counter-path SHA-256 interval-path SHA-256 [restored-state]"
@@ -451,21 +488,7 @@ mod gnu {
             Some("--panic-event") => b"counter-panic-event-v1",
             _ => b"counter-v1",
         };
-        let mut registry = LibraryRegistry::new(2, 64 * 1024 * 1024)
-            .map_err(|e| anyhow::anyhow!("{}", e.message_string()))?;
-        let counter = File::open(&args[0])?;
-        let interval = File::open(&args[2])?;
-        // SAFETY: the private VPS driver verifies the complete local build
-        // receipts/source hashes, root-owned immutable fixture files and the
-        // constructor-free fixture sources, before entering its networkless UID.
-        let counter = unsafe { registry.load_admitted(&counter, decode_hash(&args[1])?, 0) }
-            .map_err(|e| anyhow::anyhow!("{}", e.message_string()))?;
-        // SAFETY: same admitted private conformance publication as above
-        let interval = unsafe { registry.load_admitted(&interval, decode_hash(&args[3])?, 0) }
-            .map_err(|e| anyhow::anyhow!("{}", e.message_string()))?;
-        // Actual callbacks and producer disposal must outlive the registry.
-        // LoadedLibrary pins both the descriptor number and dlopen handle.
-        drop(registry);
+        let [counter, interval] = load_libraries(&args)?;
         let records = Rc::new(RefCell::new(Vec::new()));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
