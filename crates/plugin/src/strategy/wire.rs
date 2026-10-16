@@ -211,3 +211,41 @@ mod tests {
         assert_eq!(restored.alert_at_ns, u64::MAX);
     }
 }
+
+/// Application policy input. Context identity and quantity are never guest fields.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedSubmit {
+    pub schema_version: u32,
+    pub instrument_id: nautilus_model::identifiers::InstrumentId,
+    pub side: nautilus_model::enums::OrderSide,
+    pub intent: serde_json::Value,
+}
+
+#[cfg(test)]
+mod managed_tests {
+    use super::*;
+    #[test]
+    fn managed_intent_cannot_supply_native_or_economic_authority() {
+        let value = serde_json::json!({"schema_version":1,"instrument_id":"ETHUSDT-PERP.BINANCE","side":"BUY","intent":{"kind":"entry"}});
+        assert!(serde_json::from_value::<ManagedSubmit>(value.clone()).is_ok());
+        for key in [
+            "account_id",
+            "client_id",
+            "strategy_id",
+            "run_id",
+            "client_order_id",
+            "quantity",
+            "equity",
+            "available_budget",
+        ] {
+            let mut changed = value.clone();
+            changed[key] = serde_json::json!("forged");
+            assert!(serde_json::from_value::<ManagedSubmit>(changed).is_err());
+        }
+        assert_eq!(
+            super::super::HostOperation::from_tag(14),
+            Some(super::super::HostOperation::ManagedSubmit)
+        );
+    }
+}

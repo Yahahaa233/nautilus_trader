@@ -120,6 +120,8 @@ pub enum HostOperation {
     Cancel,
     Query,
     Log,
+    /// Application-approved quantity and native submit under one original ID.
+    ManagedSubmit,
 }
 
 impl HostOperation {
@@ -140,6 +142,7 @@ impl HostOperation {
             Self::Cancel => 11,
             Self::Query => 12,
             Self::Log => 13,
+            Self::ManagedSubmit => 14,
         }
     }
 
@@ -160,6 +163,7 @@ impl HostOperation {
             11 => Some(Self::Cancel),
             12 => Some(Self::Query),
             13 => Some(Self::Log),
+            14 => Some(Self::ManagedSubmit),
             _ => None,
         }
     }

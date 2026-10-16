@@ -668,3 +668,90 @@ fn owning_guest_restore_precedes_every_runtime_callback_and_cannot_repeat() {
             .is_err()
     );
 }
+
+#[derive(Debug)]
+struct IgnoredNativeFailure;
+impl Algorithm for IgnoredNativeFailure {
+    const DESCRIPTOR_JSON: &'static str = Counter::DESCRIPTOR_JSON;
+    fn validate(_: &[u8]) -> Result<(), PluginError> {
+        Ok(())
+    }
+    fn create(_: &[u8]) -> Result<Self, PluginError> {
+        Ok(Self)
+    }
+    fn start(&mut self, host: &mut Host<'_>) -> Result<(), PluginError> {
+        let _first = host.call(HostOperation::Clock, b"");
+        let _second = host.call(HostOperation::Clock, b"");
+        Ok(())
+    }
+    fn on_event(&mut self, _: &[u8], _: &mut Host<'_>) -> Result<(), PluginError> {
+        Ok(())
+    }
+    fn save(&self, _: &mut ReadOnlyHost<'_>) -> Result<Vec<u8>, PluginError> {
+        Ok(0u64.to_le_bytes().to_vec())
+    }
+    fn restore(&mut self, _: u32, _: &[u8], _: &mut ReadOnlyHost<'_>) -> Result<(), PluginError> {
+        Ok(())
+    }
+    fn pause(&mut self, _: &mut Host<'_>) -> Result<(), PluginError> {
+        Ok(())
+    }
+    fn resume(&mut self, _: &mut Host<'_>) -> Result<(), PluginError> {
+        Ok(())
+    }
+    fn stop(&mut self, _: &[u8], _: &mut Host<'_>) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+#[test]
+fn ignored_native_panic_or_durability_failure_stops_subsequent_host_effects() {
+    for code in [
+        PluginErrorCode::Panic,
+        PluginErrorCode::SerializationFailed,
+        PluginErrorCode::Generic,
+    ] {
+        let api = Box::leak(Box::new(
+            StrategyApi::for_algorithm::<IgnoredNativeFailure>(),
+        ));
+        // SAFETY: generated static table and test producer have process lifetime.
+        let mut guest = unsafe {
+            instance::GuestInstance::create(
+                api,
+                IgnoredNativeFailure::DESCRIPTOR_JSON.as_bytes(),
+                b"counter-v1",
+                limits(),
+                Box::new(CounterStateValidator),
+            )
+        }
+        .unwrap();
+        let mut calls = 0;
+        let mut facade = |_, _: &[u8]| {
+            calls += 1;
+            assert!(code != PluginErrorCode::Panic, "original native host panic");
+            Err(PluginError::new(code, "original native host refusal"))
+        };
+        let result = guest.invoke(CallbackKind::Start, 1, b"", &mut facade);
+        if code == PluginErrorCode::Generic {
+            assert!(result.is_ok());
+            assert!(!guest.is_faulted());
+            assert_eq!(calls, 2);
+        } else {
+            let failure = result.unwrap_err();
+            assert_eq!(failure.code, code);
+            assert_eq!(calls, 1);
+            let original = guest
+                .first_failure()
+                .map(|(code, message)| (code, message.to_owned()))
+                .unwrap();
+            let late = guest
+                .invoke(
+                    CallbackKind::Save,
+                    1,
+                    b"",
+                    &mut |_, _: &[u8]| Ok(Vec::new()),
+                )
+                .unwrap_err();
+            assert_eq!((late.code, late.message_string()), original);
+        }
+    }
+}

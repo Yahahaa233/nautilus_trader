@@ -223,6 +223,22 @@ impl GuestInstance {
             CallbackKind::Stop => 1024,
             _ => 0,
         };
+        let mut native_failure: Option<(PluginErrorCode, String)> = None;
+        let mut watched_facade = |operation, payload: &[u8]| {
+            if let Some((code, message)) = &native_failure {
+                return Err(PluginError::new(*code, message));
+            }
+            let result = crate::panic::guard(|| facade(operation, payload)).into_result();
+            if let Err(error) = &result
+                && matches!(
+                    error.code,
+                    PluginErrorCode::Panic | PluginErrorCode::SerializationFailed
+                )
+            {
+                native_failure = Some((error.code, error.message_string()));
+            }
+            result
+        };
         let result = if kind == CallbackKind::Restore && already_used {
             Err(invalid(
                 "algorithm Restore requires an unused physical guest",
@@ -237,7 +253,7 @@ impl GuestInstance {
             };
             admitted
                 .and_then(|()| {
-                    with_host_scope(self.instance, facade, |lease| {
+                    with_host_scope(self.instance, &mut watched_facade, |lease| {
                         // SAFETY: self owns the live guest and its pinned API;
                         // the current scope holds exclusive native facade access.
                         let response = unsafe {
@@ -265,6 +281,13 @@ impl GuestInstance {
                     }
                     Ok(output)
                 })
+        };
+        // A producer cannot swallow a native panic or durability failure and
+        // continue host effects. This happened before any later producer error.
+        let result = if let Some((code, message)) = native_failure {
+            Err(PluginError::new(code, &message))
+        } else {
+            result
         };
         if let Err(error) = &result {
             self.failure = Some((error.code, error.message_string()));

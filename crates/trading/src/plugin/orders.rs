@@ -8,7 +8,7 @@
 use anyhow::{Context, Result, ensure};
 use nautilus_common::actor::DataActor;
 use nautilus_core::UnixNanos;
-use nautilus_model::{enums::TimeInForce, orders::Order};
+use nautilus_model::{enums::TimeInForce, identifiers::ClientOrderId, orders::Order};
 
 use super::{PluginOrderType, PluginStrategy, require_version, wire};
 use crate::strategy::{Strategy, StrategyNative};
@@ -84,7 +84,14 @@ fn decode_submit(input: &[u8]) -> Result<wire::SubmitRequest> {
 
 impl PluginStrategy {
     pub(super) fn submit_encoded(&mut self, input: &[u8]) -> Result<Vec<u8>> {
-        let request = decode_submit(input)?;
+        self.submit_native_request(&decode_submit(input)?, None)
+    }
+
+    pub(super) fn submit_native_request(
+        &mut self,
+        request: &wire::SubmitRequest,
+        client_order_id: Option<ClientOrderId>,
+    ) -> Result<Vec<u8>> {
         self.require_instrument(request.instrument_id)?;
         let kind = match request.order_type {
             wire::NativeOrderType::Market => PluginOrderType::Market,
@@ -149,7 +156,7 @@ impl PluginStrategy {
                 None,
                 None,
                 None,
-                None,
+                client_order_id,
             )?,
             PluginOrderType::Limit => self.order_factory().try_limit(
                 request.instrument_id,
@@ -167,7 +174,7 @@ impl PluginStrategy {
                 None,
                 None,
                 None,
-                None,
+                client_order_id,
             )?,
             PluginOrderType::StopMarket => self.order_factory().try_stop_market(
                 request.instrument_id,
@@ -187,7 +194,7 @@ impl PluginStrategy {
                 None,
                 None,
                 None,
-                None,
+                client_order_id,
             )?,
             PluginOrderType::StopLimit => self.order_factory().try_stop_limit(
                 request.instrument_id,
@@ -209,10 +216,14 @@ impl PluginStrategy {
                 None,
                 None,
                 None,
-                None,
+                client_order_id,
             )?,
         };
         let id = order.client_order_id();
+        ensure!(
+            client_order_id.is_none_or(|expected| id == expected),
+            "native prepared order identity changed"
+        );
         self.submit_order(order, request.position_id, Some(self.scope.client_id), None)?;
         Ok(serde_json::to_vec(&wire::OrderId {
             schema_version: wire::VERSION,

@@ -36,6 +36,7 @@ mod facts;
 #[cfg(feature = "live")]
 pub mod historical;
 mod history_requests;
+pub mod managed;
 mod orders;
 mod routing;
 mod subscriptions;
@@ -83,6 +84,7 @@ pub struct PluginStrategy {
     guest: Rc<RefCell<GuestInstance>>,
     scope: PluginScope,
     adapter: adapter::AdapterState,
+    managed_policy: Option<managed::ManagedPolicyBinding>,
     history_reissue_after_restore: bool,
     restored_resources_unprepared: bool,
     #[cfg(feature = "live")]
@@ -103,6 +105,8 @@ struct CheckpointIdentity {
     /// required to resume under the complete scope. Never infer that proof.
     #[serde(default)]
     native_scope: Option<PluginScope>,
+    #[serde(default)]
+    managed_policy_identity: Option<managed::ManagedPolicyIdentity>,
     #[serde(default)]
     trader_id: Option<nautilus_model::identifiers::TraderId>,
     #[serde(default)]
@@ -155,6 +159,10 @@ impl PluginStrategy {
             descriptor_sha256: self.scope.descriptor_sha256.clone(),
             configuration_sha256: self.scope.configuration_sha256.clone(),
             native_scope: Some(self.scope.clone()),
+            managed_policy_identity: self
+                .managed_policy
+                .as_ref()
+                .map(|binding| binding.identity.clone()),
             trader_id: self.core.trader_id(),
             strategy_id: self.core.strategy_id(),
         }
@@ -262,6 +270,7 @@ impl PluginStrategy {
             guest: Rc::new(RefCell::new(guest)),
             scope,
             adapter: adapter::AdapterState::default(),
+            managed_policy: None,
             history_reissue_after_restore: false,
             restored_resources_unprepared: false,
             #[cfg(feature = "live")]
@@ -282,8 +291,13 @@ impl PluginStrategy {
                     .readonly(operation, input)
                     .map_err(|error| PluginError::generic(format!("{error:#}")));
             }
-            self.dispatch(operation, input)
-                .map_err(|error| PluginError::generic(format!("{error:#}")))
+            self.dispatch(operation, input).map_err(|error| {
+                if let Some(fatal) = error.downcast_ref::<managed::NativeManagedFailure>() {
+                    PluginError::new(fatal.code, &fatal.message)
+                } else {
+                    PluginError::generic(format!("{error:#}"))
+                }
+            })
         };
         guest
             .try_borrow_mut()?
@@ -438,6 +452,7 @@ impl PluginStrategy {
                 Ok(Vec::new())
             }
             HostOperation::Submit => self.submit_encoded(input),
+            HostOperation::ManagedSubmit => self.managed_submit(input),
             HostOperation::Cancel => {
                 let request: wire::OrderId = serde_json::from_slice(input)?;
                 require_version(request.schema_version)?;
