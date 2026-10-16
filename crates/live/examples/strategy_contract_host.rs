@@ -24,7 +24,7 @@ mod gnu {
     use nautilus_live::node::{LiveNode, NodeRunMode};
     use nautilus_model::identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId};
     use nautilus_plugin::strategy::{
-        instance::CallbackLimits,
+        instance::{CallbackLimits, StateValidator},
         linux_loader::{LibraryRegistry, LoadedLibrary},
     };
     use nautilus_trading::{
@@ -40,6 +40,48 @@ mod gnu {
         include_str!("../../plugin/examples/contract_counter.descriptor.json");
     const INTERVAL_DESCRIPTOR: &str =
         include_str!("../../plugin/examples/contract_interval.descriptor.json");
+
+    #[derive(Debug)]
+    struct FixtureStateValidator {
+        counter: bool,
+        reject: bool,
+    }
+
+    impl StateValidator for FixtureStateValidator {
+        fn validate(&self, version: u32, raw: &[u8]) -> Result<(), nautilus_plugin::PluginError> {
+            if self.reject {
+                return Err(nautilus_plugin::PluginError::new(
+                    nautilus_plugin::PluginErrorCode::SerializationFailed,
+                    "contract_counter_original_state_refusal",
+                ));
+            }
+            let refuse =
+                || nautilus_plugin::PluginError::generic("native fixture state contract refused");
+            let value: Value = serde_json::from_slice(raw).map_err(|_| refuse())?;
+            let fields = value.as_object().ok_or_else(refuse)?;
+            let names = if self.counter {
+                ["events", "denied", "pending"]
+            } else {
+                ["scheduled_at", "elapsed_ns", "denied"]
+            };
+            if version != 1
+                || fields.len() != 3
+                || names.iter().any(|key| !fields.contains_key(*key))
+            {
+                return Err(refuse());
+            }
+            for name in names {
+                if self.counter && name == "pending" {
+                    if !value[name].is_boolean() {
+                        return Err(refuse());
+                    }
+                } else if !value[name].is_u64() {
+                    return Err(refuse());
+                }
+            }
+            Ok(())
+        }
+    }
 
     #[derive(Debug)]
     struct NoGrant {
@@ -156,6 +198,7 @@ mod gnu {
         counter_configuration: &[u8],
         records: &Rc<RefCell<Vec<Value>>>,
         restored: Option<&Value>,
+        reject_counter_state: bool,
     ) -> Result<()> {
         for (id, client, library, descriptor, configuration) in [
             (
@@ -182,6 +225,10 @@ mod gnu {
                         state_bytes: 4096,
                         event_bytes: 4096,
                     },
+                    Box::new(FixtureStateValidator {
+                        counter: id == "COUNTER-001",
+                        reject: id == "COUNTER-001" && reject_counter_state,
+                    }),
                 )
                 .map_err(|e| anyhow::anyhow!("{}", e.message_string()))?;
             let strategy_id = StrategyId::from(id);
@@ -241,9 +288,15 @@ mod gnu {
     ) -> Result<Value> {
         let mut actor = try_get_actor_unchecked::<PluginStrategy>(&"COUNTER-001".into())
             .context("faulted actual plugin actor missing")?;
+        // In the Save-contract case this first call must retain a terminal
+        // checkpoint immediately, without another callback or collection retry.
+        let failure_state = actor.on_save()?;
+        let native_faulted = actor.is_faulted();
         ensure!(
             if restored {
                 actor.is_start_inhibited() && !actor.is_running()
+            } else if mode == "--reject-save" {
+                actor.is_start_inhibited()
             } else {
                 actor.is_faulted()
             },
@@ -257,16 +310,15 @@ mod gnu {
         let first = actor
             .callback_failure()
             .context("original guest fault not retained")?;
-        let expected = if mode == "--panic-event" {
-            "contract_counter_original_event_panic"
-        } else {
-            "contract_counter_original_event_error"
+        let expected = match mode {
+            "--panic-event" => "contract_counter_original_event_panic",
+            "--reject-save" => "contract_counter_original_state_refusal",
+            _ => "contract_counter_original_event_error",
         };
         ensure!(
             first.1.contains(expected),
             "original callback fault replaced"
         );
-        let failure_state = actor.on_save()?;
         ensure!(
             failure_state.contains_key("plugin.failure")
                 && !failure_state.contains_key("plugin.state"),
@@ -304,7 +356,10 @@ mod gnu {
                 && if restored {
                     records.is_empty()
                 } else {
-                    records.len() == 1 && records[0]["client_id"] == "CONTRACT-B"
+                    records.len() == if mode == "--reject-save" { 2 } else { 1 }
+                        && records
+                            .iter()
+                            .any(|record| record["client_id"] == "CONTRACT-B")
                 },
             "healthy B did not complete its actual callback after A failure"
         );
@@ -321,7 +376,7 @@ mod gnu {
         )?;
         Ok(
             json!({"schema":"NativeStrategyContractProbe.v1","pid":std::process::id(),"single_live_node":true,
-                    "mode":mode,"counter_failure_code":format!("{:?}",first.0),"counter_first_failure":first.1,"counter_native_faulted":!restored,"counter_start_inhibited":start_inhibited,"restored_terminal_failure":restored,"common_component_checkpoint_complete":true,
+                    "mode":mode,"counter_failure_code":format!("{:?}",first.0),"counter_first_failure":first.1,"counter_native_faulted":native_faulted,"counter_start_inhibited":start_inhibited,"restored_terminal_failure":restored,"common_component_checkpoint_complete":true,
                     "interval_state":interval_state,"healthy_sibling_faulted":false,"actual_native_denials":records,
                     "registry_released_before_callbacks":true,"execution_authorized":false,"financial_requests":0,"algorithm_state_only":true,"production_acceptance":false}),
         )
@@ -385,8 +440,10 @@ mod gnu {
             .get(5)
             .or_else(|| args.get(4).filter(|mode| mode.starts_with("--")));
         ensure!(
-            failure_mode
-                .is_none_or(|mode| matches!(mode.as_str(), "--fail-event" | "--panic-event")),
+            failure_mode.is_none_or(|mode| matches!(
+                mode.as_str(),
+                "--fail-event" | "--panic-event" | "--reject-save"
+            )),
             "unknown component fault mode"
         );
         let counter_configuration: &[u8] = match failure_mode.map(String::as_str) {
@@ -431,6 +488,7 @@ mod gnu {
                 counter_configuration,
                 &records,
                 restored.as_ref(),
+                failure_mode.is_some_and(|mode| mode == "--reject-save"),
             )?;
             let handle = node.handle();
             let recorded = Rc::clone(&records);
@@ -439,7 +497,11 @@ mod gnu {
                     if handle.is_running()
                         && (restored.is_some()
                             || recorded.borrow().len()
-                                == if failure_mode.is_some() { 1 } else { 2 })
+                                == if failure_mode.is_some_and(|mode| mode != "--reject-save") {
+                                    1
+                                } else {
+                                    2
+                                })
                     {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         handle.stop();

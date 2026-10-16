@@ -84,6 +84,13 @@ container or trait object crosses the ABI: bounded bytes are copied and freed by
 side. A `GuestInstance` owns one opaque algorithm allocation and retains its first callback failure.
 Save or Restore cannot clear that failure.
 
+Creating an owning guest also requires a host-owned `StateValidator` bound to the admitted
+descriptor and schema. Restore validates the complete original bytes before any guest callback;
+Save validates the returned bytes before exposing them to checkpoint owners. The validator has no
+mutable host capability. Its refusal or contained panic uses the same first-failure latch as an
+algorithm callback, so another Restore or a runtime callback cannot clear it. The application must
+provide its real state contract; a permissive validator is not production qualification.
+
 ### Native host access and lifecycle
 
 `Host` is borrowed, non-cloneable and non-Send. Each callback receives a process-unique instance and
@@ -98,6 +105,8 @@ bar subscriptions, bounded one-shot timers, market/limit construction and submis
 strategy/account/instrument-scoped cached order query/modify/cancel. Unsupported operations return
 an error, including history/portfolio/instrument operations not yet implemented by this bridge.
 An application's capability admission must reject declarations that require those missing paths.
+Encoded request types live in `nautilus_plugin::strategy::wire` and are re-exported by the native
+adapter. An algorithm therefore needs no dependency on `StrategyCore` to use the shared protocol.
 
 Native market, historical-bar, order, position and timer callbacks enter the encoded Event hook.
 A reported event failure or contained panic faults that actual actor, retains the first guest error,
@@ -108,6 +117,9 @@ claiming that its partially mutated opaque state is resumable. Only an unused ph
 retain that failure during restore; native startup inhibition keeps it inactive while unrelated
 components start normally. Explicit native starts also refuse an inhibited component. This
 restriction never grants execution authority or clears the original error.
+If the first failure occurs inside Save or its state validator, that same component collection
+returns the distinct terminal-failure record immediately. Invalid state bytes are not returned,
+and the caller does not need another Save attempt to preserve the original failure.
 
 A two-process component-state test does not prove a complete order/portfolio/risk/timer checkpoint
 or production recovery qualification. Those remain requirements of the application's common

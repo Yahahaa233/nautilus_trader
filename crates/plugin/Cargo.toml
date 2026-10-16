@@ -34,6 +34,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 nautilus-core = { workspace = true, optional = true }
 nautilus-model = { workspace = true }
 
+serde = { workspace = true }
 log = { workspace = true }
 libc = { workspace = true, optional = true }
 sha2 = { version = "0.11", optional = true }

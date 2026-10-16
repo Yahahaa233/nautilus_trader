@@ -19,11 +19,10 @@ use nautilus_common::{actor::DataActor, component::Component, timer::TimeEvent};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, BarType, QuoteTick, TradeTick},
-    enums::{OrderSide, TimeInForce},
+    enums::TimeInForce,
     events::{OrderEventAny, PositionEvent},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId},
     orders::{Order, OrderAny},
-    types::{Price, Quantity},
 };
 use nautilus_plugin::{
     PluginError,
@@ -55,76 +54,8 @@ pub enum PluginOrderType {
     Limit,
 }
 
-/// Supported wire messages are intentionally explicit. An unsupported host
-/// operation returns an error; it is never treated as an empty success.
-pub mod wire {
-    use super::{
-        BarType, ClientOrderId, Deserialize, InstrumentId, OrderSide, Price, Quantity, Serialize,
-    };
-
-    /// First encoded native strategy protocol.
-    pub const VERSION: u32 = 1;
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Subscription {
-        pub schema_version: u32,
-        pub bar_type: BarType,
-    }
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Timer {
-        pub schema_version: u32,
-        pub name: String,
-        pub alert_at_ns: u64,
-    }
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct TimerName {
-        pub schema_version: u32,
-        pub name: String,
-    }
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    #[serde(tag = "order_type", rename_all = "snake_case", deny_unknown_fields)]
-    pub enum Submit {
-        Market {
-            schema_version: u32,
-            instrument_id: InstrumentId,
-            side: OrderSide,
-            quantity: Quantity,
-            reduce_only: bool,
-        },
-        Limit {
-            schema_version: u32,
-            instrument_id: InstrumentId,
-            side: OrderSide,
-            quantity: Quantity,
-            price: Price,
-            reduce_only: bool,
-            post_only: bool,
-        },
-    }
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct OrderId {
-        pub schema_version: u32,
-        pub client_order_id: ClientOrderId,
-    }
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct Modify {
-        pub schema_version: u32,
-        pub client_order_id: ClientOrderId,
-        pub quantity: Option<Quantity>,
-        pub price: Option<Price>,
-        pub trigger_price: Option<Price>,
-    }
-}
+/// Shared encoded requests do not require algorithms to depend on a Core.
+pub use nautilus_plugin::strategy::wire;
 
 /// Uses the same native registration, component, clock, cache and execution
 /// facades as an ordinary compiled strategy. Native framework recovery still
@@ -180,6 +111,26 @@ impl PluginStrategy {
             descriptor_sha256: self.scope.descriptor_sha256.clone(),
             configuration_sha256: self.scope.configuration_sha256.clone(),
         }
+    }
+
+    fn terminal_checkpoint(&self) -> Result<Option<IndexMap<String, Vec<u8>>>> {
+        let Some((code, message)) = self.callback_failure() else {
+            return Ok(None);
+        };
+        Ok(Some(IndexMap::from([
+            (
+                "plugin.failure".into(),
+                serde_json::to_vec(&FailureCheckpoint {
+                    schema: "NautilusStrategyComponentFailure.v1".into(),
+                    code: code as u32,
+                    message,
+                })?,
+            ),
+            (
+                "plugin.identity".into(),
+                serde_json::to_vec(&self.checkpoint_identity())?,
+            ),
+        ])))
     }
 
     fn clock_facts(&self) -> Result<Vec<u8>> {
@@ -616,24 +567,11 @@ impl DataActor for PluginStrategy {
     }
 
     fn on_save(&self) -> Result<IndexMap<String, Vec<u8>>> {
-        if let Some((code, message)) = self.callback_failure() {
+        if let Some(checkpoint) = self.terminal_checkpoint()? {
             // Never call a failed algorithm again or assert that its partial
             // opaque state is resumable. Native cache/ledger/framework facts
             // remain with their common checkpoint owners.
-            return Ok(IndexMap::from([
-                (
-                    "plugin.failure".into(),
-                    serde_json::to_vec(&FailureCheckpoint {
-                        schema: "NautilusStrategyComponentFailure.v1".into(),
-                        code: code as u32,
-                        message,
-                    })?,
-                ),
-                (
-                    "plugin.identity".into(),
-                    serde_json::to_vec(&self.checkpoint_identity())?,
-                ),
-            ]));
+            return Ok(checkpoint);
         }
         let mut readonly = |operation, input: &[u8]| {
             if operation != HostOperation::Clock || !input.is_empty() {
@@ -644,16 +582,29 @@ impl DataActor for PluginStrategy {
             self.clock_facts()
                 .map_err(|error| PluginError::generic(error.to_string()))
         };
-        let payload = self
-            .guest
-            .try_borrow_mut()?
-            .invoke(
+        let result = {
+            let mut guest = self.guest.try_borrow_mut()?;
+            guest.invoke(
                 CallbackKind::Save,
                 self.scope.state_schema_version,
                 b"",
                 &mut readonly,
             )
-            .map_err(|error| anyhow::anyhow!("plugin save: {}", error.message_string()))?;
+        };
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(e) => {
+                log::error!(
+                    "Plugin Save retained terminal failure: {}",
+                    e.message_string()
+                );
+                // First Save failure must already be represented in this cut,
+                // without returning unvalidated bytes or waiting for a retry.
+                return self
+                    .terminal_checkpoint()?
+                    .context("guest Save failed without its original failure latch");
+            }
+        };
         Ok(IndexMap::from([
             ("plugin.state".into(), payload),
             (

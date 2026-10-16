@@ -32,6 +32,7 @@ pub mod instance;
     target_arch = "x86_64"
 ))]
 pub mod linux_loader;
+pub mod wire;
 
 #[cfg(test)]
 mod tests;

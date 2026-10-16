@@ -25,6 +25,24 @@ fn limits() -> instance::CallbackLimits {
     }
 }
 
+#[derive(Debug)]
+struct CounterStateValidator;
+
+impl instance::StateValidator for CounterStateValidator {
+    fn validate(&self, version: u32, state: &[u8]) -> Result<(), PluginError> {
+        if version != 1
+            || state.len() != size_of::<u64>()
+            || u64::from_le_bytes(state.try_into().unwrap()) > 1_000_000
+        {
+            return Err(PluginError::new(
+                PluginErrorCode::SerializationFailed,
+                "counter state contract refused",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[test]
 fn owning_instance_refuses_mismatched_abi_build_descriptor_and_invalid_limits() {
     for mutation in 0..7 {
@@ -45,8 +63,16 @@ fn owning_instance_refuses_mismatched_abi_build_descriptor_and_invalid_limits() 
         // SAFETY: the readable table is deliberately incompatible, but all
         // producer functions and storage remain valid for process lifetime.
         assert!(
-            unsafe { instance::GuestInstance::create(api, expected, b"counter-v1", capacity) }
-                .is_err()
+            unsafe {
+                instance::GuestInstance::create(
+                    api,
+                    expected,
+                    b"counter-v1",
+                    capacity,
+                    Box::new(CounterStateValidator),
+                )
+            }
+            .is_err()
         );
     }
 }
@@ -61,6 +87,7 @@ fn owning_instance_latches_original_panic_and_cannot_restore_it_away() {
             Counter::DESCRIPTOR_JSON.as_bytes(),
             b"counter-v1",
             limits(),
+            Box::new(CounterStateValidator),
         )
     }
     .unwrap();
@@ -88,6 +115,7 @@ fn owning_instance_latches_original_panic_and_cannot_restore_it_away() {
 }
 
 static DISPOSED: AtomicUsize = AtomicUsize::new(0);
+static RESTORED: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 struct Counter(u64);
@@ -138,6 +166,7 @@ impl Algorithm for Counter {
             return Err(PluginError::generic("invalid counter state"));
         }
         self.0 = u64::from_le_bytes(state.try_into().unwrap());
+        RESTORED.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     fn pause(&mut self, _: &mut Host<'_>) -> Result<(), PluginError> {
@@ -148,6 +177,106 @@ impl Algorithm for Counter {
     }
     fn stop(&mut self, _: &[u8], _: &mut Host<'_>) -> Result<(), PluginError> {
         Ok(())
+    }
+}
+
+#[test]
+fn owning_state_contract_refuses_restore_before_guest_and_keeps_first_failure() {
+    let api = Box::leak(Box::new(StrategyApi::for_algorithm::<Counter>()));
+    // SAFETY: the generated static API and producer remain live
+    let mut guest = unsafe {
+        instance::GuestInstance::create(
+            api,
+            Counter::DESCRIPTOR_JSON.as_bytes(),
+            b"counter-v1",
+            limits(),
+            Box::new(CounterStateValidator),
+        )
+    }
+    .unwrap();
+    let before = RESTORED.load(Ordering::SeqCst);
+    let mut facade = |_, _: &[u8]| Ok(Vec::new());
+    let first = guest
+        .invoke(
+            CallbackKind::Restore,
+            1,
+            &u64::MAX.to_le_bytes(),
+            &mut facade,
+        )
+        .unwrap_err();
+    assert_eq!(first.code, PluginErrorCode::SerializationFailed);
+    assert_eq!(RESTORED.load(Ordering::SeqCst), before);
+    let later = guest
+        .invoke(CallbackKind::Restore, 1, &7u64.to_le_bytes(), &mut facade)
+        .unwrap_err();
+    assert_eq!(later.code, first.code);
+    assert_eq!(later.message_string(), first.message_string());
+    assert_eq!(RESTORED.load(Ordering::SeqCst), before);
+    assert!(guest.is_faulted());
+}
+
+#[derive(Debug)]
+struct RejectingStateValidator {
+    panic: bool,
+}
+
+fn original_state_validator_panic() -> ! {
+    panic!("state validator original panic")
+}
+
+impl instance::StateValidator for RejectingStateValidator {
+    fn validate(&self, _: u32, _: &[u8]) -> Result<(), PluginError> {
+        if self.panic {
+            original_state_validator_panic();
+        }
+        Err(PluginError::new(
+            PluginErrorCode::SerializationFailed,
+            "state validator original refusal",
+        ))
+    }
+}
+
+#[test]
+fn owning_save_contract_contains_policy_panics_and_restricts_later_callbacks() {
+    let api = Box::leak(Box::new(StrategyApi::for_algorithm::<Counter>()));
+    for panic in [false, true] {
+        // SAFETY: the generated static API and producer remain live
+        let mut guest = unsafe {
+            instance::GuestInstance::create(
+                api,
+                Counter::DESCRIPTOR_JSON.as_bytes(),
+                b"counter-v1",
+                limits(),
+                Box::new(RejectingStateValidator { panic }),
+            )
+        }
+        .unwrap();
+        let mut facade = |_, _: &[u8]| Ok(Vec::new());
+        let first = guest
+            .invoke(CallbackKind::Save, 1, b"", &mut facade)
+            .unwrap_err();
+        assert_eq!(
+            first.code,
+            if panic {
+                PluginErrorCode::Panic
+            } else {
+                PluginErrorCode::SerializationFailed
+            }
+        );
+        assert_eq!(
+            first.message_string(),
+            if panic {
+                "state validator original panic"
+            } else {
+                "state validator original refusal"
+            }
+        );
+        let later = guest
+            .invoke(CallbackKind::Event, 1, b"event", &mut facade)
+            .unwrap_err();
+        assert_eq!(later.code, first.code);
+        assert_eq!(later.message_string(), first.message_string());
+        assert!(guest.is_faulted());
     }
 }
 
@@ -377,6 +506,7 @@ fn terminal_checkpoint_failure_only_restricts_an_unused_guest() {
                 Counter::DESCRIPTOR_JSON.as_bytes(),
                 b"counter-v1",
                 limits(),
+                Box::new(CounterStateValidator),
             )
         }
         .unwrap()
@@ -441,6 +571,7 @@ fn owning_guest_restore_precedes_every_runtime_callback_and_cannot_repeat() {
             Counter::DESCRIPTOR_JSON.as_bytes(),
             b"counter-v1",
             limits(),
+            Box::new(CounterStateValidator),
         )
     }
     .unwrap();

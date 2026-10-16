@@ -75,10 +75,19 @@ impl LoadedLibrary {
         descriptor: &[u8],
         configuration: &[u8],
         limits: CallbackLimits,
+        state_validator: Box<dyn super::instance::StateValidator>,
     ) -> Result<GuestInstance, PluginError> {
         // SAFETY: the trusted publication contract and pinned loaded library
         // establish the process-long executable table's layout and lifetime.
-        unsafe { GuestInstance::create(self.pinned.api, descriptor, configuration, limits) }
+        unsafe {
+            GuestInstance::create(
+                self.pinned.api,
+                descriptor,
+                configuration,
+                limits,
+                state_validator,
+            )
+        }
     }
 }
 

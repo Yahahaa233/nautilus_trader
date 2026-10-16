@@ -28,6 +28,18 @@ pub struct CallbackLimits {
     pub event_bytes: usize,
 }
 
+/// Host-owned state contract bound to the admitted executable descriptor.
+/// Validation receives bytes only, without a mutable native host capability.
+/// Every owning Save and Restore uses this contract, including recovery calls.
+pub trait StateValidator: std::fmt::Debug {
+    /// Validates the exact declared version and complete algorithm state.
+    ///
+    /// # Errors
+    ///
+    /// Refuses incomplete, unknown, oversized or incompatible state values.
+    fn validate(&self, version: u32, state: &[u8]) -> Result<(), PluginError>;
+}
+
 /// Retains the first original callback error while the native owner handles
 /// fault, stop and recovery. A faulted guest cannot silently resume callbacks.
 #[derive(Debug)]
@@ -38,6 +50,7 @@ pub struct GuestInstance {
     limits: CallbackLimits,
     failure: Option<(PluginErrorCode, String)>,
     callbacks_used: bool,
+    state_validator: Box<dyn StateValidator>,
 }
 
 fn invalid(message: &str) -> PluginError {
@@ -73,6 +86,7 @@ impl GuestInstance {
         descriptor: &[u8],
         configuration: &[u8],
         limits: CallbackLimits,
+        state_validator: Box<dyn StateValidator>,
     ) -> Result<Self, PluginError> {
         if api.is_null() {
             return Err(invalid("null executable strategy API"));
@@ -168,6 +182,7 @@ impl GuestInstance {
             limits,
             failure: None,
             callbacks_used: false,
+            state_validator,
         };
         if !output.is_empty() {
             instance.failure = Some((
@@ -215,32 +230,60 @@ impl GuestInstance {
         } else if input.len() > bound {
             Err(invalid("callback input exceeds the declared bound"))
         } else {
-            with_host_scope(self.instance, facade, |lease| {
-                // SAFETY: self owns the live guest and its pinned API;
-                // the current scope holds exclusive native facade access.
-                let response = unsafe {
-                    (self.api.callback)(
-                        self.handle.as_ptr(),
-                        kind.tag(),
-                        version,
-                        Slice::from_slice(input),
-                        lease,
-                    )
-                };
-                let bound = if kind == CallbackKind::Save {
-                    self.limits.state_bytes
-                } else {
-                    0
-                };
-                // SAFETY: response is producer-owned live storage
-                unsafe { response.copy_result(bound) }
-            })
-            .and_then(std::convert::identity)
+            let admitted = if kind == CallbackKind::Restore {
+                self.validate_state(version, input)
+            } else {
+                Ok(())
+            };
+            admitted
+                .and_then(|()| {
+                    with_host_scope(self.instance, facade, |lease| {
+                        // SAFETY: self owns the live guest and its pinned API;
+                        // the current scope holds exclusive native facade access.
+                        let response = unsafe {
+                            (self.api.callback)(
+                                self.handle.as_ptr(),
+                                kind.tag(),
+                                version,
+                                Slice::from_slice(input),
+                                lease,
+                            )
+                        };
+                        let bound = if kind == CallbackKind::Save {
+                            self.limits.state_bytes
+                        } else {
+                            0
+                        };
+                        // SAFETY: response is producer-owned live storage
+                        unsafe { response.copy_result(bound) }
+                    })
+                    .and_then(std::convert::identity)
+                })
+                .and_then(|output| {
+                    if kind == CallbackKind::Save {
+                        self.validate_state(version, &output)?;
+                    }
+                    Ok(output)
+                })
         };
         if let Err(error) = &result {
             self.failure = Some((error.code, error.message_string()));
         }
         result
+    }
+
+    fn validate_state(&self, version: u32, state: &[u8]) -> Result<(), PluginError> {
+        crate::panic::guard(|| self.state_validator.validate(version, state))
+            .into_result()
+            .map_err(|e| {
+                if e.code == PluginErrorCode::Ok
+                    || e.message_string().len() > super::MAX_ERROR_BYTES
+                {
+                    invalid("state validator returned an invalid failure")
+                } else {
+                    e
+                }
+            })
     }
 
     /// Reinstates only a terminal failure from a checked checkpoint into an
