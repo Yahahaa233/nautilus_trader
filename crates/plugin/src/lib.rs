@@ -55,6 +55,7 @@ pub mod component;
 pub mod host;
 pub mod manifest;
 pub mod panic;
+pub mod strategy;
 
 mod macros;
 

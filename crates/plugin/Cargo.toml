@@ -24,7 +24,7 @@ crate-type = ["rlib"]
 default = []
 component-binding = ["dep:nautilus-core"]
 # Compatibility feature retained for downstream manifests
-host = []
+host = ["dep:libc", "dep:sha2"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -35,6 +35,19 @@ nautilus-core = { workspace = true, optional = true }
 nautilus-model = { workspace = true }
 
 log = { workspace = true }
+libc = { workspace = true, optional = true }
+sha2 = { version = "0.11", optional = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
+serde_json = { workspace = true }
+
+[[example]]
+name = "contract_counter"
+path = "examples/contract_counter.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "contract_interval"
+path = "examples/contract_interval.rs"
+crate-type = ["cdylib"]

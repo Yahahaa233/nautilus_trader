@@ -108,6 +108,8 @@ pub mod _macro_reexports {
 
 pub mod algorithm;
 pub mod controller;
+#[cfg(feature = "strategy-plugin")]
+pub mod plugin;
 pub mod sessions;
 pub mod strategy;
 

@@ -1053,6 +1053,13 @@ impl LiveNode {
             .into()
             .dispatch(|message| self.process_time_event_unobserved_result(message))
     }
+    #[cfg_attr(
+        not(feature = "dispatch-observer"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "Native dispatch observer completion can fail; both feature modes retain the same typed completion contract"
+        )
+    )]
     fn process_time_event_unobserved_result(
         &self,
         message: TimeEventMessage,

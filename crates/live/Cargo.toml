@@ -32,6 +32,7 @@ node = [
   "dep:nautilus-trading",
 ]
 plugin = ["node"]
+strategy-plugin = ["node", "dep:nautilus-plugin", "nautilus-plugin/host", "nautilus-trading/strategy-plugin"]
 examples = ["node", "dep:nautilus-testkit", "nautilus-trading/examples"]
 streaming = ["node", "nautilus-persistence", "nautilus-system/streaming"]
 extension-module = [
@@ -104,6 +105,7 @@ nautilus-testkit = { workspace = true, default-features = false, features = [
   "testers",
 ], optional = true }
 nautilus-trading = { workspace = true, optional = true }
+nautilus-plugin = { path = "../plugin", optional = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
@@ -127,6 +129,7 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+sha2 = "0.11"
 nautilus-model = { workspace = true, features = ["test-support"] }
 nautilus-testkit = { workspace = true, default-features = false, features = [
   "testers",
@@ -144,6 +147,11 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 tokio-tungstenite = { workspace = true }
 toml = { workspace = true }
 ustr = { workspace = true }
+
+[[example]]
+name = "strategy_contract_host"
+path = "examples/strategy_contract_host.rs"
+required-features = ["strategy-plugin"]
 
 # Run with `cargo bench -p nautilus-live --bench runner`
 [[bench]]

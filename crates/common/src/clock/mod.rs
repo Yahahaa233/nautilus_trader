@@ -91,14 +91,19 @@ impl PortfolioEquityCurveTimerCallback {
             callback.is_local(),
             "portfolio callback must own the node thread"
         );
-        Ok(Self {
+        let bound = Self {
             #[cfg(feature = "live")]
             name: format!("portfolio_equity_curve.{account}").as_str().into(),
             profile: serde_json::json!({"factory":"portfolio_equity_curve_callback.v1", "rust_factory_type": Self::FACTORY_TYPE,
                 "account_id":account,"configuration":serde_json::to_value(configuration)?}),
             #[cfg(feature = "live")]
             callback,
-        })
+        };
+        // The non-Live profile does not retain an executable callback, release
+        // that owned reference only after the complete profile was captured.
+        #[cfg(not(feature = "live"))]
+        drop(callback);
+        Ok(bound)
     }
 
     // Tests here verify registry/FIFO mechanics with local counters. Production

@@ -147,12 +147,19 @@ pub trait Component {
         self.transition_state(ComponentTrigger::Initialize)
     }
 
+    /// Reports a persistent component-owned startup restriction. False only
+    /// permits the ordinary lifecycle; it never grants trading authority.
+    fn is_start_inhibited(&self) -> bool {
+        false
+    }
+
     /// Starts the component.
     ///
     /// # Errors
     ///
     /// Returns an error if the component fails to start.
     fn start(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.is_start_inhibited(), "component startup is inhibited");
         self.transition_state(ComponentTrigger::Start)?; // -> Starting
 
         self.on_start()?;
@@ -613,6 +620,37 @@ pub fn component_state(id: &Ustr) -> anyhow::Result<ComponentState> {
     unsafe {
         let component = &*component_ref.get();
         Ok(component.state())
+    }
+}
+
+/// Reads the actual registered component's startup restriction with the same
+/// registry borrow protection as lifecycle dispatch.
+///
+/// # Errors
+///
+/// Refuses a missing or currently borrowed component.
+pub fn component_start_inhibited(id: &Ustr) -> anyhow::Result<bool> {
+    let component_ref = with_component_registry(|registry| {
+        let component_ref = registry
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Component '{id}' not found in global registry"))?;
+
+        if !registry.try_borrow(*id) {
+            anyhow::bail!(
+                "Component '{id}' is already mutably borrowed. \
+                 This would create aliasing mutable references (undefined behavior)."
+            );
+        }
+
+        Ok::<_, anyhow::Error>(component_ref)
+    })?;
+
+    let _guard = BorrowGuard::new(*id);
+
+    // SAFETY: Borrow tracking ensures there is no concurrent mutable lifecycle access.
+    unsafe {
+        let component = &*component_ref.get();
+        Ok(component.is_start_inhibited())
     }
 }
 

@@ -6088,7 +6088,7 @@ fn position_fill_report_totals(
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::{clock::VirtualClock, config::ConfigError};
+    use nautilus_common::{clock::VirtualClock, config::ConfigError, live::dst};
     use nautilus_core::{DurationNanos, Params};
     use nautilus_execution::reconciliation::generate_reconciliation_order_events;
     use nautilus_model::{
@@ -7554,8 +7554,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut manager =
-            ExecutionManager::new(clock.clone(), cache.clone(), config.clone()).unwrap();
+        let mut manager = ExecutionManager::new(clock, cache.clone(), config).unwrap();
         if pending_status == OrderStatus::PendingCancel {
             assert!(manager.register_cancel_inflight(id, command_id).unwrap());
         } else {
@@ -7632,7 +7631,9 @@ mod tests {
             let snapshot = manager
                 .checkpoint_inventory(dst::time::Instant::now())
                 .unwrap();
-            let mut restored = ExecutionManager::new(clock, cache.clone(), config).unwrap();
+            let mut restored =
+                ExecutionManager::new(manager.clock.clone(), cache.clone(), manager.config.clone())
+                    .unwrap();
             restored
                 .restore_checkpoint_inventory_at(&snapshot, 0, dst::time::Instant::now())
                 .unwrap();

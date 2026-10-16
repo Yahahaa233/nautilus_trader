@@ -6426,6 +6426,7 @@ dependencies = [
  "nautilus-model",
  "nautilus-network",
  "nautilus-persistence",
+ "nautilus-plugin",
  "nautilus-portfolio",
  "nautilus-risk",
  "nautilus-system",
@@ -6441,6 +6442,7 @@ dependencies = [
  "rust_decimal_macros",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tabled",
  "tokio",
  "tokio-tungstenite 0.30.0",
@@ -6644,10 +6646,13 @@ dependencies = [
 name = "nautilus-plugin"
 version = "0.66.0"
 dependencies = [
+ "libc",
  "log",
  "nautilus-core",
  "nautilus-model",
  "rstest",
+ "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -7002,6 +7007,7 @@ dependencies = [
  "nautilus-execution",
  "nautilus-indicators",
  "nautilus-model",
+ "nautilus-plugin",
  "nautilus-portfolio",
  "pyo3",
  "pyo3-stub-gen",

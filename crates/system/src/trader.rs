@@ -35,9 +35,9 @@ use nautilus_common::{
     cache::Cache,
     clock::Clock,
     component::{
-        Component, component_state, deregister_component, dispose_component,
-        register_component_actor, release_component_subscriptions, reset_component,
-        start_component, stop_component,
+        Component, component_start_inhibited, component_state, deregister_component,
+        dispose_component, register_component_actor, release_component_subscriptions,
+        reset_component, start_component, stop_component,
     },
     enums::{ComponentState, ComponentTrigger, Environment},
     logging::RECV,
@@ -1143,6 +1143,10 @@ impl Trader {
 
     fn start_component_if_not_running(component_id: Ustr) -> anyhow::Result<()> {
         if component_state(&component_id)? == ComponentState::Running {
+            return Ok(());
+        }
+        if component_start_inhibited(&component_id)? {
+            log::warn!("Keeping component {component_id} inactive: native startup restriction");
             return Ok(());
         }
 

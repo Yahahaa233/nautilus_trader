@@ -384,6 +384,13 @@ fn native_strategy_stop_framework<S: Strategy + StrategyNative + ?Sized>(
 
 // Only a producer-recorded default route admits framework replay. Calling an
 // overridden method without this route would invent a default implementation.
+#[cfg_attr(
+    not(feature = "live"),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Live route guards can fail; both feature modes keep the same typed call contract"
+    )
+)]
 fn native_require_default_route<S: StrategyNative + ?Sized>(
     strategy: &S,
     kind: &str,
@@ -408,6 +415,13 @@ fn native_require_default_route<S: StrategyNative + ?Sized>(
     Ok(())
 }
 
+#[cfg_attr(
+    not(feature = "live"),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Live historical route health can fail; non-Live calls preserve the same result contract"
+    )
+)]
 fn native_historical_route_health() -> anyhow::Result<()> {
     #[cfg(feature = "live")]
     if nautilus_common::recovery_trace::historical::active() {

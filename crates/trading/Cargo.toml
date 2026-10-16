@@ -25,6 +25,7 @@ live = ["nautilus-common/live"]
 defi = ["nautilus-model/defi"]
 examples = ["nautilus-indicators"]
 high-precision = ["nautilus-model/high-precision"]
+strategy-plugin = ["dep:nautilus-plugin"]
 extension-module = [
   "nautilus-common/extension-module",
   "nautilus-core/extension-module",
@@ -55,6 +56,7 @@ nautilus-core = { workspace = true }
 nautilus-execution = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-portfolio = { workspace = true }
+nautilus-plugin = { path = "../plugin", optional = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }

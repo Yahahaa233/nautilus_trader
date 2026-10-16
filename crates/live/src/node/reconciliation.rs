@@ -79,6 +79,13 @@ impl LiveNode {
     }
 
     /// The same prepared result handler is used by the live collector and proof-bound history.
+    #[cfg_attr(
+        not(feature = "native-tail-replay"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "Original native report context validation can fail with native-tail-replay; retain the same result contract in both feature modes"
+        )
+    )]
     pub(super) fn apply_open_order_report_outcome(
         &mut self,
         result: ReportTaskOutcome<OpenOrderReportResult>,
@@ -126,6 +133,13 @@ impl LiveNode {
             }
         }
     }
+    #[cfg_attr(
+        not(feature = "native-tail-replay"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "Original native report context validation can fail with native-tail-replay; retain the same result contract in both feature modes"
+        )
+    )]
     pub(super) fn apply_targeted_report_outcome(
         &mut self,
         result: ReportTaskOutcome<Vec<TargetedOrderReportResult>>,
@@ -149,6 +163,13 @@ impl LiveNode {
         }
         Ok(())
     }
+    #[cfg_attr(
+        not(feature = "native-tail-replay"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "Original native report context validation can fail with native-tail-replay; retain the same result contract in both feature modes"
+        )
+    )]
     pub(super) fn apply_position_report_outcome(
         &mut self,
         result: ReportTaskOutcome<PositionReportTaskResult>,

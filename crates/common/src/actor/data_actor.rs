@@ -374,6 +374,12 @@ pub trait DataActor {
         &self.core().config
     }
 
+    /// Keeps this actor inactive during automatic or explicit native startup.
+    /// This read-only restriction must not mutate state or mint permission.
+    fn start_inhibited(&self) -> bool {
+        false
+    }
+
     /// Actions to be performed when the actor state is saved.
     ///
     /// # Errors
@@ -4206,6 +4212,10 @@ where
         clock.borrow_mut().register_default_handler(callback);
 
         self.initialize()
+    }
+
+    fn is_start_inhibited(&self) -> bool {
+        DataActor::start_inhibited(self)
     }
 
     fn on_start(&mut self) -> anyhow::Result<()> {

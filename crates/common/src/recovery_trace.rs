@@ -142,6 +142,13 @@ impl NativeReadProducerToken {
 struct NativeReadBinding {
     producer: NativeReadProducerToken,
     witness: NativeReadWitness,
+    #[cfg_attr(
+        not(feature = "live"),
+        expect(
+            dead_code,
+            reason = "the opaque value retains producer storage even without Live read access"
+        )
+    )]
     value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
 }
 
