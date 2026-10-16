@@ -62,7 +62,15 @@ fn elf_reads_exact_dependency_and_nonexecuting_layout_facts() {
     let facts = ElfLibrary::inspect(&fixture()).unwrap();
     assert_eq!(facts.dependencies, BTreeSet::from(["libc.so.6".to_owned()]));
     assert!(facts.has_relro);
+    assert_eq!(facts.mapped_bytes, 1024);
     assert!(!facts.has_initializers);
+}
+
+#[test]
+fn elf_refuses_small_files_with_unbounded_native_memory() {
+    let mut bytes = fixture();
+    put64(&mut bytes, 64 + 40, 536_870_913);
+    assert!(ElfLibrary::inspect(&bytes).is_err());
 }
 
 #[test]

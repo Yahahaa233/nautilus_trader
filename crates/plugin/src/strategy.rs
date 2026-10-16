@@ -27,11 +27,21 @@ pub mod host_scope;
 pub mod instance;
 #[cfg(all(
     feature = "host",
+    any(
+        all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )
+))]
+pub mod library_loader;
+#[cfg(all(
+    feature = "host",
     target_os = "linux",
     target_env = "gnu",
     target_arch = "x86_64"
 ))]
-pub mod linux_loader;
+pub use library_loader as linux_loader;
+#[cfg(feature = "host")]
+pub mod macho;
 pub mod wire;
 
 #[cfg(test)]

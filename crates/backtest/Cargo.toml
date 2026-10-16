@@ -95,6 +95,8 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+sha2 = "0.11"
+nautilus-plugin = { path = "../plugin", features = ["host"] }
 nautilus-indicators = { workspace = true }
 nautilus-model = { workspace = true, features = ["test-support"] }
 nautilus-persistence = { workspace = true }
@@ -102,7 +104,7 @@ nautilus-testkit = { workspace = true, default-features = false, features = [
   "datasets",
   "testers",
 ] }
-nautilus-trading = { workspace = true, features = ["examples"] }
+nautilus-trading = { workspace = true, features = ["examples", "strategy-plugin"] }
 
 criterion = { workspace = true }
 rstest = { workspace = true }

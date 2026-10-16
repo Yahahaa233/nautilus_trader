@@ -33,6 +33,7 @@ const SYSTEM_LIBRARIES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElfLibrary {
     pub dependencies: BTreeSet<String>,
+    pub mapped_bytes: u64,
     pub has_initializers: bool,
     pub has_relro: bool,
 }
@@ -81,6 +82,26 @@ struct ProgramImage {
     loads: Vec<(u64, u64, u64)>,
     dynamic: (u64, u64),
     relro: bool,
+    mapped_bytes: u64,
+}
+
+fn validate_virtual_span(virtual_ranges: &[(u64, u64)]) -> Result<(), PluginError> {
+    let span = virtual_ranges
+        .iter()
+        .map(|(_, end)| *end)
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(
+            virtual_ranges
+                .iter()
+                .map(|(start, _)| *start)
+                .min()
+                .unwrap_or(0),
+        );
+    if span > 536_870_912 {
+        return Err(invalid("ELF virtual image span exceeds capacity"));
+    }
+    Ok(())
 }
 
 impl ProgramImage {
@@ -105,6 +126,8 @@ impl ProgramImage {
         let mut dynamic = None;
         let mut stack = false;
         let mut relro = false;
+        let mut mapped_bytes = 0u64;
+        let mut virtual_ranges = Vec::new();
         for index in 0..count {
             let header = offset + u64::from(index) * 56;
             let kind = data.u32(header)?;
@@ -122,9 +145,24 @@ impl ProgramImage {
                     if flags & 3 == 3 {
                         return Err(invalid("writable executable ELF mapping"));
                     }
-                    address
+                    let end = address
                         .checked_add(memory_size)
                         .ok_or_else(|| invalid("ELF virtual range overflow"))?;
+                    if memory_size > 0 {
+                        if virtual_ranges
+                            .iter()
+                            .any(|(start, limit)| address < *limit && *start < end)
+                        {
+                            return Err(invalid("overlapping ELF load segments"));
+                        }
+                        virtual_ranges.push((address, end));
+                    }
+                    mapped_bytes = mapped_bytes
+                        .checked_add(memory_size)
+                        .ok_or_else(|| invalid("ELF memory capacity overflow"))?;
+                    if mapped_bytes > 536_870_912 {
+                        return Err(invalid("ELF mapped image exceeds capacity"));
+                    }
                     loads.push((address, file_offset, size));
                 }
                 2 => {
@@ -150,10 +188,12 @@ impl ProgramImage {
         if !stack {
             return Err(invalid("ELF does not declare a non-executable stack"));
         }
+        validate_virtual_span(&virtual_ranges)?;
         Ok(Self {
             loads,
             dynamic: dynamic.ok_or_else(|| invalid("ELF dynamic table missing"))?,
             relro,
+            mapped_bytes,
         })
     }
 }
@@ -259,6 +299,7 @@ impl ElfLibrary {
         }
         Ok(Self {
             dependencies,
+            mapped_bytes: image.mapped_bytes,
             has_initializers: initializers,
             has_relro: image.relro,
         })

@@ -7,18 +7,17 @@
 //  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
 // -------------------------------------------------------------------------------------------------
 
-//! GNU loader for already-published trusted algorithms. Hash/ELF checks and
-//! sealed backing bytes precede constructors. Handles and descriptor numbers
-//! are retained for process lifetime: reusing a `/proc/self/fd/N` pathname could
-//! otherwise make the dynamic loader return an older library under that name.
+//! Platform loader for already-published trusted algorithms. Hash, image and
+//! dependency checks precede constructors. GNU uses sealed memfd bytes; Darwin
+//! needs private named signed backing and trusted same-UID host custody.
+//! Handles, backing files and descriptor numbers remain pinned until exit.
 
 use std::{
     collections::BTreeMap,
     ffi::{CStr, CString, c_void},
     fs::File,
-    io::Write,
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::AsRawFd,
         unix::fs::{FileExt, MetadataExt},
     },
     ptr::NonNull,
@@ -28,10 +27,20 @@ use sha2::{Digest, Sha256};
 
 use super::{
     STRATEGY_INIT_SYMBOL, StrategyApi,
-    elf::ElfLibrary,
     instance::{CallbackLimits, GuestInstance},
 };
 use crate::{HostVTable, PluginError, PluginErrorCode, PluginInitFn, PluginManifest};
+
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+#[path = "library_loader/gnu.rs"]
+mod backend;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[path = "library_loader/darwin.rs"]
+mod backend;
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+use super::elf::ElfLibrary as PlatformLibrary;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::macho::MachLibrary as PlatformLibrary;
 
 static METADATA_TOKEN: u8 = 0;
 type StrategyInitFn = unsafe extern "C" fn() -> *const StrategyApi;
@@ -39,10 +48,10 @@ type StrategyInitFn = unsafe extern "C" fn() -> *const StrategyApi;
 #[derive(Debug)]
 struct Pinned {
     _handle: NonNull<c_void>,
-    _backing: &'static File,
+    _backing: &'static backend::Backing,
     api: *const StrategyApi,
     metadata: &'static PluginManifest,
-    elf: ElfLibrary,
+    facts: PlatformLibrary,
 }
 
 /// A library whose allocation functions and callbacks remain live until exit.
@@ -60,8 +69,15 @@ impl LoadedLibrary {
 
     /// Returns the pre-constructor ELF dependency facts.
     #[must_use]
-    pub const fn elf(&self) -> &ElfLibrary {
-        &self.pinned.elf
+    #[cfg(target_os = "linux")]
+    pub const fn elf(&self) -> &PlatformLibrary {
+        &self.pinned.facts
+    }
+    /// Returns pre-constructor Mach-O layout and dependency facts.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub const fn macho(&self) -> &PlatformLibrary {
+        &self.pinned.facts
     }
 
     /// Creates one instance after the business owner has admitted its exact
@@ -99,6 +115,9 @@ pub struct LibraryRegistry {
     failures: BTreeMap<[u8; 32], (PluginErrorCode, String)>,
     maximum_libraries: usize,
     maximum_library_bytes: usize,
+    remaining_library_bytes: usize,
+    #[cfg(target_os = "macos")]
+    directory: backend::LibraryDirectory,
 }
 
 fn invalid(message: impl AsRef<str>) -> PluginError {
@@ -114,10 +133,13 @@ impl LibraryRegistry {
     ///
     /// # Errors
     ///
-    /// Refuses zero or above-transport capacities.
+    /// Refuses zero or above-transport capacities. The byte budget covers both
+    /// copied files and declared mapped images across successful/failed loads.
+    /// Darwin additionally requires an existing private host storage directory.
     pub fn new(
         maximum_libraries: usize,
         maximum_library_bytes: usize,
+        #[cfg(target_os = "macos")] backing_directory: &std::path::Path,
     ) -> Result<Self, PluginError> {
         if maximum_libraries == 0
             || maximum_libraries > 1024
@@ -130,16 +152,27 @@ impl LibraryRegistry {
             failures: BTreeMap::new(),
             maximum_libraries,
             maximum_library_bytes,
+            remaining_library_bytes: maximum_library_bytes,
+            #[cfg(target_os = "macos")]
+            directory: backend::LibraryDirectory::new(backing_directory)?,
         })
     }
 
-    /// Loads the exact admitted bytes under the unprivileged trading identity.
+    /// Returns this host registry's conservative unspent byte budget.
+    /// The server retains one registry for the process lifetime: dropping it
+    /// never unloads code and must not be used to recycle resident capacity.
+    #[must_use]
+    pub const fn remaining_library_bytes(&self) -> usize {
+        self.remaining_library_bytes
+    }
+
+    /// Loads the exact admitted bytes under the unprivileged host identity.
     /// No library is loaded by an administrator or a metadata inspection command.
     ///
     /// # Errors
     ///
     /// Refuses privileged callers, modified/untrusted files, loader overrides,
-    /// incompatible ELF, capacity, sealing or dynamic-loader failures.
+    /// incompatible image/dependencies, capacity, backing or dynamic-loader failures.
     ///
     /// # Safety
     ///
@@ -161,7 +194,7 @@ impl LibraryRegistry {
         }
         if std::env::vars_os().any(|(name, _)| {
             let name = name.to_string_lossy();
-            name.starts_with("LD_") || name == "GLIBC_TUNABLES"
+            name.starts_with("LD_") || name.starts_with("DYLD_") || name == "GLIBC_TUNABLES"
         }) {
             return Err(invalid("native algorithm loader environment is overridden"));
         }
@@ -182,6 +215,9 @@ impl LibraryRegistry {
                 expected_sha256,
                 publisher_uid,
                 self.maximum_library_bytes,
+                &mut self.remaining_library_bytes,
+                #[cfg(target_os = "macos")]
+                &self.directory,
             )
         };
         match &result {
@@ -202,6 +238,8 @@ unsafe fn load_file(
     expected_sha256: [u8; 32],
     publisher_uid: u32,
     maximum_library_bytes: usize,
+    remaining_library_bytes: &mut usize,
+    #[cfg(target_os = "macos")] directory: &backend::LibraryDirectory,
 ) -> Result<LoadedLibrary, PluginError> {
     let metadata = source.metadata().map_err(|error| io_error(&error))?;
     if !metadata.is_file()
@@ -217,6 +255,7 @@ unsafe fn load_file(
     }
     let length =
         usize::try_from(metadata.len()).map_err(|_| invalid("native library size overflow"))?;
+    reserve_bytes(remaining_library_bytes, length)?;
     let mut bytes = vec![0; length];
     let mut read = 0;
     while read < bytes.len() {
@@ -234,18 +273,28 @@ unsafe fn load_file(
     if actual != expected_sha256 {
         return Err(invalid("native library differs from admitted SHA-256"));
     }
-    let elf = ElfLibrary::inspect(&bytes)?;
-    let backing = sealed_backing(&bytes)?;
-    let path = CString::new(format!("/proc/self/fd/{}", backing.as_raw_fd()))
-        .map_err(|_| invalid("invalid sealed library descriptor"))?;
-    // SAFETY: the path is a live sealed FD to pre-inspected trusted bytes;
+    let facts = PlatformLibrary::inspect(&bytes)?;
+    reserve_bytes(
+        remaining_library_bytes,
+        usize::try_from(facts.mapped_bytes).map_err(|_| invalid("native mapped size overflow"))?,
+    )?;
+    let backing = backend::prepare(
+        &bytes,
+        #[cfg(target_os = "macos")]
+        directory,
+    )?;
+    let path = CString::new(format!(
+        "{}/{}",
+        backend::FD_DIRECTORY,
+        backing.file().as_raw_fd()
+    ))
+    .map_err(|_| invalid("invalid sealed library descriptor"))?;
+    let flags = libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_NODELETE;
+    #[cfg(target_os = "macos")]
+    let flags = flags | libc::RTLD_FIRST;
+    // SAFETY: the path names a live protected FD to pre-inspected trusted bytes;
     // flags request immediate local binding and permanent loader retention.
-    let handle = unsafe {
-        libc::dlopen(
-            path.as_ptr(),
-            libc::RTLD_NOW | libc::RTLD_LOCAL | libc::RTLD_NODELETE,
-        )
-    };
+    let handle = unsafe { libc::dlopen(path.as_ptr(), flags) };
     let handle = NonNull::new(handle).ok_or_else(loader_error)?;
 
     // Pin the backing FD immediately, including later entry/metadata failure.
@@ -286,37 +335,17 @@ unsafe fn load_file(
         _backing: backing,
         api,
         metadata,
-        elf,
+        facts,
     }));
     let library = LoadedLibrary { pinned };
     Ok(library)
 }
 
-fn sealed_backing(bytes: &[u8]) -> Result<File, PluginError> {
-    // SAFETY: constant name/flags; the successful FD is immediately owned by File
-    let descriptor = unsafe {
-        libc::memfd_create(
-            c"nautilus-algorithm".as_ptr(),
-            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | libc::MFD_EXEC,
-        )
-    };
-    if descriptor < 0 {
-        return Err(io_error(&std::io::Error::last_os_error()));
-    }
-    // SAFETY: descriptor is newly created and has exactly one Rust owner
-    let mut file = unsafe { File::from_raw_fd(descriptor) };
-    file.write_all(bytes).map_err(|error| io_error(&error))?;
-    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
-    // SAFETY: fcntl operates on the owned memfd using integer seal flags
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
-        return Err(io_error(&std::io::Error::last_os_error()));
-    }
-    // SAFETY: F_GET_SEALS reads the seal mask of the owned memfd
-    let actual = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
-    if actual < 0 || actual & seals != seals {
-        return Err(invalid("native library backing is not fully sealed"));
-    }
-    Ok(file)
+fn reserve_bytes(remaining: &mut usize, bytes: usize) -> Result<(), PluginError> {
+    *remaining = remaining
+        .checked_sub(bytes)
+        .ok_or_else(|| invalid("native library resident byte capacity exceeded"))?;
+    Ok(())
 }
 
 fn loader_error() -> PluginError {
