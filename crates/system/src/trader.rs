@@ -83,6 +83,9 @@ type PersistedComponentState = IndexMap<String, Vec<u8>>;
 type ComponentStateLoadFn = fn(Ustr, PersistedComponentState) -> anyhow::Result<()>;
 type ComponentStateSaveFn = fn(Ustr) -> anyhow::Result<PersistedComponentState>;
 #[cfg(feature = "live")]
+type NativePendingResponsesFn =
+    fn(Ustr) -> anyhow::Result<Vec<nautilus_common::msgbus::NativePendingResponse>>;
+#[cfg(feature = "live")]
 type NativeComponentStateLoadFn =
     fn(Ustr, PersistedComponentState, &serde_json::Value, &serde_json::Value) -> anyhow::Result<()>;
 /// A registered owner and its original local clock.
@@ -100,6 +103,8 @@ struct ComponentStateCallbacks {
     native_load: Option<NativeComponentStateLoadFn>,
     #[cfg(feature = "live")]
     historical_save: ComponentStateSaveFn,
+    #[cfg(feature = "live")]
+    pending_responses: Option<NativePendingResponsesFn>,
     #[cfg(feature = "live")]
     historical_prepare: fn(Ustr, &dyn std::any::Any) -> anyhow::Result<()>,
     #[cfg(feature = "live")]
@@ -436,6 +441,8 @@ impl Trader {
                 #[cfg(feature = "live")]
                 historical_save: Self::save_historical_component_state::<T>,
                 #[cfg(feature = "live")]
+                pending_responses: Some(Self::pending_component_responses::<T>),
+                #[cfg(feature = "live")]
                 historical_prepare: Self::prepare_historical_component::<T>,
                 #[cfg(feature = "live")]
                 historical_lifecycle: Self::dispatch_historical_lifecycle::<T>,
@@ -480,6 +487,8 @@ impl Trader {
                 native_load: None,
                 #[cfg(feature = "live")]
                 historical_save: Self::save_historical_component_state::<T>,
+                #[cfg(feature = "live")]
+                pending_responses: Some(Self::pending_component_responses::<T>),
                 #[cfg(feature = "live")]
                 historical_prepare: Self::prepare_historical_component::<T>,
                 #[cfg(feature = "live")]
@@ -609,6 +618,8 @@ impl Trader {
                 native_load: Some(Self::load_native_strategy_state::<T>),
                 #[cfg(feature = "live")]
                 historical_save: Self::save_historical_component_state::<T>,
+                #[cfg(feature = "live")]
+                pending_responses: Some(Self::pending_component_responses::<T>),
                 #[cfg(feature = "live")]
                 historical_prepare: Self::prepare_historical_component::<T>,
                 #[cfg(feature = "live")]
@@ -850,6 +861,8 @@ impl Trader {
                 native_load: Some(Self::load_native_strategy_state::<T>),
                 #[cfg(feature = "live")]
                 historical_save: Self::save_historical_component_state::<T>,
+                #[cfg(feature = "live")]
+                pending_responses: Some(Self::pending_component_responses::<T>),
                 #[cfg(feature = "live")]
                 historical_prepare: Self::prepare_historical_component::<T>,
                 #[cfg(feature = "live")]
@@ -2536,6 +2549,68 @@ impl Trader {
             ),
         )
     }
+    /// Collects owner declarations from actual registered objects, without Save callbacks.
+    /// # Errors
+    /// Refuses duplicate IDs, cross-owner claims or registration changes.
+    #[cfg(feature = "live")]
+    pub fn collect_native_pending_responses(
+        trader: &Rc<RefCell<Self>>,
+    ) -> anyhow::Result<Vec<nautilus_common::msgbus::NativePendingResponse>> {
+        let (actors, strategies) = {
+            let current = trader.try_borrow()?;
+            (
+                current.actor_state_callbacks()?,
+                current.strategy_state_callbacks()?,
+            )
+        };
+        let mut out = Vec::new();
+        let mut ids = std::collections::BTreeSet::new();
+        for (owner, callback) in actors
+            .iter()
+            .map(|(id, cb)| (id.inner(), cb))
+            .chain(strategies.iter().map(|(id, cb)| (id.inner(), cb)))
+        {
+            if let Some(callback) = callback.pending_responses {
+                for claim in callback(owner)? {
+                    anyhow::ensure!(
+                        claim.owner == owner.as_str()
+                            && ids.insert(claim.correlation_id.to_string()),
+                        "native response claim changed or duplicated owner"
+                    );
+                    out.push(claim);
+                }
+            }
+        }
+        let current = trader.try_borrow()?;
+        anyhow::ensure!(
+            current
+                .actor_ids
+                .iter()
+                .copied()
+                .eq(actors.iter().map(|(id, _)| *id))
+                && current
+                    .strategy_ids
+                    .iter()
+                    .copied()
+                    .eq(strategies.iter().map(|(id, _)| *id)),
+            "component registration changed during response collection"
+        );
+        out.sort_by_key(|claim| claim.correlation_id.to_string());
+        Ok(out)
+    }
+
+    #[cfg(feature = "live")]
+    fn pending_component_responses<T>(
+        id: Ustr,
+    ) -> anyhow::Result<Vec<nautilus_common::msgbus::NativePendingResponse>>
+    where
+        T: DataActor + DataActorNative + Debug + 'static,
+    {
+        let component = try_get_actor_unchecked::<T>(&id)
+            .ok_or_else(|| anyhow::anyhow!("native response owner absent: {id}"))?;
+        component.native_pending_responses()
+    }
+
     #[cfg(feature = "live")]
     fn save_historical_component_state<T>(id: Ustr) -> anyhow::Result<PersistedComponentState>
     where

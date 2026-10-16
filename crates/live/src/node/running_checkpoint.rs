@@ -24,7 +24,6 @@ use nautilus_common::{
     messages::{ExecutionEvent, SystemCommand, SystemEvent},
 };
 use nautilus_system::trader::CollectedComponentState;
-#[cfg(feature = "native-tail-replay")]
 use nautilus_system::trader::Trader;
 
 use super::{LiveNode, NodeState, recovery_quiescence};
@@ -1309,6 +1308,7 @@ pub struct RunningCheckpointInventory {
     #[cfg(feature = "native-tail-replay")]
     strategy_framework: serde_json::Value,
     message_bus_mode: &'static str,
+    native_pending_responses: Vec<nautilus_common::msgbus::NativePendingResponse>,
     execution_authorized: bool,
 }
 
@@ -1844,8 +1844,11 @@ impl LiveNode {
             // No adapter/runner/timer freeze has begun. Pending correlations are
             // a typed local-bus observation, never an error-text retry heuristic.
             proof.verify()?;
+            let owned_responses = Trader::collect_native_pending_responses(&self.kernel.trader)?;
             if let nautilus_common::msgbus::LocalRecoveryReadiness::PendingResponses { count } =
-                nautilus_common::msgbus::local_only_recovery_readiness()?
+                nautilus_common::msgbus::local_recovery_readiness_with_owned_responses(
+                    &owned_responses,
+                )?
             {
                 ensure!(
                     !terminal,
@@ -1928,23 +1931,26 @@ impl LiveNode {
                         execution.submissions_fenced(),
                         risk.trading_state(),
                     );
-                    nautilus_common::msgbus::with_local_only_recovery_inventory(|bus| {
-                        nautilus_common::runner::with_empty_sync_command_queues(|| {
-                            let mut pending = receivers.snapshot(&ingress, &guard, &registry)?;
-                            let callback_ancestry = pending
-                                .callback_ancestry()
-                                .context("native callback ancestry inventory missing")?
-                                .clone();
-                            let retained_timers = self
-                                .recovery_timers
-                                .as_ref()
-                                .map(|timers| timers.inventory(&registry))
-                                .transpose()?;
-                            if let Some(timers) = &self.recovery_timers {
-                                let mut retained = timers.pending_entries(&registry)?;
-                                let count = retained.len() as u64;
-                                for entry in &mut pending.entries {
-                                    if entry.channel
+                    nautilus_common::msgbus::with_owned_response_recovery_inventory(
+                        &owned_responses,
+                        |bus| {
+                            nautilus_common::runner::with_empty_sync_command_queues(|| {
+                                let mut pending =
+                                    receivers.snapshot(&ingress, &guard, &registry)?;
+                                let callback_ancestry = pending
+                                    .callback_ancestry()
+                                    .context("native callback ancestry inventory missing")?
+                                    .clone();
+                                let retained_timers = self
+                                    .recovery_timers
+                                    .as_ref()
+                                    .map(|timers| timers.inventory(&registry))
+                                    .transpose()?;
+                                if let Some(timers) = &self.recovery_timers {
+                                    let mut retained = timers.pending_entries(&registry)?;
+                                    let count = retained.len() as u64;
+                                    for entry in &mut pending.entries {
+                                        if entry.channel
                                         == crate::runner_recovery::RunnerRecoveryChannel::TimeEvent
                                     {
                                         entry.channel_ordinal = entry
@@ -1952,146 +1958,154 @@ impl LiveNode {
                                             .checked_add(count)
                                             .context("timer FIFO ordinal exhausted")?;
                                     }
+                                    }
+                                    retained.append(&mut pending.entries);
+                                    pending.entries = retained;
                                 }
-                                retained.append(&mut pending.entries);
-                                pending.entries = retained;
-                            }
-                            let mut runner_counts = [
-                                "time_event",
-                                "system_event",
-                                "system_command",
-                                "execution_event",
-                                "execution_command",
-                                "data_event",
-                                "data_command",
-                            ]
-                            .into_iter()
-                            .map(|name| (name.to_owned(), 0))
-                            .collect::<BTreeMap<_, u64>>();
-                            for entry in &pending.entries {
-                                let name = serde_json::to_value(entry.channel)?
-                                    .as_str()
-                                    .context("invalid runner channel")?
-                                    .to_owned();
-                                *runner_counts.entry(name).or_insert(0) += 1;
-                            }
-                            let inventory = RunningCheckpointInventory {
-                                profile: if terminal {
-                                    "terminal_completed_root_closed_admission.v1"
-                                } else {
-                                    "running_completed_root_local_bus_registered_live_timers.v1"
-                                },
-                                node_state: if terminal {
-                                    "shutting_down"
-                                } else if capture_state == NodeState::Observing {
-                                    "observing"
-                                } else {
-                                    "running"
-                                },
-                                runner_counts,
-                                callback_ancestry: callback_ancestry.clone(),
-                                timer_counts: timers.clone(),
-                                timers: timer_state.clone(),
-                                synchronous_queue_counts: BTreeMap::from([
-                                    ("data_command".into(), 0),
-                                    ("trading_command".into(), 0),
-                                ]),
-                                adapters: adapters
-                                    .iter()
-                                    .map(|(id, guard)| (id.clone(), guard.inventory().clone()))
-                                    .collect(),
-                                execution_manager: manager.clone(),
-                                dispatch_coverage: coverage.clone(),
-                                startup_reconciliation: self.handle.startup_reconciliation(),
-                                node_instance_id: self.kernel.instance_id,
-                                captured_at_ns: self
-                                    .kernel
-                                    .clock
-                                    .try_borrow()?
-                                    .timestamp_ns()
-                                    .as_u64(),
-                                recovery_frontier: self.recovery_native_frontier.clone(),
-                                empty_bootstrap: self.recovery_empty_bootstrap.clone(),
-                                retained_recovery_timers: retained_timers.clone(),
-                                restored_adapters: self.recovery_adapter_source.clone(),
-                                data_client_state: data_client_state.clone(),
-                                data_engine: data_engine_state.clone(),
-                                portfolio: portfolio_state.clone(),
-                                #[cfg(feature = "native-tail-replay")]
-                                strategy_framework: strategy_framework.clone(),
-                                message_bus_mode: "local_only",
-                                execution_authorized: false,
-                            };
-                            let verify = || -> Result<()> {
-                                self.verify_running_checkpoint_pending_response_deadline()?;
-                                ensure!(
-                                    self.state() == capture_state
-                                        && (terminal || !self.handle.should_stop()),
-                                    "node lifecycle changed during checkpoint"
-                                );
-                                ensure!(
-                                    self.recovery_timers
-                                        .as_ref()
-                                        .map(|timers| timers.inventory(&registry))
-                                        .transpose()?
-                                        == retained_timers,
-                                    "retained native timer handoff changed during checkpoint"
-                                );
-                                verify_timers()?;
-                                guard.verify()?;
-                                bus.verify()?;
-                                proof.verify()?;
-                                ensure!(
-                                    receivers.callback_ancestry()? == callback_ancestry,
-                                    "native physical FIFO callback ancestry changed during checkpoint"
-                                );
-                                ensure!(
-                                    observer.coverage()? == coverage,
-                                    "dispatch inventory changed during checkpoint"
-                                );
-                                ensure!(
-                                    self.collect_recovery_checkpoint_components()? == components,
-                                    "component state changed during checkpoint"
-                                );
-                                #[cfg(feature = "native-tail-replay")]
-                                Trader::verify_native_strategy_framework_timers(
-                                    &self.kernel.trader,
-                                    &strategy_framework,
-                                    timer_state,
-                                )?;
-                                ensure!(
-                                    data.running_checkpoint_state()? == data_engine_state,
-                                    "actual native DataEngine internal inventory changed"
-                                );
-                                ensure!(
-                                    self.kernel
-                                        .portfolio
+                                let mut runner_counts = [
+                                    "time_event",
+                                    "system_event",
+                                    "system_command",
+                                    "execution_event",
+                                    "execution_command",
+                                    "data_event",
+                                    "data_command",
+                                ]
+                                .into_iter()
+                                .map(|name| (name.to_owned(), 0))
+                                .collect::<BTreeMap<_, u64>>();
+                                for entry in &pending.entries {
+                                    let name = serde_json::to_value(entry.channel)?
+                                        .as_str()
+                                        .context("invalid runner channel")?
+                                        .to_owned();
+                                    *runner_counts.entry(name).or_insert(0) += 1;
+                                }
+                                let inventory = RunningCheckpointInventory {
+                                    profile: if terminal {
+                                        "terminal_completed_root_closed_admission.v1"
+                                    } else {
+                                        "running_completed_root_local_bus_registered_live_timers.v1"
+                                    },
+                                    node_state: if terminal {
+                                        "shutting_down"
+                                    } else if capture_state == NodeState::Observing {
+                                        "observing"
+                                    } else {
+                                        "running"
+                                    },
+                                    runner_counts,
+                                    callback_ancestry: callback_ancestry.clone(),
+                                    timer_counts: timers.clone(),
+                                    timers: timer_state.clone(),
+                                    synchronous_queue_counts: BTreeMap::from([
+                                        ("data_command".into(), 0),
+                                        ("trading_command".into(), 0),
+                                    ]),
+                                    adapters: adapters
+                                        .iter()
+                                        .map(|(id, guard)| (id.clone(), guard.inventory().clone()))
+                                        .collect(),
+                                    execution_manager: manager.clone(),
+                                    dispatch_coverage: coverage.clone(),
+                                    startup_reconciliation: self.handle.startup_reconciliation(),
+                                    node_instance_id: self.kernel.instance_id,
+                                    captured_at_ns: self
+                                        .kernel
+                                        .clock
                                         .try_borrow()?
-                                        .running_checkpoint_state()?
-                                        == portfolio_state,
-                                    "actual native Portfolio history changed during checkpoint"
-                                );
-                                ensure!(
-                                    self.exec_manager.checkpoint_inventory(now)? == manager,
-                                    "reconciliation state changed during checkpoint"
-                                );
-                                ensure!(
-                                    (
-                                        execution.command_count(),
-                                        execution.event_count(),
-                                        execution.report_count(),
-                                        execution.submissions_fenced(),
-                                        risk.trading_state()
-                                    ) == engine_counts,
-                                    "native execution/risk state changed during checkpoint"
-                                );
-                                for (_, adapter) in &adapters {
-                                    adapter.verify()?;
-                                }
-                                Ok(())
-                            };
-                            verify()?;
-                            #[cfg(feature = "native-tail-replay")]
+                                        .timestamp_ns()
+                                        .as_u64(),
+                                    recovery_frontier: self.recovery_native_frontier.clone(),
+                                    empty_bootstrap: self.recovery_empty_bootstrap.clone(),
+                                    retained_recovery_timers: retained_timers.clone(),
+                                    restored_adapters: self.recovery_adapter_source.clone(),
+                                    data_client_state: data_client_state.clone(),
+                                    data_engine: data_engine_state.clone(),
+                                    portfolio: portfolio_state.clone(),
+                                    #[cfg(feature = "native-tail-replay")]
+                                    strategy_framework: strategy_framework.clone(),
+                                    message_bus_mode: "local_only",
+                                    native_pending_responses: owned_responses.clone(),
+                                    execution_authorized: false,
+                                };
+                                let verify = || -> Result<()> {
+                                    self.verify_running_checkpoint_pending_response_deadline()?;
+                                    ensure!(
+                                        self.state() == capture_state
+                                            && (terminal || !self.handle.should_stop()),
+                                        "node lifecycle changed during checkpoint"
+                                    );
+                                    ensure!(
+                                        self.recovery_timers
+                                            .as_ref()
+                                            .map(|timers| timers.inventory(&registry))
+                                            .transpose()?
+                                            == retained_timers,
+                                        "retained native timer handoff changed during checkpoint"
+                                    );
+                                    verify_timers()?;
+                                    guard.verify()?;
+                                    bus.verify()?;
+                                    ensure!(
+                                        Trader::collect_native_pending_responses(
+                                            &self.kernel.trader
+                                        )? == owned_responses,
+                                        "actual native response owner state changed during checkpoint"
+                                    );
+                                    proof.verify()?;
+                                    ensure!(
+                                        receivers.callback_ancestry()? == callback_ancestry,
+                                        "native physical FIFO callback ancestry changed during checkpoint"
+                                    );
+                                    ensure!(
+                                        observer.coverage()? == coverage,
+                                        "dispatch inventory changed during checkpoint"
+                                    );
+                                    ensure!(
+                                        self.collect_recovery_checkpoint_components()?
+                                            == components,
+                                        "component state changed during checkpoint"
+                                    );
+                                    #[cfg(feature = "native-tail-replay")]
+                                    Trader::verify_native_strategy_framework_timers(
+                                        &self.kernel.trader,
+                                        &strategy_framework,
+                                        timer_state,
+                                    )?;
+                                    ensure!(
+                                        data.running_checkpoint_state()? == data_engine_state,
+                                        "actual native DataEngine internal inventory changed"
+                                    );
+                                    ensure!(
+                                        self.kernel
+                                            .portfolio
+                                            .try_borrow()?
+                                            .running_checkpoint_state()?
+                                            == portfolio_state,
+                                        "actual native Portfolio history changed during checkpoint"
+                                    );
+                                    ensure!(
+                                        self.exec_manager.checkpoint_inventory(now)? == manager,
+                                        "reconciliation state changed during checkpoint"
+                                    );
+                                    ensure!(
+                                        (
+                                            execution.command_count(),
+                                            execution.event_count(),
+                                            execution.report_count(),
+                                            execution.submissions_fenced(),
+                                            risk.trading_state()
+                                        ) == engine_counts,
+                                        "native execution/risk state changed during checkpoint"
+                                    );
+                                    for (_, adapter) in &adapters {
+                                        adapter.verify()?;
+                                    }
+                                    Ok(())
+                                };
+                                verify()?;
+                                #[cfg(feature = "native-tail-replay")]
                             let native_trace_cut = observer.native_trace().map(|trace| {
                                 let receipts = receivers.native_pending_receipts()?;
                                 let original_inputs = receivers.native_pending_inputs(&|source, input| {
@@ -2127,30 +2141,31 @@ impl LiveNode {
                                     "actual staged source payload/receipt inventory differs");
                                 Ok(cut)
                             }).transpose()?;
-                            let boundary = RunningCheckpointBoundary {
-                                #[cfg(feature = "native-tail-replay")]
-                                native_trace_cut: native_trace_cut.as_ref(),
-                                #[cfg(feature = "native-tail-replay")]
-                                native_trace: observer.native_trace(),
-                                proof: &proof,
-                                pending: &pending,
-                                inventory: &inventory,
-                                cache: &cache,
-                                components: &components,
-                                verify_frozen: &verify,
-                            };
-                            let value = collect(&boundary)?;
-                            verify()?;
-                            persist(&boundary, value)?;
-                            verify()?;
-                            if terminal {
-                                guard.finish_terminal()?;
-                            } else {
-                                guard.finish()?;
-                            }
-                            Ok(())
-                        })
-                    })
+                                let boundary = RunningCheckpointBoundary {
+                                    #[cfg(feature = "native-tail-replay")]
+                                    native_trace_cut: native_trace_cut.as_ref(),
+                                    #[cfg(feature = "native-tail-replay")]
+                                    native_trace: observer.native_trace(),
+                                    proof: &proof,
+                                    pending: &pending,
+                                    inventory: &inventory,
+                                    cache: &cache,
+                                    components: &components,
+                                    verify_frozen: &verify,
+                                };
+                                let value = collect(&boundary)?;
+                                verify()?;
+                                persist(&boundary, value)?;
+                                verify()?;
+                                if terminal {
+                                    guard.finish_terminal()?;
+                                } else {
+                                    guard.finish()?;
+                                }
+                                Ok(())
+                            })
+                        },
+                    )
                 },
             )?;
             // Reopen adapters only after the runner is ready. No await occurs

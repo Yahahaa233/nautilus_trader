@@ -299,6 +299,17 @@ fn native_bar_framework(
 /// [`DataActorNative`] and [`Component`] bounds. The actor ID and clock facades
 /// use [`DataActorBinding`] to access component state.
 pub trait DataActor {
+    /// Complete outstanding native response ownership in this same private cut.
+    /// Unsupported components declare none and retain the existing deferral/refusal.
+    /// # Errors
+    /// Refuses a corrupt or unsupported owned pending request.
+    #[cfg(feature = "live")]
+    fn native_pending_responses(
+        &self,
+    ) -> anyhow::Result<Vec<crate::msgbus::NativePendingResponse>> {
+        Ok(Vec::new())
+    }
+
     /// Installs only this original object's local historical pubsub routes. This
     /// must not call ordinary `on_start`, reset private history, or contact a venue.
     /// Custom `TypedHandler` closures must use historical admission on this same owner.
@@ -799,6 +810,14 @@ pub trait DataActor {
     #[allow(unused_variables)]
     fn on_historical_bars(&mut self, bars: &[Bar]) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Receives the complete native bars response, including original routing.
+    ///
+    /// # Errors
+    /// Returns the original historical-bars callback failure.
+    fn on_historical_bars_response(&mut self, response: &BarsResponse) -> anyhow::Result<()> {
+        self.on_historical_bars(&response.data)
     }
 
     /// Actions to be performed when receiving historical mark prices.
@@ -2284,7 +2303,7 @@ pub trait DataActor {
             return;
         }
 
-        if let Err(e) = self.on_historical_bars(&resp.data) {
+        if let Err(e) = self.on_historical_bars_response(resp) {
             log_error(&e);
         }
     }
@@ -2528,6 +2547,41 @@ pub trait DataActor {
         );
         self.core_mut()
             .add_native_local_quote_subscription(topic, handler)
+    }
+
+    /// Restores a local trade callback without a venue subscription command.
+    /// The original source/configuration is verified by the component hook;
+    /// normal startup later upgrades this same handler to a remote subscription.
+    ///
+    /// # Errors
+    /// Refuses a foreign registration, an active component or remote downgrade.
+    #[cfg(feature = "live")]
+    fn restore_native_local_trades(
+        &mut self,
+        instrument_id: InstrumentId,
+        preparation: &crate::recovery_trace::historical::HistoricalReplayPreparation<'_>,
+    ) -> anyhow::Result<()>
+    where
+        Self: DataActorNative + 'static + Debug + Sized,
+    {
+        self.core().check_native_local_preparation(preparation)?;
+        let actor_id = self.core().actor_id().inner();
+        let topic = get_trades_topic(instrument_id);
+        let handler = TypedHandler::from_with_id(
+            format!("native.local.trade:{actor_id}:{topic}"),
+            move |trade: &TradeTick| {
+                if !super::recovery_observation::callback_admitted(&actor_id) {
+                    return;
+                }
+                if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                    actor.handle_trade(trade);
+                } else {
+                    log::error!("Actor {actor_id} not found for local historical trade handling");
+                }
+            },
+        );
+        self.core_mut()
+            .add_native_local_trade_subscription(topic, handler)
     }
 
     /// Restores the same registered actor's local mark callback only. Normal
@@ -4073,6 +4127,94 @@ pub trait DataActor {
         )
     }
 
+    /// Requests bars under an ID reserved by this native owner before dispatch.
+    ///
+    /// # Errors
+    /// Refuses invalid inputs or a foreign handler before sending a command.
+    #[expect(clippy::too_many_arguments)]
+    fn request_bars_with_id(
+        &mut self,
+        request_id: UUID4,
+        bar_type: BarType,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
+        limit: Option<NonZeroUsize>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+    ) -> anyhow::Result<UUID4>
+    where
+        Self: DataActorNative + 'static + Debug + Sized,
+    {
+        let actor_id = self.core().actor_id().inner();
+        let handler = native_bars_response_handler::<Self>(actor_id, request_id);
+        DataActorCore::request_bars_with_id(
+            self.core_mut(),
+            bar_type,
+            start,
+            end,
+            limit,
+            client_id,
+            params,
+            handler,
+            Some(request_id),
+        )
+    }
+
+    /// Restores only this owner's original response handler, without transport,
+    /// clock reads or UUID allocation. The reader verifies complete private state.
+    ///
+    /// # Errors
+    /// Refuses a foreign/active registration or an existing foreign handler.
+    #[cfg(feature = "live")]
+    fn restore_native_local_bars_response(
+        &mut self,
+        request_id: UUID4,
+        preparation: &crate::recovery_trace::historical::HistoricalReplayPreparation<'_>,
+    ) -> anyhow::Result<()>
+    where
+        Self: DataActorNative + 'static + Debug + Sized,
+    {
+        self.core().check_native_local_preparation(preparation)?;
+        let actor_id = self.core().actor_id().inner();
+        let handler = native_bars_response_handler::<Self>(actor_id, request_id);
+        let bus = get_message_bus();
+        let mut bus = bus.borrow_mut();
+        if let Some(existing) = bus.get_response_handler(&request_id) {
+            anyhow::ensure!(
+                existing.id() == handler.id(),
+                "original bars response ID belongs to another owner"
+            );
+        } else {
+            bus.register_response_handler(&request_id, handler)?;
+        }
+        Ok(())
+    }
+
+    /// Retires only this actor's stable bars response handler. An already
+    /// consumed response is harmless; a foreign handler is always refused.
+    ///
+    /// # Errors
+    /// Refuses a foreign handler rather than removing it.
+    fn retire_native_bars_response(&mut self, request_id: UUID4) -> anyhow::Result<()>
+    where
+        Self: DataActorNative,
+    {
+        let expected = format!(
+            "native.bars_response:{}:{request_id}",
+            self.core().actor_id()
+        );
+        let bus = get_message_bus();
+        let mut bus = bus.borrow_mut();
+        if let Some(existing) = bus.get_response_handler(&request_id) {
+            anyhow::ensure!(
+                existing.id().as_str() == expected,
+                "cannot retire another owner's bars response handler"
+            );
+            bus.take_response_handler(&request_id);
+        }
+        Ok(())
+    }
+
     /// Request historical [`FundingRateUpdate`] data for the given `instrument_id`.
     ///
     /// # Errors
@@ -4410,6 +4552,30 @@ impl DataActorCore {
     }
 
     #[cfg(feature = "live")]
+    fn add_native_local_trade_subscription(
+        &mut self,
+        topic: MStr<Topic>,
+        handler: TypedHandler<TradeTick>,
+    ) -> anyhow::Result<()> {
+        if let Some(existing) = self.trade_handlers.get(&topic) {
+            anyhow::ensure!(
+                existing.command.is_none() && existing.handler.id() == handler.id(),
+                "native local trade subscription cannot replace an existing remote or foreign handler"
+            );
+            return Ok(());
+        }
+        self.trade_handlers.insert(
+            topic,
+            Subscription {
+                handler: handler.clone(),
+                command: None,
+            },
+        );
+        msgbus::subscribe_trades(topic.into(), handler, None);
+        Ok(())
+    }
+
+    #[cfg(feature = "live")]
     fn add_native_local_bar_subscription(
         &mut self,
         topic: MStr<Topic>,
@@ -4476,7 +4642,12 @@ impl DataActorCore {
         handler: TypedHandler<TradeTick>,
         command: DataCommand,
     ) -> bool {
-        if self.trade_handlers.contains_key(&topic) {
+        if let Some(subscription) = self.trade_handlers.get_mut(&topic) {
+            // Reuse the reader-verified local handler on the first live upgrade.
+            if subscription.command.is_none() {
+                subscription.command = Some(command);
+                return true;
+            }
             log::warn!(
                 "Actor {} attempted duplicate trade subscription to '{topic}'",
                 self.actor_id
@@ -5515,6 +5686,74 @@ impl DataActorCore {
                 && matches!(self.state, ComponentState::Ready | ComponentState::Stopped),
             "native local subscription differs from paused original registration"
         );
+        Ok(())
+    }
+
+    /// Captures the actual retained bar/quote/trade subscription commands in
+    /// deterministic family/topic order. This does not invent original IDs.
+    ///
+    /// # Errors
+    /// Refuses a local-only or foreign command in these registered resources.
+    pub fn native_data_subscription_commands(&self) -> anyhow::Result<Vec<SubscribeCommand>> {
+        let mut commands = Vec::new();
+        macro_rules! collect {
+            ($handlers:expr, $variant:ident) => {
+                let mut entries = $handlers.iter().collect::<Vec<_>>();
+                entries.sort_unstable_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
+                for (_, subscription) in entries {
+                    match &subscription.command {
+                        Some(DataCommand::Subscribe(command @ SubscribeCommand::$variant(_))) => {
+                            commands.push(command.clone())
+                        }
+                        _ => anyhow::bail!(
+                            "native data binding has no original retained subscription command"
+                        ),
+                    }
+                }
+            };
+        }
+        collect!(self.bar_handlers, Bars);
+        collect!(self.quote_handlers, Quotes);
+        collect!(self.trade_handlers, Trades);
+        Ok(commands)
+    }
+
+    /// Retains an original source command on this actor's already restored
+    /// local handler. No transport, UUID or clock operation is performed.
+    ///
+    /// # Errors
+    /// Refuses a foreign preparation, absent handler or conflicting command.
+    #[cfg(feature = "live")]
+    pub fn restore_native_data_subscription_command(
+        &mut self,
+        command: SubscribeCommand,
+        preparation: &crate::recovery_trace::historical::HistoricalReplayPreparation<'_>,
+    ) -> anyhow::Result<()> {
+        self.check_native_local_preparation(preparation)?;
+        let original = DataCommand::Subscribe(command.clone());
+        let retained = match command {
+            SubscribeCommand::Bars(value) => self
+                .bar_handlers
+                .get_mut(&get_bars_topic(value.bar_type.standard()))
+                .map(|slot| &mut slot.command),
+            SubscribeCommand::Quotes(value) => self
+                .quote_handlers
+                .get_mut(&get_quotes_topic(value.instrument_id))
+                .map(|slot| &mut slot.command),
+            SubscribeCommand::Trades(value) => self
+                .trade_handlers
+                .get_mut(&get_trades_topic(value.instrument_id))
+                .map(|slot| &mut slot.command),
+            _ => anyhow::bail!("unsupported original native subscription family"),
+        }
+        .ok_or_else(|| {
+            anyhow::anyhow!("original native subscription has no restored local handler")
+        })?;
+        anyhow::ensure!(
+            retained.is_none() || retained.as_ref() == Some(&original),
+            "original subscription cannot replace another native command"
+        );
+        *retained = Some(original);
         Ok(())
     }
 
@@ -7025,6 +7264,28 @@ impl DataActorCore {
         params: Option<Params>,
         handler: ShareableMessageHandler,
     ) -> anyhow::Result<UUID4> {
+        self.request_bars_with_id(
+            bar_type, start, end, limit, client_id, params, handler, None,
+        )
+    }
+
+    /// Dispatches a bars request using an already reserved native correlation ID.
+    /// Reuses only the same owner's stable restored response handler.
+    ///
+    /// # Errors
+    /// Refuses invalid inputs or a foreign handler before sending a command.
+    #[expect(clippy::too_many_arguments)]
+    pub fn request_bars_with_id(
+        &self,
+        bar_type: BarType,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
+        limit: Option<NonZeroUsize>,
+        client_id: Option<ClientId>,
+        params: Option<Params>,
+        handler: ShareableMessageHandler,
+        reserved_id: Option<UUID4>,
+    ) -> anyhow::Result<UUID4> {
         self.check_registered();
 
         anyhow::ensure!(
@@ -7036,7 +7297,7 @@ impl DataActorCore {
         let now = self.clock_ref().utc_now();
         check_timestamps(now, start, end)?;
 
-        let request_id = crate::recovery_trace::native_event_uuid();
+        let request_id = reserved_id.unwrap_or_else(crate::recovery_trace::native_event_uuid);
         let command = RequestCommand::Bars(RequestBars {
             bar_type,
             start,
@@ -7048,9 +7309,18 @@ impl DataActorCore {
             params,
         });
 
-        get_message_bus()
-            .borrow_mut()
-            .register_response_handler(command.request_id(), handler)?;
+        {
+            let bus = get_message_bus();
+            let mut bus = bus.borrow_mut();
+            if let Some(existing) = bus.get_response_handler(command.request_id()) {
+                anyhow::ensure!(
+                    reserved_id.is_some() && existing.id() == handler.id(),
+                    "native bars request cannot replace a foreign response handler"
+                );
+            } else {
+                bus.register_response_handler(command.request_id(), handler)?;
+            }
+        }
 
         self.send_data_cmd(DataCommand::Request(command));
 
@@ -7229,6 +7499,25 @@ where
     T: Debug,
 {
     log::debug!("{RECV} {msg:?}");
+}
+
+fn native_bars_response_handler<T>(actor_id: Ustr, request_id: UUID4) -> ShareableMessageHandler
+where
+    T: DataActor + DataActorNative + 'static + Debug,
+{
+    ShareableMessageHandler::from_typed_with_id(
+        format!("native.bars_response:{actor_id}:{request_id}"),
+        move |response: &BarsResponse| {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
+            if let Some(mut actor) = try_get_actor_unchecked::<T>(&actor_id) {
+                actor.handle_bars_response(response);
+            } else {
+                log::error!("Actor {actor_id} not found for original bars response handling");
+            }
+        },
+    )
 }
 
 fn log_received_bulk(kind: &str, correlation_id: &UUID4, records: usize) {

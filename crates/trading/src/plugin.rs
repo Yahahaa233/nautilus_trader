@@ -19,7 +19,6 @@ use nautilus_common::{actor::DataActor, component::Component, timer::TimeEvent};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, BarType, QuoteTick, TradeTick},
-    enums::TimeInForce,
     events::{OrderEventAny, PositionEvent},
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId},
     orders::{Order, OrderAny},
@@ -33,29 +32,43 @@ use serde::{Deserialize, Serialize};
 use crate::strategy::{Strategy, StrategyConfig, StrategyCore};
 
 mod adapter;
+mod facts;
 #[cfg(feature = "live")]
 pub mod historical;
+mod history_requests;
+mod orders;
+mod routing;
+mod subscriptions;
 
 /// Explicit native routing and bounds, supplied by the server's admitted
 /// deployment. Guests cannot select another client, account or instrument.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginScope {
     pub client_id: ClientId,
+    /// Public data routing is separate from account execution routing.
+    pub data_client_id: ClientId,
     pub account_id: AccountId,
     pub instruments: BTreeSet<InstrumentId>,
     pub bar_types: Vec<BarType>,
     pub order_types: BTreeSet<PluginOrderType>,
     pub max_timers: usize,
+    /// Zero disables history requests. Nonzero limits each native bars request.
+    pub max_history_bars: usize,
+    pub quote_instruments: BTreeSet<InstrumentId>,
+    pub trade_instruments: BTreeSet<InstrumentId>,
     pub state_schema_version: u32,
     pub descriptor_sha256: String,
     pub configuration_sha256: String,
 }
 
 /// Order construction currently implemented by the encoded native facade.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PluginOrderType {
     Market,
     Limit,
+    StopMarket,
+    StopLimit,
 }
 
 /// Shared encoded requests do not require algorithms to depend on a Core.
@@ -70,6 +83,8 @@ pub struct PluginStrategy {
     guest: Rc<RefCell<GuestInstance>>,
     scope: PluginScope,
     adapter: adapter::AdapterState,
+    history_reissue_after_restore: bool,
+    restored_resources_unprepared: bool,
     #[cfg(feature = "live")]
     historical_verifier: Option<Rc<dyn historical::PluginHistoricalVerifier>>,
     #[cfg(feature = "live")]
@@ -84,6 +99,14 @@ struct CheckpointIdentity {
     schema_version: u32,
     descriptor_sha256: String,
     configuration_sha256: String,
+    /// Old experimental identities remain readable, but lack the routing proof
+    /// required to resume under the complete scope. Never infer that proof.
+    #[serde(default)]
+    native_scope: Option<PluginScope>,
+    #[serde(default)]
+    trader_id: Option<nautilus_model::identifiers::TraderId>,
+    #[serde(default)]
+    strategy_id: Option<nautilus_model::identifiers::StrategyId>,
 }
 
 /// Terminal native adapter state, deliberately distinct from algorithm state.
@@ -116,11 +139,24 @@ impl FailureCheckpoint {
 }
 
 impl PluginStrategy {
+    fn adapter_checkpoint(&self) -> Result<adapter::AdapterState> {
+        let mut state = self.adapter.clone();
+        if !self.restored_resources_unprepared {
+            state.retained_subscriptions = nautilus_common::actor::DataActorNative::core(self)
+                .native_data_subscription_commands()?;
+        }
+        state.validate(&self.scope)?;
+        Ok(state)
+    }
+
     fn checkpoint_identity(&self) -> CheckpointIdentity {
         CheckpointIdentity {
             schema_version: self.scope.state_schema_version,
             descriptor_sha256: self.scope.descriptor_sha256.clone(),
             configuration_sha256: self.scope.configuration_sha256.clone(),
+            native_scope: Some(self.scope.clone()),
+            trader_id: self.core.trader_id(),
+            strategy_id: self.core.strategy_id(),
         }
     }
 
@@ -141,7 +177,10 @@ impl PluginStrategy {
                 "plugin.identity".into(),
                 serde_json::to_vec(&self.checkpoint_identity())?,
             ),
-            ("plugin.adapter".into(), serde_json::to_vec(&self.adapter)?),
+            (
+                "plugin.adapter".into(),
+                serde_json::to_vec(&self.adapter_checkpoint()?)?,
+            ),
         ])))
     }
 
@@ -190,6 +229,15 @@ impl PluginStrategy {
             scope.state_schema_version > 0,
             "plugin state schema is absent"
         );
+        ensure!(
+            scope.max_history_bars <= 50_000,
+            "native history request capacity exceeds the host limit"
+        );
+        ensure!(
+            scope.quote_instruments.is_subset(&scope.instruments)
+                && scope.trade_instruments.is_subset(&scope.instruments),
+            "native data capabilities exceed admitted instruments"
+        );
         for hash in [&scope.descriptor_sha256, &scope.configuration_sha256] {
             ensure!(
                 hash.len() == 64
@@ -214,6 +262,8 @@ impl PluginStrategy {
             guest: Rc::new(RefCell::new(guest)),
             scope,
             adapter: adapter::AdapterState::default(),
+            history_reissue_after_restore: false,
+            restored_resources_unprepared: false,
             #[cfg(feature = "live")]
             historical_verifier: None,
             #[cfg(feature = "live")]
@@ -227,12 +277,10 @@ impl PluginStrategy {
         let guest = Rc::clone(&self.guest);
         let version = self.scope.state_schema_version;
         let mut native = |operation, input: &[u8]| {
-            if matches!(kind, CallbackKind::Save | CallbackKind::Restore)
-                && operation != HostOperation::Clock
-            {
-                return Err(PluginError::generic(
-                    "state handoff has no mutating native capability",
-                ));
+            if matches!(kind, CallbackKind::Save | CallbackKind::Restore) {
+                return self
+                    .readonly(operation, input)
+                    .map_err(|error| PluginError::generic(format!("{error:#}")));
             }
             self.dispatch(operation, input)
                 .map_err(|error| PluginError::generic(format!("{error:#}")))
@@ -307,25 +355,51 @@ impl PluginStrategy {
 
     fn dispatch(&mut self, operation: HostOperation, input: &[u8]) -> Result<Vec<u8>> {
         match operation {
-            HostOperation::Clock => {
-                ensure!(input.is_empty(), "clock request must be empty");
-                self.clock_facts()
+            HostOperation::Clock
+            | HostOperation::Instrument
+            | HostOperation::Portfolio
+            | HostOperation::Query => self.readonly(operation, input),
+            HostOperation::RequestHistory => self.request_history(input),
+            HostOperation::Log => {
+                let request: wire::LogRecord = serde_json::from_slice(input)?;
+                require_version(request.schema_version)?;
+                ensure!(
+                    !request.message.is_empty()
+                        && request.message.len() <= 4096
+                        && !request.message.chars().any(char::is_control),
+                    "native log message is empty, oversized or contains control characters"
+                );
+                let owner = self.strategy_id().context("plugin owner is unregistered")?;
+                match request.level {
+                    wire::LogLevel::Debug => log::debug!(
+                        "Plugin {owner} account={} client={}: {}",
+                        self.scope.account_id,
+                        self.scope.client_id,
+                        request.message
+                    ),
+                    wire::LogLevel::Info => log::info!(
+                        "Plugin {owner} account={} client={}: {}",
+                        self.scope.account_id,
+                        self.scope.client_id,
+                        request.message
+                    ),
+                    wire::LogLevel::Warn => log::warn!(
+                        "Plugin {owner} account={} client={}: {}",
+                        self.scope.account_id,
+                        self.scope.client_id,
+                        request.message
+                    ),
+                    wire::LogLevel::Error => log::error!(
+                        "Plugin {owner} account={} client={}: {}",
+                        self.scope.account_id,
+                        self.scope.client_id,
+                        request.message
+                    ),
+                }
+                Ok(Vec::new())
             }
             HostOperation::Subscribe | HostOperation::Unsubscribe => {
-                let request: wire::Subscription = serde_json::from_slice(input)?;
-                require_version(request.schema_version)?;
-                self.require_instrument(request.bar_type.instrument_id())?;
-                ensure!(
-                    self.scope.bar_types.contains(&request.bar_type),
-                    "bar subscription is outside the admitted declaration"
-                );
-                if operation == HostOperation::Subscribe {
-                    self.subscribe_bars(request.bar_type, Some(self.scope.client_id), None);
-                    self.adapter.subscribed_bars.insert(request.bar_type);
-                } else {
-                    self.unsubscribe_bars(request.bar_type, Some(self.scope.client_id), None);
-                    self.adapter.subscribed_bars.remove(&request.bar_type);
-                }
+                self.data_subscription(operation, input)?;
                 Ok(Vec::new())
             }
             HostOperation::SetTimer => {
@@ -363,86 +437,11 @@ impl PluginStrategy {
                 self.clock().cancel_timer(&self.timer_name(&request.name)?);
                 Ok(Vec::new())
             }
-            HostOperation::Submit => {
-                let request: wire::Submit = serde_json::from_slice(input)?;
-                let order = match request {
-                    wire::Submit::Market {
-                        schema_version,
-                        instrument_id,
-                        side,
-                        quantity,
-                        reduce_only,
-                    } => {
-                        ensure!(
-                            self.scope.order_types.contains(&PluginOrderType::Market),
-                            "market order capability was not admitted"
-                        );
-                        require_version(schema_version)?;
-                        self.require_instrument(instrument_id)?;
-                        self.order().market(
-                            instrument_id,
-                            side,
-                            quantity,
-                            Some(TimeInForce::Gtc),
-                            Some(reduce_only),
-                            Some(false),
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                    }
-                    wire::Submit::Limit {
-                        schema_version,
-                        instrument_id,
-                        side,
-                        quantity,
-                        price,
-                        reduce_only,
-                        post_only,
-                    } => {
-                        ensure!(
-                            self.scope.order_types.contains(&PluginOrderType::Limit),
-                            "limit order capability was not admitted"
-                        );
-                        require_version(schema_version)?;
-                        self.require_instrument(instrument_id)?;
-                        self.order().limit(
-                            instrument_id,
-                            side,
-                            quantity,
-                            price,
-                            Some(TimeInForce::Gtc),
-                            None,
-                            Some(post_only),
-                            Some(reduce_only),
-                            Some(false),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                    }
-                };
-                let id = order.client_order_id();
-                // Native submission keeps the application's interceptor and the
-                // final adapter fence; no direct execution client is exposed.
-                self.submit_order(order, None, Some(self.scope.client_id), None)?;
-                Ok(serde_json::to_vec(&wire::OrderId {
-                    schema_version: wire::VERSION,
-                    client_order_id: id,
-                })?)
-            }
-            HostOperation::Cancel | HostOperation::Query => {
+            HostOperation::Submit => self.submit_encoded(input),
+            HostOperation::Cancel => {
                 let request: wire::OrderId = serde_json::from_slice(input)?;
                 require_version(request.schema_version)?;
-                let order = self.owned_order(request.client_order_id)?;
-                if operation == HostOperation::Query {
-                    return Ok(serde_json::to_vec(&order)?);
-                }
+                self.owned_order(request.client_order_id)?;
                 self.cancel_order(request.client_order_id, Some(self.scope.client_id), None)?;
                 Ok(Vec::new())
             }
@@ -460,8 +459,35 @@ impl PluginStrategy {
                 )?;
                 Ok(Vec::new())
             }
-            _ => anyhow::bail!("host operation is not implemented by this native bridge"),
         }
+    }
+
+    fn release_algorithm_resources(&mut self, retire_history: bool) -> Result<()> {
+        let prefix = format!(
+            "plugin:{}:",
+            self.strategy_id().context("plugin is unregistered")?
+        );
+        let clock = self.clock();
+        for name in clock.timer_names() {
+            if name.starts_with(&prefix) {
+                clock.cancel_timer(&name);
+            }
+        }
+        drop(clock);
+        self.release_subscriptions();
+        self.adapter.subscribed_bars.clear();
+        self.adapter.subscribed_quotes.clear();
+        self.adapter.subscribed_trades.clear();
+        self.adapter.retained_subscriptions.clear();
+        self.restored_resources_unprepared = false;
+        if retire_history {
+            if let Some(pending) = &self.adapter.pending_history {
+                self.retire_native_bars_response(pending.id()?)?;
+            }
+            self.adapter.pending_history = None;
+            self.history_reissue_after_restore = false;
+        }
+        Ok(())
     }
 
     fn fault_callback(&mut self, error: &anyhow::Error) {
@@ -541,18 +567,51 @@ crate::nautilus_strategy!(PluginStrategy, {
     }
 
     fn on_order_event(&mut self, event: OrderEventAny) {
-        if let Err(error) = self.event("order", event) {
+        let scope = self.check_order_route(&event);
+        if let Err(error) = self
+            .retain_route_result(scope)
+            .and_then(|()| self.event("order", event))
+        {
             log::error!("Plugin order callback: {error:#}");
         }
     }
     fn on_position_event(&mut self, event: PositionEvent) {
-        if let Err(error) = self.event("position", event) {
+        let scope = self.check_position_route(&event);
+        if let Err(error) = self
+            .retain_route_result(scope)
+            .and_then(|()| self.event("position", event))
+        {
             log::error!("Plugin position callback: {error:#}");
         }
     }
 });
 
 impl DataActor for PluginStrategy {
+    #[cfg(feature = "live")]
+    fn native_pending_responses(
+        &self,
+    ) -> Result<Vec<nautilus_common::msgbus::NativePendingResponse>> {
+        let Some(pending) = &self.adapter.pending_history else {
+            return Ok(Vec::new());
+        };
+        ensure!(
+            self.callback_failure().is_none(),
+            "failed guest retains unsupported pending response"
+        );
+        self.adapter_checkpoint()?;
+        let owner = self
+            .core
+            .strategy_id()
+            .context("native response owner absent")?
+            .to_string();
+        let id = pending.id()?;
+        Ok(vec![nautilus_common::msgbus::NativePendingResponse {
+            handler_id: format!("native.bars_response:{owner}:{id}"),
+            owner,
+            correlation_id: id,
+        }])
+    }
+
     #[cfg(feature = "live")]
     fn prepare_native_recovery(
         &mut self,
@@ -576,6 +635,14 @@ impl DataActor for PluginStrategy {
     }
 
     fn start_inhibited(&self) -> bool {
+        if self.restored_resources_unprepared
+            && (!self.adapter.subscribed_bars.is_empty()
+                || !self.adapter.subscribed_quotes.is_empty()
+                || !self.adapter.subscribed_trades.is_empty()
+                || self.adapter.pending_history.is_some())
+        {
+            return true;
+        }
         #[cfg(feature = "live")]
         if self.historical_failed {
             return true;
@@ -584,47 +651,121 @@ impl DataActor for PluginStrategy {
     }
 
     fn on_start(&mut self) -> Result<()> {
+        ensure!(
+            !self.restored_resources_unprepared
+                || (self.adapter.subscribed_bars.is_empty()
+                    && self.adapter.subscribed_quotes.is_empty()
+                    && self.adapter.subscribed_trades.is_empty()
+                    && self.adapter.pending_history.is_none()),
+            "native data resources require original reader preparation"
+        );
+        self.restored_resources_unprepared = false;
+        if self.history_reissue_after_restore && self.adapter.pending_history.is_some() {
+            #[cfg(feature = "live")]
+            ensure!(
+                self.historical_prepared && !self.historical_failed,
+                "pending history cannot restart without original reader preparation"
+            );
+            #[cfg(not(feature = "live"))]
+            anyhow::bail!("pending history requires native reader recovery");
+            #[cfg(feature = "live")]
+            {
+                self.send_pending_history()?;
+                self.history_reissue_after_restore = false;
+            }
+        }
         self.invoke(CallbackKind::Start, b"").map(|_| ())
     }
     fn on_stop(&mut self) -> Result<()> {
-        self.invoke(CallbackKind::Stop, b"native_stop").map(|_| ())
+        let callback = self.invoke(CallbackKind::Stop, b"native_stop").map(|_| ());
+        let cleanup = self.release_algorithm_resources(false);
+        if let Err(first) = callback {
+            if let Err(secondary) = cleanup {
+                log::error!(
+                    "Native cleanup failed: {secondary:#}; original stop failure: {first:#}"
+                );
+            }
+            return Err(first);
+        }
+        cleanup
     }
     fn on_resume(&mut self) -> Result<()> {
         self.invoke(CallbackKind::Resume, b"").map(|_| ())
     }
     fn on_bar(&mut self, bar: &Bar) -> Result<()> {
+        let valid = self.scope.bar_types.contains(&bar.bar_type);
+        self.retain_route_result(if valid {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "native bar callback exceeds the admitted route"
+            ))
+        })?;
         self.event("bar", bar)
     }
     fn on_quote(&mut self, quote: &QuoteTick) -> Result<()> {
+        let valid = self.scope.quote_instruments.contains(&quote.instrument_id);
+        self.retain_route_result(if valid {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "native quote callback exceeds the admitted route"
+            ))
+        })?;
         self.event("quote", quote)
     }
     fn on_trade(&mut self, trade: &TradeTick) -> Result<()> {
+        let valid = self.scope.trade_instruments.contains(&trade.instrument_id);
+        self.retain_route_result(if valid {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "native trade callback exceeds the admitted route"
+            ))
+        })?;
         self.event("trade", trade)
     }
+    fn on_historical_bars_response(
+        &mut self,
+        response: &nautilus_common::messages::data::BarsResponse,
+    ) -> Result<()> {
+        self.history_response(response)
+    }
+
     fn on_historical_bars(&mut self, bars: &[Bar]) -> Result<()> {
+        let valid = bars.len() <= self.scope.max_history_bars
+            && bars
+                .iter()
+                .all(|bar| self.scope.bar_types.contains(&bar.bar_type));
+        self.retain_route_result(if valid {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "native history callback exceeds the admitted route or bound"
+            ))
+        })?;
         self.event("historical_bars", bars)
     }
     fn on_time_event(&mut self, event: &TimeEvent) -> Result<()> {
+        let valid = self
+            .strategy_id()
+            .is_some_and(|owner| event.name.as_str().starts_with(&format!("plugin:{owner}:")));
+        self.retain_route_result(if valid {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(
+                "native timer callback belongs to another owner"
+            ))
+        })?;
         self.event("timer", serde_json::json!({"name":event.name.to_string(),"event_id":event.event_id.to_string(),"ts_event":event.ts_event.as_u64(),"ts_init":event.ts_init.as_u64()}))
     }
 
     fn on_fault(&mut self) -> Result<()> {
-        // A failed guest cannot perform cleanup through another guest callback.
-        // Release only this actor's admitted native timers. Component::fault
-        // releases the actor's subscriptions; financial state remains native.
-        let prefix = format!(
-            "plugin:{}:",
-            self.strategy_id().context("plugin is unregistered")?
-        );
-        let clock = self.clock();
-        for name in clock.timer_names() {
-            if name.starts_with(&prefix) {
-                clock.cancel_timer(&name);
-            }
-        }
-        drop(clock);
-        self.adapter.subscribed_bars.clear();
-        Ok(())
+        self.release_algorithm_resources(true)
+    }
+
+    fn on_dispose(&mut self) -> Result<()> {
+        self.release_algorithm_resources(true)
     }
 
     fn on_save(&self) -> Result<IndexMap<String, Vec<u8>>> {
@@ -635,13 +776,8 @@ impl DataActor for PluginStrategy {
             return Ok(checkpoint);
         }
         let mut readonly = |operation, input: &[u8]| {
-            if operation != HostOperation::Clock || !input.is_empty() {
-                return Err(PluginError::generic(
-                    "Save has no mutating native capability",
-                ));
-            }
-            self.clock_facts()
-                .map_err(|error| PluginError::generic(error.to_string()))
+            self.readonly(operation, input)
+                .map_err(|error| PluginError::generic(format!("{error:#}")))
         };
         let result = {
             let mut guest = self.guest.try_borrow_mut()?;
@@ -672,7 +808,10 @@ impl DataActor for PluginStrategy {
                 "plugin.identity".into(),
                 serde_json::to_vec(&self.checkpoint_identity())?,
             ),
-            ("plugin.adapter".into(), serde_json::to_vec(&self.adapter)?),
+            (
+                "plugin.adapter".into(),
+                serde_json::to_vec(&self.adapter_checkpoint()?)?,
+            ),
         ]))
     }
 
@@ -682,15 +821,16 @@ impl DataActor for PluginStrategy {
             "incomplete or unknown plugin checkpoint members"
         );
         let adapter = if let Some(raw) = state.swap_remove("plugin.adapter") {
-            let adapter: adapter::AdapterState = serde_json::from_slice(&raw)?;
-            adapter.validate(&self.scope)?;
-            adapter
+            adapter::AdapterState::decode(&raw, &self.scope)?
         } else {
             // ABI-1 timer-only checkpoints predate adapter inventories. Their
             // empty declared bar domain proves that no bar route can be lost.
             // Other legacy checkpoints require a separately qualified migration.
             ensure!(
-                self.scope.bar_types.is_empty(),
+                self.scope.bar_types.is_empty()
+                    && self.scope.quote_instruments.is_empty()
+                    && self.scope.trade_instruments.is_empty()
+                    && self.scope.max_history_bars == 0,
                 "legacy plugin checkpoint lacks its native subscription inventory"
             );
             adapter::AdapterState::default()
@@ -714,13 +854,16 @@ impl DataActor for PluginStrategy {
                     anyhow::anyhow!("plugin terminal restore: {}", error.message_string())
                 })?;
             self.adapter = adapter;
+            self.restored_resources_unprepared = true;
             return Ok(());
         }
         let payload = state
             .swap_remove("plugin.state")
             .context("plugin checkpoint state missing")?;
         self.invoke(CallbackKind::Restore, &payload)?;
+        self.history_reissue_after_restore = adapter.pending_history.is_some();
         self.adapter = adapter;
+        self.restored_resources_unprepared = true;
         Ok(())
     }
 }

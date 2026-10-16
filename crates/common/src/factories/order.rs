@@ -170,7 +170,11 @@ impl OrderFactory {
     }
 
     #[expect(clippy::too_many_arguments)]
-    pub(crate) fn try_market(
+    /// Constructs a native order without unwinding on invalid parameters.
+    ///
+    /// # Errors
+    /// Returns the original model validation failure for these order inputs.
+    pub fn try_market(
         &mut self,
         instrument_id: InstrumentId,
         order_side: OrderSide,
@@ -260,7 +264,11 @@ impl OrderFactory {
     }
 
     #[expect(clippy::too_many_arguments)]
-    pub(crate) fn try_limit(
+    /// Constructs a native order without unwinding on invalid parameters.
+    ///
+    /// # Errors
+    /// Returns the original model validation failure for these order inputs.
+    pub fn try_limit(
         &mut self,
         instrument_id: InstrumentId,
         order_side: OrderSide,
@@ -362,7 +370,11 @@ impl OrderFactory {
     }
 
     #[expect(clippy::too_many_arguments)]
-    pub(crate) fn try_stop_market(
+    /// Constructs a native order without unwinding on invalid parameters.
+    ///
+    /// # Errors
+    /// Returns the original model validation failure for these order inputs.
+    pub fn try_stop_market(
         &mut self,
         instrument_id: InstrumentId,
         order_side: OrderSide,
@@ -468,7 +480,11 @@ impl OrderFactory {
     }
 
     #[expect(clippy::too_many_arguments)]
-    pub(crate) fn try_stop_limit(
+    /// Constructs a native order without unwinding on invalid parameters.
+    ///
+    /// # Errors
+    /// Returns the original model validation failure for these order inputs.
+    pub fn try_stop_limit(
         &mut self,
         instrument_id: InstrumentId,
         order_side: OrderSide,

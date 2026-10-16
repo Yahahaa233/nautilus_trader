@@ -286,6 +286,26 @@ impl GuestInstance {
             })
     }
 
+    /// Latches an actual native admission failure before entering a guest callback.
+    /// A used guest remains failed; later failures cannot replace the first one.
+    /// This grants neither Restore nor checkpoint authority.
+    /// # Errors
+    /// Refuses success codes or unbounded diagnostic text without clearing any failure.
+    pub fn retain_native_failure(
+        &mut self,
+        code: PluginErrorCode,
+        message: &str,
+    ) -> Result<(), PluginError> {
+        if code == PluginErrorCode::Ok || message.len() > super::MAX_ERROR_BYTES {
+            return Err(invalid("native failure requires bounded original error"));
+        }
+        if self.failure.is_none() {
+            self.failure = Some((code, message.to_owned()));
+        }
+        self.callbacks_used = true;
+        Ok(())
+    }
+
     /// Reinstates only a terminal failure from a checked checkpoint into an
     /// unused physical guest. It never calls the algorithm or enables startup.
     ///

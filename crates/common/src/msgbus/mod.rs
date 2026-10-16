@@ -375,6 +375,56 @@ pub enum LocalRecoveryReadiness {
 /// # Errors
 /// Missing/busy buses, external I/O, active dispatch and nested capture still refuse.
 pub fn local_only_recovery_readiness() -> anyhow::Result<LocalRecoveryReadiness> {
+    local_recovery_readiness_with_owned_responses(&[])
+}
+
+/// Original correlations explicitly owned by recoverable native components.
+/// The reader restores the complete owner state before binding these handlers.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePendingResponse {
+    pub owner: String,
+    pub correlation_id: UUID4,
+    pub handler_id: String,
+}
+
+fn verify_owned_responses(bus: &MessageBus, owned: &[NativePendingResponse]) -> anyhow::Result<()> {
+    if owned.is_empty() {
+        bus.verify_local_only_recovery_inventory()?;
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for claim in owned {
+        anyhow::ensure!(
+            !claim.owner.is_empty()
+                && claim.owner.len() <= 256
+                && claim.handler_id
+                    == format!(
+                        "native.bars_response:{}:{}",
+                        claim.owner, claim.correlation_id
+                    )
+                && ids.insert(claim.correlation_id.to_string()),
+            "duplicate or unsupported native response owner"
+        );
+        let handler = bus
+            .correlation_index
+            .get(&claim.correlation_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("declared native response is not actually registered")
+            })?;
+        anyhow::ensure!(
+            handler.id().as_str() == claim.handler_id,
+            "native pending response handler belongs to another owner"
+        );
+    }
+    Ok(())
+}
+
+/// Observes undeclared responses while checking every declared native handler.
+/// # Errors
+/// Refuses invalid/missing owners, external buses, active dispatch and nested capture.
+pub fn local_recovery_readiness_with_owned_responses(
+    owned: &[NativePendingResponse],
+) -> anyhow::Result<LocalRecoveryReadiness> {
     MESSAGE_BUS.with(|slot| {
         let slot = slot.try_borrow()?;
         let bus = slot
@@ -387,11 +437,14 @@ pub fn local_only_recovery_readiness() -> anyhow::Result<LocalRecoveryReadiness>
             "message bus dispatch remains active"
         );
         anyhow::ensure!(!RECOVERY_CAPTURE_ACTIVE.get(), "nested message bus capture");
-        Ok(if bus.correlation_index.is_empty() {
+        if !owned.is_empty() {
+            verify_owned_responses(&bus, owned)?;
+        }
+        Ok(if bus.correlation_index.len() == owned.len() {
             LocalRecoveryReadiness::Ready
         } else {
             LocalRecoveryReadiness::PendingResponses {
-                count: bus.correlation_index.len(),
+                count: bus.correlation_index.len() - owned.len(),
             }
         })
     })
@@ -410,13 +463,31 @@ pub fn local_only_recovery_readiness() -> anyhow::Result<LocalRecoveryReadiness>
 pub fn with_local_only_recovery_inventory<T>(
     capture: impl FnOnce(&LocalOnlyRecoveryInventory) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    with_owned_response_recovery_inventory(&[], capture)
+}
+
+/// Holds the immutable local bus and checks exact native response ownership.
+/// Undeclared responses remain unsupported; callbacks cannot mutate the bus.
+/// # Errors
+/// Refuses changed, unknown or duplicate response bindings and invalid capture.
+/// # Panics
+/// Propagates callback panic and rejects bus dispatch/mutation during capture.
+pub fn with_owned_response_recovery_inventory<T>(
+    owned: &[NativePendingResponse],
+    capture: impl FnOnce(&LocalOnlyRecoveryInventory) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     MESSAGE_BUS.with(|slot| {
         let slot = slot.try_borrow()?;
         let bus = slot
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("message bus missing"))?;
         let bus = bus.try_borrow()?;
-        bus.verify_local_only_recovery_inventory()?;
+        bus.verify_local_only_recovery_source()?;
+        verify_owned_responses(&bus, owned)?;
+        anyhow::ensure!(
+            bus.correlation_index.len() == owned.len(),
+            "message bus responses remain pending"
+        );
         anyhow::ensure!(
             BUS_DISPATCH_DEPTH.get() == 0,
             "message bus dispatch remains active"
@@ -427,7 +498,11 @@ pub fn with_local_only_recovery_inventory<T>(
         let guard = LocalOnlyRecoveryInventory { _private: () };
         let result = capture(&guard);
         guard.verify()?;
-        bus.verify_local_only_recovery_inventory()?;
+        verify_owned_responses(&bus, owned)?;
+        anyhow::ensure!(
+            bus.correlation_index.len() == owned.len(),
+            "native response inventory changed"
+        );
         result
     })
 }
@@ -435,6 +510,68 @@ pub fn with_local_only_recovery_inventory<T>(
 #[cfg(test)]
 mod recovery_inventory_tests {
     use super::*;
+    #[test]
+    fn owned_native_responses_require_exact_actual_bindings_and_keep_unknown_refusal() {
+        std::thread::spawn(|| {
+            use crate::messages::data::BarsResponse;
+            let bus = Rc::new(RefCell::new(MessageBus::default()));
+            set_message_bus(bus.clone());
+            let id = UUID4::new();
+            let claim = NativePendingResponse {
+                owner: "OWNER-001".into(),
+                correlation_id: id,
+                handler_id: format!("native.bars_response:OWNER-001:{id}"),
+            };
+            register_response_handler(
+                &id,
+                ShareableMessageHandler::from_typed_with_id(
+                    &claim.handler_id,
+                    |_: &BarsResponse| {},
+                ),
+            );
+            assert_eq!(
+                local_recovery_readiness_with_owned_responses(std::slice::from_ref(&claim))
+                    .unwrap(),
+                LocalRecoveryReadiness::Ready
+            );
+            with_owned_response_recovery_inventory(
+                std::slice::from_ref(&claim),
+                LocalOnlyRecoveryInventory::verify,
+            )
+            .unwrap();
+            assert!(with_local_only_recovery_inventory(|_| Ok(())).is_err());
+            let mut changed = claim.clone();
+            changed.owner = "FOREIGN-001".into();
+            assert!(local_recovery_readiness_with_owned_responses(&[changed]).is_err());
+            let mut changed = claim.clone();
+            changed.correlation_id = UUID4::new();
+            changed.handler_id = format!(
+                "native.bars_response:{}:{}",
+                changed.owner, changed.correlation_id
+            );
+            assert!(local_recovery_readiness_with_owned_responses(&[changed]).is_err());
+            let mut changed = claim.clone();
+            changed.handler_id = "arbitrary-handler".into();
+            assert!(with_owned_response_recovery_inventory(&[changed], |_| Ok(())).is_err());
+            assert!(
+                local_recovery_readiness_with_owned_responses(&[claim.clone(), claim.clone()])
+                    .is_err()
+            );
+            let unknown = UUID4::new();
+            register_response_handler(&unknown, stubs::get_stub_shareable_handler(None));
+            assert_eq!(
+                local_recovery_readiness_with_owned_responses(std::slice::from_ref(&claim))
+                    .unwrap(),
+                LocalRecoveryReadiness::PendingResponses { count: 1 }
+            );
+            assert!(with_owned_response_recovery_inventory(&[claim], |_| Ok(())).is_err());
+            assert!(bus.borrow().get_response_handler(&id).is_some());
+            assert!(bus.borrow().get_response_handler(&unknown).is_some());
+        })
+        .join()
+        .unwrap();
+    }
+
     #[test]
     fn local_recovery_readiness_preserves_actual_correlations_until_response() {
         std::thread::spawn(|| {

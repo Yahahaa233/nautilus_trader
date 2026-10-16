@@ -11,8 +11,8 @@
 
 use nautilus_model::{
     data::BarType,
-    enums::OrderSide,
-    identifiers::{ClientOrderId, InstrumentId},
+    enums::{OrderSide, TimeInForce, TriggerType},
+    identifiers::{ClientOrderId, InstrumentId, PositionId},
     types::{Price, Quantity},
 };
 use serde::{Deserialize, Serialize};
@@ -20,11 +20,66 @@ use serde::{Deserialize, Serialize};
 /// First encoded native strategy protocol.
 pub const VERSION: u32 = 1;
 
+/// A read-only request within this instance's admitted instrument domain.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentRequest {
+    pub schema_version: u32,
+    pub instrument_id: InstrumentId,
+}
+
+/// Bounded historical bars. Nanosecond bounds preserve the original native
+/// time range; the host returns the actual request UUID, never a completion.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryRequest {
+    pub schema_version: u32,
+    pub bar_type: BarType,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub limit: u32,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogRecord {
+    pub schema_version: u32,
+    pub level: LogLevel,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Subscription {
     pub schema_version: u32,
     pub bar_type: BarType,
+}
+
+/// Explicit data family; original untagged version-1 bar requests remain read.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DataSubscription {
+    Bar {
+        schema_version: u32,
+        bar_type: BarType,
+    },
+    Quote {
+        schema_version: u32,
+        instrument_id: InstrumentId,
+    },
+    Trade {
+        schema_version: u32,
+        instrument_id: InstrumentId,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -63,6 +118,35 @@ pub enum Submit {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeOrderType {
+    Market,
+    Limit,
+    StopMarket,
+    StopLimit,
+}
+
+/// Complete version-2 native order construction. Irrelevant fields must be
+/// absent; prices and quantities use the model's exact decimal encoding.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitRequest {
+    pub schema_version: u32,
+    pub order_type: NativeOrderType,
+    pub instrument_id: InstrumentId,
+    pub side: OrderSide,
+    pub quantity: Quantity,
+    pub price: Option<Price>,
+    pub trigger_price: Option<Price>,
+    pub trigger_type: Option<TriggerType>,
+    pub time_in_force: TimeInForce,
+    pub expire_time_ns: Option<u64>,
+    pub reduce_only: bool,
+    pub post_only: bool,
+    pub position_id: Option<PositionId>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrderId {
@@ -83,6 +167,25 @@ pub struct Modify {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_order_wire_preserves_exact_conditional_fields_and_rejects_unknown_scope() {
+        let original = serde_json::json!({"schema_version":2,"order_type":"stop_limit",
+            "instrument_id":"ETHUSDT-PERP.BINANCE","side":"SELL","quantity":"0.00000001",
+            "price":"12345.67000001","trigger_price":"12345.67000002","trigger_type":"MARK_PRICE",
+            "time_in_force":"GTD","expire_time_ns":u64::MAX,"reduce_only":true,"post_only":false,
+            "position_id":"P-001"});
+        let request: SubmitRequest = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), original);
+        let mut foreign = original.clone();
+        foreign["account_id"] = serde_json::json!("BINANCE-OTHER");
+        assert!(serde_json::from_value::<SubmitRequest>(foreign).is_err());
+        for field in ["quantity", "price", "trigger_price"] {
+            let mut approximate = original.clone();
+            approximate[field] = serde_json::json!(0.125);
+            assert!(serde_json::from_value::<SubmitRequest>(approximate).is_err());
+        }
+    }
 
     #[test]
     fn shared_wire_preserves_exact_values_and_refuses_ambiguous_requests() {

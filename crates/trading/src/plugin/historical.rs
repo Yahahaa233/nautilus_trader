@@ -107,6 +107,22 @@ impl PluginStrategy {
             for bar in self.adapter.subscribed_bars.clone() {
                 self.restore_native_local_bars(bar, boundary)?;
             }
+            for instrument in self.adapter.subscribed_quotes.clone() {
+                self.restore_native_local_quotes(instrument, boundary)?;
+            }
+            for instrument in self.adapter.subscribed_trades.clone() {
+                self.restore_native_local_trades(instrument, boundary)?;
+            }
+            if self.callback_failure().is_none()
+                && let Some(pending) = &self.adapter.pending_history
+            {
+                self.restore_native_local_bars_response(pending.id()?, boundary)?;
+            }
+            for command in self.adapter.retained_subscriptions.clone() {
+                nautilus_common::actor::DataActorNative::core_mut(self)
+                    .restore_native_data_subscription_command(command, boundary)?;
+            }
+            self.restored_resources_unprepared = false;
             self.historical_prepared = true;
             Ok(())
         })();
@@ -153,7 +169,7 @@ impl PluginStrategy {
         let running =
             boundary.original_component_state()? == nautilus_common::enums::ComponentState::Running;
         let outcome = if let Some(response) = input.downcast_ref::<BarsResponse>() {
-            DataActor::on_historical_bars(self, &response.data)
+            DataActor::on_historical_bars_response(self, response)
         } else if let Some(lifecycle) = input.downcast_ref::<NativeComponentLifecycle>() {
             ensure!(
                 Some(lifecycle.component_id.as_str())

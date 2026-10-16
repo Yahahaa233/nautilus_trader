@@ -69,6 +69,8 @@ fn register(
             #[cfg(feature = "live")]
             historical_save: save_actor,
             #[cfg(feature = "live")]
+            pending_responses: None,
+            #[cfg(feature = "live")]
             historical_prepare: |_, _| {
                 anyhow::bail!("collection fixture has no historical preparation")
             },
@@ -91,6 +93,8 @@ fn register(
             native_load: None,
             #[cfg(feature = "live")]
             historical_save: save_strategy,
+            #[cfg(feature = "live")]
+            pending_responses: None,
             #[cfg(feature = "live")]
             historical_prepare: |_, _| {
                 anyhow::bail!("collection fixture has no historical preparation")

@@ -496,6 +496,69 @@ fn invalid_buffer_tag_and_configuration_are_refused_before_guest_access() {
 }
 
 #[test]
+fn native_admission_failure_latches_used_guest_and_preserves_first_failure() {
+    let api = Box::leak(Box::new(StrategyApi::for_algorithm::<Counter>()));
+    // SAFETY: generated static producer table and storage remain live.
+    let mut guest = unsafe {
+        instance::GuestInstance::create(
+            api,
+            Counter::DESCRIPTOR_JSON.as_bytes(),
+            b"counter-v1",
+            limits(),
+            Box::new(CounterStateValidator),
+        )
+    }
+    .unwrap();
+    let mut facade = |_, _: &[u8]| Ok(Vec::new());
+    guest
+        .invoke(CallbackKind::Event, 1, b"event", &mut facade)
+        .unwrap();
+    assert!(
+        guest
+            .retain_native_failure(PluginErrorCode::Ok, "invalid success")
+            .is_err()
+    );
+    assert!(!guest.is_faulted());
+    assert!(
+        guest
+            .retain_native_failure(PluginErrorCode::Generic, &"x".repeat(MAX_ERROR_BYTES + 1))
+            .is_err()
+    );
+    guest
+        .retain_native_failure(
+            PluginErrorCode::InvalidArgument,
+            "original native route mismatch",
+        )
+        .unwrap();
+    guest
+        .retain_native_failure(PluginErrorCode::Generic, "secondary cleanup failure")
+        .unwrap();
+    for kind in [
+        CallbackKind::Start,
+        CallbackKind::Event,
+        CallbackKind::Save,
+        CallbackKind::Restore,
+        CallbackKind::Resume,
+    ] {
+        let failure = guest.invoke(kind, 1, b"", &mut facade).unwrap_err();
+        assert_eq!(failure.code, PluginErrorCode::InvalidArgument);
+        assert_eq!(failure.message_string(), "original native route mismatch");
+    }
+    assert!(
+        guest
+            .retain_checkpoint_failure(PluginErrorCode::Panic, "forged restoration")
+            .is_err()
+    );
+    assert_eq!(
+        guest.first_failure(),
+        Some((
+            PluginErrorCode::InvalidArgument,
+            "original native route mismatch"
+        ))
+    );
+}
+
+#[test]
 fn terminal_checkpoint_failure_only_restricts_an_unused_guest() {
     let api = Box::leak(Box::new(StrategyApi::for_algorithm::<Counter>()));
     let create = || {

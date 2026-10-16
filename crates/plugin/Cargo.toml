@@ -52,3 +52,8 @@ crate-type = ["cdylib"]
 name = "contract_interval"
 path = "examples/contract_interval.rs"
 crate-type = ["cdylib"]
+
+[[example]]
+name = "contract_facade"
+path = "examples/contract_facade.rs"
+crate-type = ["cdylib"]

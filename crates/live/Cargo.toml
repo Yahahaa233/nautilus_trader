@@ -178,3 +178,8 @@ required-features = ["node"]
 name = "book"
 path = "tests/book/main.rs"
 required-features = ["test-support"]
+
+[[example]]
+name = "strategy_facade_host"
+path = "examples/strategy_facade_host.rs"
+required-features = ["strategy-plugin", "test-support"]
