@@ -50,7 +50,7 @@ use super::{
     Actor,
     binding::DataActorBinding,
     indicators::{Indicators, SharedActorIndicator},
-    registry::try_get_actor_unchecked,
+    registry::{ActorEventBinding, try_get_actor_unchecked},
 };
 #[cfg(feature = "defi")]
 use crate::defi;
@@ -299,6 +299,16 @@ fn native_bar_framework(
 /// [`DataActorNative`] and [`Component`] bounds. The actor ID and clock facades
 /// use [`DataActorBinding`] to access component state.
 pub trait DataActor {
+    /// Uses the existing ordered native callback queue for signal deliveries.
+    /// Ordinary actors retain immediate signal behavior by default.
+    #[must_use]
+    fn defer_signal_events() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
     /// Complete outstanding native response ownership in this same private cut.
     /// Unsupported components declare none and retain the existing deferral/refusal.
     /// # Errors
@@ -1035,35 +1045,66 @@ pub trait DataActor {
     where
         Self: Component,
     {
+        self.handle_signal_with_route(signal, None);
+    }
+
+    /// Handles a queued signal using its original native lifecycle admission.
+    #[doc(hidden)]
+    fn handle_signal_with_admission(&mut self, signal: &Signal, arrival: &CallbackStateSnapshot)
+    where
+        Self: Component + DataActorNative,
+    {
+        let route = crate::recovery_trace::NativeCallbackArrival {
+            component_state: format!("{:?}", arrival.state()),
+            lifecycle_current: arrival.is_current(&self.core().callback_state_view()),
+        };
+        self.handle_signal_with_route(signal, Some(route));
+    }
+
+    /// Applies the native signal wrapper without adding another dispatcher.
+    #[doc(hidden)]
+    fn handle_signal_with_route(
+        &mut self,
+        signal: &Signal,
+        arrival: Option<crate::recovery_trace::NativeCallbackArrival>,
+    ) where
+        Self: Component,
+    {
+        let admitted = arrival
+            .as_ref()
+            .is_none_or(|route| route.component_state == "Running" && route.lifecycle_current);
         #[cfg(feature = "live")]
         {
             let component_id = self.component_id().to_string();
             if crate::recovery_trace::historical::dispatch_if_active(
                 &component_id,
                 "handle_signal",
-                |boundary| self.on_native_recovery_input(boundary, signal),
+                |boundary| {
+                    if boundary.original_callback_admitted()? {
+                        self.on_native_recovery_input(boundary, signal)?;
+                    }
+                    Ok(())
+                },
             ) {
                 return;
             }
-            if let Err(error) = crate::recovery_trace::scope::note_callback(
+            if let Err(e) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
-                    arrival: None,
+                    arrival,
                     component_id,
                     kind: "handle_signal".into(),
                     component_state: format!("{:?}", self.state()),
                 },
             ) {
-                log_error(&error);
+                log_error(&e);
                 return;
             }
         }
         log_received(&signal);
-
-        if self.not_running() {
+        if !admitted || self.not_running() {
             log_not_running(&signal);
             return;
         }
-
         if let Err(e) = self.on_signal(signal) {
             log_error(&e);
         }
@@ -2426,20 +2467,15 @@ pub trait DataActor {
         Self: 'static + Debug + Sized,
     {
         let actor_id = self.core().actor_id().inner();
-        // Signals are published as `CustomData` wrapping a `Signal`; downcast
-        // the inner value so subscribers receive the typed `Signal` in `on_signal`.
-        let handler = ShareableMessageHandler::from_typed(move |data: &CustomData| {
-            if let Some(signal) = data.data.as_any().downcast_ref::<Signal>() {
-                if !super::recovery_observation::callback_admitted(&actor_id) {
-                    return;
-                }
-                if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
-                    actor.handle_signal(signal);
-                } else {
-                    log::error!("Actor {actor_id} not found for signal handling");
-                }
-            }
+        let queued = Self::defer_signal_events().then(|| {
+            (
+                ActorEventBinding::<Self>::bind(actor_id)
+                    .expect("signal subscriber must have its original native registration"),
+                self.core().callback_state_view(),
+            )
         });
+        let handler =
+            ShareableMessageHandler::from_typed(native_signal_callback::<Self>(actor_id, queued));
 
         DataActorCore::subscribe_signal(self.core_mut(), handler, name, priority);
     }
@@ -2528,22 +2564,16 @@ pub trait DataActor {
         self.core().check_native_local_preparation(preparation)?;
         let actor_id = self.core().actor_id().inner();
         let pattern = get_signal_pattern(name);
+        let queued = Self::defer_signal_events().then(|| {
+            (
+                ActorEventBinding::<Self>::bind(actor_id)
+                    .expect("local signal owner must have its original native registration"),
+                self.core().callback_state_view(),
+            )
+        });
         let handler = ShareableMessageHandler::from_typed_with_id(
             format!("native.local.signal:{actor_id}:{pattern}"),
-            move |data: &CustomData| {
-                if let Some(signal) = data.data.as_any().downcast_ref::<Signal>() {
-                    if !super::recovery_observation::callback_admitted(&actor_id) {
-                        return;
-                    }
-                    if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
-                        actor.handle_signal(signal);
-                    } else {
-                        log::error!(
-                            "Actor {actor_id} not found for local historical signal handling"
-                        );
-                    }
-                }
-            },
+            native_signal_callback::<Self>(actor_id, queued),
         );
         self.core_mut()
             .add_native_local_signal_subscription(pattern, handler, priority)
@@ -4421,6 +4451,39 @@ where
 
     fn on_dispose(&mut self) -> anyhow::Result<()> {
         DataActor::on_dispose(self)
+    }
+}
+
+// The same native queue retains ordering, original registration and arrival
+// lifecycle while an author callback is still active.
+fn native_signal_callback<T>(
+    actor_id: Ustr,
+    queued: Option<(ActorEventBinding<T>, CallbackStateView)>,
+) -> impl Fn(&CustomData)
+where
+    T: DataActor + DataActorNative + Debug + 'static,
+{
+    move |data: &CustomData| {
+        let Some(signal) = data.data.as_any().downcast_ref::<Signal>() else {
+            return;
+        };
+        if let Some((binding, state)) = &queued {
+            let arrival = state.snapshot();
+            binding.enqueue(
+                signal.value.len(),
+                || (signal.clone(), arrival),
+                |actor, (signal, arrival)| actor.handle_signal_with_admission(signal, arrival),
+            );
+        } else {
+            if !super::recovery_observation::callback_admitted(&actor_id) {
+                return;
+            }
+            if let Some(mut actor) = try_get_actor_unchecked::<T>(&actor_id) {
+                actor.handle_signal(signal);
+            } else {
+                log::error!("Actor {actor_id} not found for signal handling");
+            }
+        }
     }
 }
 

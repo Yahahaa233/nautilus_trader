@@ -40,17 +40,19 @@ pub(super) struct AdapterState {
     pub(super) subscribed_trades: BTreeSet<InstrumentId>,
     pub(super) pending_history: Option<PendingHistory>,
     pub(super) retained_subscriptions: Vec<SubscribeCommand>,
+    pub(super) managed_frame_subscribed: bool,
 }
 
 impl Default for AdapterState {
     fn default() -> Self {
         Self {
-            schema_version: 4,
+            schema_version: 5,
             subscribed_bars: BTreeSet::new(),
             subscribed_quotes: BTreeSet::new(),
             subscribed_trades: BTreeSet::new(),
             pending_history: None,
             retained_subscriptions: Vec::new(),
+            managed_frame_subscribed: false,
         }
     }
 }
@@ -70,6 +72,16 @@ impl AdapterState {
             subscribed_bars: BTreeSet<BarType>,
             subscribed_quotes: BTreeSet<InstrumentId>,
             subscribed_trades: BTreeSet<InstrumentId>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyHistory {
+            schema_version: u32,
+            subscribed_bars: BTreeSet<BarType>,
+            subscribed_quotes: BTreeSet<InstrumentId>,
+            subscribed_trades: BTreeSet<InstrumentId>,
+            pending_history: Option<PendingHistory>,
+            retained_subscriptions: Vec<SubscribeCommand>,
         }
         let header: serde_json::Value = serde_json::from_slice(raw)?;
         let state = if header["schema_version"] == 1 {
@@ -102,7 +114,30 @@ impl AdapterState {
                 subscribed_trades: legacy.subscribed_trades,
                 ..Self::default()
             }
+        } else if header["schema_version"] == 4 {
+            ensure!(
+                header.get("pending_history").is_some()
+                    && header.get("retained_subscriptions").is_some(),
+                "legacy native history/subscription inventory is absent"
+            );
+            let legacy: LegacyHistory = serde_json::from_slice(raw)?;
+            ensure!(
+                legacy.schema_version == 4,
+                "unknown legacy native adapter state"
+            );
+            Self {
+                subscribed_bars: legacy.subscribed_bars,
+                subscribed_quotes: legacy.subscribed_quotes,
+                subscribed_trades: legacy.subscribed_trades,
+                pending_history: legacy.pending_history,
+                retained_subscriptions: legacy.retained_subscriptions,
+                ..Self::default()
+            }
         } else {
+            ensure!(
+                header.get("managed_frame_subscribed").is_some(),
+                "native application frame subscription inventory is absent"
+            );
             ensure!(
                 header.get("pending_history").is_some()
                     && header.get("retained_subscriptions").is_some(),
@@ -116,7 +151,7 @@ impl AdapterState {
 
     pub(super) fn validate(&self, scope: &PluginScope) -> Result<()> {
         ensure!(
-            self.schema_version == 4,
+            self.schema_version == 5,
             "unknown native plugin adapter state"
         );
         let mut bars = BTreeSet::new();

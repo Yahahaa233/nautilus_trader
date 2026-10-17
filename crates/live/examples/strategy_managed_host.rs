@@ -155,6 +155,30 @@ mod supported {
                 inputs.len() == contexts.len(),
                 "private batch identity changed"
             );
+            if self.case.starts_with("batch-frame") {
+                let context = contexts
+                    .first()
+                    .context("private frame has no original native owner")?;
+                let name = nautilus_trading::plugin::managed_frame_signal_name(context.strategy_id);
+                let signal=nautilus_common::signal::Signal::new(name.as_str().into(),
+                    json!({"schema_version":1,"frame_owner":context.strategy_id,"frame_sequence":1}).to_string(),
+                    nautilus_core::UnixNanos::from(context.timestamp_ns),
+                    nautilus_core::UnixNanos::from(context.timestamp_ns));
+                let data_type = nautilus_model::data::DataType::new(
+                    &format!(
+                        "Signal{}",
+                        nautilus_core::string::conversions::title_case(&name)
+                    ),
+                    None,
+                    None,
+                );
+                let data =
+                    nautilus_model::data::CustomData::new(std::sync::Arc::new(signal), data_type);
+                // The native callback is deliberately published while this same
+                // guest's original timer and batch host call are still active.
+                let topic = nautilus_common::msgbus::switchboard::get_custom_topic(&data.data_type);
+                nautilus_common::msgbus::publish_any(topic, &data);
+            }
             contexts
                 .iter()
                 .zip(inputs)
@@ -279,7 +303,9 @@ mod supported {
         let library =
             unsafe { registry.load_admitted(&File::open(&args[0])?, digest, args[3].parse()?) }
                 .map_err(|error| anyhow::anyhow!("{}", error.message_string()))?;
-        let configuration: &[u8] = if case == "batch-empty" {
+        let configuration: &[u8] = if case == "batch-frame-failure" {
+            b"managed-frame-fault-v1"
+        } else if case == "batch-empty" {
             b"managed-empty-batch-v1"
         } else if case.starts_with("batch-") {
             b"managed-batch-v1"

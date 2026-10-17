@@ -39,6 +39,8 @@ mod facts;
 #[cfg(feature = "live")]
 pub mod historical;
 mod history_requests;
+mod managed_frame;
+pub use managed_frame::managed_frame_signal_name;
 pub mod managed;
 mod orders;
 mod routing;
@@ -507,6 +509,7 @@ impl PluginStrategy {
             }
         }
         drop(clock);
+        self.release_managed_frame()?;
         self.release_subscriptions();
         self.adapter.subscribed_bars.clear();
         self.adapter.subscribed_quotes.clear();
@@ -635,6 +638,10 @@ crate::nautilus_strategy!(PluginStrategy, {
 });
 
 impl DataActor for PluginStrategy {
+    fn defer_signal_events() -> bool {
+        true
+    }
+
     #[cfg(feature = "live")]
     fn native_pending_responses(
         &self,
@@ -687,7 +694,8 @@ impl DataActor for PluginStrategy {
             && (!self.adapter.subscribed_bars.is_empty()
                 || !self.adapter.subscribed_quotes.is_empty()
                 || !self.adapter.subscribed_trades.is_empty()
-                || self.adapter.pending_history.is_some())
+                || self.adapter.pending_history.is_some()
+                || self.adapter.managed_frame_subscribed)
         {
             return true;
         }
@@ -704,7 +712,8 @@ impl DataActor for PluginStrategy {
                 || (self.adapter.subscribed_bars.is_empty()
                     && self.adapter.subscribed_quotes.is_empty()
                     && self.adapter.subscribed_trades.is_empty()
-                    && self.adapter.pending_history.is_none()),
+                    && self.adapter.pending_history.is_none()
+                    && !self.adapter.managed_frame_subscribed),
             "native data resources require original reader preparation"
         );
         self.restored_resources_unprepared = false;
@@ -722,6 +731,7 @@ impl DataActor for PluginStrategy {
                 self.history_reissue_after_restore = false;
             }
         }
+        self.subscribe_managed_frame()?;
         self.invoke(CallbackKind::Start, b"").map(|_| ())
     }
     fn on_stop(&mut self) -> Result<()> {
@@ -739,6 +749,9 @@ impl DataActor for PluginStrategy {
     }
     fn on_resume(&mut self) -> Result<()> {
         self.invoke(CallbackKind::Resume, b"").map(|_| ())
+    }
+    fn on_signal(&mut self, signal: &nautilus_common::signal::Signal) -> Result<()> {
+        self.managed_frame_event(signal)
     }
     fn on_bar(&mut self, bar: &Bar) -> Result<()> {
         let valid = self.scope.bar_types.contains(&bar.bar_type);
@@ -883,6 +896,10 @@ impl DataActor for PluginStrategy {
             );
             adapter::AdapterState::default()
         };
+        ensure!(
+            !adapter.managed_frame_subscribed || self.managed_frames_enabled(),
+            "original application frame has no matching native managed policy"
+        );
         ensure!(state.len() == 2, "unknown plugin checkpoint member");
         let identity: CheckpointIdentity = serde_json::from_slice(
             &state

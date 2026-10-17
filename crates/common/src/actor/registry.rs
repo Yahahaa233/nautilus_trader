@@ -364,6 +364,9 @@ impl<T: Actor> ActorEventBinding<T> {
         capture: impl FnOnce() -> E,
         handler: fn(&mut T, &E),
     ) {
+        if !queued_callback_admitted(&self.id) {
+            return;
+        }
         let current =
             ACTOR_REGISTRY
                 .try_with(|registry| {
@@ -381,6 +384,16 @@ impl<T: Actor> ActorEventBinding<T> {
     }
 }
 
+// Historical wrappers validate the reader's original admission separately;
+// current live delivery must remain closed at both publication and consumption.
+fn queued_callback_admitted(id: &Ustr) -> bool {
+    #[cfg(feature = "live")]
+    if crate::recovery_trace::historical::active() {
+        return true;
+    }
+    super::recovery_observation::callback_admitted(id)
+}
+
 struct ActorDelivery<T: Actor, E> {
     id: Ustr,
     registration: Registration,
@@ -390,6 +403,9 @@ struct ActorDelivery<T: Actor, E> {
 
 impl<T: Actor, E> ActorDelivery<T, E> {
     fn run(&mut self) -> bool {
+        if !queued_callback_admitted(&self.id) {
+            return true;
+        }
         let current =
             ACTOR_REGISTRY
                 .try_with(|registry| {

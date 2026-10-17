@@ -24,6 +24,7 @@ struct Managed {
     state: State,
     batch: bool,
     empty_batch: bool,
+    frame_fault: bool,
 }
 fn error(value: impl std::fmt::Display) -> PluginError {
     PluginError::generic(value.to_string())
@@ -36,6 +37,7 @@ impl Algorithm for Managed {
             b"managed-batch-v1",
             b"managed-empty-batch-v1",
             b"managed-bracket-v1",
+            b"managed-frame-fault-v1",
         ]
         .contains(&raw)
         {
@@ -48,8 +50,11 @@ impl Algorithm for Managed {
         Self::validate(raw)?;
         Ok(Self {
             state: State::default(),
-            batch: raw == b"managed-batch-v1" || raw == b"managed-empty-batch-v1",
+            batch: raw == b"managed-batch-v1"
+                || raw == b"managed-empty-batch-v1"
+                || raw == b"managed-frame-fault-v1",
             empty_batch: raw == b"managed-empty-batch-v1",
+            frame_fault: raw == b"managed-frame-fault-v1",
         })
     }
     fn start(&mut self, host: &mut Host<'_>) -> Result<(), PluginError> {
@@ -74,6 +79,36 @@ impl Algorithm for Managed {
     }
     fn on_event(&mut self, raw: &[u8], host: &mut Host<'_>) -> Result<(), PluginError> {
         let value: Value = serde_json::from_slice(raw).map_err(error)?;
+        if value["kind"] == "managed_frame" {
+            if !self.batch || !self.state.attempted {
+                return Err(error("unexpected private application frame lifecycle"));
+            }
+            let frame: Value = serde_json::from_str(
+                value["event"]["value"]
+                    .as_str()
+                    .ok_or_else(|| error("private frame bytes absent"))?,
+            )
+            .map_err(error)?;
+            if frame["schema_version"] != 1
+                || frame["frame_owner"] != "MANAGED-001"
+                || frame["frame_sequence"] != 1
+            {
+                return Err(error("original private application frame changed"));
+            }
+            if self.frame_fault {
+                return Err(error("original private managed-frame callback failure"));
+            }
+            let secondary = self.state.secondary.get_or_insert_with(|| json!({}));
+            let events = secondary
+                .as_object_mut()
+                .ok_or_else(|| error("private event inventory differs"))?
+                .entry("frame_events")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .ok_or_else(|| error("private frame event inventory differs"))?;
+            events.push(value["event"].clone());
+            return Ok(());
+        }
         if value["kind"] == "order" {
             let mut events = self
                 .state

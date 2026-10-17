@@ -7547,3 +7547,193 @@ fn test_native_borrow_before_registration_returns_component_access_error() {
         }
     );
 }
+
+#[derive(Debug)]
+struct QueuedSignalActor {
+    core: DataActorCore,
+    name: &'static str,
+    trace: Rc<RefCell<Vec<String>>>,
+}
+
+nautilus_actor!(QueuedSignalActor);
+
+impl DataActor for QueuedSignalActor {
+    fn defer_signal_events() -> bool {
+        true
+    }
+
+    fn on_signal(&mut self, signal: &Signal) -> anyhow::Result<()> {
+        self.trace
+            .borrow_mut()
+            .push(format!("{}:{}:enter", self.name, signal.value));
+        if self.name == "A" && signal.value == "outer" {
+            self.publish_signal("managed_queue", "inner".into(), UnixNanos::from(2));
+        }
+        self.trace
+            .borrow_mut()
+            .push(format!("{}:{}:exit", self.name, signal.value));
+        Ok(())
+    }
+}
+
+#[rstest]
+#[case::same_actor(false)]
+#[case::two_actors(true)]
+fn test_opt_in_signal_queue_keeps_nested_publication_order_without_actor_reentry(
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    #[case] fanout: bool,
+) {
+    super::clear_callbacks().unwrap();
+    set_data_cmd_sender(Arc::new(SyncDataCommandSender));
+    *get_message_bus().borrow_mut() = MessageBus::default();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    for (name, priority) in [("A", 100), ("B", 10)] {
+        if name == "B" && !fanout {
+            continue;
+        }
+        let mut actor = QueuedSignalActor {
+            core: DataActorCore::new(DataActorConfig {
+                actor_id: Some(ActorId::new(format!("QUEUED-{fanout}-{name}"))),
+                ..Default::default()
+            }),
+            name,
+            trace: trace.clone(),
+        };
+        actor
+            .register(trader_id, clock.clone(), cache.clone())
+            .unwrap();
+        let id = actor.actor_id().inner();
+        register_actor(actor);
+        let mut actor = get_actor_unchecked::<QueuedSignalActor>(&id);
+        actor.start().unwrap();
+        actor.subscribe_signal("managed_queue", Some(priority));
+    }
+    let mut publisher = TestDataActor::new(DataActorConfig::default());
+    publisher.register(trader_id, clock, cache).unwrap();
+    publisher.publish_signal("managed_queue", "outer".into(), UnixNanos::from(1));
+    assert!(trace.borrow().is_empty());
+    assert!(!super::drain_callbacks(8).unwrap());
+    let mut expected = Vec::new();
+    for value in ["outer", "inner"] {
+        for name in if fanout { &["A", "B"][..] } else { &["A"][..] } {
+            expected.push(format!("{name}:{value}:enter"));
+            expected.push(format!("{name}:{value}:exit"));
+        }
+    }
+    assert_eq!(*trace.borrow(), expected);
+    super::clear_callbacks().unwrap();
+}
+
+#[rstest]
+fn test_opt_in_signal_queue_keeps_startup_and_retired_lifecycle_arrivals_ineligible(
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+) {
+    super::clear_callbacks().unwrap();
+    set_data_cmd_sender(Arc::new(SyncDataCommandSender));
+    *get_message_bus().borrow_mut() = MessageBus::default();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let mut actor = QueuedSignalActor {
+        core: DataActorCore::new(DataActorConfig {
+            actor_id: Some(ActorId::new("QUEUED-LIFECYCLE")),
+            ..Default::default()
+        }),
+        name: "Q",
+        trace: trace.clone(),
+    };
+    actor
+        .register(trader_id, clock.clone(), cache.clone())
+        .unwrap();
+    let id = actor.actor_id().inner();
+    register_actor(actor);
+    let mut publisher = TestDataActor::new(DataActorConfig::default());
+    publisher.register(trader_id, clock, cache).unwrap();
+    {
+        let mut actor = get_actor_unchecked::<QueuedSignalActor>(&id);
+        actor.subscribe_signal("managed_queue", None);
+    }
+    publisher.publish_signal("managed_queue", "startup".into(), UnixNanos::from(1));
+    get_actor_unchecked::<QueuedSignalActor>(&id)
+        .start()
+        .unwrap();
+    assert!(!super::drain_callbacks(8).unwrap());
+    assert!(trace.borrow().is_empty());
+    publisher.publish_signal("managed_queue", "old".into(), UnixNanos::from(2));
+    {
+        let mut actor = get_actor_unchecked::<QueuedSignalActor>(&id);
+        actor.stop().unwrap();
+        actor.reset().unwrap();
+        actor.start().unwrap();
+        actor.subscribe_signal("managed_queue", None);
+    }
+    assert!(!super::drain_callbacks(8).unwrap());
+    assert!(trace.borrow().is_empty());
+    publisher.publish_signal("managed_queue", "fresh".into(), UnixNanos::from(3));
+    assert!(!super::drain_callbacks(8).unwrap());
+    assert_eq!(*trace.borrow(), ["Q:fresh:enter", "Q:fresh:exit"]);
+    super::clear_callbacks().unwrap();
+}
+
+#[rstest]
+#[case::publication_closed(true)]
+#[case::delivery_closed(false)]
+fn test_opt_in_signal_queue_cannot_escape_recovery_observation_admission(
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    trader_id: TraderId,
+    #[case] publication_closed: bool,
+) {
+    super::clear_callbacks().unwrap();
+    set_data_cmd_sender(Arc::new(SyncDataCommandSender));
+    *get_message_bus().borrow_mut() = MessageBus::default();
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let mut actor = QueuedSignalActor {
+        core: DataActorCore::new(DataActorConfig {
+            actor_id: Some(ActorId::new(format!(
+                "QUEUED-OBSERVATION-{publication_closed}"
+            ))),
+            ..Default::default()
+        }),
+        name: "Q",
+        trace: trace.clone(),
+    };
+    actor
+        .register(trader_id, clock.clone(), cache.clone())
+        .unwrap();
+    let id = actor.actor_id().inner();
+    register_actor(actor);
+    {
+        let mut actor = get_actor_unchecked::<QueuedSignalActor>(&id);
+        actor.start().unwrap();
+        actor.subscribe_signal("managed_queue", None);
+    }
+    let mut publisher = TestDataActor::new(DataActorConfig::default());
+    publisher.register(trader_id, clock, cache).unwrap();
+    let observer = "ONLY-OBSERVATION-ACTOR".into();
+    if publication_closed {
+        let admission =
+            super::recovery_observation::RecoveryObservationAdmission::enter(&[observer]).unwrap();
+        publisher.publish_signal("managed_queue", "blocked".into(), UnixNanos::from(1));
+        admission.finish().unwrap();
+        assert!(!super::drain_callbacks(8).unwrap());
+    } else {
+        publisher.publish_signal("managed_queue", "blocked".into(), UnixNanos::from(1));
+        let admission =
+            super::recovery_observation::RecoveryObservationAdmission::enter(&[observer]).unwrap();
+        let pending = super::drain_callbacks(8).unwrap();
+        admission.finish().unwrap();
+        assert!(!pending);
+    }
+    assert!(
+        trace.borrow().is_empty(),
+        "queued signal escaped its actual recovery observation boundary: {:?}",
+        trace.borrow()
+    );
+    publisher.publish_signal("managed_queue", "fresh".into(), UnixNanos::from(2));
+    assert!(!super::drain_callbacks(8).unwrap());
+    assert_eq!(*trace.borrow(), ["Q:fresh:enter", "Q:fresh:exit"]);
+    super::clear_callbacks().unwrap();
+}

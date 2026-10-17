@@ -440,7 +440,7 @@ impl Trader {
         self.actor_state_callbacks.insert(
             actor_id,
             ComponentStateCallbacks {
-                deferred_strategy_events: false,
+                deferred_strategy_events: T::defer_signal_events(),
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
                 #[cfg(feature = "live")]
@@ -488,7 +488,7 @@ impl Trader {
         self.actor_state_callbacks.insert(
             actor_id,
             ComponentStateCallbacks {
-                deferred_strategy_events: false,
+                deferred_strategy_events: T::defer_signal_events(),
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
                 #[cfg(feature = "live")]
@@ -665,7 +665,8 @@ impl Trader {
         self.strategy_state_callbacks.insert(
             strategy_id,
             ComponentStateCallbacks {
-                deferred_strategy_events: T::defer_order_and_position_events(),
+                deferred_strategy_events: T::defer_order_and_position_events()
+                    || T::defer_signal_events(),
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
                 #[cfg(feature = "live")]
@@ -890,7 +891,8 @@ impl Trader {
         self.strategy_state_callbacks.insert(
             strategy_id,
             ComponentStateCallbacks {
-                deferred_strategy_events: T::defer_order_and_position_events(),
+                deferred_strategy_events: T::defer_order_and_position_events()
+                    || T::defer_signal_events(),
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
                 #[cfg(feature = "live")]

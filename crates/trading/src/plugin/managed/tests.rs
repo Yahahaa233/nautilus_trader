@@ -733,3 +733,96 @@ fn recorded_native_fault_finalizes_cached_submission_unknown_on_original_policy(
     ensure!(evidence.finalizations[0][0].factory_order_ids == vec![id]);
     Ok(())
 }
+
+#[test]
+fn native_frame_adapter_migrates_only_explicit_legacy_no_signal_inventory() -> Result<()> {
+    let (strategy, _) = fixture("all-rejected")?;
+    let current = serde_json::to_value(strategy.adapter_checkpoint()?)?;
+    ensure!(
+        current["schema_version"] == 5 && current["managed_frame_subscribed"] == false,
+        "new native frame inventory is not explicit"
+    );
+    let mut legacy = current.clone();
+    legacy["schema_version"] = json!(4);
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("managed_frame_subscribed");
+    let restored = crate::plugin::adapter::AdapterState::decode(
+        &serde_json::to_vec(&legacy)?,
+        &strategy.scope,
+    )?;
+    ensure!(
+        serde_json::to_value(restored)? == current,
+        "legacy no-signal inventory changed another resource"
+    );
+    let mut missing = current;
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("managed_frame_subscribed");
+    ensure!(
+        crate::plugin::adapter::AdapterState::decode(
+            &serde_json::to_vec(&missing)?,
+            &strategy.scope
+        )
+        .is_err(),
+        "new native checkpoint inferred a missing frame inventory"
+    );
+    Ok(())
+}
+
+#[test]
+fn native_frame_restore_rejects_a_signal_without_its_bounded_native_policy() -> Result<()> {
+    use nautilus_common::actor::DataActor;
+    let (source, _) = fixture("batch-disabled")?;
+    let mut saved = source.on_save()?;
+    let mut adapter: Value = serde_json::from_slice(saved.get("plugin.adapter").unwrap())?;
+    adapter["managed_frame_subscribed"] = json!(true);
+    saved.insert("plugin.adapter".into(), serde_json::to_vec(&adapter)?);
+    let (mut target, evidence) = fixture("batch-disabled")?;
+    ensure!(
+        target.on_load(saved).is_err(),
+        "unbound native frame restored"
+    );
+    ensure!(
+        evidence.borrow().prepares == 0 && evidence.borrow().commands.is_empty(),
+        "invalid native frame restore changed policy or execution"
+    );
+    Ok(())
+}
+
+#[test]
+fn native_frame_refuses_foreign_owner_and_oversized_payload_before_guest() -> Result<()> {
+    use nautilus_common::{actor::DataActor, signal::Signal};
+    use nautilus_core::UnixNanos;
+    for oversized in [false, true] {
+        let (mut strategy, evidence) = fixture("all-rejected")?;
+        strategy.adapter.managed_frame_subscribed = true;
+        let owner = if oversized {
+            "MANAGED-001"
+        } else {
+            "FOREIGN-001"
+        };
+        let name = crate::plugin::managed_frame_signal_name(owner.into());
+        let signal = Signal::new(
+            name.into(),
+            if oversized {
+                "x".repeat(1_048_577)
+            } else {
+                "{}".into()
+            },
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        );
+        ensure!(
+            strategy.on_signal(&signal).is_err() && strategy.callback_failure().is_some(),
+            "foreign/oversized native frame reached author code"
+        );
+        ensure!(
+            evidence.borrow().prepares == 0 && evidence.borrow().commands.is_empty(),
+            "invalid native frame changed policy or execution"
+        );
+    }
+    Ok(())
+}

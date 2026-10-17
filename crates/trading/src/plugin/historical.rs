@@ -24,6 +24,7 @@ use nautilus_common::{
             HistoricalInputBoundary, HistoricalReplayPreparation, pending_callback_route,
         },
     },
+    signal::Signal,
     timer::TimeEvent,
 };
 use nautilus_model::{
@@ -122,6 +123,7 @@ impl PluginStrategy {
                 nautilus_common::actor::DataActorNative::core_mut(self)
                     .restore_native_data_subscription_command(command, boundary)?;
             }
+            self.restore_managed_frame(boundary)?;
             self.restored_resources_unprepared = false;
             self.historical_prepared = true;
             Ok(())
@@ -184,7 +186,8 @@ impl PluginStrategy {
                 || input.is::<TradeTick>()
                 || input.is::<TimeEvent>()
                 || input.is::<OrderEventAny>()
-                || input.is::<PositionEvent>())
+                || input.is::<PositionEvent>()
+                || input.is::<Signal>())
         {
             return Ok(());
         } else if let Some(bar) = input.downcast_ref::<Bar>() {
@@ -193,6 +196,8 @@ impl PluginStrategy {
             DataActor::on_quote(self, quote)
         } else if let Some(trade) = input.downcast_ref::<TradeTick>() {
             DataActor::on_trade(self, trade)
+        } else if let Some(signal) = input.downcast_ref::<Signal>() {
+            DataActor::on_signal(self, signal)
         } else if let Some(event) = input.downcast_ref::<TimeEvent>() {
             DataActor::on_time_event(self, event)
         } else if let Some(event) = input.downcast_ref::<OrderEventAny>() {

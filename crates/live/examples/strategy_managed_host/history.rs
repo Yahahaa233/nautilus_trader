@@ -61,6 +61,8 @@ mod history {
         EventPanic,
         BatchNormal,
         BatchEmpty,
+        BatchFrame,
+        BatchFrameFailure,
         BatchPanic,
         BatchNativePanic,
         Bracket,
@@ -74,6 +76,8 @@ mod history {
                 Self::EventPanic => "panic",
                 Self::BatchNormal => "batch-normal",
                 Self::BatchEmpty => "batch-empty",
+                Self::BatchFrame => "batch-frame",
+                Self::BatchFrameFailure => "batch-frame-failure",
                 Self::BatchPanic => "batch-panic",
                 Self::BatchNativePanic => "batch-native-panic",
                 Self::Bracket => "bracket",
@@ -82,15 +86,26 @@ mod history {
         fn denials(self) -> usize {
             match self {
                 Self::EventPanic | Self::BatchPanic | Self::BatchEmpty => 0,
-                Self::BatchNormal | Self::BatchNativePanic => 2,
+                Self::BatchNormal
+                | Self::BatchNativePanic
+                | Self::BatchFrame
+                | Self::BatchFrameFailure => 2,
                 _ => 1,
             }
         }
         fn failure(self) -> Option<PluginErrorCode> {
             match self {
-                Self::Normal | Self::CacheDenied | Self::BatchNormal | Self::BatchEmpty | Self::Bracket => None,
+                Self::Normal
+                | Self::CacheDenied
+                | Self::BatchNormal
+                | Self::BatchEmpty
+                | Self::BatchFrame
+                | Self::Bracket => None,
+                Self::BatchFrameFailure => Some(PluginErrorCode::Generic),
                 Self::EventFailure => Some(PluginErrorCode::SerializationFailed),
-                Self::EventPanic | Self::BatchPanic | Self::BatchNativePanic => Some(PluginErrorCode::Panic),
+                Self::EventPanic | Self::BatchPanic | Self::BatchNativePanic => {
+                    Some(PluginErrorCode::Panic)
+                }
             }
         }
     }
@@ -192,22 +207,36 @@ mod history {
     #[derive(Debug)]
     struct CommandCodec;
     impl RunnerRecoveryCodec for CommandCodec {
-        fn channel(&self) -> RunnerRecoveryChannel { RunnerRecoveryChannel::ExecutionCommand }
-        fn codec_id(&self) -> &'static str { "actual_managed_history_command.v1" }
+        fn channel(&self) -> RunnerRecoveryChannel {
+            RunnerRecoveryChannel::ExecutionCommand
+        }
+        fn codec_id(&self) -> &'static str {
+            "actual_managed_history_command.v1"
+        }
         fn encode(&self, event: RunnerRecoveryEventRef<'_>) -> Result<Value> {
-            if let RunnerRecoveryEventRef::ExecutionCommand(value) = event { return Ok(command_payload(value)); }
+            if let RunnerRecoveryEventRef::ExecutionCommand(value) = event {
+                return Ok(command_payload(value));
+            }
             bail!("managed history command codec received another channel")
         }
         fn decode(&self, input: &RunnerRecoveryEnvelope) -> Result<RunnerRecoveryEvent> {
-            Ok(RunnerRecoveryEvent::ExecutionCommand(nautilus_common::runner::TradingCommandMessage::new(
-                input.payload["endpoint"].as_str().context("original command endpoint absent")?.into(),
-                serde_json::from_value(input.payload["command"].clone())?,
-            )))
+            Ok(RunnerRecoveryEvent::ExecutionCommand(
+                nautilus_common::runner::TradingCommandMessage::new(
+                    input.payload["endpoint"]
+                        .as_str()
+                        .context("original command endpoint absent")?
+                        .into(),
+                    serde_json::from_value(input.payload["command"].clone())?,
+                ),
+            ))
         }
     }
 
     fn registry() -> Result<Rc<RunnerRecoveryCodecRegistry>> {
-        let mut registry = RunnerRecoveryCodecRegistry::new([RunnerRecoveryChannel::TimeEvent, RunnerRecoveryChannel::ExecutionCommand]);
+        let mut registry = RunnerRecoveryCodecRegistry::new([
+            RunnerRecoveryChannel::TimeEvent,
+            RunnerRecoveryChannel::ExecutionCommand,
+        ]);
         registry.register_owner_bound_timer_codec(TimerCodec)?;
         registry.register(CommandCodec)?;
         Ok(Rc::new(registry.seal()?))
@@ -254,7 +283,9 @@ mod history {
                     value.canonical_payload()?
                 } else if let Some(value) = input.downcast_ref::<TimeEventMessage>() {
                     time_payload(value)?
-                } else if let Some(value) = input.downcast_ref::<nautilus_common::runner::TradingCommandMessage>() {
+                } else if let Some(value) =
+                    input.downcast_ref::<nautilus_common::runner::TradingCommandMessage>()
+                {
                     command_payload(value)
                 } else {
                     bail!("unexpected external input in non-financial plugin history probe")
@@ -284,7 +315,10 @@ mod history {
         node.add_strategy(construct_strategy(args, case, records)?)?;
         if mode == HistoryMode::CacheDenied {
             // Cache feedback only: no account, clients, funds or transmission.
-            node.kernel().risk_engine().borrow_mut().set_trading_state(TradingState::Halted);
+            node.kernel()
+                .risk_engine()
+                .borrow_mut()
+                .set_trading_state(TradingState::Halted);
         }
         Ok(())
     }
@@ -345,20 +379,82 @@ mod history {
         let control = async move {
             for _ in 0..2000 {
                 let expected_prepared = match mode {
-                    HistoryMode::BatchNormal | HistoryMode::BatchPanic | HistoryMode::BatchNativePanic => 2,
+                    HistoryMode::BatchNormal
+                    | HistoryMode::BatchPanic
+                    | HistoryMode::BatchNativePanic
+                    | HistoryMode::BatchFrame
+                    | HistoryMode::BatchFrameFailure => 2,
                     HistoryMode::BatchEmpty => 0,
                     _ => 1,
                 };
-                let frame_complete = mode != HistoryMode::BatchEmpty ||
-                    (recorded.borrow().batches.len()==1 && recorded.borrow().batch_outcomes.len()==1);
+                let frame_complete = mode != HistoryMode::BatchEmpty
+                    || (recorded.borrow().batches.len() == 1
+                        && recorded.borrow().batch_outcomes.len() == 1);
                 let feedback_complete = if mode == HistoryMode::CacheDenied {
-                    if let Some(actor) = try_get_actor_unchecked::<PluginStrategy>(&"MANAGED-001".into()) {
-                    actor.callback_failure().is_none() && actor.state() == nautilus_common::enums::ComponentState::Running
-                        && actor.on_save().ok().and_then(|state|state.get("plugin.state").and_then(|raw|serde_json::from_slice::<Value>(raw).ok()))
-                            .is_some_and(|state|state["secondary"]["order_events"].as_array().is_some_and(|events| events.len()>=2))
-                    } else { false }
-                } else { true };
-                if frame_complete && feedback_complete && recorded.borrow().prepared.len() == expected_prepared
+                    if let Some(actor) =
+                        try_get_actor_unchecked::<PluginStrategy>(&"MANAGED-001".into())
+                    {
+                        actor.callback_failure().is_none()
+                            && actor.state() == nautilus_common::enums::ComponentState::Running
+                            && actor
+                                .on_save()
+                                .ok()
+                                .and_then(|state| {
+                                    state
+                                        .get("plugin.state")
+                                        .and_then(|raw| serde_json::from_slice::<Value>(raw).ok())
+                                })
+                                .is_some_and(|state| {
+                                    state["secondary"]["order_events"]
+                                        .as_array()
+                                        .is_some_and(|events| events.len() >= 2)
+                                })
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                };
+                let application_frame_complete = if matches!(
+                    mode,
+                    HistoryMode::BatchFrame | HistoryMode::BatchFrameFailure
+                ) {
+                    if let Some(actor) =
+                        try_get_actor_unchecked::<PluginStrategy>(&"MANAGED-001".into())
+                    {
+                        if mode == HistoryMode::BatchFrameFailure {
+                            actor.callback_failure().is_some_and(|(code, message)| {
+                                code == PluginErrorCode::Generic
+                                    && message
+                                        .contains("original private managed-frame callback failure")
+                            })
+                        } else {
+                            actor.callback_failure().is_none()
+                                && actor.state() == nautilus_common::enums::ComponentState::Running
+                                && actor
+                                    .on_save()
+                                    .ok()
+                                    .and_then(|state| {
+                                        state.get("plugin.state").and_then(|raw| {
+                                            serde_json::from_slice::<Value>(raw).ok()
+                                        })
+                                    })
+                                    .is_some_and(|state| {
+                                        state["secondary"]["frame_events"]
+                                            .as_array()
+                                            .is_some_and(|events| events.len() == 1)
+                                    })
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                };
+                if application_frame_complete
+                    && frame_complete
+                    && feedback_complete
+                    && recorded.borrow().prepared.len() == expected_prepared
                     && recorded.borrow().commands.len() == mode.denials()
                     && observed.borrow().len() >= 3
                 {
@@ -580,6 +676,8 @@ mod history {
             "panic" => HistoryMode::EventPanic,
             "batch-normal" => HistoryMode::BatchNormal,
             "batch-empty" => HistoryMode::BatchEmpty,
+            "batch-frame" => HistoryMode::BatchFrame,
+            "batch-frame-failure" => HistoryMode::BatchFrameFailure,
             "batch-panic" => HistoryMode::BatchPanic,
             "batch-native-panic" => HistoryMode::BatchNativePanic,
             "bracket" => HistoryMode::Bracket,
