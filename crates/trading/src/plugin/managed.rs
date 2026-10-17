@@ -91,6 +91,9 @@ pub struct ManagedOrderObservationContext {
 pub struct ManagedOrderFacts {
     /// True until the original amendment has a matching financial settlement.
     pub pending_exit_amendment: bool,
+    /// The installed owner verified an actual native liquidation reduction.
+    /// Cached quantities, a guest tag or a rejection string alone are no proof.
+    pub native_liquidation_reduced_protection: bool,
 }
 
 /// Native cache recording only; a recorded order can already be locally Denied.
@@ -388,10 +391,21 @@ impl PluginStrategy {
                     .time_in_force(entry.time_in_force)
                     .entry_post_only(entry.post_only)
                     .entry_client_order_id(context.client_order_id)
+                    // Preserve the existing native factory defaults when the
+                    // policy supplies no annotation; explicit per-leg tags
+                    // must reach the same original native constructors.
+                    .entry_tags(entry.tags.as_ref().map_or_else(
+                        || vec![ustr::Ustr::from("ENTRY")],
+                        |tags| tags.iter().map(|t| ustr::Ustr::from(t.as_str())).collect(),
+                    ))
                     .tp_order_type(OrderType::Limit)
                     .maybe_tp_price(bracket.take_profit.price)
                     .tp_time_in_force(bracket.take_profit.time_in_force)
                     .tp_post_only(bracket.take_profit.post_only)
+                    .tp_tags(bracket.take_profit.tags.as_ref().map_or_else(
+                        || vec![ustr::Ustr::from("TAKE_PROFIT")],
+                        |tags| tags.iter().map(|t| ustr::Ustr::from(t.as_str())).collect(),
+                    ))
                     .sl_order_type(OrderType::StopMarket)
                     .maybe_sl_trigger_price(bracket.stop_loss.trigger_price)
                     .sl_trigger_type(
@@ -401,6 +415,10 @@ impl PluginStrategy {
                             .context("managed stop trigger type absent")?,
                     )
                     .sl_time_in_force(bracket.stop_loss.time_in_force)
+                    .sl_tags(bracket.stop_loss.tags.as_ref().map_or_else(
+                        || vec![ustr::Ustr::from("STOP_LOSS")],
+                        |tags| tags.iter().map(|t| ustr::Ustr::from(t.as_str())).collect(),
+                    ))
                     .contingency_type(bracket.contingency)
                     .call()?;
                 ensure!(

@@ -54,6 +54,7 @@ pub fn validate_native_framework_timers(
 use super::{
     api::{OrderApi, PortfolioApi},
     config::StrategyConfig,
+    execution_scope::StrategyExecutionScope,
 };
 
 /// The core component of a [`Strategy`](crate::strategy::Strategy), managing data, orders,
@@ -68,6 +69,7 @@ use super::{
 pub struct StrategyCore {
     pub(crate) actor: DataActorCore,
     pub(crate) submission_interceptor: Option<Rc<dyn super::SubmissionInterceptor>>,
+    pub(crate) execution_scope: Option<StrategyExecutionScope>,
     /// The strategy configuration.
     pub config: StrategyConfig,
     strategy_id: Option<StrategyId>,
@@ -211,6 +213,7 @@ impl StrategyCore {
         Ok(Self {
             actor: DataActorCore::new(actor_config),
             submission_interceptor: None,
+            execution_scope: None,
             config,
             strategy_id,
             order_id_tag,

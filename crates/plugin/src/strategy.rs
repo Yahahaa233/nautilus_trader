@@ -128,6 +128,9 @@ pub enum HostOperation {
     ManagedSubmitBatch,
     /// Read-only original-order facts from the installed application owner.
     ManagedOrderFacts,
+    /// Request the original native iterative exit in the host-admitted scope.
+    /// This neither authorizes a venue mutation nor overrides business fences.
+    ManagedMarketExit,
 }
 
 impl HostOperation {
@@ -152,6 +155,7 @@ impl HostOperation {
             Self::CachedBars => 15,
             Self::ManagedSubmitBatch => 16,
             Self::ManagedOrderFacts => 17,
+            Self::ManagedMarketExit => 18,
         }
     }
 
@@ -176,6 +180,7 @@ impl HostOperation {
             15 => Some(Self::CachedBars),
             16 => Some(Self::ManagedSubmitBatch),
             17 => Some(Self::ManagedOrderFacts),
+            18 => Some(Self::ManagedMarketExit),
             _ => None,
         }
     }

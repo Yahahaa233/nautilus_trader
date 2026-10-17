@@ -155,6 +155,10 @@ pub struct SubmitRequest {
     pub reduce_only: bool,
     pub post_only: bool,
     pub position_id: Option<PositionId>,
+    /// Bounded algorithm annotations. Native execution/fault authority is not
+    /// encoded in tags; reserved framework tags are rejected by the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -162,6 +166,14 @@ pub struct SubmitRequest {
 pub struct OrderId {
     pub schema_version: u32,
     pub client_order_id: ClientOrderId,
+}
+
+/// The guest supplies no account, client, instrument, order identity or quantity.
+/// The original native framework uses the immutable host-installed scope.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedMarketExit {
+    pub schema_version: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -274,8 +274,14 @@ impl PluginStrategy {
                 "bar is outside admitted instruments"
             );
         }
+        let mut core = StrategyCore::new_checked(config)?;
+        core.execution_scope = Some(crate::strategy::execution_scope::StrategyExecutionScope {
+            account_id: scope.account_id,
+            client_id: scope.client_id,
+            instruments: scope.instruments.clone(),
+        });
         Ok(Self {
-            core: StrategyCore::new_checked(config)?,
+            core,
             native_failure: guest.native_failure_recorder(),
             guest: Rc::new(RefCell::new(guest)),
             scope,
@@ -370,10 +376,16 @@ impl PluginStrategy {
     }
 
     fn owned_order(&self, id: ClientOrderId) -> Result<OrderAny> {
-        let order = self.cache().order(&id).context("plugin order is absent")?;
+        let cache = self.cache();
+        let order = cache.order(&id).context("plugin order is absent")?;
         ensure!(
-            Some(order.strategy_id()) == self.strategy_id(),
-            "order belongs to another strategy"
+            Some(order.strategy_id()) == self.strategy_id()
+                && Some(order.trader_id()) == self.core.trader_id(),
+            "order belongs to another strategy or trader"
+        );
+        ensure!(
+            cache.client_id(&id) == Some(self.scope.client_id),
+            "order belongs to another or unbound native client"
         );
         self.require_instrument(order.instrument_id())?;
         if let Some(account) = order.account_id() {
@@ -474,6 +486,24 @@ impl PluginStrategy {
             HostOperation::Submit => self.submit_encoded(input),
             HostOperation::ManagedSubmit => self.managed_submit(input),
             HostOperation::ManagedSubmitBatch => self.managed_submit_batch(input),
+            HostOperation::ManagedMarketExit => {
+                let request: wire::ManagedMarketExit = serde_json::from_slice(input)?;
+                require_version(request.schema_version)?;
+                ensure!(
+                    self.managed_policy.is_some()
+                        && self.core.execution_scope.is_some()
+                        && self.scope.order_types.contains(&PluginOrderType::Market)
+                        && self.core.config.market_exit_reduce_only
+                        && self.state() == nautilus_common::enums::ComponentState::Running,
+                    "managed native exit requires the installed scoped owner and a running reduce-only framework"
+                );
+                self.market_exit()?;
+                Ok(serde_json::to_vec(&serde_json::json!({
+                    "schema_version":1,"native_framework_requested":true,
+                    "is_exiting":self.core.is_exiting,
+                    "execution_authorized":false
+                }))?)
+            }
             HostOperation::Cancel => {
                 let request: wire::OrderId = serde_json::from_slice(input)?;
                 require_version(request.schema_version)?;

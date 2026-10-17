@@ -187,6 +187,7 @@ fn entry(context: &ManagedSubmissionContext) -> wire::SubmitRequest {
         reduce_only: false,
         post_only: false,
         position_id: None,
+        tags: None,
     }
 }
 impl Policy {
@@ -229,6 +230,11 @@ impl Policy {
         if self.case == "bracket-quantity-mismatch" {
             stop_loss.quantity = Quantity::from("0.002");
         }
+        if self.case == "bracket-tags" {
+            parent.tags = Some(vec!["ADX_ENTRY".into()]);
+            take_profit.tags = Some(vec!["ADX_BREAKOUT_PORTFOLIO_TP".into()]);
+            stop_loss.tags = Some(vec!["ADX_BREAKOUT_PORTFOLIO_SL".into()]);
+        }
         ManagedOrderPlan::Bracket(Box::new(ManagedBracketRequest {
             entry: parent,
             take_profit,
@@ -251,6 +257,7 @@ impl ManagedSubmissionPolicy for Policy {
         }
         Ok(ManagedOrderFacts {
             pending_exit_amendment: self.case == "observed-pending",
+            native_liquidation_reduced_protection: self.case == "observed-native-liquidation",
         })
     }
     fn prepare(&self, context: &ManagedSubmissionContext, _: &[u8]) -> Result<ManagedOrderPlan> {
@@ -354,7 +361,7 @@ fn observation_order(strategy: &PluginStrategy, case: &str) -> Result<()> {
     }
     .into();
     let id = "original-protection-1".into();
-    let mut order: OrderAny = MarketOrder::new_checked(
+    let order: OrderAny = MarketOrder::new_checked(
         trader,
         strategy_id,
         instrument,
@@ -376,31 +383,9 @@ fn observation_order(strategy: &PluginStrategy, case: &str) -> Result<()> {
         None,
     )?
     .into();
-    if case != "unbound-account" {
-        order.apply(OrderEventAny::Submitted(OrderSubmitted::new(
-            trader,
-            strategy_id,
-            instrument,
-            id,
-            account,
-            UUID4::new(),
-            0.into(),
-            0.into(),
-        )))?;
-        order.apply(OrderEventAny::Accepted(OrderAccepted::new(
-            trader,
-            strategy_id,
-            instrument,
-            id,
-            "original-venue-1".into(),
-            account,
-            UUID4::new(),
-            0.into(),
-            0.into(),
-            false,
-        )))?;
-    }
-    strategy.cache_rc().borrow_mut().add_order(
+    let cache = strategy.cache_rc();
+    let mut cache = cache.borrow_mut();
+    cache.add_order(
         order,
         None,
         if case == "unbound-client" {
@@ -417,15 +402,184 @@ fn observation_order(strategy: &PluginStrategy, case: &str) -> Result<()> {
         },
         false,
     )?;
+    if case != "unbound-account" {
+        cache.update_order(&OrderEventAny::Submitted(OrderSubmitted::new(
+            trader,
+            strategy_id,
+            instrument,
+            id,
+            account,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+        )))?;
+        cache.update_order(&OrderEventAny::Accepted(OrderAccepted::new(
+            trader,
+            strategy_id,
+            instrument,
+            id,
+            "original-venue-1".into(),
+            account,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+            false,
+        )))?;
+    }
     Ok(())
 }
 
 #[rstest::rstest]
-#[case("observed-pending", true)]
-#[case("observed-settled", false)]
+fn ordinary_order_operations_refuse_foreign_client_and_trader_before_native_effects(
+    #[values("foreign-client", "unbound-client", "foreign-trader")] case: &'static str,
+    #[values(
+        nautilus_plugin::strategy::HostOperation::Query,
+        nautilus_plugin::strategy::HostOperation::Cancel,
+        nautilus_plugin::strategy::HostOperation::Modify
+    )]
+    operation: nautilus_plugin::strategy::HostOperation,
+) -> Result<()> {
+    use nautilus_common::actor::DataActorNative;
+    let (mut strategy, evidence) = fixture("observed-pending")?;
+    observation_order(&strategy, case)?;
+    let id = "original-protection-1".into();
+    let cache = strategy.cache_rc();
+    let before = {
+        let cache = cache.borrow();
+        let order = cache.order(&id).context("original native order missing")?;
+        serde_json::to_value(order.as_ref())?
+    };
+    let count = strategy.order_factory().client_order_id_count();
+    let request = if operation == nautilus_plugin::strategy::HostOperation::Modify {
+        json!({"schema_version":1,"client_order_id":id,"quantity":"0.002","price":null,"trigger_price":null})
+    } else {
+        json!({"schema_version":1,"client_order_id":id})
+    };
+    let result = strategy.dispatch(operation, &serde_json::to_vec(&request)?);
+    ensure!(
+        result.is_err(),
+        "{case} {operation:?} crossed original native ownership"
+    );
+    let cache = cache.borrow();
+    let original = cache.order(&id).context("original order disappeared")?;
+    ensure!(
+        serde_json::to_value(original.as_ref())? == before
+            && strategy.order_factory().client_order_id_count() == count,
+        "refused foreign operation changed original order or identity"
+    );
+    let e = evidence.borrow();
+    ensure!(
+        e.prepares == 0
+            && e.bound == 0
+            && e.commands.is_empty()
+            && e.finalizations.is_empty()
+            && e.observations.is_empty(),
+        "foreign operation reached the original submission owner"
+    );
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case(wire::NativeOrderType::Market)]
+#[case(wire::NativeOrderType::Limit)]
+#[case(wire::NativeOrderType::StopMarket)]
+#[case(wire::NativeOrderType::StopLimit)]
+fn ordinary_native_factory_preserves_original_algorithm_tags(
+    #[case] kind: wire::NativeOrderType,
+) -> Result<()> {
+    let (mut strategy, evidence) = fixture("algorithm-tags")?;
+    let limit = matches!(
+        kind,
+        wire::NativeOrderType::Limit | wire::NativeOrderType::StopLimit
+    );
+    let stop = matches!(
+        kind,
+        wire::NativeOrderType::StopMarket | wire::NativeOrderType::StopLimit
+    );
+    let request = wire::SubmitRequest {
+        schema_version: 2,
+        order_type: kind,
+        instrument_id: "ETHUSDT-PERP.BINANCE".into(),
+        side: OrderSide::Sell,
+        quantity: Quantity::from("0.001"),
+        price: limit.then(|| Price::from("3000.00")),
+        trigger_price: stop.then(|| Price::from("2900.00")),
+        trigger_type: stop.then_some(TriggerType::Default),
+        time_in_force: TimeInForce::Gtc,
+        expire_time_ns: None,
+        reduce_only: true,
+        post_only: false,
+        position_id: None,
+        tags: Some(vec![
+            if stop {
+                "ADX_BREAKOUT_PORTFOLIO_SL"
+            } else {
+                "ADX_BREAKOUT_PORTFOLIO_TP"
+            }
+            .into(),
+        ]),
+    };
+    let result = strategy.submit_native_request(&request, None)?;
+    let id: wire::OrderId = serde_json::from_slice(&result)?;
+    let original = strategy.owned_order(id.client_order_id)?;
+    let tags: Vec<_> = original
+        .tags()
+        .context("native tags lost")?
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    ensure!(
+        Some(tags) == request.tags && original.is_reduce_only(),
+        "native order annotations changed"
+    );
+    ensure!(
+        evidence.borrow().bound == 1,
+        "tagged order bypassed the original interceptor"
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_or_framework_reserved_tags_are_refused_before_native_identity_and_interceptor()
+-> Result<()> {
+    let (mut strategy, evidence) = fixture("algorithm-tags")?;
+    let before = strategy.order_factory().client_order_id_count();
+    for tags in [
+        vec![],
+        vec![String::new()],
+        vec!["x".repeat(129)],
+        vec!["line\nbreak".into()],
+        vec!["duplicate".into(), "duplicate".into()],
+        (0..33).map(|n| format!("tag{n}")).collect(),
+        vec!["MARKET_EXIT".into()],
+    ] {
+        let mut request: wire::SubmitRequest = serde_json::from_value(json!({
+            "schema_version":2,"order_type":"market","instrument_id":"ETHUSDT-PERP.BINANCE",
+            "side":"SELL","quantity":"0.001","time_in_force":"GTC","reduce_only":true,"post_only":false
+        }))?;
+        request.tags = Some(tags);
+        ensure!(
+            strategy.submit_native_request(&request, None).is_err(),
+            "invalid tags reached native construction"
+        );
+    }
+    ensure!(
+        strategy.order_factory().client_order_id_count() == before
+            && evidence.borrow().bound == 0
+            && evidence.borrow().prepares == 0,
+        "invalid tags consumed native identity or reached the original interceptor"
+    );
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case("observed-pending", true, false)]
+#[case("observed-settled", false, false)]
+#[case("observed-native-liquidation", false, true)]
 fn managed_observation_uses_original_native_scope_without_generating_identity(
     #[case] case: &'static str,
     #[case] pending: bool,
+    #[case] native_liquidation: bool,
 ) -> Result<()> {
     use nautilus_plugin::strategy::HostOperation;
     let (mut strategy, evidence) = fixture(case)?;
@@ -437,6 +591,7 @@ fn managed_observation_uses_original_native_scope_without_generating_identity(
     let result: Value = serde_json::from_slice(&raw)?;
     ensure!(
         result["facts"]["pending_exit_amendment"] == pending
+            && result["facts"]["native_liquidation_reduced_protection"] == native_liquidation
             && result["context"]["client_order_id"] == "original-protection-1"
             && result["context"]["strategy_id"] == "MANAGED-001"
             && result["context"]["account_id"] == "BINANCE-MANAGED"
@@ -659,6 +814,273 @@ fn intent() -> Value {
 }
 
 #[rstest::rstest]
+#[case("owned", true)]
+#[case("foreign-client", false)]
+#[case("unbound-client", false)]
+#[case("foreign-account", false)]
+#[case("foreign-trader", false)]
+fn scoped_market_exit_reuses_original_native_cancel_and_timer_without_foreign_effects(
+    #[case] order_scope: &'static str,
+    #[case] canceled: bool,
+) -> Result<()> {
+    use crate::strategy::Strategy;
+    use nautilus_common::{
+        actor::registry::{deregister_actor, try_get_actor_unchecked},
+        component::{deregister_component, register_component_actor, start_component},
+        msgbus::{self, MessagingSwitchboard, stubs::get_typed_into_message_saving_handler},
+        timer::TimeEventCallback,
+    };
+    use nautilus_plugin::strategy::HostOperation;
+    let (mut strategy, evidence) = fixture("scoped-market-exit")?;
+    observation_order(&strategy, order_scope)?;
+    let (handler, cancellations) = get_typed_into_message_saving_handler::<TradingCommand>(None);
+    msgbus::register_trading_command_endpoint(
+        MessagingSwitchboard::exec_engine_queue_execute(),
+        handler,
+    );
+    strategy
+        .core
+        .clock_mut()
+        .register_default_handler(TimeEventCallback::from(|_| {}));
+    let actor_id = strategy.component_id().inner();
+    register_component_actor(strategy);
+    start_component(&actor_id)?;
+    let mut strategy = try_get_actor_unchecked::<PluginStrategy>(&actor_id)
+        .context("original native registered exit actor is missing")?;
+    let request = br#"{"schema_version":1}"#;
+    let result: Value =
+        serde_json::from_slice(&strategy.dispatch(HostOperation::ManagedMarketExit, request)?)?;
+    ensure!(
+        result["native_framework_requested"] == true
+            && result["is_exiting"] == true
+            && result["execution_authorized"] == false
+            && strategy.is_exiting(),
+        "managed exit did not use the original native framework"
+    );
+    let commands = cancellations.get_messages();
+    let count = commands.len();
+    ensure!(
+        count == usize::from(canceled),
+        "native exit changed foreign order scope"
+    );
+    if canceled {
+        let TradingCommand::CancelOrder(command) = &commands[0] else {
+            bail!("native scoped exit did not use original cancellation");
+        };
+        ensure!(
+            command.client_id == Some("MANAGED-EXEC".into())
+                && command.client_order_id.as_str() == "original-protection-1",
+            "native scoped cancellation changed original route/identity"
+        );
+    }
+    strategy.dispatch(HostOperation::ManagedMarketExit, request)?;
+    ensure!(
+        cancellations.get_messages().len() == count,
+        "repeated exit resent original cancellation"
+    );
+    ensure!(
+        evidence.borrow().commands.is_empty(),
+        "native cancellation entered a new entry allocation"
+    );
+    strategy.cancel_market_exit();
+    Component::stop(&mut *strategy)?;
+    drop(strategy);
+    deregister_component(&actor_id);
+    deregister_actor(&actor_id);
+    Ok(())
+}
+
+#[test]
+fn scoped_market_exit_rejects_guest_scope_and_nonrunning_requests_before_native_effects()
+-> Result<()> {
+    use nautilus_plugin::strategy::HostOperation;
+    let (mut strategy, evidence) = fixture("scoped-market-exit")?;
+    for raw in [
+        br#"{"schema_version":1}"#.as_slice(),
+        br#"{"schema_version":2}"#.as_slice(),
+        br#"{"schema_version":1,"account_id":"FOREIGN"}"#.as_slice(),
+        br#"{"schema_version":1,"client_id":"FOREIGN"}"#.as_slice(),
+    ] {
+        ensure!(
+            strategy
+                .dispatch(HostOperation::ManagedMarketExit, raw)
+                .is_err(),
+            "invalid scope/lifecycle started native exit"
+        );
+    }
+    ensure!(
+        !strategy.core.is_exiting && evidence.borrow().commands.is_empty(),
+        "rejected exit changed the original native owner"
+    );
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case("owned", true)]
+#[case("foreign-account", false)]
+#[case("foreign-trader", false)]
+#[case("foreign-strategy", false)]
+#[case("foreign-instrument", false)]
+fn scoped_market_exit_closes_only_original_positions_and_retries_on_native_timer(
+    #[case] position_scope: &'static str,
+    #[case] closed: bool,
+) -> Result<()> {
+    use crate::strategy::Strategy;
+    use nautilus_common::{
+        actor::registry::{deregister_actor, try_get_actor_unchecked},
+        component::{deregister_component, register_component_actor, start_component},
+        msgbus::{self, MessagingSwitchboard, stubs::get_typed_into_message_saving_handler},
+        timer::{TimeEvent, TimeEventCallback},
+    };
+    use nautilus_core::UUID4;
+    use nautilus_model::{
+        enums::OmsType, events::order::spec::OrderFilledSpec, identifiers::PositionId,
+        position::Position,
+    };
+    use nautilus_plugin::strategy::HostOperation;
+
+    let (mut strategy, evidence) = fixture("scoped-market-exit")?;
+    let mut instrument = crypto_perpetual_ethusdt();
+    if position_scope == "foreign-instrument" {
+        instrument.id = "BTCUSDT-PERP.BINANCE".into();
+    }
+    let instrument = InstrumentAny::CryptoPerpetual(instrument);
+    let position_id = PositionId::from("original-exit-position");
+    let fill = OrderFilledSpec::builder()
+        .trader_id(if position_scope == "foreign-trader" {
+            "FOREIGN-TRADER".into()
+        } else {
+            "TRADER-001".into()
+        })
+        .strategy_id(if position_scope == "foreign-strategy" {
+            "FOREIGN-001".into()
+        } else {
+            "MANAGED-001".into()
+        })
+        .account_id(if position_scope == "foreign-account" {
+            "BINANCE-FOREIGN".into()
+        } else {
+            "BINANCE-MANAGED".into()
+        })
+        .instrument_id(instrument.id())
+        .client_order_id("original-position-opening-fill".into())
+        .position_id(position_id)
+        .last_qty(Quantity::from("0.003"))
+        .last_px(Price::from("2000.00"))
+        .currency(instrument.quote_currency())
+        .build();
+    let position = Position::new(&instrument, fill);
+    strategy
+        .core
+        .cache_rc()
+        .borrow_mut()
+        .add_position_without_order(&position, OmsType::Netting)?;
+
+    let (handler, submissions) = get_typed_into_message_saving_handler::<TradingCommand>(None);
+    msgbus::register_trading_command_endpoint(
+        MessagingSwitchboard::risk_engine_queue_execute(),
+        handler,
+    );
+    strategy
+        .core
+        .clock_mut()
+        .register_default_handler(TimeEventCallback::from(|_| {}));
+    let actor_id = strategy.component_id().inner();
+    register_component_actor(strategy);
+    start_component(&actor_id)?;
+    let mut strategy = try_get_actor_unchecked::<PluginStrategy>(&actor_id)
+        .context("original native registered position owner is missing")?;
+    let request = br#"{"schema_version":1}"#;
+    strategy.dispatch(HostOperation::ManagedMarketExit, request)?;
+    let commands = submissions.get_messages();
+    ensure!(
+        commands.len() == usize::from(closed),
+        "native position exit affected foreign scope: {commands:?}"
+    );
+    let event = || {
+        TimeEvent::new(
+            "MARKET_EXIT_CHECK:MANAGED-001".into(),
+            UUID4::new(),
+            1.into(),
+            1.into(),
+        )
+    };
+    if closed {
+        let TradingCommand::SubmitOrder(first) = &commands[0] else {
+            bail!("native exit did not submit an original market close");
+        };
+        let first_order = strategy
+            .core
+            .cache_ref()
+            .try_order_owned(&first.client_order_id)?;
+        ensure!(
+            first.client_id == Some("MANAGED-EXEC".into())
+                && first.position_id == Some(position_id)
+                && first_order.order_side() == OrderSide::Sell
+                && first_order.quantity() == Quantity::from("0.003")
+                && first_order.is_reduce_only()
+                && first_order
+                    .tags()
+                    .is_some_and(|tags| { tags.len() == 1 && tags[0].as_str() == "MARKET_EXIT" }),
+            "native exit changed original position, route, quantity or protective tag"
+        );
+        strategy.dispatch(HostOperation::ManagedMarketExit, request)?;
+        strategy.check_market_exit(event());
+        ensure!(
+            submissions.get_messages().len() == 1 && strategy.is_exiting(),
+            "initialized native close was duplicated before its outcome"
+        );
+        strategy.deny_order(&first_order, "private original native denial".into());
+        strategy.check_market_exit(event());
+        let retried = submissions.get_messages();
+        ensure!(
+            retried.len() == 2,
+            "original native timer did not retry denied close"
+        );
+        let TradingCommand::SubmitOrder(second) = &retried[1] else {
+            bail!("native timer retry did not use original market submit");
+        };
+        let second_order = strategy
+            .core
+            .cache_ref()
+            .try_order_owned(&second.client_order_id)?;
+        ensure!(
+            second.client_id == first.client_id
+                && second.position_id == first.position_id
+                && second_order.quantity() == first_order.quantity()
+                && second_order.is_reduce_only()
+                && second_order.client_order_id() != first_order.client_order_id(),
+            "native timer retry changed original scope or reused terminal native identity"
+        );
+    } else {
+        strategy.check_market_exit(event());
+        ensure!(
+            !strategy.is_exiting() && submissions.get_messages().is_empty(),
+            "foreign positions kept scoped native exit active or received commands"
+        );
+    }
+    ensure!(
+        evidence.borrow().prepares == 0,
+        "native risk-reduction exit created an additional entry allocation"
+    );
+    ensure!(
+        !strategy
+            .core
+            .cache_ref()
+            .position(&position_id)
+            .context("original native position disappeared")?
+            .is_closed(),
+        "no-execution fixture fabricated an actual position close"
+    );
+    strategy.cancel_market_exit();
+    Component::stop(&mut *strategy)?;
+    drop(strategy);
+    deregister_component(&actor_id);
+    deregister_actor(&actor_id);
+    Ok(())
+}
+
+#[rstest::rstest]
 #[case("all-accepted", 3, 3, false)]
 #[case("empty", 0, 0, false)]
 #[case("all-rejected", 3, 0, false)]
@@ -862,6 +1284,7 @@ fn successful_missing_cache_result_calls_same_policy_unknown_finalizer_before_fa
 #[case("bracket-limit", true)]
 #[case("bracket-stop-market", true)]
 #[case("bracket-stop-limit", true)]
+#[case("bracket-tags", true)]
 #[case("bracket-foreign-child", false)]
 #[case("bracket-quantity-mismatch", false)]
 #[case("bracket-manager-missing", false)]
@@ -898,6 +1321,23 @@ fn actual_bracket_uses_native_linked_children_and_final_interceptor(
             "native managed fixture equality failed"
         );
         let orders = &command.order_inits;
+        if case == "bracket-tags" {
+            for order in orders {
+                let expected = match order.order_type {
+                    nautilus_model::enums::OrderType::Market => "ADX_ENTRY",
+                    nautilus_model::enums::OrderType::Limit => "ADX_BREAKOUT_PORTFOLIO_TP",
+                    nautilus_model::enums::OrderType::StopMarket => "ADX_BREAKOUT_PORTFOLIO_SL",
+                    _ => bail!("native bracket changed the original leg type"),
+                };
+                ensure!(
+                    order
+                        .tags
+                        .as_ref()
+                        .is_some_and(|tags| tags.len() == 1 && tags[0].as_str() == expected),
+                    "original native bracket leg annotation changed"
+                );
+            }
+        }
         ensure!(
             (orders[0].client_order_id) == (evidence.contexts[0].client_order_id),
             "native managed fixture equality failed"

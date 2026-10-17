@@ -9,6 +9,7 @@ use anyhow::{Context, Result, ensure};
 use nautilus_common::actor::DataActor;
 use nautilus_core::UnixNanos;
 use nautilus_model::{enums::TimeInForce, identifiers::ClientOrderId, orders::Order};
+use ustr::Ustr;
 
 use super::{PluginOrderType, PluginStrategy, require_version, wire};
 use crate::strategy::{Strategy, StrategyNative};
@@ -71,6 +72,7 @@ fn decode_submit(input: &[u8]) -> Result<wire::SubmitRequest> {
             reduce_only,
             post_only,
             position_id: None,
+            tags: None,
         }
     } else {
         serde_json::from_slice(input)?
@@ -102,6 +104,19 @@ impl PluginStrategy {
             self.scope.order_types.contains(&kind),
             "native order capability was not admitted"
         );
+        if let Some(tags) = &request.tags {
+            let unique: std::collections::BTreeSet<_> = tags.iter().collect();
+            ensure!(
+                !tags.is_empty()
+                    && tags.len() <= 32
+                    && unique.len() == tags.len()
+                    && tags.iter().all(|tag| !tag.is_empty()
+                        && tag.len() <= 128
+                        && !tag.chars().any(char::is_control)
+                        && tag.as_str() != self.core.market_exit_tag.as_str()),
+                "native algorithm tags are invalid, duplicated, oversized or framework-reserved"
+            );
+        }
         let limit = matches!(kind, PluginOrderType::Limit | PluginOrderType::StopLimit);
         let stop = matches!(
             kind,
@@ -154,6 +169,10 @@ impl PluginStrategy {
     ) -> Result<Vec<u8>> {
         let kind = self.validate_native_request(request)?;
         let expiry = request.expire_time_ns.map(UnixNanos::from);
+        let tags: Option<Vec<Ustr>> = request
+            .tags
+            .as_ref()
+            .map(|tags| tags.iter().map(|tag| Ustr::from(tag.as_str())).collect());
         let order = match kind {
             PluginOrderType::Market => self.order_factory().try_market(
                 request.instrument_id,
@@ -164,7 +183,7 @@ impl PluginStrategy {
                 Some(false),
                 None,
                 None,
-                None,
+                tags,
                 client_order_id,
             )?,
             PluginOrderType::Limit => self.order_factory().try_limit(
@@ -182,7 +201,7 @@ impl PluginStrategy {
                 None,
                 None,
                 None,
-                None,
+                tags,
                 client_order_id,
             )?,
             PluginOrderType::StopMarket => self.order_factory().try_stop_market(
@@ -202,7 +221,7 @@ impl PluginStrategy {
                 None,
                 None,
                 None,
-                None,
+                tags,
                 client_order_id,
             )?,
             PluginOrderType::StopLimit => self.order_factory().try_stop_limit(
@@ -224,7 +243,7 @@ impl PluginStrategy {
                 None,
                 None,
                 None,
-                None,
+                tags,
                 client_order_id,
             )?,
         };
@@ -258,6 +277,13 @@ mod tests {
         let request = decode_submit(legacy).unwrap();
         assert_eq!(request.schema_version, 2);
         assert_eq!(request.time_in_force, TimeInForce::Gtc);
+        assert!(request.tags.is_none());
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("tags")
+                .is_none()
+        );
         assert!(
             request.price.is_none()
                 && request.trigger_price.is_none()

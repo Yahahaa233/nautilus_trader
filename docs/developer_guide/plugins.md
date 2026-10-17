@@ -100,13 +100,32 @@ receive `ReadOnlyHost`; native dispatch also refuses mutating requests during st
 
 `nautilus_trading::plugin::PluginStrategy` uses one real `StrategyCore`, native component state,
 cache, clock, order factory and submission interception. It adds no runner, venue client, order
-manager or ledger. Supported encoded host operations currently cover clock/timer facts, declared
-bar subscriptions, bounded one-shot timers, market/limit construction and submission, and
-strategy/account/instrument-scoped cached order query/modify/cancel. Unsupported operations return
-an error, including history/portfolio/instrument operations not yet implemented by this bridge.
-An application's capability admission must reject declarations that require those missing paths.
+manager or ledger. Encoded host operations cover clock/timer facts, declared bars/quotes/trades,
+bounded cached warmup and historical-bar requests, native market/limit/stop construction, scoped
+cached facts and order query/modify/cancel, and managed single/batch/bracket submission through the
+application's installed policy. Unsupported operations return an error. Capability admission must
+match the paths, limits and policy actually installed by the application.
 Encoded request types live in `nautilus_plugin::strategy::wire` and are re-exported by the native
 adapter. An algorithm therefore needs no dependency on `StrategyCore` to use the shared protocol.
+
+Ordinary order operations require the original cache's exact client binding in addition to native
+strategy, trader, account and instrument ownership. New requests may supply bounded unique
+algorithm tags; they cannot supply the native `MARKET_EXIT` tag. Bracket entry/take-profit/stop-loss
+tags remain attached to their actual native legs, including the native factory's defaults when
+none are supplied.
+
+Managed original-order observations distinguish a pending economic amendment from an actual
+native liquidation reduction verified by the installed application owner. A smaller cached
+position, an algorithm tag or a rejection string is not a liquidation proof. The bridge only
+encodes the owner's scoped observation; it cannot create or alter the native proof.
+
+`ManagedMarketExit` accepts only its schema version. A Running component with an installed managed
+policy and reduce-only native exit configuration may request the existing native market-exit
+framework. The immutable host scope restricts its original order cancellation, position closing
+and timer retries to the admitted account, client and instruments. It creates no guest-supplied
+scope, second timer, entry allocation or execution permission; original native submission
+interception and transport controls still apply. A repeated request does not restart the loop,
+and an initialized local close remains pending rather than being duplicated by the next check.
 
 Native market, historical-bar, order, position and timer callbacks enter the encoded Event hook.
 A reported event failure or contained panic faults that actual actor, retains the first guest error,

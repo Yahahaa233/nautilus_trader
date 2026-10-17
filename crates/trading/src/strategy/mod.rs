@@ -18,6 +18,7 @@ pub mod api;
 pub mod binding;
 pub mod config;
 pub mod core;
+pub(crate) mod execution_scope;
 
 #[cfg(feature = "live")]
 pub use core::NativeStrategyFrameworkCheckpoint;
@@ -183,6 +184,7 @@ fn native_market_exit_framework<S: Strategy + StrategyNative + ?Sized>(
 ) -> anyhow::Result<()> {
     let core = StrategyNative::strategy_core_mut(strategy);
     let strategy_id = registered_strategy_id(core)?;
+    let execution_scope = core.execution_scope.clone();
 
     if state != ComponentState::Running {
         log::warn!("{strategy_id} Cannot market exit: strategy is not running");
@@ -193,6 +195,8 @@ fn native_market_exit_framework<S: Strategy + StrategyNative + ?Sized>(
         log::warn!("{strategy_id} Market exit called when already in progress");
         return Ok(());
     }
+
+    let trader_id = registered_trader_id(core)?;
 
     core.is_exiting = true;
     core.market_exit_attempts = 0;
@@ -209,7 +213,11 @@ fn native_market_exit_framework<S: Strategy + StrategyNative + ?Sized>(
     let mut instruments: AHashSet<InstrumentId> = AHashSet::new();
 
     for client_order_id in cache.iter_client_order_ids_open(None, None, Some(&strategy_id), None) {
-        if let Some(order) = cache.order(&client_order_id) {
+        if let Some(order) = cache.order(&client_order_id)
+            && execution_scope
+                .as_ref()
+                .is_none_or(|scope| scope.owns_order(&cache, order.as_ref(), trader_id))
+        {
             instruments.insert(order.instrument_id());
         }
     }
@@ -217,14 +225,31 @@ fn native_market_exit_framework<S: Strategy + StrategyNative + ?Sized>(
     for client_order_id in
         cache.iter_client_order_ids_inflight(None, None, Some(&strategy_id), None)
     {
-        if let Some(order) = cache.order(&client_order_id) {
+        if let Some(order) = cache.order(&client_order_id)
+            && execution_scope
+                .as_ref()
+                .is_none_or(|scope| scope.owns_order(&cache, order.as_ref(), trader_id))
+        {
             instruments.insert(order.instrument_id());
         }
     }
 
     for position_id in cache.iter_position_open_ids(None, None, Some(&strategy_id), None) {
-        if let Some(position) = cache.position(&position_id) {
+        if let Some(position) = cache.position(&position_id)
+            && execution_scope
+                .as_ref()
+                .is_none_or(|scope| scope.owns_position(position.as_ref(), trader_id))
+        {
             instruments.insert(position.instrument_id);
+        }
+    }
+    // Host-scoped strategies also retain local commands queued earlier in the
+    // same callback. They are canceled by the original native cascade below.
+    if let Some(scope) = &execution_scope {
+        for order in cache.orders_active_local(None, None, Some(&strategy_id), None, None) {
+            if scope.owns_order(&cache, order.as_ref(), trader_id) {
+                instruments.insert(order.instrument_id());
+            }
         }
     }
 
@@ -524,6 +549,8 @@ fn native_check_market_exit_framework<S: Strategy + StrategyNative + Component +
         log::error!("Cannot check market exit: strategy_id is not set");
         return Ok(());
     };
+    let trader_id = registered_trader_id(core)?;
+    let execution_scope = core.execution_scope.clone();
 
     core.market_exit_attempts += 1;
     let attempts = core.market_exit_attempts;
@@ -533,11 +560,33 @@ fn native_check_market_exit_framework<S: Strategy + StrategyNative + Component +
 
     if attempts >= max_attempts {
         let cache = core.cache_ref();
-        let open_orders_count = cache.orders_open_count(None, None, Some(&strategy_id), None, None);
-        let inflight_orders_count =
-            cache.orders_inflight_count(None, None, Some(&strategy_id), None, None);
-        let open_positions_count =
-            cache.positions_open_count(None, None, Some(&strategy_id), None, None);
+        let open_orders_count = cache
+            .orders_open(None, None, Some(&strategy_id), None, None)
+            .iter()
+            .filter(|order| {
+                execution_scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.owns_order(&cache, order.as_ref(), trader_id))
+            })
+            .count();
+        let inflight_orders_count = cache
+            .orders_inflight(None, None, Some(&strategy_id), None, None)
+            .iter()
+            .filter(|order| {
+                execution_scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.owns_order(&cache, order.as_ref(), trader_id))
+            })
+            .count();
+        let open_positions_count = cache
+            .positions_open(None, None, Some(&strategy_id), None, None)
+            .iter()
+            .filter(|position| {
+                execution_scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.owns_position(position.as_ref(), trader_id))
+            })
+            .count();
 
         drop(cache);
 
@@ -555,20 +604,41 @@ fn native_check_market_exit_framework<S: Strategy + StrategyNative + Component +
     }
 
     let cache = core.cache_ref();
-    let has_open_orders = !cache
+    let has_open_orders = cache
         .orders_open(None, None, Some(&strategy_id), None, None)
-        .is_empty();
-    let has_inflight_orders = !cache
+        .iter()
+        .any(|order| {
+            execution_scope
+                .as_ref()
+                .is_none_or(|scope| scope.owns_order(&cache, order.as_ref(), trader_id))
+        });
+    let has_inflight_orders = cache
         .orders_inflight(None, None, Some(&strategy_id), None, None)
-        .is_empty();
+        .iter()
+        .any(|order| {
+            execution_scope
+                .as_ref()
+                .is_none_or(|scope| scope.owns_order(&cache, order.as_ref(), trader_id))
+        });
+    let has_local_orders = execution_scope.as_ref().is_some_and(|scope| {
+        cache
+            .orders_active_local(None, None, Some(&strategy_id), None, None)
+            .iter()
+            .any(|order| scope.owns_order(&cache, order.as_ref(), trader_id))
+    });
 
-    if has_open_orders || has_inflight_orders {
+    if has_open_orders || has_inflight_orders || has_local_orders {
         return Ok(());
     }
 
     let positions_data: Vec<_> = cache
         .positions_open(None, None, Some(&strategy_id), None, None)
         .iter()
+        .filter(|position| {
+            execution_scope
+                .as_ref()
+                .is_none_or(|scope| scope.owns_position(position.as_ref(), trader_id))
+        })
         .map(|p| (p.id, p.instrument_id, p.side, p.quantity, p.is_closed()))
         .collect();
 
@@ -601,7 +671,12 @@ fn native_check_market_exit_framework<S: Strategy + StrategyNative + Component +
                 None,
             );
 
-            if let Err(e) = strategy.submit_order(order, Some(pos_id), None, None) {
+            if let Err(e) = strategy.submit_order(
+                order,
+                Some(pos_id),
+                execution_scope.as_ref().map(|scope| scope.client_id),
+                None,
+            ) {
                 log::error!("Error re-submitting close order for position {pos_id}: {e}");
             }
         }
@@ -1669,6 +1744,16 @@ pub trait Strategy: DataActor {
 
         let trader_id = registered_trader_id(core)?;
         let strategy_id = registered_strategy_id(core)?;
+        let execution_scope = core.execution_scope.clone();
+        let client_id = if let Some(scope) = &execution_scope {
+            anyhow::ensure!(
+                strategy_only,
+                "host-scoped strategy cannot cancel account-wide orders"
+            );
+            Some(scope.client_for(instrument_id, client_id)?)
+        } else {
+            client_id
+        };
         let ts_init = core.clock_mut().timestamp_ns();
 
         if !strategy_only {
@@ -1765,6 +1850,11 @@ pub trait Strategy: DataActor {
         }
 
         let matches_client = |client_order_id: &ClientOrderId| {
+            if let Some(scope) = &execution_scope {
+                return cache
+                    .order(client_order_id)
+                    .is_some_and(|order| scope.owns_order(&cache, order.as_ref(), trader_id));
+            }
             client_id.is_none_or(|client_id| {
                 cache
                     .client_id(client_order_id)
@@ -1919,13 +2009,20 @@ pub trait Strategy: DataActor {
     {
         let core = StrategyNative::strategy_core_mut(self);
         let strategy_id = registered_strategy_id(core)?;
+        let trader_id = registered_trader_id(core)?;
+        let execution_scope = core.execution_scope.clone();
+        let client_id = if let Some(scope) = &execution_scope {
+            Some(scope.client_for(instrument_id, client_id)?)
+        } else {
+            client_id
+        };
         let cache = core.cache_ref();
 
         let positions_open = cache.positions_open(
             None,
             Some(&instrument_id),
             Some(&strategy_id),
-            None,
+            execution_scope.as_ref().map(|scope| &scope.account_id),
             position_side,
         );
 
@@ -1944,6 +2041,11 @@ pub trait Strategy: DataActor {
 
         let positions_data: Vec<_> = positions_open
             .iter()
+            .filter(|position| {
+                execution_scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.owns_position(position.as_ref(), trader_id))
+            })
             .map(|p| (p.id, p.instrument_id, p.side, p.quantity, p.is_closed()))
             .collect();
         drop(positions_open);

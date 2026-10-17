@@ -115,6 +115,7 @@ mod supported {
                 reduce_only: false,
                 post_only: false,
                 position_id: None,
+                tags: None,
             };
             if self.case == "bracket" {
                 use nautilus_trading::plugin::wire::NativeOrderType;

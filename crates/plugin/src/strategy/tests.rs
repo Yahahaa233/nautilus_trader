@@ -48,6 +48,16 @@ fn original_order_observation_has_an_additive_tag_and_a_typed_read_only_facade()
     );
 }
 
+#[test]
+fn managed_market_exit_has_one_additive_native_operation_tag() {
+    assert_eq!(HostOperation::ManagedMarketExit.tag(), 18);
+    assert_eq!(
+        HostOperation::from_tag(18),
+        Some(HostOperation::ManagedMarketExit)
+    );
+    assert_eq!(HostOperation::ManagedOrderFacts.tag(), 17);
+}
+
 fn limits() -> instance::CallbackLimits {
     instance::CallbackLimits {
         configuration_bytes: 128,
