@@ -279,16 +279,12 @@ pub fn actor_count() -> usize {
     with_actor_registry(ActorRegistry::len)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Registration {
     actor: Rc<UnsafeCell<dyn Actor>>,
     identity: Rc<()>,
 }
 
-#[allow(
-    dead_code,
-    reason = "registration-bound admission remains inactive until runtime integration"
-)]
 pub(super) fn reserve_actor<T: Actor, E: 'static>(
     id: Ustr,
     heap_bytes: usize,
@@ -305,20 +301,12 @@ pub(super) fn reserve_actor<T: Actor, E: 'static>(
     })
 }
 
-#[allow(
-    dead_code,
-    reason = "registration-bound admission remains inactive until runtime integration"
-)]
 pub(super) struct ActorAdmission<T: Actor, E> {
     id: Ustr,
     registration: Registration,
     admission: super::dispatch::Admission<ActorDelivery<T, E>>,
 }
 
-#[allow(
-    dead_code,
-    reason = "registration-bound admission remains inactive until runtime integration"
-)]
 impl<T: Actor, E: 'static> ActorAdmission<T, E> {
     pub(super) fn commit(self, event: E, handler: fn(&mut T, &E)) {
         self.admission.commit(
@@ -330,6 +318,66 @@ impl<T: Actor, E: 'static> ActorAdmission<T, E> {
             },
             ActorDelivery::run,
         );
+    }
+}
+
+/// Fixed original registration of a native event subscriber. A retained old
+/// subscriber cannot enqueue an event on a replacement actor using the same ID.
+#[derive(Debug)]
+pub struct ActorEventBinding<T: Actor> {
+    id: Ustr,
+    registration: Registration,
+    marker: PhantomData<T>,
+}
+
+impl<T: Actor> Clone for ActorEventBinding<T> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            registration: self.registration.clone(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Actor> ActorEventBinding<T> {
+    /// Captures an already registered native owner without entering the actor.
+    #[must_use]
+    pub fn bind(id: Ustr) -> Option<Self> {
+        let registration = ACTOR_REGISTRY
+            .try_with(|registry| registry.actors.borrow().get(&id).cloned())
+            .ok()
+            .flatten()?;
+        Some(Self {
+            id,
+            registration,
+            marker: PhantomData,
+        })
+    }
+
+    /// Reserves native count/storage/order before making an owned capture.
+    /// The runtime owns draining. Retired subscribers capture nothing, and
+    /// delivery independently rechecks the same original registration.
+    pub fn enqueue<E: 'static>(
+        &self,
+        heap_bytes: usize,
+        capture: impl FnOnce() -> E,
+        handler: fn(&mut T, &E),
+    ) {
+        let current =
+            ACTOR_REGISTRY
+                .try_with(|registry| {
+                    registry.actors.borrow().get(&self.id).is_some_and(|entry| {
+                        Rc::ptr_eq(&entry.identity, &self.registration.identity)
+                    })
+                })
+                .unwrap_or(false);
+        if !current {
+            return;
+        }
+        if let Some(admission) = reserve_actor::<T, E>(self.id, heap_bytes) {
+            admission.commit(capture(), handler);
+        }
     }
 }
 
@@ -398,6 +446,43 @@ mod tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
+    }
+
+    #[rstest]
+    fn retained_old_subscriber_cannot_capture_for_replacement_registration() {
+        super::super::dispatch::clear().unwrap();
+        clear_actor_registry();
+        let id = Ustr::from("replaced-subscriber");
+        register_actor(TestActor { id, value: 11 });
+        let original = ActorEventBinding::<TestActor>::bind(id).unwrap();
+        let captured = std::cell::Cell::new(0);
+        register_actor(TestActor { id, value: 42 });
+        original.enqueue(
+            0,
+            || {
+                captured.set(captured.get() + 1);
+                7
+            },
+            |actor, value| actor.value += value,
+        );
+        assert_eq!(captured.get(), 0);
+        assert!(!super::super::dispatch::has_pending());
+        let current = ActorEventBinding::<TestActor>::bind(id).unwrap();
+        current.enqueue(
+            0,
+            || {
+                captured.set(captured.get() + 1);
+                7
+            },
+            |actor, value| actor.value += value,
+        );
+        assert_eq!(captured.get(), 1);
+        assert_eq!(crate::actor::drain_callbacks(1), Ok(false));
+        assert_eq!(get_actor_unchecked::<TestActor>(&id).value, 49);
+        clear_actor_registry();
+        drop(original);
+        drop(current);
+        super::super::dispatch::clear().unwrap();
     }
 
     #[rstest]

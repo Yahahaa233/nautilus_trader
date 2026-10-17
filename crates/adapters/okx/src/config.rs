@@ -514,7 +514,7 @@ load_spreads = true
 
         assert_eq!(config.region, OKXRegion::Global);
         assert_eq!(config.http_base_url(), "https://www.okx.com");
-        assert_eq!(config.ws_public_url(), "wss://ws.okx.com:8443/ws/v5/public");
+        assert_eq!(config.ws_public_url(), "wss://ws.okx.com/ws/v5/public");
     }
 
     #[rstest]
@@ -524,13 +524,10 @@ load_spreads = true
             .build();
 
         assert_eq!(config.http_base_url(), "https://eea.okx.com");
-        assert_eq!(
-            config.ws_public_url(),
-            "wss://wseea.okx.com:8443/ws/v5/public"
-        );
+        assert_eq!(config.ws_public_url(), "wss://wseea.okx.com/ws/v5/public");
         assert_eq!(
             config.ws_business_url(),
-            "wss://wseea.okx.com:8443/ws/v5/business"
+            "wss://wseea.okx.com/ws/v5/business"
         );
     }
 
@@ -541,13 +538,10 @@ load_spreads = true
             .build();
 
         assert_eq!(config.http_base_url(), "https://eea.okx.com");
-        assert_eq!(
-            config.ws_private_url(),
-            "wss://wseea.okx.com:8443/ws/v5/private"
-        );
+        assert_eq!(config.ws_private_url(), "wss://wseea.okx.com/ws/v5/private");
         assert_eq!(
             config.ws_business_url(),
-            "wss://wseea.okx.com:8443/ws/v5/business"
+            "wss://wseea.okx.com/ws/v5/business"
         );
     }
 

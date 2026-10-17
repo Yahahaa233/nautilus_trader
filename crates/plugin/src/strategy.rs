@@ -122,6 +122,10 @@ pub enum HostOperation {
     Log,
     /// Application-approved quantity and native submit under one original ID.
     ManagedSubmit,
+    /// Bounded existing native cache data only; never starts a network request.
+    CachedBars,
+    /// One application-owned allocation frame and native submission sequence.
+    ManagedSubmitBatch,
 }
 
 impl HostOperation {
@@ -143,6 +147,8 @@ impl HostOperation {
             Self::Query => 12,
             Self::Log => 13,
             Self::ManagedSubmit => 14,
+            Self::CachedBars => 15,
+            Self::ManagedSubmitBatch => 16,
         }
     }
 
@@ -164,6 +170,8 @@ impl HostOperation {
             12 => Some(Self::Query),
             13 => Some(Self::Log),
             14 => Some(Self::ManagedSubmit),
+            15 => Some(Self::CachedBars),
+            16 => Some(Self::ManagedSubmitBatch),
             _ => None,
         }
     }
@@ -330,6 +338,7 @@ pub enum ReadOperation {
     Instrument,
     Portfolio,
     Order,
+    CachedBars,
 }
 
 /// Read-only callback capability used by Save/Restore. Safe algorithm code
@@ -368,6 +377,7 @@ impl ReadOnlyHost<'_> {
             ReadOperation::Instrument => HostOperation::Instrument,
             ReadOperation::Portfolio => HostOperation::Portfolio,
             ReadOperation::Order => HostOperation::Query,
+            ReadOperation::CachedBars => HostOperation::CachedBars,
         };
         self.host.call(operation, payload)
     }

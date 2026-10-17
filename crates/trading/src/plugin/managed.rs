@@ -6,8 +6,12 @@
 //! An atomic bridge to the application's existing allocation/submission owner.
 //! It adds no allocator, account, runner, order state machine or economic ledger.
 
+mod batch;
+#[cfg(test)]
+mod tests;
+
 use super::{PluginStrategy, wire};
-use crate::strategy::StrategyNative;
+use crate::strategy::{Strategy, StrategyNative};
 use anyhow::{Context, Result, ensure};
 use nautilus_common::actor::DataActor;
 use nautilus_model::{
@@ -24,6 +28,8 @@ pub struct ManagedPolicyIdentity {
     pub policy_id: String,
     pub schema_version: u32,
     pub configuration_sha256: String,
+    /// Zero disables batches; otherwise the immutable frame bound is 1..=64.
+    pub max_batch_size: u16,
 }
 impl ManagedPolicyIdentity {
     fn validate(&self) -> Result<()> {
@@ -45,6 +51,10 @@ impl ManagedPolicyIdentity {
                     .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value)),
             "invalid native managed policy configuration identity"
         );
+        ensure!(
+            self.max_batch_size <= 64,
+            "native managed batch bound exceeds 64"
+        );
         Ok(())
     }
 }
@@ -63,7 +73,8 @@ pub struct ManagedSubmissionContext {
     pub timestamp_ns: u64,
 }
 
-/// Native admission only. Accepted does not mean a venue accepted or filled it.
+/// Native cache recording only; a recorded order can already be locally Denied.
+/// Accepted never proves transmission, venue acceptance or a fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedSubmissionStatus {
@@ -79,6 +90,28 @@ pub struct ManagedSubmissionOutcome {
     pub status: ManagedSubmissionStatus,
     pub cache_contains_order: bool,
     pub error: Option<String>,
+    /// Exact native identities made by this operation, including linked children.
+    pub factory_order_ids: Vec<ClientOrderId>,
+    /// Actual current cache evidence; absence alone is never a venue conclusion.
+    pub cached_order_ids: Vec<ClientOrderId>,
+}
+
+/// Host-approved order shape. The guest never supplies this native plan.
+#[derive(Clone, Debug)]
+pub enum ManagedOrderPlan {
+    Single(wire::SubmitRequest),
+    Bracket(Box<ManagedBracketRequest>),
+    Refused { reason: String },
+}
+
+/// Full-quantity native OTO entry with linked OUO/OCO exits. Prices, quantity,
+/// trigger types, routing and resource admission stay explicit. No extra OMS.
+#[derive(Clone, Debug)]
+pub struct ManagedBracketRequest {
+    pub entry: wire::SubmitRequest,
+    pub take_profit: wire::SubmitRequest,
+    pub stop_loss: wire::SubmitRequest,
+    pub contingency: nautilus_model::enums::ContingencyType,
 }
 
 /// Installed by the application before registration, never supplied by a guest.
@@ -93,7 +126,7 @@ pub trait ManagedSubmissionPolicy: Debug {
         &self,
         context: &ManagedSubmissionContext,
         original_request: &[u8],
-    ) -> Result<wire::SubmitRequest>;
+    ) -> Result<ManagedOrderPlan>;
     /// Persists the original outcome. Unknown/cached requests keep their existing
     /// economic occupancy. Only proven unsubmitted reservations may be retired.
     /// # Errors
@@ -102,7 +135,31 @@ pub trait ManagedSubmissionPolicy: Debug {
         &self,
         context: &ManagedSubmissionContext,
         outcome: &ManagedSubmissionOutcome,
+        original_request: &[u8],
     ) -> Result<()>;
+    /// Allocates the complete portfolio frame once using these original native
+    /// identities. Implementations must preserve their shared ledger on unwind.
+    /// # Errors
+    /// Refuses unsupported batches or unavailable business facts.
+    fn prepare_batch(
+        &self,
+        _contexts: &[ManagedSubmissionContext],
+        _original_request: &[u8],
+    ) -> Result<Vec<ManagedOrderPlan>> {
+        anyhow::bail!("native managed policy does not implement batch preparation")
+    }
+    /// Persists the entire original outcome frame under the same economic owner.
+    /// Called once even when preparation or any native submission panics.
+    /// # Errors
+    /// Refuses non-durable or ambiguous financial transitions.
+    fn finish_batch(
+        &self,
+        _contexts: &[ManagedSubmissionContext],
+        _outcomes: &[ManagedSubmissionOutcome],
+        _original_request: &[u8],
+    ) -> Result<()> {
+        anyhow::bail!("native managed policy does not implement batch finalization")
+    }
 }
 
 #[derive(Debug)]
@@ -166,6 +223,133 @@ impl PluginStrategy {
         catch_managed_panic(|| self.managed_submit_inner(input))
             .map_err(|message| fatal(nautilus_plugin::PluginErrorCode::Panic, message))?
     }
+    fn submit_managed_plan(
+        &mut self,
+        context: &ManagedSubmissionContext,
+        plan: &ManagedOrderPlan,
+        factory_ids: &mut Vec<ClientOrderId>,
+    ) -> Result<()> {
+        let entry = match plan {
+            ManagedOrderPlan::Single(entry) => entry,
+            ManagedOrderPlan::Bracket(bracket) => &bracket.entry,
+            ManagedOrderPlan::Refused { .. } => {
+                anyhow::bail!("refused managed plan has no native order")
+            }
+        };
+        ensure!(
+            entry.schema_version == 2
+                && entry.instrument_id == context.instrument_id
+                && entry.side == context.side,
+            "native managed policy returned another order scope"
+        );
+        match plan {
+            ManagedOrderPlan::Single(entry) => {
+                self.submit_native_request(entry, Some(context.client_order_id))?;
+            }
+            ManagedOrderPlan::Bracket(bracket) => {
+                use nautilus_model::{
+                    enums::{ContingencyType, OrderType, TriggerType},
+                    orders::Order,
+                };
+                self.validate_native_request(entry)?;
+                ensure!(
+                    self.core.config.manage_order_lists_locally,
+                    "managed brackets require the installed native local order-list manager"
+                );
+                ensure!(
+                    !entry.reduce_only && entry.position_id.is_none(),
+                    "managed bracket parent must be an independent risk entry"
+                );
+                let opposite = if entry.side == OrderSide::Buy {
+                    OrderSide::Sell
+                } else {
+                    OrderSide::Buy
+                };
+                for child in [&bracket.take_profit, &bracket.stop_loss] {
+                    self.validate_native_request(child)?;
+                    ensure!(
+                        child.schema_version == 2
+                            && child.instrument_id == entry.instrument_id
+                            && child.side == opposite
+                            && child.quantity == entry.quantity
+                            && child.reduce_only
+                            && child.position_id.is_none()
+                            && child.expire_time_ns.is_none(),
+                        "managed native bracket child scope or full-quantity protection differs"
+                    );
+                }
+                ensure!(
+                    bracket.take_profit.order_type == wire::NativeOrderType::Limit
+                        && bracket.stop_loss.order_type == wire::NativeOrderType::StopMarket
+                        && matches!(
+                            bracket.contingency,
+                            ContingencyType::Ouo | ContingencyType::Oco
+                        ),
+                    "unsupported managed native bracket shape"
+                );
+                let entry_type = match entry.order_type {
+                    wire::NativeOrderType::Market => OrderType::Market,
+                    wire::NativeOrderType::Limit => OrderType::Limit,
+                    wire::NativeOrderType::StopMarket => OrderType::StopMarket,
+                    wire::NativeOrderType::StopLimit => OrderType::StopLimit,
+                };
+                let orders = self
+                    .order_factory()
+                    .try_bracket()
+                    .instrument_id(entry.instrument_id)
+                    .order_side(entry.side)
+                    .quantity(entry.quantity)
+                    .entry_order_type(entry_type)
+                    .maybe_entry_price(entry.price)
+                    .maybe_entry_trigger_price(entry.trigger_price)
+                    .entry_trigger_type(entry.trigger_type.unwrap_or(TriggerType::Default))
+                    .maybe_expire_time(entry.expire_time_ns.map(nautilus_core::UnixNanos::from))
+                    .time_in_force(entry.time_in_force)
+                    .entry_post_only(entry.post_only)
+                    .entry_client_order_id(context.client_order_id)
+                    .tp_order_type(OrderType::Limit)
+                    .maybe_tp_price(bracket.take_profit.price)
+                    .tp_time_in_force(bracket.take_profit.time_in_force)
+                    .tp_post_only(bracket.take_profit.post_only)
+                    .sl_order_type(OrderType::StopMarket)
+                    .maybe_sl_trigger_price(bracket.stop_loss.trigger_price)
+                    .sl_trigger_type(
+                        bracket
+                            .stop_loss
+                            .trigger_type
+                            .context("managed stop trigger type absent")?,
+                    )
+                    .sl_time_in_force(bracket.stop_loss.time_in_force)
+                    .contingency_type(bracket.contingency)
+                    .call()?;
+                ensure!(
+                    orders.len() == 3 && orders[0].client_order_id() == context.client_order_id,
+                    "native bracket changed its original parent or leg inventory"
+                );
+                for order in &orders {
+                    let id = order.client_order_id();
+                    if id != context.client_order_id {
+                        factory_ids.push(id);
+                    }
+                }
+                ensure!(
+                    factory_ids
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        == 3,
+                    "native bracket generated duplicate identities"
+                );
+                self.submit_order_list(orders, None, Some(self.scope.client_id), None)?;
+            }
+            ManagedOrderPlan::Refused { .. } => {
+                anyhow::bail!("refused managed plan has no native construction")
+            }
+        }
+        Ok(())
+    }
+
     fn managed_submit_inner(&mut self, input: &[u8]) -> Result<Vec<u8>> {
         ensure!(
             input.len() <= 1_048_576,
@@ -213,87 +397,142 @@ impl PluginStrategy {
             timestamp_ns,
         };
         let mut prepared = false;
+        let mut factory_order_ids = vec![client_order_id];
         let attempt = catch_managed_panic(|| -> Result<()> {
-            // Pass original bytes: the application validates its own strict typed
-            // schema rather than trusting a JSON Value with duplicate members.
-            let order = policy.prepare(&context, input)?;
-            prepared = true;
-            ensure!(
-                order.schema_version == 2
-                    && order.instrument_id == context.instrument_id
-                    && order.side == context.side,
-                "native managed policy returned another order scope"
-            );
-            self.submit_native_request(&order, Some(client_order_id))?;
-            Ok(())
-        });
-        let cached = self.cache().order_exists(&client_order_id);
-        // A panic may have happened after the shared owner reserved funds or
-        // native work began. It is unknown even when no cache order is present.
-        // Give the same owner its actual ID/context before latching the panic.
-        let (attempt, original_panic) = match attempt {
-            Ok(attempt) => (attempt, None),
-            Err(message) => (Err(anyhow::anyhow!(message.clone())), Some(message)),
-        };
-        let status = match (prepared, attempt.is_ok(), cached, original_panic.is_some()) {
-            (_, true, true, false) => ManagedSubmissionStatus::NativeAccepted,
-            (_, _, _, true) | (_, _, true, false) => ManagedSubmissionStatus::NativeUnknown,
-            (false, false, false, false) => ManagedSubmissionStatus::PreparationRefused,
-            (_, false, false, false) => ManagedSubmissionStatus::NativeRejected,
-            (_, true, false, false) => {
-                return Err(fatal(
-                    nautilus_plugin::PluginErrorCode::SerializationFailed,
-                    format!(
-                        "native managed submission succeeded without its original cache identity: {client_order_id}"
-                    ),
-                ));
+            let plan = policy.prepare(&context, input)?;
+            if let ManagedOrderPlan::Refused { reason } = &plan {
+                ensure!(
+                    !reason.is_empty() && reason.len() <= 4096,
+                    "invalid managed refusal"
+                );
+                anyhow::bail!("{reason}");
             }
+            prepared = true;
+            self.submit_managed_plan(&context, &plan, &mut factory_order_ids)
+        });
+        let cached_order_ids: Vec<_> = factory_order_ids
+            .iter()
+            .copied()
+            .filter(|id| self.cache().order_exists(id))
+            .collect();
+        let (outcome, original_failure) = classify_managed_attempt(
+            &context,
+            prepared,
+            factory_order_ids,
+            cached_order_ids,
+            self.callback_failure(),
+            attempt,
+        );
+        finish_managed_single(&context, policy.as_ref(), input, &outcome, original_failure)
+    }
+}
+
+fn classify_managed_attempt(
+    context: &ManagedSubmissionContext,
+    prepared: bool,
+    factory_order_ids: Vec<ClientOrderId>,
+    cached_order_ids: Vec<ClientOrderId>,
+    retained_failure: Option<(nautilus_plugin::PluginErrorCode, String)>,
+    attempt: std::result::Result<Result<()>, String>,
+) -> (
+    ManagedSubmissionOutcome,
+    Option<(nautilus_plugin::PluginErrorCode, String)>,
+) {
+    let client_order_id = context.client_order_id;
+    let cached = cached_order_ids.contains(&client_order_id);
+    let (attempt, mut original_failure) = match attempt {
+        Ok(attempt) => (attempt, retained_failure),
+        Err(message) => (
+            Err(anyhow::anyhow!(message.clone())),
+            retained_failure.or(Some((nautilus_plugin::PluginErrorCode::Panic, message))),
+        ),
+    };
+    let complete_cache = cached && cached_order_ids.len() == factory_order_ids.len();
+    if attempt.is_ok() && !complete_cache && original_failure.is_none() {
+        original_failure = Some((
+            nautilus_plugin::PluginErrorCode::SerializationFailed,
+            format!(
+                "native managed submission succeeded without its complete original cache identities: original={factory_order_ids:?}, cached={cached_order_ids:?}"
+            ),
+        ));
+    }
+    if attempt.is_err() && !cached_order_ids.is_empty() && original_failure.is_none() {
+        original_failure = Some((
+            nautilus_plugin::PluginErrorCode::SerializationFailed,
+            format!(
+                "native managed failure after cache admission: original={factory_order_ids:?}, cached={cached_order_ids:?}"
+            ),
+        ));
+    }
+    let status = if original_failure.is_some() || (!cached_order_ids.is_empty() && attempt.is_err())
+    {
+        ManagedSubmissionStatus::NativeUnknown
+    } else if attempt.is_ok() && complete_cache {
+        ManagedSubmissionStatus::NativeAccepted
+    } else if prepared {
+        ManagedSubmissionStatus::NativeRejected
+    } else {
+        ManagedSubmissionStatus::PreparationRefused
+    };
+    let outcome = ManagedSubmissionOutcome {
+        status,
+        cache_contains_order: cached,
+        error: attempt.err().map(|error| format!("{error:#}")).or_else(|| {
+            original_failure
+                .as_ref()
+                .map(|(_, message)| message.clone())
+        }),
+        factory_order_ids,
+        cached_order_ids,
+    };
+    (outcome, original_failure)
+}
+
+fn finish_managed_single(
+    context: &ManagedSubmissionContext,
+    policy: &dyn ManagedSubmissionPolicy,
+    input: &[u8],
+    outcome: &ManagedSubmissionOutcome,
+    original_failure: Option<(nautilus_plugin::PluginErrorCode, String)>,
+) -> Result<Vec<u8>> {
+    let client_order_id = context.client_order_id;
+    // Never undo unknown work or invent a new key. The application owns this
+    // exact reservation and decides which transition is actually proven.
+    let finalization = catch_managed_panic(|| policy.finish(context, outcome, input));
+    if let Some((code, original)) = original_failure {
+        let finalization = match finalization {
+            Ok(Ok(())) => String::new(),
+            Ok(Err(error)) => format!("; original outcome finalization failed: {error:#}"),
+            Err(message) => format!("; original outcome finalization panicked: {message}"),
         };
-        let outcome = ManagedSubmissionOutcome {
-            status,
-            cache_contains_order: cached,
-            error: attempt.err().map(|error| format!("{error:#}")),
-        };
-        // Never undo unknown work or invent a new key. The application owns this
-        // exact reservation and decides which transition is actually proven.
-        let finalization = catch_managed_panic(|| policy.finish(&context, &outcome));
-        if let Some(original) = original_panic {
-            let finalization = match finalization {
-                Ok(Ok(())) => String::new(),
-                Ok(Err(error)) => format!("; original outcome finalization failed: {error:#}"),
-                Err(message) => format!("; original outcome finalization panicked: {message}"),
-            };
+        return Err(fatal(
+            code,
+            format!("{original}; original id={client_order_id}, outcome={outcome:?}{finalization}"),
+        ));
+    }
+    match finalization {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
             return Err(fatal(
-                nautilus_plugin::PluginErrorCode::Panic,
+                nautilus_plugin::PluginErrorCode::SerializationFailed,
                 format!(
-                    "{original}; original id={client_order_id}, outcome={outcome:?}{finalization}"
+                    "native managed outcome was not durably finalized: id={client_order_id}, original={outcome:?}; finalization: {error:#}"
                 ),
             ));
         }
-        match finalization {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                return Err(fatal(
-                    nautilus_plugin::PluginErrorCode::SerializationFailed,
-                    format!(
-                        "native managed outcome was not durably finalized: id={client_order_id}, original={outcome:?}; finalization: {error:#}"
-                    ),
-                ));
-            }
-            Err(message) => {
-                return Err(fatal(
-                    nautilus_plugin::PluginErrorCode::Panic,
-                    format!(
-                        "native managed outcome finalization panicked: id={client_order_id}, original={outcome:?}; {message}"
-                    ),
-                ));
-            }
+        Err(message) => {
+            return Err(fatal(
+                nautilus_plugin::PluginErrorCode::Panic,
+                format!(
+                    "native managed outcome finalization panicked: id={client_order_id}, original={outcome:?}; {message}"
+                ),
+            ));
         }
-        Ok(serde_json::to_vec(
-            &serde_json::json!({"schema_version":1,"client_order_id":client_order_id,
-            "native_outcome":outcome,"venue_acceptance_proven":false}),
-        )?)
     }
+    Ok(serde_json::to_vec(
+        &serde_json::json!({"schema_version":1,"client_order_id":client_order_id,
+        "native_outcome":outcome,"venue_acceptance_proven":false}),
+    )?)
 }
 
 fn catch_managed_panic<T>(

@@ -233,6 +233,18 @@ pub(super) fn drain_at_boundary(budget: usize) -> Result<DrainResult, DispatchEr
     }
 }
 
+// A durable native input owns all of its callbacks until its effects are
+// captured. Use the existing causal ceiling, without admitting another input
+// or leaving its ambient source scope installed across an async yield.
+pub(super) fn settle_native_input() -> Result<(), DispatchError> {
+    let result = drain_at_boundary(MAX_CHAIN)?;
+    if result.status == DrainStatus::BudgetExhausted {
+        record_failure(DispatchError::Runaway);
+        return Err(DispatchError::Runaway);
+    }
+    Ok(())
+}
+
 pub(super) fn drain(budget: usize) -> Result<DrainResult, DispatchError> {
     let status = DISPATCH
         .try_with(|state| {

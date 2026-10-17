@@ -202,6 +202,7 @@ mod supported {
                     order_types: BTreeSet::from([PluginOrderType::Market]),
                     max_timers: 1,
                     max_history_bars: 0,
+                    allow_history_requests: false,
                     quote_instruments: BTreeSet::new(),
                     trade_instruments: BTreeSet::new(),
                     state_schema_version: 1,

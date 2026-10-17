@@ -58,6 +58,7 @@ fn register(
     trader.actor_state_callbacks.insert(
         actor,
         ComponentStateCallbacks {
+            deferred_strategy_events: false,
             load,
             save: save_actor,
             #[cfg(feature = "live")]
@@ -83,6 +84,7 @@ fn register(
     trader.strategy_state_callbacks.insert(
         strategy,
         ComponentStateCallbacks {
+            deferred_strategy_events: false,
             load,
             save: save_strategy,
             #[cfg(feature = "live")]

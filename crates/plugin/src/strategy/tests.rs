@@ -755,3 +755,56 @@ fn ignored_native_panic_or_durability_failure_stops_subsequent_host_effects() {
         }
     }
 }
+
+#[test]
+fn native_failure_handle_records_during_guest_borrow_and_blocks_swallowed_host_effects() {
+    let api = Box::leak(Box::new(
+        StrategyApi::for_algorithm::<IgnoredNativeFailure>(),
+    ));
+    // SAFETY: generated table and producer storage remain live for the test.
+    let guest = unsafe {
+        instance::GuestInstance::create(
+            api,
+            IgnoredNativeFailure::DESCRIPTOR_JSON.as_bytes(),
+            b"counter-v1",
+            limits(),
+            Box::new(CounterStateValidator),
+        )
+    }
+    .unwrap();
+    let recorder = guest.native_failure_recorder();
+    let guest = std::cell::RefCell::new(guest);
+    let mut calls = 0;
+    let failure = guest
+        .borrow_mut()
+        .invoke(CallbackKind::Start, 1, b"", &mut |_, _: &[u8]| {
+            calls += 1;
+            assert!(guest.try_borrow_mut().is_err());
+            recorder
+                .retain(PluginErrorCode::SerializationFailed, "original reentry")
+                .unwrap();
+            recorder
+                .retain(PluginErrorCode::Generic, "secondary cleanup")
+                .unwrap();
+            assert_eq!(
+                recorder.first_failure(),
+                Some((PluginErrorCode::SerializationFailed, "original reentry"))
+            );
+            Ok(Vec::new())
+        })
+        .unwrap_err();
+    assert_eq!(calls, 1);
+    assert_eq!(failure.code, PluginErrorCode::SerializationFailed);
+    assert_eq!(failure.message_string(), "original reentry");
+    assert_eq!(guest.borrow().first_failure(), recorder.first_failure());
+    assert!(
+        guest
+            .borrow_mut()
+            .retain_checkpoint_failure(PluginErrorCode::Generic, "replacement")
+            .is_err()
+    );
+    assert_eq!(
+        recorder.first_failure(),
+        Some((PluginErrorCode::SerializationFailed, "original reentry"))
+    );
+}

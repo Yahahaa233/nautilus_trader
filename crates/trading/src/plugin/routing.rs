@@ -44,9 +44,8 @@ impl PluginStrategy {
 
     pub(super) fn retain_route_result(&mut self, result: Result<()>) -> Result<()> {
         if let Err(error) = &result {
-            self.guest
-                .try_borrow_mut()?
-                .retain_native_failure(PluginErrorCode::InvalidArgument, &format!("{error:#}"))
+            self.native_failure
+                .retain(PluginErrorCode::InvalidArgument, &format!("{error:#}"))
                 .map_err(|failure| {
                     anyhow::anyhow!(
                         "native callback refusal could not retain its first failure: {}",

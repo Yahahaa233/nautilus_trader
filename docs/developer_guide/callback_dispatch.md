@@ -4,10 +4,11 @@ This page defines the ownership, ordering, and progress requirements for queued 
 callbacks. The [design principles](design_principles.md#queued-callback-dispatch-requirements) explain
 the policy.
 
-:::info Queued delivery is not yet active
-These requirements are design constraints for queued actor and strategy callback delivery, not
-guarantees of the existing synchronous dispatch paths.
-Support for synchronous message-bus reentry does not activate queued actor or strategy callbacks.
+:::info Scoped encoded-strategy activation
+Encoded native strategy order and position subscriptions use the dispatcher below.
+Other canonical data, compiled and Python callback routes retain their existing synchronous paths.
+See [encoded native strategy events](#encoded-native-strategy-order-and-position-events) for the
+implemented scope and remaining ownership limits.
 :::
 
 Read this page by purpose:
@@ -24,7 +25,7 @@ For failure messages and corrective action, see [reentrancy and dispatch diagnos
 
 ## Worked callback sequence
 
-This example illustrates the queued contract; production canonical callbacks remain synchronous.
+This example illustrates the queued contract; activation is limited to the routes identified above.
 Assume event A has two eligible recipients, strategies S1 and S2, and event B has recipient S3.
 There is no unrelated pending work, and all required access is available at each drain boundary.
 
@@ -245,8 +246,8 @@ startup with a clear error before queued callbacks can be admitted; it must not 
 to synchronous delivery or leave callbacks undelivered. This restriction concerns standalone startup,
 not a stop request through the handle of a node running its event loop.
 
-Queued actor delivery and this rejection are not implemented. Enforcing the lifecycle restriction
-is an activation requirement; it does not change the existing standalone APIs.
+The encoded-strategy activation enforces this rejection before standalone startup. Other
+synchronous strategies keep the existing standalone APIs.
 
 #### Hosted-run cancellation and abandonment
 
@@ -758,3 +759,45 @@ boundary; callback dispatch does not implicitly transfer allocation ownership ac
 
 Admission tickets and cleanup scopes remain framework machinery; author fields, callback signatures,
 and canonical facade APIs do not expose them.
+
+
+## Encoded native strategy order and position events
+
+`PluginStrategy` opts into the existing registration-bound dispatcher for its
+Trader order and position subscriptions. The subscriber reserves existing
+storage/count/order capacity before cloning a payload and never looks up a
+mutable actor during publication. Ordinary compiled and Python strategies
+retain their previous callback paths. This is a scoped activation, not a claim
+that all legacy raw actor access is checked or that arbitrary native libraries
+are memory-safe.
+
+The arrival lifecycle view reads the same `DataActorCore` state cell without
+borrowing the actor. The view cannot transition a component. Cloning an entire
+core creates an independent state cell; cloning a view retains the original
+one. Each transition advances the same native lifecycle generation. Arrival snapshots
+retain the original physical allocation and generation, so stop/reset/start cannot
+reactivate old captures. Optional native route evidence records actual arrival
+state and generation validity; historical callbacks verify that original evidence.
+Startup and stopped events therefore cannot acquire author eligibility by
+waiting in a queue. Delivery still performs the native framework prelude before
+specific and aggregate author callbacks, and rechecks the current lifecycle.
+Historical delivery consumes the original reader-verified callback admission
+rather than using the fresh target's physical Ready state.
+
+The live loop's existing 64-slot passes remain in place for ordinary live
+execution. A node using durable native source capture must settle its descendants
+inside the same acknowledged input, after synchronous handler borrows end and
+before sampling native effects or completing its guard. That atomic settlement
+uses the existing 1,048,576 causal ceiling; it does not yield with an ambient
+capture scope across async work. Exhaustion is a retained fatal dispatch error,
+not a completed input or dropped tail. The existing durability/Guardian budgets
+still apply. Backtest startup/event settlement already owns these drains.
+Standalone `LiveNode::start` rejects registered queued strategies before startup;
+`run` and `run_with_mode` own the supported live lifecycle.
+
+The guest and native adapter share one immutable first-failure cell. An adapter
+can record a native failure while the guest allocation is borrowed. A producer
+cannot hide that failure by returning success or replace it with a later cleanup
+error. Managed submissions with a recorded native fault finalize Unknown on the
+original policy and original IDs before the fatal error returns. Cache admission
+alone remains distinct from healthy callback delivery and venue acceptance.

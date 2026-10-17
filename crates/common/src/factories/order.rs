@@ -1163,6 +1163,7 @@ impl OrderFactory {
         #[builder(default = OrderType::Market)] entry_order_type: OrderType,
         entry_price: Option<Price>,
         entry_trigger_price: Option<Price>,
+        #[builder(default = TriggerType::Default)] entry_trigger_type: TriggerType,
         expire_time: Option<nautilus_core::UnixNanos>,
         #[builder(default = TimeInForce::Gtc)] time_in_force: TimeInForce,
         #[builder(default = false)] entry_post_only: bool,
@@ -1209,6 +1210,7 @@ impl OrderFactory {
             .entry_order_type(entry_order_type)
             .maybe_entry_price(entry_price)
             .maybe_entry_trigger_price(entry_trigger_price)
+            .entry_trigger_type(entry_trigger_type)
             .maybe_expire_time(expire_time)
             .time_in_force(time_in_force)
             .entry_post_only(entry_post_only)
@@ -1247,7 +1249,7 @@ impl OrderFactory {
 
     #[expect(clippy::too_many_lines)]
     #[builder]
-    pub(crate) fn try_bracket(
+    pub fn try_bracket(
         &mut self,
         instrument_id: InstrumentId,
         order_side: OrderSide,
@@ -1260,6 +1262,7 @@ impl OrderFactory {
         #[builder(default = OrderType::Market)] entry_order_type: OrderType,
         entry_price: Option<Price>,
         entry_trigger_price: Option<Price>,
+        #[builder(default = TriggerType::Default)] entry_trigger_type: TriggerType,
         expire_time: Option<nautilus_core::UnixNanos>,
         #[builder(default = TimeInForce::Gtc)] time_in_force: TimeInForce,
         #[builder(default = false)] entry_post_only: bool,
@@ -1369,6 +1372,38 @@ impl OrderFactory {
                 crate::recovery_trace::native_event_uuid(),
                 ts_init,
             )?),
+            OrderType::StopMarket => {
+                OrderAny::StopMarket(StopMarketOrder::new_checked(
+                    self.trader_id,
+                    self.strategy_id,
+                    instrument_id,
+                    entry_client_order_id,
+                    order_side,
+                    quantity,
+                    required(
+                        entry_trigger_price,
+                        "`entry_trigger_price` is required for a STOP_MARKET entry",
+                    )?,
+                    entry_trigger_type,
+                    time_in_force,
+                    expire_time,
+                    false, // reduce_only
+                    quote_quantity,
+                    None, // display_qty
+                    emulation_trigger,
+                    trigger_instrument_id,
+                    entry_contingency_type,
+                    entry_order_list_id,
+                    entry_linked_order_ids,
+                    entry_parent_order_id,
+                    entry_exec_algorithm_id,
+                    entry_exec_algorithm_params,
+                    entry_exec_spawn_id,
+                    entry_tags,
+                    crate::recovery_trace::native_event_uuid(),
+                    ts_init,
+                )?)
+            }
             OrderType::MarketIfTouched => {
                 OrderAny::MarketIfTouched(MarketIfTouchedOrder::new_checked(
                     self.trader_id,
@@ -1381,7 +1416,7 @@ impl OrderFactory {
                         entry_trigger_price,
                         "`entry_trigger_price` is required for a MARKET_IF_TOUCHED entry",
                     )?,
-                    TriggerType::Default,
+                    entry_trigger_type,
                     time_in_force,
                     expire_time,
                     false, // reduce_only
@@ -1416,7 +1451,7 @@ impl OrderFactory {
                         entry_trigger_price,
                         "`entry_trigger_price` is required for a LIMIT_IF_TOUCHED entry",
                     )?,
-                    TriggerType::Default,
+                    entry_trigger_type,
                     time_in_force,
                     expire_time,
                     entry_post_only,
@@ -1452,7 +1487,7 @@ impl OrderFactory {
                     entry_trigger_price,
                     "`entry_trigger_price` is required for a STOP_LIMIT entry",
                 )?,
-                TriggerType::Default,
+                entry_trigger_type,
                 time_in_force,
                 expire_time,
                 entry_post_only,

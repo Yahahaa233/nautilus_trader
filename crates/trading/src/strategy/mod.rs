@@ -488,6 +488,7 @@ fn native_finalize_market_exit_framework<S: Strategy + StrategyNative + Componen
             if state == ComponentState::Running {
                 nautilus_common::recovery_trace::scope::note_callback(
                     nautilus_common::recovery_trace::NativeCallbackRoute {
+                        arrival: None,
                         component_id: owner,
                         kind: "lifecycle.stop".into(),
                         component_state: format!("{state:?}"),
@@ -706,6 +707,16 @@ fn native_expire_gtd_framework<S: Strategy + StrategyNative + ?Sized>(
 /// [`StrategyNative`] and [`Component`] bounds. Implementations that only need
 /// behavioral callbacks do not own or implement native runtime state.
 pub trait Strategy: DataActor {
+    /// Encoded guests cannot be reentered by their own synchronous native
+    /// publications. The runtime delivers these events at its safe boundary.
+    #[must_use]
+    fn defer_order_and_position_events() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
     /// Explicit native framework-aware business checkpoint callback. The SDK
     /// captures this opaque value from the same actual registered object; it is
     /// not execution authority and never reads a Clock or generates a UUID.
@@ -2048,6 +2059,35 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        self.handle_order_event_with_admission(event, None);
+    }
+
+    /// Handles one native event with the lifecycle admission captured before
+    /// queueing. Maintenance still runs; stopped/startup events cannot become
+    /// newly eligible merely because delivery occurred later.
+    #[doc(hidden)]
+    fn handle_order_event_with_admission(
+        &mut self,
+        event: OrderEventAny,
+        arrival: Option<nautilus_common::actor::data_actor::CallbackStateSnapshot>,
+    ) where
+        Self: StrategyNative,
+    {
+        let current = StrategyNative::strategy_core(self).actor.state();
+        let lifecycle_current = arrival.as_ref().is_none_or(|arrival| {
+            arrival.is_current(
+                &StrategyNative::strategy_core(self)
+                    .actor
+                    .callback_state_view(),
+            )
+        });
+        let admitted_state = arrival.as_ref().map_or(current, |arrival| {
+            if arrival.state() == ComponentState::Running {
+                current
+            } else {
+                arrival.state()
+            }
+        });
         #[cfg(feature = "live")]
         {
             let component_id = StrategyNative::strategy_core(self)
@@ -2058,13 +2098,12 @@ pub trait Strategy: DataActor {
                 &component_id,
                 "handle_order_event",
                 |boundary| {
-                    if boundary.original_callback_admitted()?
-                        && native_order_event_framework(
-                            self,
-                            &event,
-                            boundary.original_component_state()?,
-                        )
-                    {
+                    let admitted = native_order_event_framework(
+                        self,
+                        &event,
+                        boundary.original_order_framework_state()?,
+                    );
+                    if boundary.original_callback_admitted()? && admitted {
                         self.on_native_recovery_input(boundary, &event)?;
                     }
                     Ok(())
@@ -2074,12 +2113,15 @@ pub trait Strategy: DataActor {
             }
             if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
                 nautilus_common::recovery_trace::NativeCallbackRoute {
+                    arrival: arrival.as_ref().map(|arrival| {
+                        nautilus_common::recovery_trace::NativeCallbackArrival {
+                            component_state: format!("{:?}", arrival.state()),
+                            lifecycle_current,
+                        }
+                    }),
                     component_id,
                     kind: "handle_order_event".into(),
-                    component_state: format!(
-                        "{:?}",
-                        StrategyNative::strategy_core(self).actor.state()
-                    ),
+                    component_state: format!("{current:?}"),
                 },
             ) {
                 log::error!("Native strategy callback refused: {error:#}");
@@ -2091,8 +2133,8 @@ pub trait Strategy: DataActor {
         ) {
             return;
         }
-        let state = StrategyNative::strategy_core(self).actor.state();
-        if !native_order_event_framework(self, &event, state) {
+        let state = admitted_state;
+        if !native_order_event_framework(self, &event, state) || !lifecycle_current {
             return;
         }
 
@@ -2165,6 +2207,33 @@ pub trait Strategy: DataActor {
     where
         Self: StrategyNative,
     {
+        self.handle_position_event_with_admission(event, None);
+    }
+
+    /// Delivers the original position payload with its native arrival admission.
+    #[doc(hidden)]
+    fn handle_position_event_with_admission(
+        &mut self,
+        event: PositionEvent,
+        arrival: Option<nautilus_common::actor::data_actor::CallbackStateSnapshot>,
+    ) where
+        Self: StrategyNative,
+    {
+        let current = StrategyNative::strategy_core(self).actor.state();
+        let lifecycle_current = arrival.as_ref().is_none_or(|arrival| {
+            arrival.is_current(
+                &StrategyNative::strategy_core(self)
+                    .actor
+                    .callback_state_view(),
+            )
+        });
+        let admitted_state = arrival.as_ref().map_or(current, |arrival| {
+            if arrival.state() == ComponentState::Running {
+                current
+            } else {
+                arrival.state()
+            }
+        });
         #[cfg(feature = "live")]
         {
             let component_id = StrategyNative::strategy_core(self)
@@ -2174,18 +2243,26 @@ pub trait Strategy: DataActor {
             if nautilus_common::recovery_trace::historical::dispatch_if_active(
                 &component_id,
                 "handle_position_event",
-                |boundary| self.on_native_recovery_input(boundary, &event),
+                |boundary| {
+                    if boundary.original_callback_admitted()? {
+                        self.on_native_recovery_input(boundary, &event)?;
+                    }
+                    Ok(())
+                },
             ) {
                 return;
             }
             if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
                 nautilus_common::recovery_trace::NativeCallbackRoute {
+                    arrival: arrival.as_ref().map(|arrival| {
+                        nautilus_common::recovery_trace::NativeCallbackArrival {
+                            component_state: format!("{:?}", arrival.state()),
+                            lifecycle_current,
+                        }
+                    }),
                     component_id,
                     kind: "handle_position_event".into(),
-                    component_state: format!(
-                        "{:?}",
-                        StrategyNative::strategy_core(self).actor.state()
-                    ),
+                    component_state: format!("{current:?}"),
                 },
             ) {
                 log::error!("Native strategy callback refused: {error:#}");
@@ -2205,10 +2282,10 @@ pub trait Strategy: DataActor {
                 log::info!("{id} {RECV}{EVT} {event:?}");
             }
 
-            core.actor.state()
+            admitted_state
         };
 
-        if state != ComponentState::Running {
+        if state != ComponentState::Running || !lifecycle_current {
             return;
         }
 
@@ -2457,6 +2534,7 @@ pub trait Strategy: DataActor {
             }
             nautilus_common::recovery_trace::scope::note_callback(
                 nautilus_common::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "lifecycle.market_exit.default".into(),
                     component_state: format!(
@@ -2492,6 +2570,7 @@ pub trait Strategy: DataActor {
             }
             if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
                 nautilus_common::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "strategy.check_market_exit.default".into(),
                     component_state: format!(
@@ -2539,6 +2618,7 @@ pub trait Strategy: DataActor {
             }
             if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
                 nautilus_common::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "lifecycle.finalize_market_exit.default".into(),
                     component_state: format!(
@@ -2581,6 +2661,7 @@ pub trait Strategy: DataActor {
             }
             if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
                 nautilus_common::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "strategy.cancel_market_exit.default".into(),
                     component_state: format!(
@@ -2654,6 +2735,7 @@ pub trait Strategy: DataActor {
             }
             if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
                 nautilus_common::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "lifecycle.strategy_stop.default".into(),
                     component_state: format!(
@@ -2855,6 +2937,7 @@ pub trait Strategy: DataActor {
             }
             if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
                 nautilus_common::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "strategy.expire_gtd_order.default".into(),
                     component_state: format!(
@@ -7368,6 +7451,43 @@ mod tests {
     }
 
     #[rstest]
+    #[case::current(0, true)]
+    #[case::arrival_ready(1, false)]
+    #[case::stopped_and_restarted(2, false)]
+    #[case::foreign_core_clone(3, false)]
+    fn queued_order_admission_preserves_lifecycle_and_native_terminal_cleanup(
+        #[case] scenario: u8,
+        #[case] expected: bool,
+    ) {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+        let ready = strategy.core.actor.callback_state_view().snapshot();
+        start_strategy(&mut strategy);
+        let current = strategy.core.actor.callback_state_view().snapshot();
+        let arrival = match scenario {
+            0 => current,
+            1 => ready,
+            2 => {
+                stop_strategy(&mut strategy);
+                Component::reset(&mut strategy).unwrap();
+                start_strategy(&mut strategy);
+                current
+            }
+            3 => strategy.core.actor.clone().callback_state_view().snapshot(),
+            _ => unreachable!(),
+        };
+        let id = ClientOrderId::from("O-001");
+        strategy
+            .core
+            .gtd_timers
+            .insert(id, Ustr::from("GTD-EXPIRY:O-001"));
+        strategy.handle_order_event_with_admission(make_rejected(id), Some(arrival));
+        assert_eq!(strategy.on_order_event_called, expected);
+        assert_eq!(strategy.on_order_rejected_called, expected);
+        assert!(!strategy.has_gtd_expiry_timer(&id));
+    }
+
+    #[rstest]
     fn test_handle_order_event_skips_dispatch_when_stopped() {
         let mut strategy = create_test_strategy();
         register_strategy(&mut strategy);
@@ -7810,6 +7930,7 @@ mod tests {
                 read_witnesses: Vec::new(),
             },
             vec![NativeCallbackRoute {
+                arrival: None,
                 component_id: owner,
                 kind: "custom.timer.override".into(),
                 component_state: "Running".into(),

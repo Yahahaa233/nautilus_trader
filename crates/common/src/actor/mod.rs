@@ -55,6 +55,14 @@ pub(crate) use dispatch::{SendChainContext, collect_command_contexts};
 
 pub use crate::component::Component;
 
+/// Measures the known variable storage of an original order event before its
+/// owned capture. Interned strings remain shared, as in the native model.
+#[doc(hidden)]
+#[must_use]
+pub fn order_event_heap_bytes(event: &nautilus_model::events::OrderEventAny) -> usize {
+    storage::order_event(event)
+}
+
 /// Drains at most `budget` callback slots at a caller-established safe boundary.
 ///
 /// Returns whether queued slots remain after exhausting the budget. Retained roots alone do not
@@ -72,6 +80,16 @@ pub use crate::component::Component;
 pub fn drain_callbacks(budget: usize) -> Result<bool, CallbackDispatchError> {
     let result = dispatch::drain_at_boundary(budget)?;
     Ok(result.status == dispatch::DrainStatus::BudgetExhausted)
+}
+
+/// Settles callbacks within one acknowledged native input before sampling its
+/// durable effects. The caller must release all enclosing mutable borrows.
+/// The existing per-causal-chain ceiling also bounds this atomic input pass.
+/// # Errors
+/// Refuses unsafe access, incomplete captures, failed or runaway delivery.
+#[doc(hidden)]
+pub fn settle_native_input_callbacks() -> Result<(), CallbackDispatchError> {
+    dispatch::settle_native_input()
 }
 
 /// Returns the first fatal callback dispatch error on this thread.

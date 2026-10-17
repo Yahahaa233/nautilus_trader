@@ -535,6 +535,9 @@ impl LiveNode {
     fn finish_node_dispatch(&self, guard: dispatch::NodeDispatchGuard) -> anyhow::Result<()> {
         #[cfg(feature = "native-tail-replay")]
         if guard.requires_native_effects() {
+            // Descendants keep this original source scope through delivery.
+            // All handler-local actor/engine/cache borrows have ended here.
+            nautilus_common::actor::settle_native_input_callbacks()?;
             // A failed historical business hook must be returned before reading
             // another Clock or sampling effects. Sampling is not error recovery.
             if self.historical_replay.is_some() {
@@ -1716,6 +1719,10 @@ impl LiveNode {
     ///
     /// Returns an error if startup fails.
     pub async fn start(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.kernel.trader.borrow().requires_callback_loop(),
+            "queued strategy events require LiveNode::run or run_with_mode; standalone start has no callback loop"
+        );
         self.ensure_recovery_start_permitted()?;
         if self.state().is_running() {
             anyhow::bail!("Already running");

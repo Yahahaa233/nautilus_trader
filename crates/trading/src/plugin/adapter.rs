@@ -167,6 +167,10 @@ impl AdapterState {
             "native subscriptions differ from their actual retained command inventory"
         );
         if let Some(pending) = &self.pending_history {
+            ensure!(
+                scope.allow_history_requests,
+                "pending external history is outside the admitted policy"
+            );
             let id: nautilus_core::UUID4 = pending.id()?;
             ensure!(
                 id.to_string() == pending.request_id

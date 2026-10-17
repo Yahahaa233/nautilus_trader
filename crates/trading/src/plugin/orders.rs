@@ -87,11 +87,10 @@ impl PluginStrategy {
         self.submit_native_request(&decode_submit(input)?, None)
     }
 
-    pub(super) fn submit_native_request(
-        &mut self,
+    pub(super) fn validate_native_request(
+        &self,
         request: &wire::SubmitRequest,
-        client_order_id: Option<ClientOrderId>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<PluginOrderType> {
         self.require_instrument(request.instrument_id)?;
         let kind = match request.order_type {
             wire::NativeOrderType::Market => PluginOrderType::Market,
@@ -145,6 +144,16 @@ impl PluginStrategy {
                 "native target position belongs to another scope or is closed"
             );
         }
+        Ok(kind)
+    }
+
+    pub(super) fn submit_native_request(
+        &mut self,
+        request: &wire::SubmitRequest,
+        client_order_id: Option<ClientOrderId>,
+    ) -> Result<Vec<u8>> {
+        let kind = self.validate_native_request(request)?;
+        let expiry = request.expire_time_ns.map(UnixNanos::from);
         let order = match kind {
             PluginOrderType::Market => self.order_factory().try_market(
                 request.instrument_id,

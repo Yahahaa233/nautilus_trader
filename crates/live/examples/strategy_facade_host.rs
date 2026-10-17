@@ -482,6 +482,7 @@ mod supported {
                 ]),
                 max_timers: 1,
                 max_history_bars: 1,
+                allow_history_requests: true,
                 quote_instruments: BTreeSet::from([instrument_id]),
                 trade_instruments: BTreeSet::from([instrument_id]),
                 state_schema_version: 1,

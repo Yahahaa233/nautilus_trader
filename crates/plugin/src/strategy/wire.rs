@@ -28,6 +28,16 @@ pub struct InstrumentRequest {
     pub instrument_id: InstrumentId,
 }
 
+/// Reads only already cached native bars at or before the native callback clock.
+/// A missing cache returns an empty array; this never falls back to HTTP/catalog.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CachedBarsRequest {
+    pub schema_version: u32,
+    pub bar_type: BarType,
+    pub limit: u32,
+}
+
 /// Bounded historical bars. Nanosecond bounds preserve the original native
 /// time range; the host returns the actual request UUID, never a completion.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -220,6 +230,16 @@ pub struct ManagedSubmit {
     pub instrument_id: nautilus_model::identifiers::InstrumentId,
     pub side: nautilus_model::enums::OrderSide,
     pub intent: serde_json::Value,
+}
+
+/// One bounded portfolio intent frame. An empty frame still commits the common
+/// application policy; it generates no order identities. A zero installed bound
+/// disables this operation entirely. Native identities are host-generated.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedSubmitBatch {
+    pub schema_version: u32,
+    pub intents: Vec<ManagedSubmit>,
 }
 
 #[cfg(test)]

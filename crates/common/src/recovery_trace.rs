@@ -441,6 +441,18 @@ pub struct NativeCallbackRoute {
     pub component_id: String,
     pub kind: String,
     pub component_state: String,
+    /// Present only for a physically queued callback; older synchronous traces
+    /// retain their original serialization and admission semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrival: Option<NativeCallbackArrival>,
+}
+
+/// Native evidence of arrival eligibility and the original physical lifecycle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCallbackArrival {
+    pub component_state: String,
+    pub lifecycle_current: bool,
 }
 
 /// A trace record stored in the same Journal as its native outputs.
@@ -1119,15 +1131,37 @@ pub mod historical {
                 .find(|state| format!("{state:?}") == self.route.component_state)
                 .context("unsupported original component state")
         }
+        /// State used by the original queued order's native framework prelude.
+        /// Arrival never becomes eligible just because physical delivery is later.
+        /// # Errors
+        /// Refuses an unknown original native arrival state.
+        pub fn original_order_framework_state(&self) -> Result<crate::enums::ComponentState> {
+            use strum::IntoEnumIterator;
+            if let Some(arrival) = &self.route.arrival
+                && arrival.component_state != "Running"
+            {
+                return crate::enums::ComponentState::iter()
+                    .find(|state| format!("{state:?}") == arrival.component_state)
+                    .context("unsupported original queued arrival state");
+            }
+            self.original_component_state()
+        }
+
         /// Original native admission, sealed by the SDK producer at Begin. A
         /// legacy or missing witness is unknown, never a current callback permit.
         ///
         /// # Errors
         /// Returns an error if the original admission witness is missing, ambiguous, or malformed.
         pub fn original_callback_admitted(&self) -> Result<bool> {
-            self.original_admission()?["admitted"]
+            let admitted = self.original_admission()?["admitted"]
                 .as_bool()
-                .context("original component admission is unknown")
+                .context("original component admission is unknown")?;
+            Ok(admitted
+                && self.route.arrival.as_ref().is_none_or(|arrival| {
+                    arrival.lifecycle_current
+                        && arrival.component_state == "Running"
+                        && self.route.component_state == "Running"
+                }))
         }
         /// The original observer exception to `Component::not_running`. It is
         /// source evidence, never admission for this physical recovery node.

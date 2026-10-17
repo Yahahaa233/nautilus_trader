@@ -12,6 +12,10 @@ use super::{PluginStrategy, adapter::PendingHistory, require_version, wire};
 
 impl PluginStrategy {
     pub(super) fn request_history(&mut self, input: &[u8]) -> Result<Vec<u8>> {
+        ensure!(
+            self.scope.allow_history_requests,
+            "external historical requests are disabled by the admitted server policy"
+        );
         let request: wire::HistoryRequest = serde_json::from_slice(input)?;
         require_version(request.schema_version)?;
         self.require_instrument(request.bar_type.instrument_id())?;
@@ -49,6 +53,10 @@ impl PluginStrategy {
     }
 
     pub(super) fn send_pending_history(&mut self) -> Result<()> {
+        ensure!(
+            self.scope.allow_history_requests,
+            "restored external historical request is outside the admitted server policy"
+        );
         let pending = self
             .adapter
             .pending_history

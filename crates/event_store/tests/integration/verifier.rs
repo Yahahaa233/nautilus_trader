@@ -163,8 +163,17 @@ fn marker_snapshot(marker_seq: u64, event_seq_before: u64) -> DataCursorSnapshot
     }
 }
 
+// Cargo (Rust 1.94+) and nextest provide the binary path at runtime. This
+// preserves archive/target remapping on another host; the compile-time path
+// remains a fallback for ordinary runs under older Cargo versions.
+fn verifier_command() -> Command {
+    let executable = std::env::var_os("CARGO_BIN_EXE_verify")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_verify").into());
+    Command::new(executable)
+}
+
 fn verify_bin(path: &std::path::Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_verify"))
+    verifier_command()
         .arg(path)
         .output()
         .expect("run verifier binary")
@@ -491,7 +500,7 @@ fn binary_worker_abort_exits_corrupt_without_quarantine() {
     let run_id = "1700000000-cafe0105";
     write_sealed_run(&tmp, run_id);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_verify"))
+    let output = verifier_command()
         .env("NAUTILUS_EVENT_STORE_VERIFY_ABORT_WORKER", "1")
         .arg(run_path(&tmp, run_id))
         .output()
@@ -520,7 +529,7 @@ fn binary_worker_timeout_exits_corrupt_without_quarantine() {
     let run_id = "1700000000-cafe0106";
     write_sealed_run(&tmp, run_id);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_verify"))
+    let output = verifier_command()
         .env("NAUTILUS_EVENT_STORE_VERIFY_SLEEP_WORKER_MS", "250")
         .env("NAUTILUS_EVENT_STORE_VERIFY_TIMEOUT_SECS", "0")
         .arg(run_path(&tmp, run_id))
@@ -552,7 +561,7 @@ fn binary_worker_output_past_pipe_capacity_still_reports_findings() {
     let path = run_path(&tmp, run_id);
     flip_stored_entry_payload_bytes(&path, 1..=4_000);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_verify"))
+    let output = verifier_command()
         .env("NAUTILUS_EVENT_STORE_VERIFY_TIMEOUT_SECS", "10")
         .arg(&path)
         .output()

@@ -15,7 +15,7 @@
 
 use std::{
     any::Any,
-    cell::{Ref, RefCell, RefMut},
+    cell::{Cell, Ref, RefCell, RefMut},
     collections::HashMap,
     fmt::Debug,
     num::NonZeroUsize,
@@ -969,6 +969,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_time_event".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1007,6 +1008,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_data".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1045,6 +1047,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_signal".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1083,6 +1086,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_queue_state".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1121,6 +1125,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_socket_state".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1159,6 +1164,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_instrument".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1197,6 +1203,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_book_deltas".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1235,6 +1242,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_book_depth".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1273,6 +1281,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_book".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1323,6 +1332,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_quote".into(),
                     component_state: format!("{:?}", self.core().state()),
@@ -1383,6 +1393,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_trade".into(),
                     component_state: format!("{:?}", self.core().state()),
@@ -1443,6 +1454,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_bar".into(),
                     component_state: format!("{:?}", self.core().state()),
@@ -1491,6 +1503,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_mark_price".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1529,6 +1542,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_index_price".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1567,6 +1581,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_funding_rate".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1605,6 +1620,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_option_greeks".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1643,6 +1659,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_option_chain".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1681,6 +1698,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_instrument_status".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1719,6 +1737,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_instrument_close".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1758,6 +1777,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_block".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1797,6 +1817,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_pool".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1836,6 +1857,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_pool_swap".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1875,6 +1897,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_pool_liquidity_update".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1914,6 +1937,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_pool_fee_collect".into(),
                     component_state: format!("{:?}", self.state()),
@@ -1953,6 +1977,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_pool_flash".into(),
                     component_state: format!("{:?}", self.state()),
@@ -2000,6 +2025,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_data_response".into(),
                     component_state: format!("{:?}", self.state()),
@@ -2038,6 +2064,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_instrument_response".into(),
                     component_state: format!("{:?}", self.state()),
@@ -2071,6 +2098,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_instruments_response".into(),
                     component_state: format!("{:?}", self.state()),
@@ -2107,6 +2135,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_book_response".into(),
                     component_state: format!("{:?}", self.state()),
@@ -2140,6 +2169,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_book_deltas_response".into(),
                     component_state: format!("{:?}", self.state()),
@@ -2174,6 +2204,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_book_depth_response".into(),
                     component_state: format!("{:?}", self.state()),
@@ -2208,6 +2239,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_quotes_response".into(),
                     component_state: format!("{:?}", self.core().state()),
@@ -2247,6 +2279,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_trades_response".into(),
                     component_state: format!("{:?}", self.core().state()),
@@ -2286,6 +2319,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_bars_response".into(),
                     component_state: format!("{:?}", self.core().state()),
@@ -2325,6 +2359,7 @@ pub trait DataActor {
             }
             if let Err(error) = crate::recovery_trace::scope::note_callback(
                 crate::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id,
                     kind: "handle_funding_rates_response".into(),
                     component_state: format!("{:?}", self.state()),
@@ -4308,22 +4343,22 @@ where
     }
 
     fn state(&self) -> ComponentState {
-        self.core().state
+        self.core().state.get()
     }
 
     fn transition_state(&mut self, trigger: ComponentTrigger) -> anyhow::Result<()> {
         let core = self.core_mut();
-        core.state = core.state.transition(&trigger)?;
+        core.state.set(core.state.get().transition(&trigger)?)?;
 
         #[cfg(feature = "python")]
-        if core.state == ComponentState::Disposed {
+        if core.state.get() == ComponentState::Disposed {
             core.message_bus.invalidate();
         }
 
         log::info!(
             component = core.actor_id.inner().as_str();
             "{}",
-            core.state.variant_name()
+            core.state.get().variant_name()
         );
         Ok(())
     }
@@ -4389,6 +4424,76 @@ where
     }
 }
 
+/// Read-only access to the original native lifecycle state. This is not a
+/// second state machine and cannot transition, start or reset a component.
+#[derive(Clone, Debug)]
+pub struct CallbackStateView(Rc<Cell<(ComponentState, u64)>>);
+
+/// Physical arrival identity for one queued native callback. It cannot start or
+/// authorize a component and is never used as a recovery permission.
+#[derive(Clone, Debug)]
+pub struct CallbackStateSnapshot {
+    state: ComponentState,
+    generation: u64,
+    owner: std::rc::Weak<Cell<(ComponentState, u64)>>,
+}
+
+impl CallbackStateSnapshot {
+    /// Original native state at publication.
+    #[must_use]
+    pub const fn state(&self) -> ComponentState {
+        self.state
+    }
+
+    /// Checks the original allocation and lifecycle, without borrowing the actor.
+    #[must_use]
+    pub fn is_current(&self, view: &CallbackStateView) -> bool {
+        self.owner.ptr_eq(&Rc::downgrade(&view.0)) && self.generation == view.0.get().1
+    }
+}
+
+impl CallbackStateView {
+    /// Reads the original component's current native state.
+    #[must_use]
+    pub fn state(&self) -> ComponentState {
+        self.0.get().0
+    }
+
+    /// Captures the physical lifecycle identity of an arriving native event.
+    #[must_use]
+    pub fn snapshot(&self) -> CallbackStateSnapshot {
+        let (state, generation) = self.0.get();
+        CallbackStateSnapshot {
+            state,
+            generation,
+            owner: Rc::downgrade(&self.0),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ComponentLifecycle(Rc<Cell<(ComponentState, u64)>>);
+
+impl ComponentLifecycle {
+    fn get(&self) -> ComponentState {
+        self.0.get().0
+    }
+    fn set(&self, state: ComponentState) -> anyhow::Result<()> {
+        let generation =
+            self.0.get().1.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("native component lifecycle generation exhausted")
+            })?;
+        self.0.set((state, generation));
+        Ok(())
+    }
+}
+
+impl Clone for ComponentLifecycle {
+    fn clone(&self) -> Self {
+        Self(Rc::new(Cell::new(self.0.get())))
+    }
+}
+
 /// Core functionality for all actors.
 #[derive(Clone)]
 #[allow(
@@ -4403,7 +4508,7 @@ pub struct DataActorCore {
     trader_id: Option<TraderId>,
     clock: Option<Rc<RefCell<dyn Clock>>>, // Wired up on registration
     cache: Option<Rc<RefCell<Cache>>>,     // Wired up on registration
-    state: ComponentState,
+    state: ComponentLifecycle,
     topic_handlers: AHashMap<MStr<Pattern>, Subscription<ShareableMessageHandler>>,
     instrument_handlers: AHashMap<MStr<Pattern>, Subscription<TypedHandler<InstrumentAny>>>,
     deltas_handlers: AHashMap<MStr<Pattern>, Subscription<TypedHandler<OrderBookDeltas>>>,
@@ -4448,7 +4553,7 @@ impl Debug for DataActorCore {
         f.debug_struct(stringify!(DataActorCore))
             .field("actor_id", &self.actor_id)
             .field("config", &self.config)
-            .field("state", &self.state)
+            .field("state", &self.state.get())
             .field("trader_id", &self.trader_id)
             .finish()
     }
@@ -5432,7 +5537,7 @@ impl DataActorCore {
             trader_id: None, // None until registered
             clock: None,     // None until registered
             cache: None,     // None until registered
-            state: ComponentState::default(),
+            state: ComponentLifecycle(Rc::new(Cell::new((ComponentState::default(), 0)))),
             topic_handlers: AHashMap::new(),
             instrument_handlers: AHashMap::new(),
             deltas_handlers: AHashMap::new(),
@@ -5544,7 +5649,15 @@ impl DataActorCore {
 
     /// Returns the actors state.
     pub fn state(&self) -> ComponentState {
-        self.state
+        self.state.get()
+    }
+
+    /// Borrows the same native lifecycle state without entering actor storage.
+    /// A subscriber may read admission state during a synchronous publication.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn callback_state_view(&self) -> CallbackStateView {
+        CallbackStateView(self.state.0.clone())
     }
 
     /// Returns the trader ID this actor is registered to.
@@ -5683,7 +5796,10 @@ impl DataActorCore {
         anyhow::ensure!(
             self.is_properly_registered()
                 && preparation.component_id() == self.actor_id.as_str()
-                && matches!(self.state, ComponentState::Ready | ComponentState::Stopped),
+                && matches!(
+                    self.state.get(),
+                    ComponentState::Ready | ComponentState::Stopped
+                ),
             "native local subscription differs from paused original registration"
         );
         Ok(())
@@ -7522,4 +7638,29 @@ where
 
 fn log_received_bulk(kind: &str, correlation_id: &UUID4, records: usize) {
     log::debug!("{RECV} {kind} correlation_id={correlation_id} records={records}");
+}
+
+#[cfg(test)]
+mod callback_state_view_tests {
+    use super::*;
+
+    #[test]
+    fn view_tracks_original_lifecycle_while_core_clone_owns_independent_state() {
+        let core = DataActorCore::new(DataActorConfig::default());
+        let view = core.callback_state_view();
+        let cloned = core.clone();
+        core.state.set(ComponentState::Running).unwrap();
+        let original = view.snapshot();
+        assert!(original.is_current(&view));
+        assert!(!original.is_current(&cloned.callback_state_view()));
+        assert_eq!(view.state(), ComponentState::Running);
+        assert_eq!(cloned.state(), ComponentState::PreInitialized);
+        cloned.state.set(ComponentState::Stopped).unwrap();
+        assert_eq!(view.state(), ComponentState::Running);
+        core.state.set(ComponentState::Faulted).unwrap();
+        assert_eq!(view.state(), ComponentState::Faulted);
+        core.state.set(ComponentState::Running).unwrap();
+        assert_eq!(view.state(), ComponentState::Running);
+        assert!(!original.is_current(&view));
+    }
 }

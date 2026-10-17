@@ -25,7 +25,10 @@ use nautilus_model::{
 };
 use nautilus_plugin::{
     PluginError,
-    strategy::{CallbackKind, HostOperation, instance::GuestInstance},
+    strategy::{
+        CallbackKind, HostOperation,
+        instance::{GuestInstance, NativeFailureRecorder},
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -54,8 +57,11 @@ pub struct PluginScope {
     pub bar_types: Vec<BarType>,
     pub order_types: BTreeSet<PluginOrderType>,
     pub max_timers: usize,
-    /// Zero disables history requests. Nonzero limits each native bars request.
+    /// Shared bound for cached bars and any explicitly allowed native request.
+    /// Zero disables both operations. A nonzero value does not allow networking.
     pub max_history_bars: usize,
+    /// Fixed application policy; network history is separate from cached warmup.
+    pub allow_history_requests: bool,
     pub quote_instruments: BTreeSet<InstrumentId>,
     pub trade_instruments: BTreeSet<InstrumentId>,
     pub state_schema_version: u32,
@@ -82,6 +88,7 @@ pub use nautilus_plugin::strategy::wire;
 pub struct PluginStrategy {
     core: StrategyCore,
     guest: Rc<RefCell<GuestInstance>>,
+    native_failure: NativeFailureRecorder,
     scope: PluginScope,
     adapter: adapter::AdapterState,
     managed_policy: Option<managed::ManagedPolicyBinding>,
@@ -267,6 +274,7 @@ impl PluginStrategy {
         }
         Ok(Self {
             core: StrategyCore::new_checked(config)?,
+            native_failure: guest.native_failure_recorder(),
             guest: Rc::new(RefCell::new(guest)),
             scope,
             adapter: adapter::AdapterState::default(),
@@ -285,6 +293,7 @@ impl PluginStrategy {
     fn invoke(&mut self, kind: CallbackKind, payload: &[u8]) -> Result<Vec<u8>> {
         let guest = Rc::clone(&self.guest);
         let version = self.scope.state_schema_version;
+        let failure = self.native_failure.clone();
         let mut native = |operation, input: &[u8]| {
             if matches!(kind, CallbackKind::Save | CallbackKind::Restore) {
                 return self
@@ -299,8 +308,16 @@ impl PluginStrategy {
                 }
             })
         };
+        let mut guest = guest.try_borrow_mut().map_err(|error| {
+            let message = format!("native callback reentered its active guest: {error}");
+            let retained = failure.retain(
+                nautilus_plugin::PluginErrorCode::SerializationFailed,
+                &message,
+            );
+            debug_assert!(retained.is_ok());
+            anyhow::anyhow!(message)
+        })?;
         guest
-            .try_borrow_mut()?
             .invoke(kind, version, payload, &mut native)
             .map_err(|error| anyhow::anyhow!("plugin callback: {}", error.message_string()))
     }
@@ -322,8 +339,7 @@ impl PluginStrategy {
     /// recovery, execution or state reset authority.
     #[must_use]
     pub fn callback_failure(&self) -> Option<(nautilus_plugin::PluginErrorCode, String)> {
-        self.guest
-            .borrow()
+        self.native_failure
             .first_failure()
             .map(|(code, message)| (code, message.to_owned()))
     }
@@ -372,7 +388,8 @@ impl PluginStrategy {
             HostOperation::Clock
             | HostOperation::Instrument
             | HostOperation::Portfolio
-            | HostOperation::Query => self.readonly(operation, input),
+            | HostOperation::Query
+            | HostOperation::CachedBars => self.readonly(operation, input),
             HostOperation::RequestHistory => self.request_history(input),
             HostOperation::Log => {
                 let request: wire::LogRecord = serde_json::from_slice(input)?;
@@ -453,6 +470,7 @@ impl PluginStrategy {
             }
             HostOperation::Submit => self.submit_encoded(input),
             HostOperation::ManagedSubmit => self.managed_submit(input),
+            HostOperation::ManagedSubmitBatch => self.managed_submit_batch(input),
             HostOperation::Cancel => {
                 let request: wire::OrderId = serde_json::from_slice(input)?;
                 require_version(request.schema_version)?;
@@ -506,6 +524,18 @@ impl PluginStrategy {
     }
 
     fn fault_callback(&mut self, error: &anyhow::Error) {
+        if self.native_failure.first_failure().is_none() {
+            let message = format!("{error:#}");
+            if let Err(failure) = self
+                .native_failure
+                .retain(nautilus_plugin::PluginErrorCode::Generic, &message)
+            {
+                log::error!(
+                    "Cannot retain original native callback failure: {}",
+                    failure.message_string()
+                );
+            }
+        }
         log::error!("Plugin callback failed: {error:#}");
         #[cfg(feature = "live")]
         if nautilus_common::recovery_trace::historical::active() {
@@ -537,6 +567,9 @@ fn require_version(version: u32) -> Result<()> {
 }
 
 crate::nautilus_strategy!(PluginStrategy, {
+    fn defer_order_and_position_events() -> bool {
+        true
+    }
     #[cfg(feature = "live")]
     fn on_native_framework_checkpoint(
         &self,

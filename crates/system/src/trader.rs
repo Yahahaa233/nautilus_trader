@@ -29,8 +29,8 @@ use indexmap::IndexMap;
 use nautilus_common::python::wrappers::release_python_wrapper;
 use nautilus_common::{
     actor::{
-        DataActor, DataActorNative,
-        registry::{deregister_actor, try_get_actor_unchecked},
+        DataActor, DataActorNative, order_event_heap_bytes,
+        registry::{ActorEventBinding, deregister_actor, try_get_actor_unchecked},
     },
     cache::Cache,
     clock::Clock,
@@ -93,6 +93,7 @@ pub type RegisteredComponentClock = (ComponentId, Rc<RefCell<dyn Clock>>);
 
 #[derive(Clone, Copy)]
 struct ComponentStateCallbacks {
+    deferred_strategy_events: bool,
     load: ComponentStateLoadFn,
     save: ComponentStateSaveFn,
     #[cfg(feature = "live")]
@@ -344,6 +345,15 @@ impl Trader {
         self.strategy_ids.clone()
     }
 
+    /// Queued strategy events require a runtime which owns callback settlement.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn requires_callback_loop(&self) -> bool {
+        self.strategy_state_callbacks
+            .values()
+            .any(|value| value.deferred_strategy_events)
+    }
+
     /// Returns a list of all registered execution algorithm IDs.
     #[must_use]
     pub fn exec_algorithm_ids(&self) -> Vec<ExecAlgorithmId> {
@@ -430,6 +440,7 @@ impl Trader {
         self.actor_state_callbacks.insert(
             actor_id,
             ComponentStateCallbacks {
+                deferred_strategy_events: false,
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
                 #[cfg(feature = "live")]
@@ -477,6 +488,7 @@ impl Trader {
         self.actor_state_callbacks.insert(
             actor_id,
             ComponentStateCallbacks {
+                deferred_strategy_events: false,
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
                 #[cfg(feature = "live")]
@@ -531,6 +543,72 @@ impl Trader {
         Ok(())
     }
 
+    fn subscribe_strategy_events<T>(
+        actor_id: Ustr,
+        strategy_id: StrategyId,
+    ) -> anyhow::Result<(Ustr, Ustr)>
+    where
+        T: Strategy + StrategyNative + DataActorNative + Component + Debug + 'static,
+    {
+        let order_topic = get_event_order_topic(strategy_id);
+        let order_actor_id = actor_id;
+        let order_binding = if T::defer_order_and_position_events() {
+            let state = try_get_actor_unchecked::<T>(&actor_id)
+                .ok_or_else(|| anyhow::anyhow!("registered strategy absent: {actor_id}"))?
+                .core()
+                .callback_state_view();
+            let binding = ActorEventBinding::<T>::bind(actor_id)
+                .ok_or_else(|| anyhow::anyhow!("strategy event registration absent: {actor_id}"))?;
+            Some((binding, state))
+        } else {
+            None
+        };
+        let position_binding = order_binding.clone();
+        let order_handler = TypedHandler::from(move |event: &OrderEventAny| {
+            if let Some((binding, state)) = &order_binding {
+                let arrival = state.snapshot();
+                binding.enqueue(
+                    order_event_heap_bytes(event),
+                    || (event.clone(), arrival),
+                    |strategy, (event, state)| {
+                        strategy
+                            .handle_order_event_with_admission(event.clone(), Some(state.clone()));
+                    },
+                );
+            } else if let Some(mut strategy) = try_get_actor_unchecked::<T>(&order_actor_id) {
+                strategy.handle_order_event(event.clone());
+            } else {
+                log::error!("Strategy {order_actor_id} not found for order event handling");
+            }
+        });
+        let order_handler_id = order_handler.id();
+        msgbus::subscribe_order_events(order_topic.into(), order_handler, None);
+
+        let position_topic = get_event_position_topic(strategy_id);
+        let position_handler = TypedHandler::from(move |event: &PositionEvent| {
+            if let Some((binding, state)) = &position_binding {
+                let arrival = state.snapshot();
+                binding.enqueue(
+                    0,
+                    || (event.clone(), arrival),
+                    |strategy, (event, state)| {
+                        strategy.handle_position_event_with_admission(
+                            event.clone(),
+                            Some(state.clone()),
+                        );
+                    },
+                );
+            } else if let Some(mut strategy) = try_get_actor_unchecked::<T>(&actor_id) {
+                strategy.handle_position_event(event.clone());
+            } else {
+                log::error!("Strategy {actor_id} not found for position event handling");
+            }
+        });
+        let position_handler_id = position_handler.id();
+        msgbus::subscribe_position_events(position_topic.into(), position_handler, None);
+        Ok((order_handler_id, position_handler_id))
+    }
+
     /// Adds an externally-registered strategy to the trader for lifecycle management
     /// and installs its order/position event subscriptions, stop hook, and control endpoint.
     ///
@@ -559,29 +637,8 @@ impl Trader {
         let actor_id = strategy_id.inner();
 
         // Subscribe to order events for this strategy
-        let order_topic = get_event_order_topic(strategy_id);
-        let order_actor_id = actor_id;
-        let order_handler = TypedHandler::from(move |event: &OrderEventAny| {
-            if let Some(mut strategy) = try_get_actor_unchecked::<T>(&order_actor_id) {
-                strategy.handle_order_event(event.clone());
-            } else {
-                log::error!("Strategy {order_actor_id} not found for order event handling");
-            }
-        });
-        let order_handler_id = order_handler.id();
-        msgbus::subscribe_order_events(order_topic.into(), order_handler, None);
-
-        // Subscribe to position events for this strategy
-        let position_topic = get_event_position_topic(strategy_id);
-        let position_handler = TypedHandler::from(move |event: &PositionEvent| {
-            if let Some(mut strategy) = try_get_actor_unchecked::<T>(&actor_id) {
-                strategy.handle_position_event(event.clone());
-            } else {
-                log::error!("Strategy {actor_id} not found for position event handling");
-            }
-        });
-        let position_handler_id = position_handler.id();
-        msgbus::subscribe_position_events(position_topic.into(), position_handler, None);
+        let (order_handler_id, position_handler_id) =
+            Self::subscribe_strategy_events::<T>(actor_id, strategy_id)?;
 
         let control_actor_id = actor_id;
         let control_handler = TypedHandler::from(move |command: &StrategyCommand| {
@@ -608,6 +665,7 @@ impl Trader {
         self.strategy_state_callbacks.insert(
             strategy_id,
             ComponentStateCallbacks {
+                deferred_strategy_events: T::defer_order_and_position_events(),
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
                 #[cfg(feature = "live")]
@@ -736,6 +794,7 @@ impl Trader {
                     }
                     if let Err(error) = nautilus_common::recovery_trace::scope::note_callback(
                         nautilus_common::recovery_trace::NativeCallbackRoute {
+                            arrival: None,
                             component_id,
                             kind: "strategy.handle_time_event".into(),
                             component_state: format!("{:?}", strategy.state()),
@@ -803,28 +862,8 @@ impl Trader {
         // Register in both component and actor registries
         register_component_actor(strategy);
 
-        let order_topic = get_event_order_topic(strategy_id);
-        let order_actor_id = actor_id;
-        let order_handler = TypedHandler::from(move |event: &OrderEventAny| {
-            if let Some(mut strategy) = try_get_actor_unchecked::<T>(&order_actor_id) {
-                strategy.handle_order_event(event.clone());
-            } else {
-                log::error!("Strategy {order_actor_id} not found for order event handling");
-            }
-        });
-        let order_handler_id = order_handler.id();
-        msgbus::subscribe_order_events(order_topic.into(), order_handler, None);
-
-        let position_topic = get_event_position_topic(strategy_id);
-        let position_handler = TypedHandler::from(move |event: &PositionEvent| {
-            if let Some(mut strategy) = try_get_actor_unchecked::<T>(&actor_id) {
-                strategy.handle_position_event(event.clone());
-            } else {
-                log::error!("Strategy {actor_id} not found for position event handling");
-            }
-        });
-        let position_handler_id = position_handler.id();
-        msgbus::subscribe_position_events(position_topic.into(), position_handler, None);
+        let (order_handler_id, position_handler_id) =
+            Self::subscribe_strategy_events::<T>(actor_id, strategy_id)?;
 
         let control_actor_id = actor_id;
         let control_handler = TypedHandler::from(move |command: &StrategyCommand| {
@@ -851,6 +890,7 @@ impl Trader {
         self.strategy_state_callbacks.insert(
             strategy_id,
             ComponentStateCallbacks {
+                deferred_strategy_events: T::defer_order_and_position_events(),
                 load: Self::load_component_state::<T>,
                 save: Self::save_component_state::<T>,
                 #[cfg(feature = "live")]
@@ -1263,6 +1303,7 @@ impl Trader {
             #[cfg(feature = "live")]
             nautilus_common::recovery_trace::scope::note_callback(
                 nautilus_common::recovery_trace::NativeCallbackRoute {
+                    arrival: None,
                     component_id: strategy_id.as_str().into(),
                     kind: "lifecycle.strategy_stop".into(),
                     component_state: format!("{:?}", component_state(&strategy_id.inner())?),
@@ -1357,6 +1398,7 @@ impl Trader {
         #[cfg(feature = "live")]
         nautilus_common::recovery_trace::scope::note_callback(
             nautilus_common::recovery_trace::NativeCallbackRoute {
+                arrival: None,
                 component_id: component_id.as_str().into(),
                 kind: "lifecycle.stop".into(),
                 component_state: format!("{:?}", component_state(&component_id)?),
@@ -2950,11 +2992,13 @@ mod tests {
         let trader = Rc::new(RefCell::new(trader));
         let routes = vec![
             NativeCallbackRoute {
+                arrival: None,
                 component_id: strategy_id.to_string(),
                 kind: kind.into(),
                 component_state: "Running".into(),
             },
             NativeCallbackRoute {
+                arrival: None,
                 component_id: strategy_id.to_string(),
                 kind: "lifecycle.stop".into(),
                 component_state: "Running".into(),
@@ -3100,6 +3144,7 @@ mod tests {
         let routes = [first, later]
             .into_iter()
             .map(|id| NativeCallbackRoute {
+                arrival: None,
                 component_id: id.to_string(),
                 kind: "lifecycle.stop".into(),
                 component_state: "Running".into(),

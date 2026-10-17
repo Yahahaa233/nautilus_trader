@@ -22,6 +22,8 @@ struct State {
 #[derive(Debug)]
 struct Managed {
     state: State,
+    batch: bool,
+    empty_batch: bool,
 }
 fn error(value: impl std::fmt::Display) -> PluginError {
     PluginError::generic(value.to_string())
@@ -29,7 +31,14 @@ fn error(value: impl std::fmt::Display) -> PluginError {
 impl Algorithm for Managed {
     const DESCRIPTOR_JSON: &'static str = include_str!("contract_managed.descriptor.json");
     fn validate(raw: &[u8]) -> Result<(), PluginError> {
-        if raw == b"managed-v1" {
+        if [
+            b"managed-v1".as_slice(),
+            b"managed-batch-v1",
+            b"managed-empty-batch-v1",
+            b"managed-bracket-v1",
+        ]
+        .contains(&raw)
+        {
             Ok(())
         } else {
             Err(error("managed fixture config differs"))
@@ -39,6 +48,8 @@ impl Algorithm for Managed {
         Self::validate(raw)?;
         Ok(Self {
             state: State::default(),
+            batch: raw == b"managed-batch-v1" || raw == b"managed-empty-batch-v1",
+            empty_batch: raw == b"managed-empty-batch-v1",
         })
     }
     fn start(&mut self, host: &mut Host<'_>) -> Result<(), PluginError> {
@@ -63,12 +74,33 @@ impl Algorithm for Managed {
     }
     fn on_event(&mut self, raw: &[u8], host: &mut Host<'_>) -> Result<(), PluginError> {
         let value: Value = serde_json::from_slice(raw).map_err(error)?;
+        if value["kind"] == "order" {
+            let mut events = self
+                .state
+                .secondary
+                .take()
+                .and_then(|value| value["order_events"].as_array().cloned())
+                .unwrap_or_default();
+            events.push(value["event"].clone());
+            self.state.secondary = Some(json!({"order_events":events}));
+            return Ok(());
+        }
         if value["kind"] != "timer" || self.state.attempted {
             return Err(error("managed fixture event differs or repeats"));
         }
         self.state.attempted = true;
         let intent=serde_json::to_vec(&json!({"schema_version":1,"instrument_id":"ETHUSDT-PERP.BINANCE","side":"BUY","intent":{"kind":"entry"}})).map_err(error)?;
-        match host.call(HostOperation::ManagedSubmit, &intent) {
+        let (operation, intent) = if self.batch {
+            let one: Value = serde_json::from_slice(&intent).map_err(error)?;
+            (
+                HostOperation::ManagedSubmitBatch,
+                serde_json::to_vec(&json!({"schema_version":1,"intents":if self.empty_batch {Vec::new()} else {vec![one.clone(),one]}}))
+                    .map_err(error)?,
+            )
+        } else {
+            (HostOperation::ManagedSubmit, intent)
+        };
+        match host.call(operation, &intent) {
             Ok(raw) => self.state.result = Some(serde_json::from_slice(&raw).map_err(error)?),
             Err(original) => {
                 self.state.error = Some(

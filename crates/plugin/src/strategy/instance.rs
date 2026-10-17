@@ -11,7 +11,7 @@
 //! runner remain with the engine; this object owns only the guest allocation
 //! and a first-failure latch. There is no second execution lifecycle.
 
-use std::{ffi::c_void, ptr::NonNull};
+use std::{cell::OnceCell, ffi::c_void, ptr::NonNull, rc::Rc};
 
 use super::{
     CallbackKind, HostOperation, MAX_PAYLOAD_BYTES, STRATEGY_ABI_VERSION, StrategyApi,
@@ -48,9 +48,36 @@ pub struct GuestInstance {
     handle: NonNull<c_void>,
     instance: InstanceId,
     limits: CallbackLimits,
-    failure: Option<(PluginErrorCode, String)>,
+    failure: NativeFailureRecorder,
     callbacks_used: bool,
     state_validator: Box<dyn StateValidator>,
+}
+
+/// A handle to this guest's one immutable first-failure record. Native adapters
+/// can retain a failure even while the guest allocation is already borrowed.
+/// Clones share the original record and cannot reset or replace it.
+#[derive(Clone, Debug, Default)]
+pub struct NativeFailureRecorder(Rc<OnceCell<(PluginErrorCode, String)>>);
+
+impl NativeFailureRecorder {
+    /// Retains a bounded original native error, preserving any earlier failure.
+    /// # Errors
+    /// Refuses success codes and oversized diagnostic text.
+    pub fn retain(&self, code: PluginErrorCode, message: &str) -> Result<(), PluginError> {
+        if code == PluginErrorCode::Ok || message.len() > super::MAX_ERROR_BYTES {
+            return Err(invalid("native failure requires bounded original error"));
+        }
+        let _ = self.0.set((code, message.to_owned()));
+        Ok(())
+    }
+
+    /// Reads the first failure without entering the guest allocation.
+    #[must_use]
+    pub fn first_failure(&self) -> Option<(PluginErrorCode, &str)> {
+        self.0
+            .get()
+            .map(|(code, message)| (*code, message.as_str()))
+    }
 }
 
 fn invalid(message: &str) -> PluginError {
@@ -175,20 +202,20 @@ impl GuestInstance {
         let output = unsafe { response.copy_result(MAX_PAYLOAD_BYTES) }?;
         let handle = NonNull::new(handle)
             .ok_or_else(|| invalid("strategy constructor returned a null instance"))?;
-        let mut instance = Self {
+        let instance = Self {
             api,
             handle,
             instance,
             limits,
-            failure: None,
+            failure: NativeFailureRecorder::default(),
             callbacks_used: false,
             state_validator,
         };
         if !output.is_empty() {
-            instance.failure = Some((
+            instance.failure.retain(
                 PluginErrorCode::InvalidArgument,
-                "constructor returned an unexpected payload".into(),
-            ));
+                "constructor returned an unexpected payload",
+            )?;
             return Err(invalid("constructor returned an unexpected payload"));
         }
         Ok(instance)
@@ -210,8 +237,8 @@ impl GuestInstance {
     where
         F: FnMut(HostOperation, &[u8]) -> Result<Vec<u8>, PluginError>,
     {
-        if let Some((code, message)) = &self.failure {
-            return Err(PluginError::new(*code, message));
+        if let Some((code, message)) = self.failure.first_failure() {
+            return Err(PluginError::new(code, message));
         }
         let already_used = self.callbacks_used;
         // A successful immutable Save can inspect the fresh target without
@@ -223,10 +250,10 @@ impl GuestInstance {
             CallbackKind::Stop => 1024,
             _ => 0,
         };
-        let mut native_failure: Option<(PluginErrorCode, String)> = None;
+        let failure = self.failure.clone();
         let mut watched_facade = |operation, payload: &[u8]| {
-            if let Some((code, message)) = &native_failure {
-                return Err(PluginError::new(*code, message));
+            if let Some((code, message)) = failure.first_failure() {
+                return Err(PluginError::new(code, message));
             }
             let result = crate::panic::guard(|| facade(operation, payload)).into_result();
             if let Err(error) = &result
@@ -235,9 +262,13 @@ impl GuestInstance {
                     PluginErrorCode::Panic | PluginErrorCode::SerializationFailed
                 )
             {
-                native_failure = Some((error.code, error.message_string()));
+                failure.retain(error.code, &error.message_string())?;
             }
-            result
+            if let Some((code, message)) = failure.first_failure() {
+                Err(PluginError::new(code, message))
+            } else {
+                result
+            }
         };
         let result = if kind == CallbackKind::Restore && already_used {
             Err(invalid(
@@ -284,13 +315,11 @@ impl GuestInstance {
         };
         // A producer cannot swallow a native panic or durability failure and
         // continue host effects. This happened before any later producer error.
-        let result = if let Some((code, message)) = native_failure {
-            Err(PluginError::new(code, &message))
-        } else {
-            result
-        };
         if let Err(error) = &result {
-            self.failure = Some((error.code, error.message_string()));
+            self.failure.retain(error.code, &error.message_string())?;
+        }
+        if let Some((code, message)) = self.failure.first_failure() {
+            return Err(PluginError::new(code, message));
         }
         result
     }
@@ -322,9 +351,7 @@ impl GuestInstance {
         if code == PluginErrorCode::Ok || message.len() > super::MAX_ERROR_BYTES {
             return Err(invalid("native failure requires bounded original error"));
         }
-        if self.failure.is_none() {
-            self.failure = Some((code, message.to_owned()));
-        }
+        self.failure.retain(code, message)?;
         self.callbacks_used = true;
         Ok(())
     }
@@ -341,7 +368,7 @@ impl GuestInstance {
         message: &str,
     ) -> Result<(), PluginError> {
         if self.callbacks_used
-            || self.failure.is_some()
+            || self.failure.first_failure().is_some()
             || code == PluginErrorCode::Ok
             || message.len() > super::MAX_ERROR_BYTES
         {
@@ -349,7 +376,7 @@ impl GuestInstance {
                 "terminal failure requires an unused guest and bounded original error",
             ));
         }
-        self.failure = Some((code, message.to_owned()));
+        self.failure.retain(code, message)?;
         self.callbacks_used = true;
         Ok(())
     }
@@ -357,15 +384,19 @@ impl GuestInstance {
     /// Returns the original callback failure without clearing or replacing it.
     #[must_use]
     pub fn first_failure(&self) -> Option<(PluginErrorCode, &str)> {
-        self.failure
-            .as_ref()
-            .map(|(code, message)| (*code, message.as_str()))
+        self.failure.first_failure()
+    }
+
+    /// Returns another handle to the same immutable failure owner.
+    #[must_use]
+    pub fn native_failure_recorder(&self) -> NativeFailureRecorder {
+        self.failure.clone()
     }
 
     /// Returns whether the native owner must recover or dispose this instance.
     #[must_use]
-    pub const fn is_faulted(&self) -> bool {
-        self.failure.is_some()
+    pub fn is_faulted(&self) -> bool {
+        self.failure.first_failure().is_some()
     }
 }
 
