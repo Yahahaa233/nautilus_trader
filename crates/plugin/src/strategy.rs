@@ -126,6 +126,8 @@ pub enum HostOperation {
     CachedBars,
     /// One application-owned allocation frame and native submission sequence.
     ManagedSubmitBatch,
+    /// Read-only original-order facts from the installed application owner.
+    ManagedOrderFacts,
 }
 
 impl HostOperation {
@@ -149,6 +151,7 @@ impl HostOperation {
             Self::ManagedSubmit => 14,
             Self::CachedBars => 15,
             Self::ManagedSubmitBatch => 16,
+            Self::ManagedOrderFacts => 17,
         }
     }
 
@@ -172,6 +175,7 @@ impl HostOperation {
             14 => Some(Self::ManagedSubmit),
             15 => Some(Self::CachedBars),
             16 => Some(Self::ManagedSubmitBatch),
+            17 => Some(Self::ManagedOrderFacts),
             _ => None,
         }
     }
@@ -339,6 +343,8 @@ pub enum ReadOperation {
     Portfolio,
     Order,
     CachedBars,
+    /// Scoped financial amendment state without any mutation capability.
+    ManagedOrderFacts,
 }
 
 /// Read-only callback capability used by Save/Restore. Safe algorithm code
@@ -378,6 +384,7 @@ impl ReadOnlyHost<'_> {
             ReadOperation::Portfolio => HostOperation::Portfolio,
             ReadOperation::Order => HostOperation::Query,
             ReadOperation::CachedBars => HostOperation::CachedBars,
+            ReadOperation::ManagedOrderFacts => HostOperation::ManagedOrderFacts,
         };
         self.host.call(operation, payload)
     }

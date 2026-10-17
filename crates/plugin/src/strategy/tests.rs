@@ -17,6 +17,37 @@ use super::{
     *,
 };
 
+#[test]
+fn original_order_observation_has_an_additive_tag_and_a_typed_read_only_facade() {
+    assert_eq!(HostOperation::ManagedOrderFacts.tag(), 17);
+    assert_eq!(
+        HostOperation::from_tag(17),
+        Some(HostOperation::ManagedOrderFacts)
+    );
+    let id = InstanceId::allocate().unwrap();
+    let mut observed = Vec::new();
+    let mut handler = |operation, input: &[u8]| {
+        observed.push((operation, input.to_vec()));
+        Ok(b"original-facts".to_vec())
+    };
+    with_host_scope(id, &mut handler, |lease| {
+        let mut host = ReadOnlyHost::new(lease);
+        assert_eq!(
+            host.call(ReadOperation::ManagedOrderFacts, b"original-order-id")
+                .unwrap(),
+            b"original-facts"
+        );
+    })
+    .unwrap();
+    assert_eq!(
+        observed,
+        vec![(
+            HostOperation::ManagedOrderFacts,
+            b"original-order-id".to_vec()
+        )]
+    );
+}
+
 fn limits() -> instance::CallbackLimits {
     instance::CallbackLimits {
         configuration_bytes: 128,

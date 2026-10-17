@@ -297,12 +297,12 @@ impl PluginStrategy {
         let version = self.scope.state_schema_version;
         let failure = self.native_failure.clone();
         let mut native = |operation, input: &[u8]| {
-            if matches!(kind, CallbackKind::Save | CallbackKind::Restore) {
-                return self
-                    .readonly(operation, input)
-                    .map_err(|error| PluginError::generic(format!("{error:#}")));
-            }
-            self.dispatch(operation, input).map_err(|error| {
+            let result = if matches!(kind, CallbackKind::Save | CallbackKind::Restore) {
+                self.readonly(operation, input)
+            } else {
+                self.dispatch(operation, input)
+            };
+            result.map_err(|error| {
                 if let Some(fatal) = error.downcast_ref::<managed::NativeManagedFailure>() {
                     PluginError::new(fatal.code, &fatal.message)
                 } else {
@@ -392,6 +392,7 @@ impl PluginStrategy {
             | HostOperation::Portfolio
             | HostOperation::Query
             | HostOperation::CachedBars => self.readonly(operation, input),
+            HostOperation::ManagedOrderFacts => self.managed_order_facts(input),
             HostOperation::RequestHistory => self.request_history(input),
             HostOperation::Log => {
                 let request: wire::LogRecord = serde_json::from_slice(input)?;

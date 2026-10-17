@@ -5,15 +5,16 @@
 
 //! Actual native factory/cache/interceptor paths; no exchange or economic ledger.
 use super::{
-    ManagedBracketRequest, ManagedOrderPlan, ManagedPolicyIdentity, ManagedSubmissionContext,
-    ManagedSubmissionOutcome, ManagedSubmissionPolicy, ManagedSubmissionStatus,
-    NativeManagedFailure, classify_managed_attempt, finish_managed_single,
+    ManagedBracketRequest, ManagedOrderFacts, ManagedOrderObservationContext, ManagedOrderPlan,
+    ManagedPolicyIdentity, ManagedSubmissionContext, ManagedSubmissionOutcome,
+    ManagedSubmissionPolicy, ManagedSubmissionStatus, NativeManagedFailure,
+    classify_managed_attempt, finish_managed_single,
 };
 use crate::{
     plugin::{PluginOrderType, PluginScope, PluginStrategy, wire},
     strategy::{PreparedSubmission, StrategyConfig, StrategyNative, SubmissionInterceptor},
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use nautilus_common::{
     cache::Cache, clock::VirtualClock, component::Component, messages::execution::TradingCommand,
 };
@@ -78,6 +79,79 @@ impl StateValidator for Contract {
     }
 }
 static API: StrategyApi = StrategyApi::for_algorithm::<Empty>();
+
+#[derive(Debug)]
+struct SwallowReadOnlyFailure(Empty);
+impl Algorithm for SwallowReadOnlyFailure {
+    const DESCRIPTOR_JSON: &'static str = "{}";
+    fn validate(raw: &[u8]) -> Result<(), PluginError> {
+        Empty::validate(raw)
+    }
+    fn create(raw: &[u8]) -> Result<Self, PluginError> {
+        Empty::create(raw).map(Self)
+    }
+    fn start(&mut self, h: &mut Host<'_>) -> Result<(), PluginError> {
+        self.0.start(h)
+    }
+    fn on_event(&mut self, raw: &[u8], h: &mut Host<'_>) -> Result<(), PluginError> {
+        self.0.on_event(raw, h)
+    }
+    fn save(&self, h: &mut ReadOnlyHost<'_>) -> Result<Vec<u8>, PluginError> {
+        let _original_ignored_result = h.call(
+            nautilus_plugin::strategy::ReadOperation::ManagedOrderFacts,
+            br#"{"schema_version":1,"client_order_id":"original-protection-1"}"#,
+        );
+        self.0.save(h)
+    }
+    fn restore(&mut self, v: u32, raw: &[u8], h: &mut ReadOnlyHost<'_>) -> Result<(), PluginError> {
+        self.0.restore(v, raw, h)
+    }
+    fn pause(&mut self, h: &mut Host<'_>) -> Result<(), PluginError> {
+        self.0.pause(h)
+    }
+    fn resume(&mut self, h: &mut Host<'_>) -> Result<(), PluginError> {
+        self.0.resume(h)
+    }
+    fn stop(&mut self, raw: &[u8], h: &mut Host<'_>) -> Result<(), PluginError> {
+        self.0.stop(raw, h)
+    }
+}
+static OBSERVER_API: StrategyApi = StrategyApi::for_algorithm::<SwallowReadOnlyFailure>();
+
+#[test]
+fn readonly_managed_owner_panic_cannot_be_swallowed_during_native_save() -> Result<()> {
+    let (mut strategy, evidence) = fixture("observe-save-panic")?;
+    observation_order(&strategy, "owned")?;
+    let original = strategy.invoke(nautilus_plugin::strategy::CallbackKind::Save, b"");
+    ensure!(
+        original.is_err(),
+        "native save swallowed the original managed observation owner panic"
+    );
+    let first = strategy
+        .callback_failure()
+        .context("native save lost original first failure")?;
+    ensure!(
+        first.0 == PluginErrorCode::Panic
+            && first.1.contains("original managed observation owner panic"),
+        "native save changed original failure classification"
+    );
+    ensure!(
+        strategy
+            .invoke(nautilus_plugin::strategy::CallbackKind::Save, b"")
+            .is_err()
+            && strategy.callback_failure() == Some(first),
+        "later save erased original financial owner failure"
+    );
+    let e = evidence.borrow();
+    ensure!(
+        e.observations.len() == 1
+            && e.commands.is_empty()
+            && e.prepares == 0
+            && e.finalizations.is_empty(),
+        "failed read-only save reached mutation path"
+    );
+    Ok(())
+}
 fn injected_prepare_panic() -> ! {
     panic!("original portfolio preparation panic");
 }
@@ -86,6 +160,7 @@ fn injected_native_panic() -> ! {
 }
 #[derive(Debug, Default)]
 struct Evidence {
+    observations: Vec<ManagedOrderObservationContext>,
     prepares: usize,
     finalizations: Vec<Vec<ManagedSubmissionOutcome>>,
     contexts: Vec<ManagedSubmissionContext>,
@@ -163,6 +238,21 @@ impl Policy {
     }
 }
 impl ManagedSubmissionPolicy for Policy {
+    fn observe_order(&self, context: &ManagedOrderObservationContext) -> Result<ManagedOrderFacts> {
+        self.evidence
+            .borrow_mut()
+            .observations
+            .push(context.clone());
+        if self.case == "observation-error" {
+            bail!("original financial observation unavailable");
+        }
+        if matches!(self.case, "observation-panic" | "observe-save-panic") {
+            observation_panic();
+        }
+        Ok(ManagedOrderFacts {
+            pending_exit_amendment: self.case == "observed-pending",
+        })
+    }
     fn prepare(&self, context: &ManagedSubmissionContext, _: &[u8]) -> Result<ManagedOrderPlan> {
         let mut evidence = self.evidence.borrow_mut();
         evidence.prepares += 1;
@@ -227,6 +317,218 @@ impl ManagedSubmissionPolicy for Policy {
         Ok(())
     }
 }
+
+fn observation_panic() -> ! {
+    panic!("original managed observation owner panic");
+}
+
+fn observation_order(strategy: &PluginStrategy, case: &str) -> Result<()> {
+    use nautilus_common::actor::DataActorNative;
+    use nautilus_core::UUID4;
+    use nautilus_model::{
+        events::{OrderAccepted, OrderEventAny, OrderSubmitted},
+        orders::{MarketOrder, OrderAny},
+    };
+    let strategy_id = if case == "foreign-strategy" {
+        "FOREIGN-001"
+    } else {
+        "MANAGED-001"
+    }
+    .into();
+    let trader = if case == "foreign-trader" {
+        "FOREIGN-TRADER"
+    } else {
+        "TRADER-001"
+    }
+    .into();
+    let account = if case == "foreign-account" {
+        "BINANCE-FOREIGN"
+    } else {
+        "BINANCE-MANAGED"
+    }
+    .into();
+    let instrument = if case == "foreign-instrument" {
+        "BTCUSDT-PERP.BINANCE"
+    } else {
+        "ETHUSDT-PERP.BINANCE"
+    }
+    .into();
+    let id = "original-protection-1".into();
+    let mut order: OrderAny = MarketOrder::new_checked(
+        trader,
+        strategy_id,
+        instrument,
+        id,
+        OrderSide::Sell,
+        Quantity::from("0.001"),
+        TimeInForce::Gtc,
+        UUID4::new(),
+        0.into(),
+        case != "risk-entry",
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?
+    .into();
+    if case != "unbound-account" {
+        order.apply(OrderEventAny::Submitted(OrderSubmitted::new(
+            trader,
+            strategy_id,
+            instrument,
+            id,
+            account,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+        )))?;
+        order.apply(OrderEventAny::Accepted(OrderAccepted::new(
+            trader,
+            strategy_id,
+            instrument,
+            id,
+            "original-venue-1".into(),
+            account,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+            false,
+        )))?;
+    }
+    strategy.cache_rc().borrow_mut().add_order(
+        order,
+        None,
+        if case == "unbound-client" {
+            None
+        } else {
+            Some(
+                if case == "foreign-client" {
+                    "FOREIGN-EXEC"
+                } else {
+                    "MANAGED-EXEC"
+                }
+                .into(),
+            )
+        },
+        false,
+    )?;
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case("observed-pending", true)]
+#[case("observed-settled", false)]
+fn managed_observation_uses_original_native_scope_without_generating_identity(
+    #[case] case: &'static str,
+    #[case] pending: bool,
+) -> Result<()> {
+    use nautilus_plugin::strategy::HostOperation;
+    let (mut strategy, evidence) = fixture(case)?;
+    observation_order(&strategy, "owned")?;
+    let before = strategy.order_factory().client_order_id_count();
+    let original = strategy.owned_order("original-protection-1".into())?;
+    let input = br#"{"schema_version":1,"client_order_id":"original-protection-1"}"#;
+    let raw = strategy.readonly(HostOperation::ManagedOrderFacts, input)?;
+    let result: Value = serde_json::from_slice(&raw)?;
+    ensure!(
+        result["facts"]["pending_exit_amendment"] == pending
+            && result["context"]["client_order_id"] == "original-protection-1"
+            && result["context"]["strategy_id"] == "MANAGED-001"
+            && result["context"]["account_id"] == "BINANCE-MANAGED"
+            && result["context"]["client_id"] == "MANAGED-EXEC"
+            && result["context"]["timestamp_ns"] == 0
+            && result["execution_authorized"] == false
+            && result["native_identity_generated"] == false,
+        "original observation scope changed"
+    );
+    ensure!(
+        strategy.order_factory().client_order_id_count() == before
+            && strategy
+                .owned_order("original-protection-1".into())?
+                .events()
+                == original.events(),
+        "read-only observation advanced native identity or order state"
+    );
+    let e = evidence.borrow();
+    ensure!(
+        e.observations.len() == 1
+            && e.prepares == 0
+            && e.bound == 0
+            && e.commands.is_empty()
+            && e.finalizations.is_empty(),
+        "observation invoked a mutation path"
+    );
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case("foreign-strategy")]
+#[case("foreign-account")]
+#[case("foreign-trader")]
+#[case("foreign-instrument")]
+#[case("risk-entry")]
+#[case("unbound-account")]
+#[case("foreign-client")]
+#[case("unbound-client")]
+fn managed_observation_refuses_foreign_or_unbound_orders_before_the_shared_owner(
+    #[case] case: &'static str,
+) -> Result<()> {
+    let (strategy, evidence) = fixture("observed-pending")?;
+    observation_order(&strategy, case)?;
+    ensure!(
+        strategy
+            .managed_order_facts(
+                br#"{"schema_version":1,"client_order_id":"original-protection-1"}"#
+            )
+            .is_err(),
+        "{case} observed another scope"
+    );
+    ensure!(
+        evidence.borrow().observations.is_empty(),
+        "foreign observation reached economic owner"
+    );
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case("observation-error", false)]
+#[case("observation-panic", true)]
+fn managed_observation_preserves_original_owner_errors_without_allocating(
+    #[case] case: &'static str,
+    #[case] panic: bool,
+) -> Result<()> {
+    let (strategy, evidence) = fixture(case)?;
+    observation_order(&strategy, "owned")?;
+    let failure = strategy
+        .managed_order_facts(br#"{"schema_version":1,"client_order_id":"original-protection-1"}"#)
+        .unwrap_err();
+    ensure!(
+        failure.to_string().contains(if panic {
+            "original managed observation owner panic"
+        } else {
+            "original financial observation unavailable"
+        }),
+        "original observation error lost"
+    );
+    ensure!(
+        failure.downcast_ref::<NativeManagedFailure>().is_some() == panic,
+        "observation panic classification lost"
+    );
+    let e = evidence.borrow();
+    ensure!(
+        e.observations.len() == 1
+            && e.prepares == 0
+            && e.finalizations.is_empty()
+            && e.commands.is_empty(),
+        "observation failure mutated funds"
+    );
+    Ok(())
+}
 #[derive(Debug)]
 struct Interceptor {
     evidence: Rc<RefCell<Evidence>>,
@@ -269,7 +571,11 @@ fn fixture(case: &'static str) -> Result<(PluginStrategy, Rc<RefCell<Evidence>>)
     // SAFETY: fixed static executable table and Rust thunks have process lifetime.
     let guest = unsafe {
         GuestInstance::create(
-            &raw const API,
+            if case == "observe-save-panic" {
+                &raw const OBSERVER_API
+            } else {
+                &raw const API
+            },
             b"{}",
             b"",
             CallbackLimits {

@@ -22,6 +22,7 @@ use crate::strategy::Strategy;
 impl PluginStrategy {
     pub(super) fn readonly(&self, operation: HostOperation, input: &[u8]) -> Result<Vec<u8>> {
         match operation {
+            HostOperation::ManagedOrderFacts => self.managed_order_facts(input),
             HostOperation::Clock => {
                 ensure!(input.is_empty(), "clock request must be empty");
                 self.clock_facts()

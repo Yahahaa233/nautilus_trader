@@ -13,7 +13,7 @@ mod tests;
 use super::{PluginStrategy, wire};
 use crate::strategy::{Strategy, StrategyNative};
 use anyhow::{Context, Result, ensure};
-use nautilus_common::actor::DataActor;
+use nautilus_common::actor::{DataActor, DataActorNative};
 use nautilus_model::{
     enums::OrderSide,
     identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId},
@@ -73,6 +73,26 @@ pub struct ManagedSubmissionContext {
     pub timestamp_ns: u64,
 }
 
+/// Actual native scope of one read-only original-order observation. Unlike a
+/// submission context, constructing this does not advance an order ID factory.
+#[derive(Clone, Debug, Serialize)]
+pub struct ManagedOrderObservationContext {
+    pub trader_id: TraderId,
+    pub strategy_id: StrategyId,
+    pub account_id: AccountId,
+    pub client_id: ClientId,
+    pub instrument_id: InstrumentId,
+    pub client_order_id: ClientOrderId,
+    pub timestamp_ns: u64,
+}
+
+/// Shared financial owner facts, not a cached-order status inference or grant.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct ManagedOrderFacts {
+    /// True until the original amendment has a matching financial settlement.
+    pub pending_exit_amendment: bool,
+}
+
 /// Native cache recording only; a recorded order can already be locally Denied.
 /// Accepted never proves transmission, venue acceptance or a fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -118,6 +138,16 @@ pub struct ManagedBracketRequest {
 /// Implementations use the existing shared business ledger and final interceptor.
 /// Source capture/recovery of that ledger remains the application owner's duty.
 pub trait ManagedSubmissionPolicy: Debug {
+    /// Observes the existing economic owner for this exact native order scope.
+    /// It must not allocate identities, reserve funds or create permissions.
+    /// # Errors
+    /// Refuses unavailable facts, ownership mismatch or unsupported observation.
+    fn observe_order(
+        &self,
+        _context: &ManagedOrderObservationContext,
+    ) -> Result<ManagedOrderFacts> {
+        anyhow::bail!("native managed policy does not implement original-order observations")
+    }
     /// Allocates once under the original native request ID. Returned quantities
     /// and order fields are application-approved, not guest authority.
     /// # Errors
@@ -200,6 +230,57 @@ fn fatal(code: nautilus_plugin::PluginErrorCode, message: String) -> anyhow::Err
 }
 
 impl PluginStrategy {
+    pub(super) fn managed_order_facts(&self, input: &[u8]) -> Result<Vec<u8>> {
+        use nautilus_model::orders::Order;
+        let request: wire::OrderId = serde_json::from_slice(input)?;
+        super::require_version(request.schema_version)?;
+        let order = self.owned_order(request.client_order_id)?;
+        ensure!(
+            order.is_reduce_only() && order.account_id() == Some(self.scope.account_id),
+            "managed order observation requires an owned account-bound reduce-only order"
+        );
+        let policy = self
+            .managed_policy
+            .as_ref()
+            .context("native managed observation policy absent")?;
+        let context = ManagedOrderObservationContext {
+            trader_id: self
+                .core
+                .trader_id()
+                .context("native observer trader unregistered")?,
+            strategy_id: self
+                .core
+                .strategy_id()
+                .context("native observer strategy unregistered")?,
+            account_id: self.scope.account_id,
+            client_id: self.scope.client_id,
+            instrument_id: order.instrument_id(),
+            client_order_id: request.client_order_id,
+            timestamp_ns: self.clock().timestamp_ns().as_u64(),
+        };
+        ensure!(
+            order.trader_id() == context.trader_id,
+            "managed observation trader differs from native order"
+        );
+        let cache = self.try_cache_ref()?;
+        ensure!(
+            cache.client_id(&context.client_order_id).copied() == Some(context.client_id),
+            "managed observation order belongs to another or unbound native client"
+        );
+        if let Some(account) = cache.account_id_for_client(&context.client_id) {
+            ensure!(
+                *account == context.account_id,
+                "managed observation client belongs to another account"
+            );
+        }
+        drop(cache);
+        let facts = catch_managed_panic(|| policy.policy.observe_order(&context))
+            .map_err(|message| fatal(nautilus_plugin::PluginErrorCode::Panic, message))??;
+        Ok(serde_json::to_vec(&serde_json::json!({"schema_version":1,
+            "context":context,"policy":policy.identity,"facts":facts,
+            "execution_authorized":false,"native_identity_generated":false}))?)
+    }
+
     /// Binds an immutable policy identity and the same application business owner.
     /// # Errors
     /// Refuses replacement, registration/use, failed guests or invalid identities.
