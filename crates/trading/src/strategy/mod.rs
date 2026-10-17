@@ -3111,6 +3111,9 @@ pub fn route_time_event<T>(strategy: &mut T, event: &TimeEvent)
 where
     T: Strategy + StrategyNative + Component + ?Sized,
 {
+    // This handoff describes this exact dispatch, never an earlier timer or a
+    // name inferred by the encoded guest adapter after framework cleanup.
+    StrategyNative::strategy_core_mut(strategy).managed_framework_event = None;
     let (gtd_order_id, is_market_exit) = {
         let core = StrategyNative::strategy_core(strategy);
         let gtd_order_id = event
@@ -3128,6 +3131,7 @@ where
 
     let core = StrategyNative::strategy_core_mut(strategy);
     if core.managed_time_event_last_id == Some(event.event_id) {
+        core.managed_framework_event = Some(event.clone());
         return;
     }
     let kind = if gtd_order_id.is_some() {
@@ -3146,6 +3150,7 @@ where
     } else {
         strategy.check_market_exit(event.clone());
     }
+    StrategyNative::strategy_core_mut(strategy).managed_framework_event = Some(event.clone());
 }
 
 pub(super) fn submit_order_native<T>(

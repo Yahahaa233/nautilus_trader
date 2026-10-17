@@ -205,3 +205,17 @@ BacktestID binding, execution authority or production acceptance.
 `strategy_contract_research_host` runs the same two dynamic algorithms in one actual BacktestEngine
 with virtual clocks and the same native submission refusal. It is also conformance evidence, not
 trading eligibility or a completed research report.
+
+### Native framework timer handoff
+
+`strategy::route_time_event` remains the owner of native GTD expiry and market-exit checks.
+After processing an owned event it retains that exact `TimeEvent` at the callback boundary.
+`PluginStrategy` consumes only this original framework handoff; it does not deliver an internal
+framework check as an encoded guest timer or charge it to the guest timer allowance. A changed
+name, UUID, scheduled time or arrival time cannot reuse the original handoff. All other encoded
+timer callbacks retain the existing guest namespace checks and normal guest dispatch.
+
+The handoff is reset at each native timer dispatch and is not serialized. It is callback routing
+metadata, not a timer, recovery proof, financial policy or execution permission. Native framework
+state, timer effects and historical verification remain with their existing owners. This does not
+by itself qualify an application's full financial/native recovery cut.

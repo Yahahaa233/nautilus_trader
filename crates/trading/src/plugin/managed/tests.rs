@@ -726,7 +726,9 @@ fn fixture(case: &'static str) -> Result<(PluginStrategy, Rc<RefCell<Evidence>>)
     // SAFETY: fixed static executable table and Rust thunks have process lifetime.
     let guest = unsafe {
         GuestInstance::create(
-            if case == "observe-save-panic" {
+            if case == "framework-timer-route" {
+                &raw const TIMER_API
+            } else if case == "observe-save-panic" {
                 &raw const OBSERVER_API
             } else {
                 &raw const API
@@ -1570,5 +1572,210 @@ fn native_frame_refuses_foreign_owner_and_oversized_payload_before_guest() -> Re
             "invalid native frame changed policy or execution"
         );
     }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct FrameworkTimerGuest(Empty);
+impl Algorithm for FrameworkTimerGuest {
+    const DESCRIPTOR_JSON: &'static str = "{}";
+    fn validate(raw: &[u8]) -> Result<(), PluginError> {
+        Empty::validate(raw)
+    }
+    fn create(raw: &[u8]) -> Result<Self, PluginError> {
+        Empty::create(raw).map(Self)
+    }
+    fn start(&mut self, h: &mut Host<'_>) -> Result<(), PluginError> {
+        self.0.start(h)
+    }
+    fn on_event(&mut self, _: &[u8], _: &mut Host<'_>) -> Result<(), PluginError> {
+        Err(PluginError::generic("private guest received a timer event"))
+    }
+    fn save(&self, h: &mut ReadOnlyHost<'_>) -> Result<Vec<u8>, PluginError> {
+        self.0.save(h)
+    }
+    fn restore(&mut self, v: u32, raw: &[u8], h: &mut ReadOnlyHost<'_>) -> Result<(), PluginError> {
+        self.0.restore(v, raw, h)
+    }
+    fn pause(&mut self, h: &mut Host<'_>) -> Result<(), PluginError> {
+        self.0.pause(h)
+    }
+    fn resume(&mut self, h: &mut Host<'_>) -> Result<(), PluginError> {
+        self.0.resume(h)
+    }
+    fn stop(&mut self, raw: &[u8], h: &mut Host<'_>) -> Result<(), PluginError> {
+        self.0.stop(raw, h)
+    }
+}
+static TIMER_API: StrategyApi = StrategyApi::for_algorithm::<FrameworkTimerGuest>();
+
+type FrameworkTimerFixture = (
+    ustr::Ustr,
+    nautilus_common::timer::TimeEvent,
+    Rc<RefCell<Evidence>>,
+);
+fn dispatched_framework_timer() -> Result<FrameworkTimerFixture> {
+    use crate::strategy::{Strategy, route_time_event};
+    use nautilus_common::{
+        actor::{DataActor, registry::try_get_actor_unchecked},
+        clock::VirtualClock,
+        component::{register_component_actor, start_component},
+        timer::TimeEventCallback,
+    };
+    let (mut strategy, evidence) = fixture("framework-timer-route")?;
+    let actor_id = strategy.component_id().inner();
+    let results = Rc::new(RefCell::new(Vec::new()));
+    let captured = results.clone();
+    strategy
+        .core
+        .clock_mut()
+        .register_default_handler(TimeEventCallback::RustLocal(Rc::new(move |event| {
+            let mut strategy = try_get_actor_unchecked::<PluginStrategy>(&actor_id)
+                .expect("original timer actor retained");
+            route_time_event(&mut *strategy, &event);
+            let result =
+                DataActor::on_time_event(&mut *strategy, &event).map_err(|e| format!("{e:#}"));
+            captured.borrow_mut().push(result);
+        })));
+    register_component_actor(strategy);
+    start_component(&actor_id)?;
+    let mut strategy = try_get_actor_unchecked::<PluginStrategy>(&actor_id)
+        .context("original clock owner missing")?;
+    strategy.dispatch(
+        nautilus_plugin::strategy::HostOperation::ManagedMarketExit,
+        br#"{"schema_version":1}"#,
+    )?;
+    let name = strategy.core.market_exit_timer_name;
+    let next = strategy
+        .core
+        .clock_mut()
+        .next_time_ns(name.as_str())
+        .context("original framework timer not scheduled")?;
+    let handlers = {
+        let mut clock = strategy.core.clock_mut();
+        let clock = clock
+            .as_any_mut()
+            .downcast_mut::<VirtualClock>()
+            .context("actual virtual clock missing")?;
+        let events = clock.advance_time(next, true);
+        ensure!(
+            events.len() == 1 && events[0].name == name,
+            "original framework clock emitted another route"
+        );
+        clock.match_handlers(events)
+    };
+    let original = handlers[0].event.clone();
+    drop(strategy);
+    for handler in handlers {
+        handler.run();
+    }
+    let mut strategy = try_get_actor_unchecked::<PluginStrategy>(&actor_id)
+        .context("original dispatched clock owner missing")?;
+    ensure!(
+        results.borrow().len() == 1 && results.borrow()[0].is_ok(),
+        "original framework timer entered guest contract: {:?}",
+        results.borrow()
+    );
+    ensure!(
+        !strategy.is_exiting() && strategy.callback_failure().is_none(),
+        "native exit timer left false failure or exit in progress"
+    );
+    ensure!(
+        strategy.state() == nautilus_common::enums::ComponentState::Running
+            && evidence.borrow().prepares == 0
+            && evidence.borrow().commands.is_empty(),
+        "empty native exit created financial effects or stopped guest"
+    );
+    // The same actual event is benign after its framework owner consumed it.
+    DataActor::on_time_event(&mut *strategy, &original)?;
+    Ok((actor_id, original, evidence))
+}
+
+#[test]
+fn framework_timer_native_exit_actual_clock_does_not_enter_guest_timer_contract() -> Result<()> {
+    use nautilus_common::{
+        actor::registry::{deregister_actor, try_get_actor_unchecked},
+        component::deregister_component,
+    };
+    let (actor_id, _, _) = dispatched_framework_timer()?;
+    let mut strategy = try_get_actor_unchecked::<PluginStrategy>(&actor_id)
+        .context("original actor missing after timer")?;
+    Component::stop(&mut *strategy)?;
+    drop(strategy);
+    deregister_component(&actor_id);
+    deregister_actor(&actor_id);
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case("name")]
+#[case("event_id")]
+#[case("ts_event")]
+#[case("ts_init")]
+fn framework_timer_consumed_event_cannot_admit_changed_original_identity(
+    #[case] field: &str,
+) -> Result<()> {
+    use nautilus_common::{
+        actor::{
+            DataActor,
+            registry::{deregister_actor, try_get_actor_unchecked},
+        },
+        component::deregister_component,
+    };
+    let (actor_id, mut event, _) = dispatched_framework_timer()?;
+    match field {
+        "name" => event.name = "MARKET_EXIT_CHECK:FOREIGN-001".into(),
+        "event_id" => event.event_id = nautilus_core::UUID4::new(),
+        "ts_event" => event.ts_event = (event.ts_event.as_u64() + 1).into(),
+        _ => event.ts_init = (event.ts_init.as_u64() + 1).into(),
+    }
+    let mut strategy = try_get_actor_unchecked::<PluginStrategy>(&actor_id)
+        .context("original timer owner missing")?;
+    let refused = DataActor::on_time_event(&mut *strategy, &event);
+    ensure!(
+        refused.is_err()
+            && strategy
+                .callback_failure()
+                .is_some_and(|(code, message)| code == PluginErrorCode::InvalidArgument
+                    && message.contains("native timer callback belongs to another owner")),
+        "framework dispatch accepted a changed original timer identity"
+    );
+    drop(strategy);
+    deregister_component(&actor_id);
+    deregister_actor(&actor_id);
+    Ok(())
+}
+
+#[test]
+fn framework_timer_guest_owned_event_still_reaches_original_guest_contract() -> Result<()> {
+    use nautilus_common::{actor::DataActor, timer::TimeEvent};
+    use nautilus_common::{
+        actor::registry::{deregister_actor, try_get_actor_unchecked},
+        component::{deregister_component, register_component_actor, start_component},
+    };
+    let (strategy, _) = fixture("framework-timer-route")?;
+    let actor_id = strategy.component_id().inner();
+    register_component_actor(strategy);
+    start_component(&actor_id)?;
+    let mut strategy = try_get_actor_unchecked::<PluginStrategy>(&actor_id)
+        .context("original ordinary timer actor missing")?;
+    let event = TimeEvent::new(
+        "plugin:MANAGED-001:original-user-timer".into(),
+        nautilus_core::UUID4::new(),
+        1.into(),
+        1.into(),
+    );
+    let actual = DataActor::on_time_event(&mut *strategy, &event);
+    ensure!(
+        actual.is_err()
+            && strategy
+                .callback_failure()
+                .is_some_and(|(code, message)| code == PluginErrorCode::Generic
+                    && message.contains("private guest received a timer event")),
+        "native framework filtering suppressed the ordinary guest timer callback"
+    );
+    drop(strategy);
+    deregister_component(&actor_id);
+    deregister_actor(&actor_id);
     Ok(())
 }

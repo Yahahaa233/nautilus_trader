@@ -25,6 +25,7 @@ use nautilus_common::{
     cache::Cache,
     clock::Clock,
     factories::OrderFactory,
+    timer::TimeEvent,
 };
 use nautilus_core::{
     UUID4,
@@ -79,6 +80,9 @@ pub struct StrategyCore {
     pub(crate) portfolio: Option<Rc<RefCell<Portfolio>>>,
     pub(crate) gtd_timers: AHashMap<ClientOrderId, Ustr>,
     pub(crate) managed_time_event_last_id: Option<UUID4>,
+    /// Exact native framework event consumed at the current callback boundary.
+    /// Recomputed by the native timer owner; not serialized or execution authority.
+    pub(crate) managed_framework_event: Option<TimeEvent>,
     pub(crate) is_exiting: bool,
     pub(crate) pending_stop: bool,
     pub(crate) market_exit_attempts: u64,
@@ -222,6 +226,7 @@ impl StrategyCore {
             portfolio: None,
             gtd_timers: AHashMap::new(),
             managed_time_event_last_id: None,
+            managed_framework_event: None,
             is_exiting: false,
             pending_stop: false,
             market_exit_attempts: 0,

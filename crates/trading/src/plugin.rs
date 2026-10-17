@@ -839,6 +839,13 @@ impl DataActor for PluginStrategy {
         self.event("historical_bars", bars)
     }
     fn on_time_event(&mut self, event: &TimeEvent) -> Result<()> {
+        // The native framework already owns and processes expiry/market-exit
+        // timers. Its exact consumed event must not become a guest timer or
+        // spend the guest's timer budget. Changed/foreign events still enter
+        // the original strict guest scope check below.
+        if self.core.managed_framework_event.as_ref() == Some(event) {
+            return Ok(());
+        }
         let valid = self
             .strategy_id()
             .is_some_and(|owner| event.name.as_str().starts_with(&format!("plugin:{owner}:")));
